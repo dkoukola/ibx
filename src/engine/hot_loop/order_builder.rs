@@ -6,9 +6,94 @@ use crate::config::{chrono_free_timestamp, unix_to_ib_utc_dash};
 use crate::engine::context::Context;
 use crate::protocol::connection::Connection;
 use crate::protocol::fix;
+use crate::protocol::order_write::OrderWriteOutcome;
 use crate::types::{AlgoParams, OrderCondition, OrderId, OrderRequest, OrderStatus, OrderUpdate, Side};
 
 use super::{HeartbeatState, format_price_ref, format_qty, format_uint};
+
+/// Only command-local encoder mutations; restored synchronously on refusal,
+/// before this hot-loop iteration can process another broker observation.
+struct PreparedOrderState {
+    id: OrderId,
+    order: Option<crate::types::Order>,
+    version: Option<u32>,
+    last_clord: Option<String>,
+    cancel_clord: Option<String>,
+    trail: Option<crate::engine::context::TrailLimitReported>,
+    bracket_key: Option<crate::engine::bracket::BracketKey>,
+    next_child: Option<u32>,
+}
+
+struct OrderPreparation {
+    orders: Vec<PreparedOrderState>,
+    bracket_groups: u32,
+    bracket_rng: u64,
+}
+
+impl OrderPreparation {
+    fn capture(context: &Context, request: &OrderRequest) -> Self {
+        let mut ids = match request {
+            OrderRequest::CancelAll { instrument } => context
+                .open_orders_for(*instrument)
+                .iter()
+                .map(|order| order.order_id)
+                .collect(),
+            _ => request_order_ids(request),
+        };
+        if let Some(parent) = request
+            .new_order_side()
+            .and_then(|(_, attrs)| attrs)
+            .map(|attrs| attrs.parent_id)
+            .filter(|id| *id > 0)
+        {
+            ids.push(parent);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Self {
+            orders: ids
+                .into_iter()
+                .map(|id| PreparedOrderState {
+                    id,
+                    order: context.order(id).copied(),
+                    version: context.modify_versions.get(&id).copied(),
+                    last_clord: context.last_clord.get(&id).cloned(),
+                    cancel_clord: context.cancel_clord.get(&id).cloned(),
+                    trail: context.trail_limit_reported.get(&id).copied(),
+                    bracket_key: context.bracket_keys.get(&id).copied(),
+                    next_child: context.bracket_next_child.get(&id).copied(),
+                })
+                .collect(),
+            bracket_groups: context.bracket_groups,
+            bracket_rng: context.bracket_rng,
+        }
+    }
+
+    fn restore(self, context: &mut Context) {
+        fn put<T>(map: &mut std::collections::HashMap<OrderId, T>, id: OrderId, value: Option<T>) {
+            if let Some(value) = value {
+                map.insert(id, value);
+            } else {
+                map.remove(&id);
+            }
+        }
+        for old in self.orders {
+            if let Some(order) = old.order {
+                context.insert_order(order);
+            } else {
+                context.remove_order(old.id);
+            }
+            put(&mut context.modify_versions, old.id, old.version);
+            put(&mut context.last_clord, old.id, old.last_clord);
+            put(&mut context.cancel_clord, old.id, old.cancel_clord);
+            put(&mut context.trail_limit_reported, old.id, old.trail);
+            put(&mut context.bracket_keys, old.id, old.bracket_key);
+            put(&mut context.bracket_next_child, old.id, old.next_child);
+        }
+        context.bracket_groups = self.bracket_groups;
+        context.bracket_rng = self.bracket_rng;
+    }
+}
 
 pub(crate) fn drain_and_send_orders(
     ccp_conn: &mut Option<Connection>,
@@ -30,7 +115,32 @@ pub(crate) fn drain_and_send_orders(
         Some(c) => c,
         None => return,
     };
-    for mut order_req in orders {
+    let mut orders = orders.into_iter();
+    while let Some(mut order_req) = orders.next() {
+        let guard = if let OrderRequest::Guarded { request, guard } = order_req {
+            order_req = *request;
+            // A clone of an already-admitted command must not run preflight
+            // again (e.g. reject its own now-PendingCancel order).
+            if !guard.pending_preparation() {
+                continue;
+            }
+            // A guard owns one native command, not a nested admission or preview.
+            if matches!(
+                order_req,
+                OrderRequest::Guarded { .. } | OrderRequest::SubmitWhatIf { .. }
+            ) {
+                guard.refuse_unprepared();
+                continue;
+            }
+            Some(guard)
+        } else {
+            None
+        };
+        let refuse_guard = || {
+            if let Some(guard) = &guard {
+                guard.refuse_unprepared();
+            }
+        };
         let oid = order_req.order_id();
         // A what-if preview is the order as it would be placed, written by
         // its own encoder (ibx#462); it is unwrapped here and wrapped again
@@ -39,10 +149,21 @@ pub(crate) fn drain_and_send_orders(
         if let OrderRequest::SubmitWhatIf { request } = order_req {
             order_req = *request;
         }
-        let rewrap = |req: OrderRequest| if what_if {
-            OrderRequest::SubmitWhatIf { request: Box::new(req) }
-        } else {
-            req
+        let rewrap = |req: OrderRequest| {
+            let request = if what_if {
+                OrderRequest::SubmitWhatIf {
+                    request: Box::new(req),
+                }
+            } else {
+                req
+            };
+            match &guard {
+                Some(guard) => OrderRequest::Guarded {
+                    request: Box::new(request),
+                    guard: guard.clone(),
+                },
+                None => request,
+            }
         };
         if what_if && matches!(order_req, OrderRequest::Cancel { .. } | OrderRequest::CancelAll { .. }
             | OrderRequest::Modify { .. } | OrderRequest::SubmitBracket { .. } | OrderRequest::SubmitWhatIf { .. })
@@ -69,6 +190,7 @@ pub(crate) fn drain_and_send_orders(
                 let (code, message) = crate::client_core::FRACTIONAL_VIA_API;
                 log::warn!("Order {} refused: fractional quantity", oid);
                 shared.orders.push_order_error(oid, code, message.into());
+                refuse_guard();
                 continue;
             }
         }
@@ -84,6 +206,7 @@ pub(crate) fn drain_and_send_orders(
                     log::warn!("Order {} refused: {}", oid, cause);
                     shared.orders.push_order_error(oid, 321,
                         format!("Error validating request.-'bH' : cause - {}", cause));
+                    refuse_guard();
                     continue;
                 }
             }
@@ -104,12 +227,14 @@ pub(crate) fn drain_and_send_orders(
                 Ready::Refused(code, message) => {
                     log::warn!("Combo order {} refused: {} {}", oid, code, message);
                     shared.orders.push_order_error(oid, code, message);
+                    refuse_guard();
                     continue;
                 }
                 Ready::Built(built) => {
                     if let Some((code, message)) = combo::order_refusal(&built, &spec) {
                         log::warn!("Combo order {} refused: {} {}", oid, code, message);
                         shared.orders.push_order_error(oid, code, message);
+                        refuse_guard();
                         continue;
                     }
                     combo_track = Some(combo_order_setup(context, shared, &mut order_req, built, spec));
@@ -120,8 +245,14 @@ pub(crate) fn drain_and_send_orders(
         // on the order's exchange is refused, as the reference (ibx#414,
         // ibx#493).
         match pegged_type_refusal(&order_req, context, conn, hb, shared) {
-            Some(false) => { context.rth_parked.push(rewrap(order_req)); continue; }
-            Some(true) => continue,
+            Some(false) => {
+                context.rth_parked.push(rewrap(order_req));
+                continue;
+            }
+            Some(true) => {
+                refuse_guard();
+                continue;
+            }
             None => {}
         }
         // Outside RTH: kept only where the reference keeps it, from the
@@ -151,6 +282,7 @@ pub(crate) fn drain_and_send_orders(
                 log::warn!("Modify of order {} refused: the order is not working", order_id);
                 let (code, message) = crate::client_core::MODIFY_OF_FINISHED_ORDER;
                 shared.orders.push_order_error(*order_id, code, message.into());
+                refuse_guard();
                 continue;
             }
         }
@@ -162,6 +294,7 @@ pub(crate) fn drain_and_send_orders(
             if let Some((code, message)) = cancel_refusal(context, *order_id) {
                 log::warn!("Cancel of order {} refused: {}", order_id, message);
                 shared.orders.push_order_error(*order_id, code, message);
+                refuse_guard();
                 continue;
             }
         }
@@ -181,8 +314,43 @@ pub(crate) fn drain_and_send_orders(
             let (code, message) = crate::client_core::PRICE_VARIATION;
             log::warn!("Order {} refused: a price off the price grid", id);
             shared.orders.push_order_error(id, code, message.into());
+            refuse_guard();
             continue;
         }
+        // All metadata/query sends precede this gate. Keep guarded commands
+        // unsigned in the existing queue until earlier output has drained.
+        if guard.is_some() && conn.has_queued_output() {
+            context.pending_orders.push(rewrap(order_req));
+            for request in orders {
+                context.pending_orders.push(request);
+            }
+            break;
+        }
+        let checkpoint = if let Some(guard) = &guard {
+            if !guard.claim() {
+                continue;
+            }
+            if conn.begin_order_batch().is_err() {
+                guard.failed();
+                continue;
+            }
+            Some(OrderPreparation::capture(context, &order_req))
+        } else {
+            None
+        };
+        let guarded_cancels = if guard.is_some() {
+            match &order_req {
+                OrderRequest::Cancel { order_id } => vec![*order_id],
+                OrderRequest::CancelAll { instrument } => context
+                    .open_orders_for(*instrument)
+                    .iter()
+                    .map(|order| order.order_id)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         // A what-if goes out under a ClOrdID of its own and stays out of
         // the order table: an order with the same id is left as it is
         // (ibx#462).
@@ -1000,7 +1168,7 @@ pub(crate) fn drain_and_send_orders(
                 ])
             }
             // Unwrapped above; a nested preview is dropped there.
-            OrderRequest::SubmitWhatIf { .. } => Ok(()),
+            OrderRequest::SubmitWhatIf { .. } | OrderRequest::Guarded { .. } => Ok(()),
             OrderRequest::SubmitLimitFractional { order_id, instrument, side, qty, price } => {
                 // The tracked quantity is fixed-point like `qty` (it was 0).
                 let mut tracked = crate::types::Order::new(
@@ -1324,7 +1492,7 @@ pub(crate) fn drain_and_send_orders(
                 let fields = cancel_fields(context, account_id, order_id, "SEL");
                 let refs: Vec<(u32, &str)> = fields.iter().map(|(t, s)| (*t, s.as_str())).collect();
                 let result = conn.send_fix(&refs);
-                if result.is_ok() {
+                if result.is_ok() && guard.is_none() {
                     synthesize_pending_cancel(context, shared, order_id);
                 }
                 result
@@ -1339,7 +1507,7 @@ pub(crate) fn drain_and_send_orders(
                     let fields = cancel_fields(context, account_id, oid, "ALL");
                     let refs: Vec<(u32, &str)> = fields.iter().map(|(t, s)| (*t, s.as_str())).collect();
                     last_result = conn.send_fix(&refs);
-                    if last_result.is_ok() {
+                    if last_result.is_ok() && guard.is_none() {
                         synthesize_pending_cancel(context, shared, oid);
                     }
                 }
@@ -1400,6 +1568,28 @@ pub(crate) fn drain_and_send_orders(
                 conn.send_fix(&refs)
             }
         };
+        let result = if let Some(guard) = &guard {
+            // Every native bracket/cancel frame has been prepared before one
+            // batch is offered to the socket. This is not broker atomicity.
+            let written = if result.is_ok() {
+                conn.finish_order_batch(guard.clone())
+            } else {
+                conn.abort_order_batch(guard);
+                Err(std::io::Error::other("order batch preparation failed"))
+            };
+            if matches!(guard.outcome(), Some(OrderWriteOutcome::NotSent)) {
+                checkpoint
+                    .expect("guarded preparation checkpoint")
+                    .restore(context);
+            } else {
+                for id in guarded_cancels {
+                    synthesize_pending_cancel(context, shared, id);
+                }
+            }
+            written.and(result)
+        } else {
+            result
+        };
         context.short_sale_send = None;
         context.combo_send = None;
         if let Some((combo_order, view)) = combo_track && result.is_ok() {
@@ -1422,6 +1612,11 @@ pub(crate) fn drain_and_send_orders(
         match result {
             Ok(()) => hb.last_ccp_sent = Instant::now(),
             Err(e) => {
+                if guard.is_some() {
+                    // A transport receipt, not a fabricated broker rejection.
+                    // After any TLS write attempt the outcome remains unknown.
+                    continue;
+                }
                 // Order failed to send — remove from engine state and notify the application.
                 // See: https://github.com/deepentropy/ibx/issues/116
                 log::error!("Failed to send order {}: {} — notifying application", oid, e);
@@ -2454,8 +2649,15 @@ fn price_mgmt_flag(
 /// The orders of a request, a bracket's three included.
 fn request_order_ids(req: &OrderRequest) -> Vec<crate::types::OrderId> {
     match req {
-        OrderRequest::SubmitWhatIf { request } => request_order_ids(request),
-        OrderRequest::SubmitBracket { parent_id, tp_id, sl_id, .. } => vec![*parent_id, *tp_id, *sl_id],
+        OrderRequest::SubmitWhatIf { request } | OrderRequest::Guarded { request, .. } => {
+            request_order_ids(request)
+        }
+        OrderRequest::SubmitBracket {
+            parent_id,
+            tp_id,
+            sl_id,
+            ..
+        } => vec![*parent_id, *tp_id, *sl_id],
         OrderRequest::CancelAll { .. } => Vec::new(),
         other => vec![other.order_id()],
     }
@@ -3101,6 +3303,373 @@ fn condition_tags(conditions: &[OrderCondition]) -> Vec<(u32, String)> {
 mod tests {
     use super::*;
     use crate::types::Order;
+
+    fn guarded_fixture() -> (
+        Context,
+        Arc<SharedState>,
+        Option<Connection>,
+        std::net::TcpStream,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut context = Context::new();
+        context.market.register(265598);
+        let shared = Arc::new(SharedState::new());
+        shared.orders.begin_execution_history("initial");
+        (
+            context,
+            shared,
+            Some(Connection::new_raw(client).unwrap()),
+            server,
+        )
+    }
+
+    fn guarded_limit(id: OrderId) -> OrderRequest {
+        OrderRequest::SubmitLimit {
+            order_id: id,
+            instrument: 0,
+            side: Side::Buy,
+            qty: 1,
+            price: 100 * P,
+        }
+    }
+
+    #[test]
+    fn guarded_order_refusal_restores_new_modify_cancel_and_bracket_state() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        for request in [
+            guarded_limit(10),
+            OrderRequest::Modify {
+                new_order_id: 7,
+                order_id: 7,
+                qty: 2,
+                kind: crate::types::OrderKind::TrailingStopLimit {
+                    lmt_offset: 0,
+                    lmt_price: Some(100 * P),
+                    trail_amt: P,
+                    trail_stop_price: 101 * P,
+                },
+                tif: b'0',
+                attrs: Default::default(),
+            },
+            OrderRequest::Cancel { order_id: 7 },
+            OrderRequest::CancelAll { instrument: 0 },
+            OrderRequest::SubmitBracket {
+                parent_id: 10,
+                tp_id: 11,
+                sl_id: 12,
+                instrument: 0,
+                side: Side::Buy,
+                qty: 1,
+                entry_price: 100 * P,
+                take_profit: 110 * P,
+                stop_loss: 90 * P,
+            },
+        ] {
+            let (mut context, shared, mut conn, mut server) = guarded_fixture();
+            context.insert_order(order(7, 3, OrderStatus::PartiallyFilled));
+            context.last_clord.insert(7, "7.4".into());
+            context.modify_versions.insert(7, 4);
+            let (groups, rng) = (context.bracket_groups, context.bracket_rng);
+            let (guard, receipt) = OrderWriteGuard::new(|| Err("durable admission refused".into()));
+            context.pending_orders.push(OrderRequest::Guarded {
+                request: Box::new(request),
+                guard,
+            });
+            assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+            assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+            assert_eq!(
+                context.order(7).unwrap().status,
+                OrderStatus::PartiallyFilled
+            );
+            assert_eq!(
+                context.order(7).unwrap().filled_fixed,
+                3 * crate::types::QTY_SCALE
+            );
+            assert_eq!(context.last_clord.get(&7).map(String::as_str), Some("7.4"));
+            assert_eq!(context.modify_versions.get(&7), Some(&4));
+            assert!(context.cancel_clord.is_empty());
+            assert!(context.trail_limit_reported.is_empty());
+            assert!(context.bracket_keys.is_empty());
+            assert!(context.bracket_next_child.is_empty());
+            assert_eq!((context.bracket_groups, context.bracket_rng), (groups, rng));
+            for id in [10, 11, 12] {
+                assert!(context.order(id).is_none());
+                assert!(!context.modify_versions.contains_key(&id));
+            }
+            assert!(
+                shared.orders.drain_order_updates().is_empty(),
+                "no fabricated rejection/pending cancel"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_native_bracket_batches_once_even_when_request_is_cloned() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let (guard, receipt) = OrderWriteGuard::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let request = OrderRequest::Guarded {
+            request: Box::new(OrderRequest::SubmitBracket {
+                parent_id: 10,
+                tp_id: 11,
+                sl_id: 12,
+                instrument: 0,
+                side: Side::Buy,
+                qty: 1,
+                entry_price: 100 * P,
+                take_profit: 110 * P,
+                stop_loss: 90 * P,
+            }),
+            guard,
+        };
+        context.pending_orders.push(request.clone());
+        context.pending_orders.push(request);
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| tag(frame, 11).unwrap())
+                .collect::<Vec<_>>(),
+            ["10.0", "11.0", "12.0"]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::Written));
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+    }
+
+    #[test]
+    fn guarded_bracket_preparation_failure_never_releases_partial_batch() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        conn.as_mut().unwrap().fail_order_batch_after(1);
+        let (guard, receipt) = OrderWriteGuard::new(|| panic!("incomplete batch authorization"));
+        context.pending_orders.push(OrderRequest::Guarded {
+            request: Box::new(OrderRequest::SubmitBracket {
+                parent_id: 10,
+                tp_id: 11,
+                sl_id: 12,
+                instrument: 0,
+                side: Side::Buy,
+                qty: 1,
+                entry_price: 100 * P,
+                take_profit: 110 * P,
+                stop_loss: 90 * P,
+            }),
+            guard,
+        });
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+        for id in [10, 11, 12] {
+            assert!(context.order(id).is_none());
+            assert!(!context.modify_versions.contains_key(&id));
+        }
+        assert!(context.bracket_keys.is_empty());
+        assert!(shared.orders.drain_order_updates().is_empty());
+        assert!(conn.as_ref().unwrap().write_error().is_some());
+    }
+
+    #[test]
+    fn guarded_api_metadata_parking_preserves_identity_without_phantom_tracking() {
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let client = crate::api::EClient::from_parts(
+            shared.clone(),
+            tx,
+            std::thread::spawn(|| {}),
+            "DU1".into(),
+        );
+        let receipt = client
+            .send_order_guarded(
+                OrderRequest::SubmitLimitEx {
+                    order_id: 60,
+                    instrument: 0,
+                    side: Side::Buy,
+                    qty: 1,
+                    price: 100 * P,
+                    tif: b'0',
+                    attrs: crate::types::OrderAttrs {
+                        outside_rth: true,
+                        ..Default::default()
+                    },
+                },
+                client.order_connection_identity().unwrap(),
+                || panic!("stale authorization"),
+            )
+            .unwrap();
+        let crate::types::ControlCommand::Order(request) = rx.recv().unwrap() else {
+            panic!("order command")
+        };
+        context.pending_orders.push(request);
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(tag(&frames[0], 35), Some("c"), "metadata only");
+        assert_eq!(receipt.outcome(), None);
+        assert!(context.order(60).is_none());
+        shared.orders.invalidate_execution_history();
+        shared.orders.begin_execution_history("reconnected");
+        for lookup in &mut context.rth_lookups {
+            lookup.2 = Instant::now();
+        }
+        sweep_rth_lookups(&mut context);
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+        assert!(context.order(60).is_none());
+        shared.orders.set_open_orders_held(false);
+        let mut wrapper = crate::api::wrapper::tests::RecordingWrapper::default();
+        client.req_open_orders(&mut wrapper);
+        client.process_msgs(&mut wrapper);
+        assert!(
+            !wrapper
+                .events
+                .iter()
+                .any(|event| event.starts_with("open_order:"))
+        );
+    }
+
+    #[test]
+    fn guarded_output_backlog_cancellation_never_authorizes_or_replays() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        let (mut context, shared, mut conn, _server) = guarded_fixture();
+        let connection = conn.as_mut().unwrap();
+        connection.set_queued_writes(true);
+        let frame = vec![b'x'; 64 * 1024];
+        for _ in 0..10_000 {
+            if connection.has_queued_output() {
+                break;
+            }
+            connection.send_raw(&frame).unwrap();
+        }
+        assert!(connection.has_queued_output());
+        let (guard, receipt) = OrderWriteGuard::new(|| panic!("cancelled backlog callback"));
+        context.pending_orders.push(OrderRequest::Guarded {
+            request: Box::new(guarded_limit(20)),
+            guard,
+        });
+        drain_and_send_orders(
+            &mut conn,
+            &mut context,
+            "DU1",
+            &mut HeartbeatState::new(),
+            false,
+            &shared,
+        );
+        assert_eq!(receipt.outcome(), None);
+        assert!(context.order(20).is_none());
+        assert_eq!(receipt.cancel(), OrderWriteOutcome::NotSent);
+        let (_, _, replacement, mut server) = guarded_fixture();
+        conn = replacement;
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert!(context.order(20).is_none());
+    }
+
+    #[test]
+    fn guarded_empty_cancel_and_retained_refused_clone_complete_without_write() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        let (guard, receipt) = OrderWriteGuard::new(|| panic!("empty cancel authorization"));
+        context.pending_orders.push(OrderRequest::Guarded {
+            request: Box::new(OrderRequest::CancelAll { instrument: 0 }),
+            guard,
+        });
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+        assert!(conn.as_ref().unwrap().write_error().is_none());
+        assert_eq!(conn.as_ref().unwrap().seq, 0);
+
+        let (guard, receipt) = OrderWriteGuard::new(|| panic!("refused cancel authorization"));
+        let request = OrderRequest::Guarded {
+            request: Box::new(OrderRequest::Cancel { order_id: 999 }),
+            guard,
+        };
+        let retained = request.clone();
+        context.pending_orders.push(request);
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert_eq!(
+            receipt.outcome(),
+            Some(OrderWriteOutcome::NotSent),
+            "retained clone cannot delay refusal"
+        );
+        context.pending_orders.push(retained);
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+    }
+
+    #[test]
+    fn guarded_cloned_pending_cancel_does_not_fail_original_partial_write() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        let (guard, receipt) = OrderWriteGuard::new(|| Ok(()));
+        assert!(guard.claim());
+        assert!(
+            guard
+                .write(|| Err(std::io::ErrorKind::WouldBlock.into()))
+                .is_err()
+        );
+        context.insert_order(order(7, 0, OrderStatus::PendingCancel));
+        context.pending_orders.push(OrderRequest::Guarded {
+            request: Box::new(OrderRequest::Cancel { order_id: 7 }),
+            guard: guard.clone(),
+        });
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert!(shared.orders.drain_order_errors().is_empty());
+        assert_eq!(
+            receipt.outcome(),
+            None,
+            "duplicate must not fail an admitted original"
+        );
+        assert_eq!(guard.write(|| Ok(1)).unwrap(), 1);
+        guard.written();
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::Written));
+    }
+
+    #[test]
+    fn guarded_api_disconnect_during_authorization_prevents_first_write() {
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let client = crate::api::EClient::from_parts(
+            shared.clone(),
+            tx,
+            std::thread::spawn(|| {}),
+            "DU1".into(),
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let receipt = client
+            .send_order_guarded(guarded_limit(10), "initial".into(), move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let crate::types::ControlCommand::Order(request) = rx.recv().unwrap() else {
+            panic!("order command")
+        };
+        context.pending_orders.push(request);
+        let writer = std::thread::spawn(move || {
+            let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+            assert!(context.order(10).is_none());
+            frames
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        client.disconnect();
+        // Another logical client can use the same wire request text. It must
+        // not revive this guard's old SharedState ownership.
+        let replacement = Arc::new(SharedState::new());
+        replacement.orders.begin_execution_history("initial");
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap().is_empty());
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+    }
 
     fn order(oid: OrderId, filled: u32, status: OrderStatus) -> Order {
         Order {

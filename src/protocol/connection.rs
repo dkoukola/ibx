@@ -11,6 +11,12 @@ use native_tls::TlsStream;
 
 use super::fix::{self, SOH};
 use super::fixcomp;
+use super::order_write::OrderWriteGuard;
+
+struct OutputFrame {
+    bytes: Vec<u8>,
+    guard: Option<OrderWriteGuard>,
+}
 
 /// Recv buffer size.
 const RECV_BUF_SIZE: usize = 32768;
@@ -87,7 +93,11 @@ pub struct Connection {
     pub read_iv: Vec<u8>,
     /// Frames accepted for sending but not yet written, oldest first
     /// (queued writes only). `out_pos` bytes of the first are written.
-    out: VecDeque<Vec<u8>>,
+    out: VecDeque<OutputFrame>,
+    /// Command-local preparation only; no bytes leave until the batch ends.
+    order_batch: Option<Vec<u8>>,
+    #[cfg(test)]
+    order_batch_fail_after: Option<usize>,
     out_pos: usize,
     /// When set, a send never blocks the caller: what the socket does not
     /// take at once waits in `out` and goes out with `flush_queued`.
@@ -116,6 +126,9 @@ impl Connection {
             read_key: Vec::new(),
             read_iv: Vec::new(),
             out: VecDeque::new(),
+            order_batch: None,
+            #[cfg(test)]
+            order_batch_fail_after: None,
             out_pos: 0,
             queued_writes: false,
             write_error: None,
@@ -140,6 +153,9 @@ impl Connection {
             read_key: Vec::new(),
             read_iv: Vec::new(),
             out: VecDeque::new(),
+            order_batch: None,
+            #[cfg(test)]
+            order_batch_fail_after: None,
             out_pos: 0,
             queued_writes: false,
             write_error: None,
@@ -331,6 +347,11 @@ impl Connection {
     /// the socket may be closed already.
     pub fn shutdown(&mut self) {
         let _ = self.stream.tcp().shutdown(std::net::Shutdown::Both);
+        for frame in &self.out {
+            if let Some(guard) = &frame.guard {
+                guard.failed();
+            }
+        }
     }
 
     /// Writes of this connection stop blocking the caller (ibx#254): each
@@ -363,7 +384,51 @@ impl Connection {
         if self.write_error.is_none() {
             self.write_error = Some((e.kind(), e.to_string()));
         }
+        // Drop every queued guard now: no command migrates to a new socket.
+        for frame in &self.out {
+            if let Some(guard) = &frame.guard {
+                guard.failed();
+            }
+        }
+        self.out.clear();
+        self.out_pos = 0;
         e
+    }
+
+    /// Called only after metadata preparation and prior output have drained.
+    pub(crate) fn begin_order_batch(&mut self) -> io::Result<()> {
+        if self.write_error.is_some() {
+            return Err(self.failed());
+        }
+        if self.has_queued_output() || self.order_batch.is_some() {
+            return Err(io::Error::other("order batch requires empty output"));
+        }
+        self.order_batch = Some(Vec::new());
+        Ok(())
+    }
+
+    pub(crate) fn finish_order_batch(&mut self, guard: OrderWriteGuard) -> io::Result<()> {
+        let bytes = self.order_batch.take().expect("prepared order batch");
+        if bytes.is_empty() {
+            guard.failed();
+            return Err(io::Error::other("empty order batch"));
+        }
+        self.out.push_back(OutputFrame {
+            bytes,
+            guard: Some(guard),
+        });
+        self.flush_queued()
+    }
+
+    pub(crate) fn abort_order_batch(&mut self, guard: &OrderWriteGuard) {
+        self.order_batch = None;
+        guard.failed();
+        self.record_write_error(io::Error::other("order batch preparation failed"));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_order_batch_after(&mut self, frames: usize) {
+        self.order_batch_fail_after = Some(frames);
     }
 
     /// Hand one complete frame to the socket. Blocking mode: written at
@@ -374,10 +439,28 @@ impl Connection {
         if self.write_error.is_some() {
             return Err(self.failed());
         }
+        #[cfg(test)]
+        if self.order_batch.is_some()
+            && let Some(remaining) = &mut self.order_batch_fail_after
+        {
+            if *remaining == 0 {
+                return Err(
+                    self.record_write_error(io::Error::other("injected preparation failure"))
+                );
+            }
+            *remaining -= 1;
+        }
+        if let Some(batch) = self.order_batch.as_mut() {
+            batch.extend_from_slice(&frame);
+            return Ok(());
+        }
         if !self.queued_writes {
             return self.stream.write_all(&frame).map_err(|e| self.record_write_error(e));
         }
-        self.out.push_back(frame);
+        self.out.push_back(OutputFrame {
+            bytes: frame,
+            guard: None,
+        });
         if self.out.len() == 1 {
             self.flush_queued()
         } else {
@@ -401,11 +484,19 @@ impl Connection {
             let Some(front) = self.out.front() else { break Ok(()) };
             // A partial TLS record is completed by calling again with the
             // same bytes, which this does.
-            match self.stream.write(&front[self.out_pos..]) {
+            let mut write = || self.stream.write(&front.bytes[self.out_pos..]);
+            let result = match &front.guard {
+                Some(guard) => guard.write(write),
+                None => write(),
+            };
+            match result {
                 Ok(0) => break Err(io::Error::new(io::ErrorKind::WriteZero, "socket accepted no bytes")),
                 Ok(n) => {
                     self.out_pos += n;
-                    if self.out_pos >= front.len() {
+                    if self.out_pos >= front.bytes.len() {
+                        if let Some(guard) = &front.guard {
+                            guard.written();
+                        }
                         self.out.pop_front();
                         self.out_pos = 0;
                     }
@@ -650,6 +741,8 @@ mod tests {
             read_key: Vec::new(),
             read_iv: Vec::new(),
             out: VecDeque::new(),
+            order_batch: None,
+            order_batch_fail_after: None,
             out_pos: 0,
             queued_writes: false,
             write_error: None,
@@ -735,6 +828,75 @@ mod tests {
         conn.send_raw(b"hello").unwrap();
         assert!(!conn.has_queued_output());
         assert_eq!(read_available(&mut server, 5), b"hello");
+    }
+
+    #[test]
+    fn guarded_batch_prepares_all_frames_before_one_authorization() {
+        use super::super::order_write::OrderWriteOutcome;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (mut conn, mut server) = loopback();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (guard, receipt) = OrderWriteGuard::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        guard.claim();
+        conn.begin_order_batch().unwrap();
+        conn.send_fix(&[(35, "D"), (11, "1.0")]).unwrap();
+        conn.send_fix(&[(35, "D"), (11, "2.0")]).unwrap();
+        assert!(read_available(&mut server, 1).is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        conn.finish_order_batch(guard).unwrap();
+        let bytes = read_available(&mut server, 1);
+        assert_eq!(bytes.windows(5).filter(|w| *w == b"35=D\x01").count(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::Written));
+    }
+
+    #[test]
+    fn guarded_batch_denial_is_not_sent_and_retires_signed_chain() {
+        use super::super::order_write::OrderWriteOutcome;
+        let (mut conn, mut server) = loopback();
+        let (guard, receipt) = OrderWriteGuard::new(|| Err("refused".into()));
+        guard.claim();
+        conn.begin_order_batch().unwrap();
+        conn.send_fix(&[(35, "D")]).unwrap();
+        assert!(conn.finish_order_batch(guard).is_err());
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+        assert!(read_available(&mut server, 1).is_empty());
+        assert!(conn.write_error().is_some());
+        assert!(conn.send_fix(&[(35, "D")]).is_err());
+    }
+
+    #[test]
+    fn guarded_batch_partial_write_cancel_and_connection_loss_never_replay() {
+        use super::super::order_write::OrderWriteOutcome;
+        let (mut conn, mut server) = loopback();
+        let (guard, receipt) = OrderWriteGuard::new(|| Ok(()));
+        guard.claim();
+        conn.begin_order_batch().unwrap();
+        conn.send_raw(&vec![b'x'; 16 * 1024 * 1024]).unwrap();
+        conn.finish_order_batch(guard).unwrap();
+        assert!(conn.has_queued_output());
+        assert_eq!(receipt.outcome(), None);
+        assert_eq!(receipt.cancel(), OrderWriteOutcome::OutcomeUnknown);
+        assert!(conn.flush_queued().is_err());
+        assert!(!conn.has_queued_output());
+        assert!(!read_available(&mut server, 1).is_empty());
+        assert!(conn.flush_queued().is_err());
+
+        let (mut conn, _server) = loopback();
+        let (guard, receipt) = OrderWriteGuard::new(|| Ok(()));
+        guard.claim();
+        conn.begin_order_batch().unwrap();
+        conn.send_fix(&[(35, "D")]).unwrap();
+        conn.shutdown();
+        assert!(conn.finish_order_batch(guard).is_err());
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::OutcomeUnknown));
     }
 
     #[test]

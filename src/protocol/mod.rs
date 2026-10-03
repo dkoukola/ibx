@@ -3,5 +3,6 @@ pub mod depth_decoder;
 pub mod fix;
 pub mod fixcomp;
 pub mod ns;
+pub mod order_write;
 pub mod tick_decoder;
 pub mod xyz;
