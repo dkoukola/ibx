@@ -32,8 +32,21 @@ impl EClient {
 
     /// Position rows of a running req_positions (ibx#477).
     pub(crate) fn dispatch_positions(&self, wrapper: &mut impl Wrapper) {
+        if !self.is_connected() {
+            return;
+        }
         let Some(batch) = self.core.prepare_positions(&self.shared, &self.account_id) else { return };
+        if !self.is_connected() {
+            return;
+        }
+        if let Some((code, message)) = batch.error {
+            wrapper.error(-1, code, &message, "");
+            return;
+        }
         for pi in &batch.rows {
+            if !self.position_snapshot_current(batch.history.as_deref()) {
+                return;
+            }
             let ac = self.core.position_contract(pi.con_id, &self.shared);
             let c = Contract {
                 con_id: ac.con_id, symbol: ac.symbol, sec_type: ac.sec_type,
@@ -44,12 +57,22 @@ impl EClient {
             };
             wrapper.position(&self.account_id, &c, pi.position_fixed as f64 / QTY_SCALE_F, pi.avg_cost as f64 / PRICE_SCALE_F);
         }
-        if batch.end {
+        if batch.end && self.position_snapshot_current(batch.history.as_deref()) {
             wrapper.position_end();
         }
-        if let Some((code, message)) = batch.error {
-            wrapper.error(-1, code, &message, "");
-        }
+    }
+
+    fn position_connection_current(&self, history: Option<&str>) -> bool {
+        self.is_connected()
+            && self
+                .shared
+                .orders
+                .execution_history_request_matches(history)
+    }
+
+    fn position_snapshot_current(&self, history: Option<&str>) -> bool {
+        self.position_connection_current(history)
+            && self.shared.portfolio.account_download_complete()
     }
 
     // ── PnL ──
@@ -215,9 +238,22 @@ impl EClient {
                 wrapper.account_update_multi_end(batch.req_id);
             }
         }
+        if !self.is_connected() {
+            return;
+        }
         for (req_id, account, model_code, batch) in self.core.prepare_positions_multi(&self.shared) {
+            if !self.is_connected() {
+                continue;
+            }
+            if let Some((code, message)) = batch.error {
+                wrapper.error(req_id, code, &message, "");
+                continue;
+            }
             let account = if account.is_empty() { self.account_id.clone() } else { account };
             for pi in &batch.rows {
+                if !self.position_snapshot_current(batch.history.as_deref()) {
+                    break;
+                }
                 let ac = self.core.position_contract(pi.con_id, &self.shared);
                 let c = Contract {
                     con_id: ac.con_id, symbol: ac.symbol, sec_type: ac.sec_type,
@@ -229,11 +265,8 @@ impl EClient {
                 wrapper.position_multi(req_id, &account, &model_code, &c,
                     pi.position_fixed as f64 / QTY_SCALE_F, pi.avg_cost as f64 / PRICE_SCALE_F);
             }
-            if batch.end {
+            if batch.end && self.position_snapshot_current(batch.history.as_deref()) {
                 wrapper.position_multi_end(req_id);
-            }
-            if let Some((code, message)) = batch.error {
-                wrapper.error(req_id, code, &message, "");
             }
         }
     }

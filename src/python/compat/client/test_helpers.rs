@@ -601,6 +601,15 @@ impl EClient {
         Ok(())
     }
 
+    /// Invalidate the last position image, as an auth-link loss does.
+    #[doc(hidden)]
+    fn _test_invalidate_position_snapshot(&self) -> PyResult<()> {
+        self.shared_state()?
+            .portfolio
+            .invalidate_position_snapshot();
+        Ok(())
+    }
+
     /// Push an account summary batch as the server sends it, for the
     /// subscription id `SR.Socket.{n}` (ibx#479).
     #[doc(hidden)]

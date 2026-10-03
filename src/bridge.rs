@@ -1862,7 +1862,7 @@ pub struct PortfolioState {
     account_rows: Mutex<AccountRows>,
     /// True once the first gateway account message ("UT"/"UM"/"RL") has been received.
     account_data_received: AtomicBool,
-    /// True once the CCP init burst has been fully processed.
+    /// The current connection has delivered an account-wide position snapshot.
     account_download_complete: AtomicBool,
     /// Position info (conId -> PositionInfo) for reqPositions and P&L.
     position_infos: Mutex<HashMap<i64, PositionInfo>>,
@@ -1955,12 +1955,19 @@ impl PortfolioState {
         self.account_data_received.store(true, Ordering::Release);
     }
 
-    /// Mark account download as complete (init burst processed).
+    /// Mark the account-wide lightweight position snapshot as complete.
     #[doc(hidden)] pub fn set_account_download_complete(&self) {
         self.account_download_complete.store(true, Ordering::Release);
     }
 
-    /// True once the CCP init burst has been fully processed.
+    /// Invalidate position readiness without discarding last-known observations.
+    #[doc(hidden)]
+    pub fn invalidate_position_snapshot(&self) {
+        self.account_download_complete
+            .store(false, Ordering::Release);
+    }
+
+    /// True after the current connection's account-wide position snapshot.
     pub fn account_download_complete(&self) -> bool {
         self.account_download_complete.load(Ordering::Acquire)
     }
@@ -1968,6 +1975,46 @@ impl PortfolioState {
     /// Changes whenever a position or its average cost changes (ibx#477).
     pub fn position_generation(&self) -> u64 {
         self.position_generation.load(Ordering::Acquire)
+    }
+
+    /// Apply one validated account-wide feed atomically. A snapshot clears
+    /// quantities absent from the new image; zero rows retain contract metadata
+    /// and let existing subscribers observe positions closed while disconnected.
+    pub(crate) fn apply_position_feed(
+        &self,
+        mut rows: Vec<PositionInfo>,
+        snapshot: bool,
+    ) -> Vec<PositionInfo> {
+        let mut map = self.position_infos.lock().unwrap();
+        if snapshot {
+            let present: std::collections::HashSet<_> = rows.iter().map(|row| row.con_id).collect();
+            for prior in map.values() {
+                if !present.contains(&prior.con_id) {
+                    rows.push(PositionInfo {
+                        con_id: prior.con_id,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        let mut changed = false;
+        for row in &rows {
+            let entry = map.entry(row.con_id).or_insert_with(|| PositionInfo {
+                con_id: row.con_id,
+                ..Default::default()
+            });
+            changed |= entry.position_fixed != row.position_fixed || entry.avg_cost != row.avg_cost;
+            entry.position_fixed = row.position_fixed;
+            entry.avg_cost = row.avg_cost;
+            if row.position_fixed == 0 {
+                entry.market_value = 0;
+                entry.unrealized_pnl = 0;
+            }
+        }
+        if changed {
+            self.position_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        rows
     }
 
     /// Move a position by a fill of this session (`delta` fixed-point,
@@ -2116,6 +2163,7 @@ impl SharedState {
     #[doc(hidden)]
     #[inline]
     pub fn set_connection_lost(&self) {
+        self.portfolio.invalidate_position_snapshot();
         self.orders.set_open_orders_held(true);
         self.orders.invalidate_execution_history();
         self.connection_lost.store(true, Ordering::Release);

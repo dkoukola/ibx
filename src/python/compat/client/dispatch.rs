@@ -73,20 +73,35 @@ impl EClient {
                 call_wrapper!(self.wrapper, py, "account_update_multi_end", (batch.req_id,));
             }
         }
+        if !self.position_client_current(shared) {
+            return Ok(());
+        }
         for (req_id, account, model_code, batch) in self.core.prepare_positions_multi(shared) {
+            if !self.position_client_current(shared) {
+                continue;
+            }
+            if let Some((code, message)) = batch.error {
+                call_wrapper!(
+                    self.wrapper,
+                    py,
+                    "error",
+                    (req_id, code, message.as_str(), "")
+                );
+                continue;
+            }
             let account = if account.is_empty() { own.clone() } else { account };
             for pi in &batch.rows {
+                if !self.position_snapshot_current(shared, batch.history.as_deref()) {
+                    break;
+                }
                 let ac = self.core.position_contract(pi.con_id, shared);
                 let c_py = Py::new(py, Contract::from_api(py, &ac)?)?.into_any();
                 call_wrapper!(self.wrapper, py, "position_multi",
                     (req_id, account.as_str(), model_code.as_str(), &c_py,
                      pi.position_fixed as f64 / QTY_SCALE_F, pi.avg_cost as f64 / PRICE_SCALE_F));
             }
-            if batch.end {
+            if batch.end && self.position_snapshot_current(shared, batch.history.as_deref()) {
                 call_wrapper!(self.wrapper, py, "position_multi_end", (req_id,));
-            }
-            if let Some((code, message)) = batch.error {
-                call_wrapper!(self.wrapper, py, "error", (req_id, code, message.as_str(), ""));
             }
         }
         Ok(())
@@ -95,20 +110,59 @@ impl EClient {
     /// Position rows of a running req_positions (ibx#477).
     pub(crate) fn dispatch_positions(&self, py: Python<'_>, shared: &Arc<SharedState>) -> PyResult<()> {
         let account = self.account();
+        if !self.position_client_current(shared) {
+            return Ok(());
+        }
         let Some(batch) = self.core.prepare_positions(shared, &account) else { return Ok(()) };
+        if !self.position_client_current(shared) {
+            return Ok(());
+        }
+        if let Some((code, message)) = batch.error {
+            call_wrapper!(
+                self.wrapper,
+                py,
+                "error",
+                (-1i64, code, message.as_str(), "")
+            );
+            return Ok(());
+        }
         for pi in &batch.rows {
+            if !self.position_snapshot_current(shared, batch.history.as_deref()) {
+                return Ok(());
+            }
             let ac = self.core.position_contract(pi.con_id, shared);
             let c_py = Py::new(py, Contract::from_api(py, &ac)?)?.into_any();
             call_wrapper!(self.wrapper, py, "position",
                 (account.as_str(), &c_py, pi.position_fixed as f64 / QTY_SCALE_F, pi.avg_cost as f64 / PRICE_SCALE_F));
         }
-        if batch.end {
+        if batch.end && self.position_snapshot_current(shared, batch.history.as_deref()) {
             call_wrapper!(self.wrapper, py, "position_end", ());
         }
-        if let Some((code, message)) = batch.error {
-            call_wrapper!(self.wrapper, py, "error", (-1i64, code, message.as_str(), ""));
-        }
         Ok(())
+    }
+
+    fn position_client_current(&self, shared: &Arc<SharedState>) -> bool {
+        self.connected.load(Ordering::Acquire)
+            && self
+                .shared
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, shared))
+    }
+
+    fn position_connection_current(
+        &self,
+        shared: &Arc<SharedState>,
+        history: Option<&str>,
+    ) -> bool {
+        self.position_client_current(shared)
+            && shared.orders.execution_history_request_matches(history)
+    }
+
+    fn position_snapshot_current(&self, shared: &Arc<SharedState>, history: Option<&str>) -> bool {
+        self.position_connection_current(shared, history)
+            && shared.portfolio.account_download_complete()
     }
 
     /// open_order for an order after a server report (ibx#473).
@@ -195,6 +249,7 @@ impl EClient {
         };
         if engine_stopped {
             shared.orders.set_open_orders_held(true);
+            shared.portfolio.invalidate_position_snapshot();
             shared.orders.invalidate_execution_history();
             self.connected.store(false, Ordering::Release);
         }

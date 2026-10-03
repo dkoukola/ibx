@@ -1277,6 +1277,11 @@ impl Context {
         self.positions[instrument as usize] += delta;
     }
 
+    /// Replace an instrument's position from an authoritative broker snapshot.
+    pub(crate) fn set_position_fixed(&mut self, instrument: InstrumentId, position: Qty) {
+        self.positions[instrument as usize] = position;
+    }
+
     pub fn insert_order(&mut self, order: Order) {
         let oid = order.order_id;
         self.open_orders.insert(oid, order);
