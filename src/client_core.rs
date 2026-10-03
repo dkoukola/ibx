@@ -384,6 +384,7 @@ pub struct AccountFieldUpdate {
 
 /// Batch of account update results (ibx#475).
 pub struct AccountUpdateBatch {
+    pub request: String,
     /// Account values to send: every value for the first image, then only
     /// the ones that changed.
     pub fields: Vec<AccountFieldUpdate>,
@@ -397,6 +398,7 @@ pub struct AccountUpdateBatch {
 /// This client's account stream (ibx#475).
 #[derive(Default)]
 pub struct AccountStream {
+    request: Option<String>,
     /// Subscribed, and the first image not sent yet.
     image_pending: bool,
     /// Last value sent per (key, currency).
@@ -776,10 +778,12 @@ pub struct AccountMultiSubscription {
     image_sent: bool,
     sent: HashMap<(String, String), String>,
     generation: u64,
+    request: Option<String>,
 }
 
 /// Rows of one req_account_updates_multi (ibx#476).
 pub struct AccountMultiBatch {
+    pub request: String,
     pub req_id: i64,
     pub account: String,
     pub model_code: String,
@@ -2979,6 +2983,7 @@ impl ClientCore {
         subs.push(AccountMultiSubscription {
             req_id, account: account.to_string(), model_code: model_code.to_string(),
             ledger_only: ledger_and_nlv, image_sent: false, sent: HashMap::new(), generation: 0,
+            request: None,
         });
         Ok(())
     }
@@ -2997,19 +3002,22 @@ impl ClientCore {
         if subs.is_empty() {
             return Vec::new();
         }
-        let (generation, complete, _) = shared.portfolio.account_rows_generation();
-        if !complete {
+        let store = shared.portfolio.account_rows();
+        let Some(request) = store.request.as_ref().filter(|_| store.image_complete) else {
             return Vec::new();
-        }
-        let mut store = None;
+        };
         let mut out = Vec::new();
         for m in subs.iter_mut() {
-            if m.image_sent && m.generation == generation {
+            if m.request.as_ref() != Some(request) {
+                m.request = Some(request.clone());
+                m.image_sent = false;
+                m.sent.clear();
+            }
+            if m.image_sent && m.generation == store.generation {
                 continue;
             }
-            let rows_now = store.get_or_insert_with(|| shared.portfolio.account_rows());
             let mut rows = Vec::new();
-            for row in rows_now.rows.iter().filter(|r| !m.ledger_only || r.ledger) {
+            for row in store.rows.iter().filter(|r| !m.ledger_only || r.ledger) {
                 let id = (row.key.clone(), row.currency.clone());
                 if m.sent.get(&id) != Some(&row.value) {
                     m.sent.insert(id, row.value.clone());
@@ -3018,9 +3026,10 @@ impl ClientCore {
             }
             let end = !m.image_sent;
             m.image_sent = true;
-            m.generation = generation;
+            m.generation = store.generation;
             if end || !rows.is_empty() {
                 out.push(AccountMultiBatch {
+                    request: request.clone(),
                     req_id: m.req_id, account: m.account.clone(), model_code: m.model_code.clone(), rows, end,
                 });
             }
@@ -4258,15 +4267,20 @@ impl ClientCore {
         if !self.account_updates_subscribed.load(Ordering::Acquire) {
             return None;
         }
-        let (generation, complete, time_secs) = shared.portfolio.account_rows_generation();
+        let store = shared.portfolio.account_rows();
+        let request = store.request.as_ref().filter(|_| store.image_complete)?;
         let mut stream = self.account_stream.lock().unwrap();
-        if stream.image_pending && !complete {
-            return None;
+        if stream.request.as_ref() != Some(request) {
+            *stream = AccountStream {
+                request: Some(request.clone()),
+                image_pending: true,
+                ..Default::default()
+            };
+            *self.last_portfolio.lock().unwrap() = None;
         }
         let first = stream.image_pending;
         let mut fields = Vec::new();
-        if first || generation != stream.generation {
-            let store = shared.portfolio.account_rows();
+        if first || store.generation != stream.generation {
             for row in &store.rows {
                 let id = (row.key.clone(), row.currency.clone());
                 if stream.sent.get(&id) != Some(&row.value) {
@@ -4289,7 +4303,12 @@ impl ClientCore {
             fields.sort_by_cached_key(|f| format!("{}!{}", f.key, f.currency));
         }
         stream.image_pending = false;
-        Some(AccountUpdateBatch { fields, time: format_account_time(time_secs), download_end: first })
+        Some(AccountUpdateBatch {
+            request: request.clone(),
+            fields,
+            time: format_account_time(store.time_secs),
+            download_end: first,
+        })
     }
 
     /// Prepare portfolio updates (position entries) for account streaming.

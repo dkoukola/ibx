@@ -677,10 +677,19 @@ impl EClient {
         // the end, once per subscription.
         if let Some(batch) = self.core.prepare_account_updates(&self.shared, &self.account_id) {
             for field in &batch.fields {
+                if !self.account_snapshot_current(&batch.request) {
+                    return;
+                }
                 wrapper.update_account_value(&field.key, &field.value, &field.currency, &self.account_id);
+            }
+            if !self.account_snapshot_current(&batch.request) {
+                return;
             }
             let portfolio = self.core.prepare_portfolio_updates(&self.shared);
             for entry in &portfolio {
+                if !self.account_snapshot_current(&batch.request) {
+                    return;
+                }
                 let ac = self.core.position_contract(entry.con_id, &self.shared);
                 let c = Contract {
                     con_id: ac.con_id, symbol: ac.symbol, sec_type: ac.sec_type,
@@ -693,12 +702,17 @@ impl EClient {
                     &c, entry.position, entry.market_price, entry.market_value,
                     entry.avg_cost, entry.unrealized_pnl, entry.realized_pnl, &self.account_id,
                 );
+                if !self.account_snapshot_current(&batch.request) {
+                    return;
+                }
                 wrapper.update_account_time(&batch.time);
             }
-            if !batch.fields.is_empty() || !portfolio.is_empty() {
+            if (!batch.fields.is_empty() || !portfolio.is_empty())
+                && self.account_snapshot_current(&batch.request)
+            {
                 wrapper.update_account_time(&batch.time);
             }
-            if batch.download_end {
+            if batch.download_end && self.account_snapshot_current(&batch.request) {
                 wrapper.account_download_end(&self.account_id);
             }
         }

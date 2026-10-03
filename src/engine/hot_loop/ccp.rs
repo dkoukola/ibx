@@ -1494,13 +1494,17 @@ impl CcpState {
             }
         }
 
+        // FIX20=3 restates an order, including its last print; it is not
+        // another execution. This also applies to the combo-leg path.
+        let is_status_report = parsed.get(&20).map(|s| s.as_str()) == Some("3");
+
         // A fill of an order of this session in the trades reply after a
         // reconnect, that is a fill made while the link was lost: the
         // reference books it (executions, position, commission report) and
         // gives no execDetails and no orderStatus; once filled, the order is
         // unknown to the client (a cancel gets 10147). Captured 30/09/2026
         // (ib-agent#192 C4). A combo keeps its own path.
-        if self.fill_up_pending.is_some()
+        if !is_status_report && self.fill_up_pending.is_some()
             && matches!(parsed.get(&150).map(String::as_str), Some("F" | "1" | "2"))
             && parsed.get(&32).and_then(|s| parse_qty(s)).is_some_and(|q| q > 0)
             && context.order(clord_id).is_some()
@@ -1519,8 +1523,10 @@ impl CcpState {
             .then(|| shared.orders.combo_view(clord_id)).flatten();
         if let Some(combo) = context.combos.orders.get_mut(&clord_id) {
             if is_leg_report(parsed) {
-                let combo = combo.clone();
-                self.handle_combo_leg_report(parsed, context, shared, clord_id, &combo);
+                if !is_status_report {
+                    let combo = combo.clone();
+                    self.handle_combo_leg_report(parsed, context, shared, clord_id, &combo);
+                }
                 return;
             }
             let qty = |tag: u32| parsed.get(&tag).and_then(|s| parse_qty(s));
@@ -1598,7 +1604,6 @@ impl CcpState {
                 crate::types::OrderStatus::PreSubmitted
             }
         };
-        let is_status_report = parsed.get(&20).map(|s| s.as_str()) == Some("3");
         let status = match ord_status {
             "0" => working(),
             // Replaced: back to working, by the same routing rule. The
@@ -1732,7 +1737,7 @@ impl CcpState {
         let mut update_out: Option<crate::types::OrderUpdate> = None;
         let mut had_fill = false;
         let mut untracked_out: Option<(api::Execution, crate::bridge::FillExec)> = None;
-        if matches!(exec_type, "F" | "1" | "2") && last_shares > 0 {
+        if !is_status_report && matches!(exec_type, "F" | "1" | "2") && last_shares > 0 {
             let tracked = context.order(clord_id).copied();
             // A duplicate execution is not booked again, but the report still
             // runs the order state below: status, order cache, and the end
@@ -3160,6 +3165,7 @@ impl CcpState {
         shared: &SharedState,
         _event_tx: &Option<Sender<Event>>,
     ) {
+        shared.portfolio.invalidate_account_image();
         shared.portfolio.invalidate_position_snapshot();
         shared.orders.set_open_orders_held(true);
         shared.orders.invalidate_execution_history();
@@ -3200,6 +3206,7 @@ impl CcpState {
         account_id: &str,
         shared: &SharedState,
     ) {
+        shared.portfolio.invalidate_account_image();
         shared.portfolio.invalidate_position_snapshot();
         shared.orders.set_open_orders_held(true);
         shared.orders.invalidate_execution_history();
@@ -3217,6 +3224,9 @@ impl CcpState {
             ]);
             // The fills of the gap come only in the answer to this request
             // (ibx#399); they take the normal report path.
+            // Reuse this connection's existing request sequence. A fixed AR.3
+            // would also accept delayed account frames arriving on a farm link.
+            let account_request = format!("AR.{}", self.next_trades_request);
             let fill_up = self.fill_up_request(account_id, &ts);
             self.fill_up_pending = fill_up.iter().find(|(t, _)| *t == 6556).map(|(_, v)| v.clone());
             let request = fill_up
@@ -3236,9 +3246,14 @@ impl CcpState {
                 (1, ""),
                 (6544, "2"),
             ]);
+            shared.portfolio.begin_account_image(&account_request);
             let _ = conn.send_fix(&[
-                (fix::TAG_MSG_TYPE, "U"), (fix::TAG_SENDING_TIME, &ts),
-                (6040, "6"), (6036, "1"), (6095, account_id), (6529, "AR.3"),
+                (fix::TAG_MSG_TYPE, "U"),
+                (fix::TAG_SENDING_TIME, &ts),
+                (6040, "6"),
+                (6036, "1"),
+                (6095, account_id),
+                (6529, &account_request),
             ]);
             // Status of the working orders; its end frame starts the
             // restored-link report.
@@ -3366,6 +3381,26 @@ pub(crate) fn handle_account_update(msg: &[u8], context: &mut Context, shared: &
         });
         return;
     }
+    let Some(request) = account_stream_id(text) else {
+        // Preserve the existing numeric-only handling of unsolicited frames.
+        // They provide no account-image ownership or completion evidence.
+        apply_account_values(text, context, shared);
+        return;
+    };
+    shared.portfolio.update_account_image(request, |store| {
+        apply_account_values(text, context, shared);
+        let (rows, time_secs) = parse_account_rows(text);
+        let ledger = text.split(SOH_CHAR).any(|p| p == "35=RL");
+        for (key, currency, value) in &rows {
+            store.set_row(key, currency, value, ledger);
+        }
+        if let Some(t) = time_secs {
+            store.time_secs = store.time_secs.max(t);
+        }
+    });
+}
+
+fn apply_account_values(text: &str, context: &mut Context, shared: &SharedState) {
     let mut key: Option<&str> = None;
     for part in text.split('\x01') {
         if let Some(val) = part.strip_prefix("8001=") {
@@ -3399,19 +3434,6 @@ pub(crate) fn handle_account_update(msg: &[u8], context: &mut Context, shared: &
         }
     }
     shared.portfolio.set_account(context.account());
-    // The account stream's values as sent, for update_account_value (ibx#475).
-    if is_account_stream(text) {
-        let (rows, time_secs) = parse_account_rows(text);
-        let ledger = text.split(SOH_CHAR).any(|p| p == "35=RL");
-        shared.portfolio.update_account_rows(|store| {
-            for (key, currency, value) in &rows {
-                store.set_row(key, currency, value, ledger);
-            }
-            if let Some(t) = time_secs {
-                store.time_secs = store.time_secs.max(t);
-            }
-        });
-    }
 }
 
 /// The account stream's frames carry `6529=AR.{n}`; other subscriptions
@@ -3423,8 +3445,10 @@ fn summary_id(text: &str) -> Option<&str> {
 
 const SOH_CHAR: char = '\x01';
 
-fn is_account_stream(text: &str) -> bool {
-    text.split('\x01').any(|p| p.starts_with("6529=AR."))
+fn account_stream_id(text: &str) -> Option<&str> {
+    text.split(SOH_CHAR)
+        .find_map(|p| p.strip_prefix("6529="))
+        .filter(|id| id.starts_with("AR."))
 }
 
 /// End marker of the account stream (`35=EB|6529=AR.{n}`): the first full
@@ -3439,8 +3463,8 @@ fn handle_account_end(msg: &[u8], shared: &SharedState) {
         });
         return;
     }
-    if is_account_stream(text) {
-        shared.portfolio.update_account_rows(|store| {
+    if let Some(request) = account_stream_id(text) {
+        shared.portfolio.update_account_image(request, |store| {
             if !store.image_complete {
                 store.image_complete = true;
                 store.generation += 1;
@@ -3893,6 +3917,23 @@ impl CcpState {
 /// most messages carry 2 or 3 rows). Parsing the whole message into one map
 /// kept only the last row (ibx#411). A message with no symbol field is one row.
 pub(crate) fn handle_portfolio_message(
+    msg: &[u8],
+    context: &mut Context,
+    shared: &SharedState,
+    event_tx: &Option<Sender<Event>>,
+) {
+    if let Ok(text) = std::str::from_utf8(msg)
+        && let Some(request) = account_stream_id(text)
+    {
+        shared.portfolio.update_account_image(request, |_| {
+            apply_portfolio_message(msg, context, shared, event_tx);
+        });
+        return;
+    }
+    apply_portfolio_message(msg, context, shared, event_tx);
+}
+
+fn apply_portfolio_message(
     msg: &[u8],
     context: &mut Context,
     shared: &SharedState,
@@ -4862,6 +4903,7 @@ mod tests {
     fn a_portfolio_message_applies_every_position_row() {
         let mut context = Context::new();
         let shared = SharedState::new();
+        shared.portfolio.begin_account_image("AR.3");
         let msft = context.market.try_register(272093).unwrap();
         let captured = "8=FIX.4.1|9=000999|35=UP|6529=AR.3|\
             6068=AXTI                  |6288=0|8001=PositionList|8002=AXTI/USD/1/4726868|6064=1|6067=107.50|6065=107.5|6066=1781529403|15=USD|6008=4726868|167=STK|6101=117.79|6235=107.5|6099=0.00|6100=-10.29|9821=0|6627=0|6920=0|8136=107.485466|8152=107.5|\
@@ -6391,6 +6433,187 @@ mod tests {
         ].into_iter().collect()
     }
 
+    #[test]
+    fn status_snapshots_update_tracked_and_untracked_orders_without_booking_fills() {
+        for tracked in [true, false] {
+            for terminal in [false, true] {
+                for exec_type in ["1", "2", "F"] {
+                    let mut ccp = CcpState::new();
+                    let mut context = Context::new();
+                    let shared = SharedState::new();
+                    let instrument = context.market.try_register(1005).unwrap();
+                    if tracked {
+                        context.insert_order(crate::types::Order::new(
+                            90,
+                            instrument,
+                            Side::Buy,
+                            300,
+                            15 * PRICE_SCALE,
+                            b'2',
+                            b'0',
+                            0,
+                        ));
+                    }
+                    assert!(ccp.record_exec_id("previous.01"));
+                    ccp.record_exec_con_id("previous.01", 1005);
+                    ccp.last_exec = Some(("previous.01".into(), "20261003-10:00:00".into()));
+                    let seen_before = ccp.seen_exec_ids.clone();
+                    let exec_order_before = ccp.exec_id_order.clone();
+                    let realized_before = ccp.exec_realized.clone();
+                    let realized_order_before = ccp.exec_realized_order.clone();
+                    let last_before = ccp.last_exec.clone();
+                    let (event_tx, event_rx) = crossbeam_channel::unbounded();
+                    let event_tx = Some(event_tx);
+                    let leaves = if terminal { 0 } else { 200 };
+                    let mut frame = fill_frame("snapshot.01", 100, "10", 100, "10", leaves);
+                    frame.insert(20, "3".into());
+                    frame.insert(97, "Y".into());
+                    frame.insert(150, exec_type.into());
+                    frame.insert(60, "20261003-10:01:00".into());
+
+                    ccp.handle_exec_report(&frame, &mut context, &shared, &event_tx, "DU123");
+
+                    assert_eq!(context.position_fixed(instrument), 0);
+                    assert_eq!(shared.portfolio.position_fixed(instrument), 0);
+                    assert!(shared.portfolio.position_infos().is_empty());
+                    assert_eq!(shared.portfolio.position_generation(), 0);
+                    assert!(shared.portfolio.money_since_seed().is_empty());
+                    assert!(shared.portfolio.realized_since_seed().is_empty());
+                    assert!(shared.orders.drain_fills_with_exec().is_empty());
+                    assert!(shared.orders.drain_untracked_executions().is_empty());
+                    assert_eq!(ccp.seen_exec_ids, seen_before);
+                    assert_eq!(ccp.exec_id_order, exec_order_before);
+                    assert_eq!(ccp.exec_realized, realized_before);
+                    assert_eq!(ccp.exec_realized_order, realized_order_before);
+                    assert_eq!(ccp.last_exec, last_before);
+                    assert!(
+                        !event_rx
+                            .try_iter()
+                            .any(|event| matches!(event, Event::Fill(_)))
+                    );
+
+                    let info = shared
+                        .orders
+                        .get_order_info(90)
+                        .expect("status still projected");
+                    assert_eq!(info.order.filled_quantity, 100.0);
+                    assert_eq!(
+                        info.order_state.status,
+                        if terminal { "Filled" } else { "Submitted" }
+                    );
+                    let updates = shared.orders.drain_order_updates();
+                    assert_eq!(updates.len(), usize::from(tracked));
+                    if tracked {
+                        assert_eq!(updates[0].filled_qty_fixed, 100 * QTY_SCALE);
+                        assert_eq!(
+                            updates[0].remaining_qty_fixed,
+                            i64::from(leaves) * QTY_SCALE
+                        );
+                        assert_eq!(
+                            updates[0].status,
+                            if terminal {
+                                crate::types::OrderStatus::Filled
+                            } else {
+                                crate::types::OrderStatus::PartiallyFilled
+                            }
+                        );
+                    }
+
+                    // A real replayed execution (97=Y, 20=0) with the same ID
+                    // is still new accounting, including after a terminal
+                    // snapshot retired the tracked order.
+                    frame.insert(20, "0".into());
+                    ccp.handle_exec_report(&frame, &mut context, &shared, &event_tx, "DU123");
+                    ccp.handle_exec_report(&frame, &mut context, &shared, &event_tx, "DU123");
+                    let fills = shared.orders.drain_fills_with_exec();
+                    let executions = shared.orders.drain_untracked_executions();
+                    assert_eq!(fills.len() + executions.len(), 1);
+                    assert_eq!(context.position_fixed(instrument), 100 * QTY_SCALE);
+                    assert_eq!(shared.portfolio.position_fixed(instrument), 100 * QTY_SCALE);
+                    assert_eq!(
+                        shared.portfolio.position_info(1005).unwrap().position_fixed,
+                        100 * QTY_SCALE
+                    );
+                    assert_eq!(shared.portfolio.money_since_seed()[&1005], -1000.0);
+                    assert!(ccp.seen_exec_ids.contains("snapshot.01"));
+                    assert_eq!(
+                        ccp.last_exec,
+                        Some(("snapshot.01".into(), "20261003-10:01:00".into()))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn status_snapshot_of_a_combo_leg_does_not_book_or_consume_its_execution() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let instrument = context.market.try_register(1005).unwrap();
+        context.combos.orders.insert(
+            90,
+            crate::engine::combo::ComboOrder {
+                combo: crate::engine::combo::Combo {
+                    bag_con_id: 9000,
+                    exchange: "SMART".into(),
+                    routed: "BEST".into(),
+                    currency: "USD".into(),
+                    trading_class: "COMB".into(),
+                    legs: vec![crate::engine::combo::Leg {
+                        con_id: 1005,
+                        ratio: 1,
+                        buy: true,
+                        exchange: "SMART".into(),
+                        symbol: "TEST".into(),
+                        sec_type: "STK".into(),
+                        currency: "USD".into(),
+                        multiplier: 1.0,
+                    }],
+                    multiplier: 1.0,
+                },
+                spec: Default::default(),
+                leg_prices: Vec::new(),
+                price: None,
+                cum_qty: 100 * QTY_SCALE,
+                leaves_qty: 200 * QTY_SCALE,
+                avg_price: 10 * PRICE_SCALE,
+                last_price: 10 * PRICE_SCALE,
+            },
+        );
+        let mut frame = fill_frame("leg.01", 100, "10", 100, "10", 200);
+        frame.insert(20, "3".into());
+        frame.insert(6013, "0:1".into());
+
+        ccp.handle_exec_report(&frame, &mut context, &shared, &None, "DU123");
+
+        assert_eq!(context.position_fixed(instrument), 0);
+        assert_eq!(shared.portfolio.position_fixed(instrument), 0);
+        assert!(shared.portfolio.position_infos().is_empty());
+        assert_eq!(shared.portfolio.position_generation(), 0);
+        assert!(shared.portfolio.money_since_seed().is_empty());
+        assert!(shared.portfolio.realized_since_seed().is_empty());
+        assert!(shared.orders.drain_fills_with_exec().is_empty());
+        assert!(shared.orders.drain_untracked_executions().is_empty());
+        assert!(ccp.seen_exec_ids.is_empty());
+        assert!(ccp.exec_id_order.is_empty());
+        assert!(ccp.exec_realized.is_empty());
+        assert!(ccp.exec_realized_order.is_empty());
+        assert!(ccp.last_exec.is_none());
+        assert!(shared.orders.drain_order_updates().is_empty());
+
+        frame.insert(20, "0".into());
+        ccp.handle_exec_report(&frame, &mut context, &shared, &None, "DU123");
+        ccp.handle_exec_report(&frame, &mut context, &shared, &None, "DU123");
+        let fills = shared.orders.drain_fills_with_exec();
+        assert_eq!(fills.len(), 1);
+        assert!(fills[0].1.combo.as_ref().unwrap().leg.is_some());
+        assert_eq!(context.position_fixed(instrument), 100 * QTY_SCALE);
+        assert_eq!(shared.portfolio.position_fixed(instrument), 100 * QTY_SCALE);
+        assert_eq!(shared.portfolio.money_since_seed()[&1005], -1000.0);
+        assert!(ccp.seen_exec_ids.contains("leg.01"));
+    }
+
     // ibx#315: the fill carries the order totals next to the print.
     // ibx#309: the order cache's filled quantity is the filled total, not
     // the quantity still working.
@@ -6861,6 +7084,7 @@ mod tests {
     #[test]
     fn the_end_marker_completes_the_image_of_the_account_stream_only() {
         let (mut context, shared) = (Context::new(), SharedState::new());
+        shared.portfolio.begin_account_image("AR.1");
         handle_account_update(soh(UM_IMAGE).as_bytes(), &mut context, &shared);
         assert_eq!(shared.portfolio.account_rows_generation().1, false);
         handle_account_end(soh("8=O|9=000016|35=EB|6529=SR.3|").as_bytes(), &shared);
@@ -6870,6 +7094,101 @@ mod tests {
         assert!(complete);
         assert_eq!(time, 1790323947);
         assert_eq!(shared.portfolio.account_rows().rows.len(), 4);
+    }
+
+    #[test]
+    fn account_image_correlates_rows_end_and_loss_without_stale_republication() {
+        let (mut context, shared) = (Context::new(), SharedState::new());
+        shared.portfolio.begin_account_image("AR.1");
+        for request in ["AR.0", "AR.5"] {
+            handle_account_update(
+                soh(&UM_IMAGE.replace("AR.1", request)).as_bytes(),
+                &mut context,
+                &shared,
+            );
+            handle_account_end(soh(&format!("35=EB|6529={request}|")).as_bytes(), &shared);
+        }
+        assert!(shared.portfolio.account_rows().rows.is_empty());
+        assert_eq!(context.account.net_liquidation, 0);
+        assert!(!shared.portfolio.account_image_matches("AR.1"));
+        handle_account_update(soh(UM_IMAGE).as_bytes(), &mut context, &shared);
+        handle_account_end(soh("35=EB|6529=AR.1|").as_bytes(), &shared);
+        assert!(shared.portfolio.account_image_matches("AR.1"));
+        assert!(
+            !shared.portfolio.account_download_complete(),
+            "AR is not U75"
+        );
+
+        let previous_value = context.account.net_liquidation;
+        shared.portfolio.invalidate_account_image();
+        handle_account_update(soh(UT_PERIODIC).as_bytes(), &mut context, &shared);
+        handle_account_end(soh("35=EB|6529=AR.1|").as_bytes(), &shared);
+        assert!(!shared.portfolio.account_rows().image_complete);
+        for request in ["AR.5", "AR.6"] {
+            shared.portfolio.begin_account_image(request);
+            shared.portfolio.set_account_download_complete();
+            assert!(
+                !shared.portfolio.account_rows().image_complete,
+                "U75 is not AR"
+            );
+            handle_account_update(soh(UM_IMAGE).as_bytes(), &mut context, &shared);
+            handle_account_end(soh("35=EB|6529=AR.1|").as_bytes(), &shared);
+            assert!(shared.portfolio.account_rows().rows.is_empty());
+            assert_eq!(context.account.net_liquidation, previous_value);
+            let row = format!("35=UT|6529={request}|8001=AccountType|8004=INDIVIDUAL|");
+            handle_account_update(soh(&row).as_bytes(), &mut context, &shared);
+            handle_account_end(soh(&format!("35=EB|6529={request}|")).as_bytes(), &shared);
+            let image = shared.portfolio.account_rows();
+            assert!(image.image_complete);
+            assert_eq!(
+                image.rows.len(),
+                1,
+                "absent old keys are not in the fresh image"
+            );
+            assert_eq!(image.rows[0].key, "AccountType");
+        }
+        shared.set_connection_lost();
+        assert!(!shared.portfolio.account_rows().image_complete);
+        assert!(shared.portfolio.account_rows().request.is_none());
+    }
+
+    #[test]
+    fn uncorrelated_account_values_remain_numeric_only_and_never_complete_an_image() {
+        let (mut context, shared) = (Context::new(), SharedState::new());
+        shared.portfolio.begin_account_image("AR.1");
+        for request in ["", "6529=other|"] {
+            let frame = format!("35=UM|{request}8001=NetLiquidation|8004=7|");
+            handle_account_update(soh(&frame).as_bytes(), &mut context, &shared);
+            handle_account_end(soh(&format!("35=EB|{request}")).as_bytes(), &shared);
+            assert_eq!(context.account.net_liquidation, 7 * PRICE_SCALE);
+            assert!(shared.portfolio.account_rows().rows.is_empty());
+            assert!(!shared.portfolio.account_rows().image_complete);
+        }
+        handle_account_update(
+            soh("35=UM|6529=AR.0|8001=NetLiquidation|8004=99|").as_bytes(),
+            &mut context,
+            &shared,
+        );
+        assert_eq!(context.account.net_liquidation, 7 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn stale_ar_portfolio_rows_cannot_change_positions() {
+        let (mut context, shared) = (Context::new(), SharedState::new());
+        shared.portfolio.begin_account_image("AR.5");
+        let row = "35=UP|6529=AR.3|6068=TEST|6008=123|6064=7|6101=2|";
+        handle_portfolio_message(soh(row).as_bytes(), &mut context, &shared, &None);
+        assert!(shared.portfolio.position_info(123).is_none());
+        handle_portfolio_message(
+            soh(&row.replace("AR.3", "AR.5")).as_bytes(),
+            &mut context,
+            &shared,
+            &None,
+        );
+        assert_eq!(
+            shared.portfolio.position_info(123).unwrap().position_fixed,
+            7 * crate::types::QTY_SCALE
+        );
     }
 
     // ibx#479: frames of an account summary subscription (6529=SR.*) go to
@@ -7487,9 +7806,14 @@ mod reconnect_tests {
         let mut active = None;
         shared.orders.begin_execution_history("today4");
         shared.orders.complete_execution_history("today4");
+        shared.portfolio.begin_account_image("AR.1");
+        shared
+            .portfolio
+            .update_account_image("AR.1", |rows| rows.image_complete = true);
         ccp.handle_disconnect(&mut context, &shared, &None);
         assert!(shared.orders.execution_history_completion().is_none());
-        for request in ["today5", "todayfillup6"] {
+        assert!(!shared.portfolio.account_image_matches("AR.1"));
+        for (request, account_request) in [("today5", "AR.5"), ("todayfillup6", "AR.6")] {
             let (client, mut server) = socket_pair();
             ccp.reconnect(
                 Connection::new_raw(client).unwrap(),
@@ -7505,6 +7829,21 @@ mod reconnect_tests {
                 .find(|message| message.contains("6040=74|"))
                 .unwrap();
             assert_eq!(position_request, "35=U|6040=74|1=|6544=2");
+            assert!(sent.iter().any(|message| {
+                message == &format!("35=U|6040=6|6036=1|6095=DU1|6529={account_request}")
+            }));
+            assert_eq!(
+                shared.portfolio.account_rows().request.as_deref(),
+                Some(account_request)
+            );
+            assert!(!shared.portfolio.account_rows().image_complete);
+            handle_account_end(&fix::fix_build(&[(35, "EB"), (6529, "AR.1")], 1), &shared);
+            assert!(!shared.portfolio.account_rows().image_complete);
+            handle_account_end(
+                &fix::fix_build(&[(35, "EB"), (6529, account_request)], 2),
+                &shared,
+            );
+            assert!(shared.portfolio.account_image_matches(account_request));
             assert!(!shared.portfolio.account_download_complete());
             assert!(
                 sent.iter()
@@ -7534,6 +7873,7 @@ mod reconnect_tests {
             );
             assert!(shared.orders.execution_history_matches(request));
             ccp.handle_disconnect(&mut context, &shared, &None);
+            assert!(!shared.portfolio.account_image_matches(account_request));
             ccp.handle_exec_report(
                 &frame(&[(6556, request)]),
                 &mut context,

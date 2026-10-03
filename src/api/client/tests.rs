@@ -52,6 +52,7 @@ fn connect_caches_reconnect_credentials() {
 /// Helper: create a test EClient backed by SharedState + channel.
 fn test_client() -> (EClient, crossbeam_channel::Receiver<ControlCommand>, Arc<SharedState>) {
     let shared = Arc::new(SharedState::new());
+    shared.portfolio.begin_account_image("AR.1");
     // Most dispatcher fixtures start after a completed synthetic history.
     // Real Gateway handoff instead installs pending today4 before its bytes.
     shared.orders.begin_execution_history("fixture");
@@ -5008,6 +5009,99 @@ fn account_updates_send_the_image_then_the_end_once() {
     let mut w = AccountRec::default();
     client.process_msgs(&mut w);
     assert!(w.events.is_empty(), "{:?}", w.events);
+}
+
+#[test]
+fn account_image_reconnect_waits_and_replays_standard_and_multi_subscriptions() {
+    let (client, _rx, shared) = test_client();
+    seed_account_rows(&shared, true);
+    client.req_account_updates(true, "");
+    client
+        .core
+        .subscribe_account_multi(9, "", "", false)
+        .unwrap();
+    let mut first = MultiRec::default();
+    client.process_msgs(&mut first);
+    assert!(first.events.iter().any(|e| e == "acct_end:9"));
+    assert!(
+        first
+            .events
+            .iter()
+            .any(|e| e == "single:account_download_end")
+    );
+
+    shared.portfolio.invalidate_account_image();
+    let mut waiting = MultiRec::default();
+    client.process_msgs(&mut waiting);
+    assert!(waiting.events.is_empty());
+    shared.portfolio.begin_account_image("AR.5");
+    shared.portfolio.update_account_rows(|rows| {
+        rows.set("NetLiquidation", "USD", "2");
+    });
+    client.process_msgs(&mut waiting);
+    assert!(
+        waiting.events.is_empty(),
+        "partial replacement cannot escape"
+    );
+    shared
+        .portfolio
+        .update_account_image("AR.5", |rows| rows.image_complete = true);
+    client.process_msgs(&mut waiting);
+    assert_eq!(
+        waiting.events,
+        [
+            "acct:9::NetLiquidation:2:USD",
+            "acct_end:9",
+            "single:update_account_value",
+            "single:account_download_end",
+        ]
+    );
+    waiting.events.clear();
+    client.process_msgs(&mut waiting);
+    assert!(waiting.events.is_empty());
+    client.disconnect();
+    assert!(shared.portfolio.account_rows().request.is_none());
+}
+
+#[test]
+fn account_image_callback_reconnect_suppresses_old_rows_and_end() {
+    struct Reconnect {
+        shared: Arc<SharedState>,
+        rows: Vec<String>,
+        ends: usize,
+    }
+    impl Wrapper for Reconnect {
+        fn update_account_value(&mut self, key: &str, _v: &str, _c: &str, _a: &str) {
+            self.rows.push(key.to_string());
+            if self.rows.len() == 1 {
+                self.shared.portfolio.invalidate_account_image();
+                self.shared.portfolio.begin_account_image("AR.5");
+                self.shared.portfolio.update_account_image("AR.5", |rows| {
+                    rows.set("Replacement", "", "1");
+                    rows.image_complete = true;
+                });
+            }
+        }
+        fn account_download_end(&mut self, _account: &str) {
+            self.ends += 1;
+        }
+    }
+    let (client, _rx, shared) = test_client();
+    seed_account_rows(&shared, true);
+    client.req_account_updates(true, "");
+    let mut observed = Reconnect {
+        shared,
+        rows: Vec::new(),
+        ends: 0,
+    };
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.rows, ["AccountType"]);
+    assert_eq!(observed.ends, 0);
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.rows, ["AccountType", "Replacement"]);
+    assert_eq!(observed.ends, 1);
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.ends, 1);
 }
 
 // A second subscribe while subscribed sends nothing: no image, no end.

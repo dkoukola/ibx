@@ -1782,6 +1782,8 @@ pub struct AccountRow {
 /// first seen (ibx#475).
 #[derive(Clone, Debug, Default)]
 pub struct AccountRows {
+    /// Exact active account-register request, invalidated with its connection.
+    pub request: Option<String>,
     pub rows: Vec<AccountRow>,
     /// Bumped on every change, so a reader can skip an unchanged store.
     pub generation: u64,
@@ -1920,6 +1922,38 @@ impl PortfolioState {
     /// Copy of the account rows.
     pub fn account_rows(&self) -> AccountRows {
         self.account_rows.lock().unwrap().clone()
+    }
+
+    /// Begin a fresh image before its buffered replies can be consumed.
+    #[doc(hidden)]
+    pub fn begin_account_image(&self, request: &str) {
+        let mut rows = self.account_rows.lock().unwrap();
+        let generation = rows.generation + 1;
+        *rows = AccountRows {
+            request: Some(request.to_string()),
+            generation,
+            ..Default::default()
+        };
+    }
+
+    #[doc(hidden)]
+    pub fn invalidate_account_image(&self) {
+        let mut rows = self.account_rows.lock().unwrap();
+        rows.request = None;
+        rows.image_complete = false;
+    }
+
+    /// Match and apply under one lock, including against explicit disconnect.
+    pub(crate) fn update_account_image(&self, request: &str, apply: impl FnOnce(&mut AccountRows)) {
+        let mut rows = self.account_rows.lock().unwrap();
+        if rows.request.as_deref() == Some(request) {
+            apply(&mut rows);
+        }
+    }
+
+    pub fn account_image_matches(&self, request: &str) -> bool {
+        let rows = self.account_rows.lock().unwrap();
+        rows.image_complete && rows.request.as_deref() == Some(request)
     }
 
     #[doc(hidden)]
@@ -2163,6 +2197,7 @@ impl SharedState {
     #[doc(hidden)]
     #[inline]
     pub fn set_connection_lost(&self) {
+        self.portfolio.invalidate_account_image();
         self.portfolio.invalidate_position_snapshot();
         self.orders.set_open_orders_held(true);
         self.orders.invalidate_execution_history();
