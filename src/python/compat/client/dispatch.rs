@@ -200,6 +200,7 @@ impl EClient {
             })
         };
         if engine_stopped {
+            shared.orders.set_open_orders_held(true);
             shared.orders.invalidate_execution_history();
             self.connected.store(false, Ordering::Release);
         }
@@ -213,6 +214,7 @@ impl EClient {
         // Open-order requests held while the auth link was lost: taken
         // before the order updates and answered after them, so the answer
         // has the replayed statuses (ibx#251).
+        let open_history = shared.orders.execution_history_request();
         let released = self.core.released_open_orders(shared);
         let execution_requests = self.core.released_execution_requests(shared);
 
@@ -390,8 +392,8 @@ impl EClient {
         // engine's status request sets the state (ibx#252).
         shared.orders.drain_cancel_rejects();
 
-        for _ in released {
-            if let Err(e) = self.answer_open_orders(py, shared) {
+        for request in released {
+            if let Err(e) = self.answer_open_orders(py, shared, request, open_history.as_deref()) {
                 callback_raised(py, "open_order", e)?;
             }
         }

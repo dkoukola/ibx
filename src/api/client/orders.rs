@@ -157,36 +157,58 @@ impl EClient {
 
     /// Request open orders for this client. Matches `reqOpenOrders` in C++.
     ///
-    /// While the auth link is lost the request is answered only after the
-    /// order replay of the new logon, from `process_msgs` (ibx#251).
-    pub fn req_open_orders(&self, wrapper: &mut impl Wrapper) {
-        if self.core.hold_open_orders(crate::client_core::OpenOrdersRequest::Open, &self.shared) {
-            return;
-        }
-        self.answer_open_orders(wrapper);
+    /// Answered from `process_msgs` after the initial/reconnect replay and
+    /// queued status updates. Interrupted replies can repeat order IDs.
+    pub fn req_open_orders(&self, _wrapper: &mut impl Wrapper) {
+        self.core
+            .queue_open_orders(crate::client_core::OpenOrdersRequest::Open);
+        self.shared.notify();
     }
 
     /// Request all open orders. Matches `reqAllOpenOrders` in C++.
     ///
-    /// Held like [`req_open_orders`](Self::req_open_orders) while the auth
-    /// link is lost (ibx#251).
-    pub fn req_all_open_orders(&self, wrapper: &mut impl Wrapper) {
-        if self.core.hold_open_orders(crate::client_core::OpenOrdersRequest::All, &self.shared) {
-            return;
-        }
-        self.answer_open_orders(wrapper);
+    /// Queued like [`req_open_orders`](Self::req_open_orders).
+    pub fn req_all_open_orders(&self, _wrapper: &mut impl Wrapper) {
+        self.core
+            .queue_open_orders(crate::client_core::OpenOrdersRequest::All);
+        self.shared.notify();
     }
 
     /// The open orders, then the end of the list.
-    pub(crate) fn answer_open_orders(&self, wrapper: &mut impl Wrapper) {
-        for (order_id, tracked) in self.core.collect_open_orders(&self.shared) {
+    pub(crate) fn answer_open_orders(
+        &self,
+        request: crate::client_core::OpenOrdersRequest,
+        history: Option<&str>,
+        wrapper: &mut impl Wrapper,
+    ) {
+        let orders = self.core.collect_open_orders(&self.shared);
+        if !self.open_order_snapshot_current(history) {
+            if self.is_connected() {
+                self.core.queue_open_orders(request);
+            }
+            return;
+        }
+        for (order_id, tracked) in orders {
             let state = crate::api::types::OrderState {
                 status: tracked.status,
                 ..Default::default()
             };
             wrapper.open_order(order_id, &tracked.contract, &tracked.order, &state);
         }
-        wrapper.open_order_end();
+        if self.open_order_snapshot_current(history) {
+            wrapper.open_order_end();
+        } else if self.is_connected() {
+            self.core.queue_open_orders(request);
+        }
+    }
+
+    fn open_order_snapshot_current(&self, history: Option<&str>) -> bool {
+        self.is_connected()
+            && self
+                .shared
+                .orders
+                .execution_history_request_matches(history)
+            && !self.shared.orders.open_orders_held()
     }
 
     // ── Completed Orders ──

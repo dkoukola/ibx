@@ -3214,7 +3214,10 @@ mod tests {
         engine.check_writes();
         assert!(engine.ccp.disconnected);
         assert!(!engine.farm.disconnected);
-        assert!(!shared.orders.open_orders_held());
+        assert!(
+            shared.orders.open_orders_held(),
+            "open-order requests wait immediately when the auth link fails, before 1100"
+        );
         engine.report_link_changes();
         assert_eq!(shared.drain_connection_notices().iter().map(|n| n.0).collect::<Vec<_>>(), vec![1100]);
         assert!(shared.orders.open_orders_held(), "open-order requests wait from the 1100 (ibx#251)");

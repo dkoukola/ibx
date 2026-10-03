@@ -205,6 +205,12 @@ fn perm_id_from_clord_id(s: &str) -> i64 {
     id.parse::<i64>().ok().filter(|id| *id > 0).unwrap_or(0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayKind {
+    Initial,
+    Reconnect,
+}
+
 pub(crate) struct CcpState {
     pub(crate) seen_exec_ids: HashSet<String>,
     /// Insertion order for `seen_exec_ids`, oldest at the front. Used to evict
@@ -312,8 +318,8 @@ pub(crate) struct CcpState {
     pub(crate) last_exec: Option<(String, String)>,
     /// Running number of the trades requests of the session.
     pub(crate) next_trades_request: u32,
-    /// Set by a reconnect until the end frame of the order status replay.
-    pub(crate) awaiting_status_replay: bool,
+    /// The initial or reconnect order replay, until its wildcard end frame.
+    pub(crate) awaiting_status_replay: Option<ReplayKind>,
     /// When the end frame of the post-reconnect status replay came; the
     /// engine reports the restored link from it (ibx#399).
     pub(crate) status_replay_end_at: Option<Instant>,
@@ -661,7 +667,7 @@ impl CcpState {
             last_exec: None,
             // The login sends the first trades request.
             next_trades_request: 5,
-            awaiting_status_replay: false,
+            awaiting_status_replay: None,
             status_replay_end_at: None,
         }
     }
@@ -1147,9 +1153,10 @@ impl CcpState {
             return;
         }
         if parsed.get(&11).map(|s| s.as_str()) == Some("*") {
-            if self.awaiting_status_replay {
-                self.awaiting_status_replay = false;
-                self.status_replay_end_at = Some(Instant::now());
+            if let Some(kind) = self.awaiting_status_replay.take() {
+                if kind == ReplayKind::Reconnect {
+                    self.status_replay_end_at = Some(Instant::now());
+                }
                 // The held open-order requests are answered from the
                 // corrected orders (ibx#251).
                 shared.orders.set_open_orders_held(false);
@@ -1419,7 +1426,7 @@ impl CcpState {
         // The replay after a reconnect answers a status request for every
         // working order: its status is set as the server gives it, as for
         // a single status request (ibx#251).
-        let replayed = is_status_report && self.awaiting_status_replay;
+        let replayed = is_status_report && self.awaiting_status_replay.is_some();
         let queried = replayed || (is_status_report && !context.status_queries.is_empty()
             && context.status_queries.remove(&clord_id));
         let change = if queried {
@@ -3046,6 +3053,7 @@ impl CcpState {
         shared: &SharedState,
         _event_tx: &Option<Sender<Event>>,
     ) {
+        shared.orders.set_open_orders_held(true);
         shared.orders.invalidate_execution_history();
         self.disconnected = true;
         // The derivative answers go with the link, as in the reference
@@ -3057,7 +3065,7 @@ impl CcpState {
         self.pending_matching_symbols.clear();
         self.matching_acked.clear();
         self.matching_permits += 1;
-        self.awaiting_status_replay = false;
+        self.awaiting_status_replay = None;
         self.status_replay_end_at = None;
         // A company lookup lost with the link is made again by the next
         // derivative row (ibx#436).
@@ -3083,6 +3091,8 @@ impl CcpState {
         account_id: &str,
         shared: &SharedState,
     ) {
+        shared.orders.set_open_orders_held(true);
+        shared.orders.invalidate_execution_history();
         *ccp_conn = Some(conn);
         self.disconnected = false;
         hb.ccp_connected(Instant::now());
@@ -3112,7 +3122,7 @@ impl CcpState {
             // Status of the working orders; its end frame starts the
             // restored-link report.
             let _ = conn.send_fix(&status_replay_request(&ts));
-            self.awaiting_status_replay = true;
+            self.awaiting_status_replay = Some(ReplayKind::Reconnect);
             self.status_replay_end_at = None;
 
             hb.last_ccp_sent = Instant::now();
@@ -6575,7 +6585,7 @@ mod reconnect_tests {
         let mut context = Context::new();
         let mut ccp = CcpState::new();
         let shared = SharedState::new();
-        ccp.awaiting_status_replay = true;
+        ccp.awaiting_status_replay = Some(ReplayKind::Reconnect);
 
         let trades_end = frame(&[(43, "N"), (52, "20260930-19:05:27"), (6556, "todayfillup88"),
             (17, "140781.1790795127.0"), (32, "*"), (150, "0"), (39, "0"), (6008, "265598"), (38, "1")]);
@@ -6591,7 +6601,7 @@ mod reconnect_tests {
         assert_eq!(context.market.count(), 0, "no instrument registered for a marker");
         assert!(shared.orders.drain_fills_with_exec().is_empty());
         assert!(shared.orders.drain_order_updates().is_empty());
-        assert!(!ccp.awaiting_status_replay);
+        assert!(ccp.awaiting_status_replay.is_none());
         assert!(ccp.status_replay_end_at.is_some(), "the status replay end is seen");
     }
 
@@ -6657,6 +6667,33 @@ mod reconnect_tests {
         }
     }
 
+    #[test]
+    fn initial_open_order_replay_does_not_announce_a_restored_link() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        shared.orders.begin_execution_history("today4");
+        shared.orders.set_open_orders_held(true);
+        ccp.awaiting_status_replay = Some(ReplayKind::Initial);
+        ccp.handle_exec_report(&frame(&[(11, "*")]), &mut context, &shared, &None, "DU1");
+        assert!(ccp.awaiting_status_replay.is_none());
+        assert!(!shared.orders.open_orders_held());
+        assert!(
+            ccp.status_replay_end_at.is_none(),
+            "only reconnect schedules 1102"
+        );
+        ccp.handle_disconnect(&mut context, &shared, &None);
+        assert!(
+            shared.orders.open_orders_held(),
+            "hold immediately, before link notification"
+        );
+        ccp.handle_exec_report(&frame(&[(11, "*")]), &mut context, &shared, &None, "DU1");
+        assert!(
+            shared.orders.open_orders_held(),
+            "no outstanding replay on the lost link"
+        );
+    }
+
     // Outside a reconnect the status replay end marks nothing.
     #[test]
     fn status_replay_end_outside_a_reconnect_marks_nothing() {
@@ -6700,7 +6737,7 @@ mod reconnect_tests {
         context.set_order_status_forced(90, OrderStatus::Submitted);
         context.set_order_status_forced(91, OrderStatus::PendingCancel);
         ccp.handle_disconnect(&mut context, &shared, &None);
-        ccp.awaiting_status_replay = true;
+        ccp.awaiting_status_replay = Some(ReplayKind::Reconnect);
 
         let working = |id: &str| frame(&[(11, id), (20, "3"), (150, "0"), (39, "0"), (37, "57311390"),
             (100, "NASDAQ"), (14, "0"), (151, "1"), (6008, "1005"), (38, "1")]);

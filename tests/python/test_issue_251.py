@@ -55,7 +55,9 @@ def test_requests_wait_for_the_order_replay():
     assert w.events == [], "answered once"
 
 
-def test_requests_are_answered_at_once_with_the_link_up():
+def test_requests_are_answered_after_dispatch_with_the_link_up():
     w, c = client()
     c.req_open_orders()
+    assert w.events == []
+    c._test_dispatch_once()
     assert w.events[-1] == ("open_order_end",)

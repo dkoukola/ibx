@@ -54,6 +54,7 @@ impl EClient {
         // Open-order requests held while the auth link was lost: taken
         // before the order updates and answered after them, so the answer
         // has the replayed statuses (ibx#251).
+        let open_history = self.shared.orders.execution_history_request();
         let released = self.core.released_open_orders(&self.shared);
         let executions = self.core.released_execution_requests(&self.shared);
         // Fills → order_status + exec_details. The commission report comes
@@ -204,8 +205,8 @@ impl EClient {
             }
         }
 
-        for _ in released {
-            self.answer_open_orders(wrapper);
+        for request in released {
+            self.answer_open_orders(request, open_history.as_deref(), wrapper);
         }
         if let Some((history, requests)) = executions {
             for (req_id, filter) in requests {

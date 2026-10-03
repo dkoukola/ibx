@@ -185,26 +185,25 @@ impl EClient {
 
     /// Request all open orders for this client.
     ///
-    /// While the auth link is lost the request is answered only after the
-    /// order replay of the new logon, from the dispatch loop (ibx#251).
-    fn req_open_orders(&self, py: Python<'_>) -> PyResult<()> {
+    /// Queued for the dispatch loop after initial/reconnect replay and
+    /// queued status updates. Interrupted replies can repeat order IDs.
+    fn req_open_orders(&self) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
         let shared = self.shared_state()?;
-        if self.core.hold_open_orders(crate::client_core::OpenOrdersRequest::Open, &shared) {
-            return Ok(());
-        }
-        self.answer_open_orders(py, &shared)
+        self.core
+            .queue_open_orders(crate::client_core::OpenOrdersRequest::Open);
+        shared.notify();
+        Ok(())
     }
 
-    /// Request all open orders across all clients. Held like
-    /// `req_open_orders` while the auth link is lost (ibx#251).
-    fn req_all_open_orders(&self, py: Python<'_>) -> PyResult<()> {
+    /// Request all open orders across all clients, queued like req_open_orders.
+    fn req_all_open_orders(&self) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
         let shared = self.shared_state()?;
-        if self.core.hold_open_orders(crate::client_core::OpenOrdersRequest::All, &shared) {
-            return Ok(());
-        }
-        self.answer_open_orders(py, &shared)
+        self.core
+            .queue_open_orders(crate::client_core::OpenOrdersRequest::All);
+        shared.notify();
+        Ok(())
     }
 
     /// Automatically bind future orders to this client.
@@ -471,8 +470,18 @@ impl EClient {
 
     /// The open orders, each as open_order then order_status, then the end
     /// of the list.
-    pub(crate) fn answer_open_orders(&self, py: Python<'_>, shared: &SharedState) -> PyResult<()> {
+    pub(crate) fn answer_open_orders(
+        &self,
+        py: Python<'_>,
+        shared: &std::sync::Arc<SharedState>,
+        request: crate::client_core::OpenOrdersRequest,
+        history: Option<&str>,
+    ) -> PyResult<()> {
         let orders = self.core.collect_open_orders(shared);
+        if !self.open_order_snapshot_current(shared, history) {
+            self.requeue_open_orders_if_current(shared, request);
+            return Ok(());
+        }
         for (order_id, tracked) in &orders {
             // A combo with its legs (ibx#470).
             let c_py = Py::new(py, Contract::from_api(py, &tracked.contract)?)?.into_any();
@@ -512,7 +521,40 @@ impl EClient {
                 None,
             )?;
         }
-        self.wrapper.call_method0(py, "open_order_end")?;
+        if self.open_order_snapshot_current(shared, history) {
+            self.wrapper.call_method0(py, "open_order_end")?;
+        } else {
+            self.requeue_open_orders_if_current(shared, request);
+        }
         Ok(())
+    }
+
+    fn open_order_snapshot_current(
+        &self,
+        shared: &std::sync::Arc<SharedState>,
+        history: Option<&str>,
+    ) -> bool {
+        let current = self.shared.lock().unwrap();
+        self.connected.load(Ordering::Acquire)
+            && current
+                .as_ref()
+                .is_some_and(|active| std::sync::Arc::ptr_eq(active, shared))
+            && shared.orders.execution_history_request_matches(history)
+            && !shared.orders.open_orders_held()
+    }
+
+    fn requeue_open_orders_if_current(
+        &self,
+        shared: &std::sync::Arc<SharedState>,
+        request: crate::client_core::OpenOrdersRequest,
+    ) {
+        let current = self.shared.lock().unwrap();
+        if self.connected.load(Ordering::Acquire)
+            && current
+                .as_ref()
+                .is_some_and(|active| std::sync::Arc::ptr_eq(active, shared))
+        {
+            self.core.queue_open_orders(request);
+        }
     }
 }

@@ -598,6 +598,7 @@ class TestReqOpenOrdersOrderState:
             action="BUY", total_quantity=100.0, lmt_price=400.0,
         )
         c.req_open_orders()
+        c._test_dispatch_once()
 
         open_events = [e for e in w.events if e[0] == "open_order"]
         assert len(open_events) == 1, f"expected 1 open_order, got {open_events}"

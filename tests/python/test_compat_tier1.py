@@ -225,6 +225,7 @@ def test_req_open_orders_empty():
     client = EClient(w)
     client._test_connect()
     client.req_open_orders()
+    client._test_dispatch_once()
     assert ("open_order_end",) in w.events
 
 
@@ -234,6 +235,7 @@ def test_req_open_orders_only_open_order_end():
     client = EClient(w)
     client._test_connect()
     client.req_open_orders()
+    client._test_dispatch_once()
     # Should only have open_order_end, no order_status
     assert len([e for e in w.events if e[0] == "order_status"]) == 0
     assert len([e for e in w.events if e[0] == "open_order_end"]) == 1
@@ -245,6 +247,7 @@ def test_req_all_open_orders_empty():
     client = EClient(w)
     client._test_connect()
     client.req_all_open_orders()
+    client._test_dispatch_once()
     assert ("open_order_end",) in w.events
 
 
@@ -600,8 +603,9 @@ def test_full_ibapi_app_pattern_with_tier1():
 
     assert len(app.events) == 3
     assert app.events[0][0] == "current_time"
-    assert app.events[1] == ("open_order_end",)
-    assert app.events[2] == ("exec_details_end", 1)
+    # Both snapshots are asynchronous; unrelated requests have no shared
+    # callback-order guarantee.
+    assert set(app.events[1:]) == {("open_order_end",), ("exec_details_end", 1)}
 
 
 # ═══════════════════════════════════════

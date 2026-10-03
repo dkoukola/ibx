@@ -5406,12 +5406,53 @@ fn open_order_requests_wait_for_the_order_replay() {
     }).collect();
     assert_eq!(kinds, vec!["open_order", "order_status", "open_order", "end", "open_order", "end"]);
 
-    // Answered at once again when the link is up.
+    // Even when ready, answer only after queued statuses are dispatched.
     let mut w = RecordingWrapper::default();
     client.req_open_orders(&mut w);
-    assert_eq!(w.events.last().map(String::as_str), Some("open_order_end"));
+    assert!(w.events.is_empty());
     client.process_msgs(&mut w);
     assert_eq!(w.events.iter().filter(|e| *e == "open_order_end").count(), 1);
+}
+
+#[test]
+fn open_order_request_after_replay_end_consumes_queued_terminal_status_first() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "BUY".into(),
+        total_quantity: 1.0,
+        order_type: "LMT".into(),
+        lmt_price: 10.0,
+        ..Default::default()
+    };
+    client.place_order(1, &spy(), &order).unwrap();
+    shared.orders.push_order_update(OrderUpdate {
+        order_id: 1,
+        instrument: 0,
+        status: OrderStatus::Cancelled,
+        filled_qty_fixed: 0,
+        remaining_qty_fixed: crate::types::QTY_SCALE,
+        avg_fill_price: 0,
+        perm_id: 0,
+        parent_id: 0,
+        timestamp_ns: 0,
+    });
+    // The wire end has arrived, but its preceding status is still queued.
+    shared.orders.set_open_orders_held(false);
+    let mut observed = RecordingWrapper::default();
+    client.req_open_orders(&mut observed);
+    assert!(observed.events.is_empty());
+    client.process_msgs(&mut observed);
+    assert!(
+        !observed
+            .events
+            .iter()
+            .any(|event| event.starts_with("open_order:"))
+    );
+    assert_eq!(
+        observed.events.last().map(String::as_str),
+        Some("open_order_end")
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
