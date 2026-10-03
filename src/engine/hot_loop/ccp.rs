@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::bridge::{Event, RichOrderInfo, SharedState};
+use crate::bridge::{Event, SharedState};
 use crate::api::types as api;
 use crate::engine::context::Context;
 use crate::config::chrono_free_timestamp;
@@ -14,7 +14,9 @@ use crate::types::{
 };
 use crossbeam_channel::Sender;
 
-use super::{HeartbeatState, emit, clone_for_event, parse_price_tag, parse_qty, decode_tif};
+use super::{HeartbeatState, emit, clone_for_event, parse_price_tag, parse_qty};
+#[cfg(test)]
+use super::decode_tif;
 
 /// API error 10159 of a matching-symbols request that could not be sent
 /// (ibx#369).
@@ -271,7 +273,7 @@ fn parent_order_id(parsed: &std::collections::HashMap<u32, String>, context: &Co
 /// The broker permId is the numeric part of its ClOrdID (tag 11), before
 /// the modify/cancel version, not FIX OrderID (tag 37) or the local API id.
 /// Earlier cancel requests prefix that same identity with `C`.
-fn perm_id_from_clord_id(s: &str) -> i64 {
+pub(super) fn perm_id_from_clord_id(s: &str) -> i64 {
     let id = s
         .strip_prefix('C')
         .unwrap_or(s)
@@ -1849,254 +1851,44 @@ impl CcpState {
             }
         }
 
-        // Enrich order/contract caches block
+        // Projection is shared; only this live path publishes accounting.
         {
-            let account = parsed.get(&1).cloned().unwrap_or_default();
-            let symbol = parsed.get(&55).cloned().unwrap_or_default();
-            let exchange = parsed.get(&207).cloned().unwrap_or_default();
-            let sec_type = parsed.get(&167).cloned().unwrap_or_default();
-            let currency = parsed.get(&15).cloned().unwrap_or_default();
-            let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let local_symbol = parsed.get(&6035).cloned().unwrap_or_default();
-            let _routing_exchange = parsed.get(&6004).cloned().unwrap_or_default();
-            let perm_id: i64 = perm_id_of(parsed);
-            let total_qty: f64 = parsed.get(&38).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let ord_type_tag = parsed.get(&40).map(|s| s.as_str()).unwrap_or("");
-            let limit_price: f64 = parsed.get(&44).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let stop_px: f64 = parsed.get(&99).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            // Kept once a report gave it: the reference's order shows it
-            // from then on, also when later reports leave it out (ibx#486,
-            // premarket_order_types of 28/09/2026: an IOC placed without
-            // it, a report with 6433=1, then openOrder outsideRth true).
-            let outside_rth = parsed.get(&6433).is_some_and(|s| s == "1")
-                || shared.orders.get_order_info(clord_id).is_some_and(|i| i.order.outside_rth);
-            let clearing_intent = parsed.get(&6419).cloned().unwrap_or_default();
-            let auto_cancel_date = parsed.get(&6596).cloned().unwrap_or_default();
-            let exec_exchange = parsed.get(&30).cloned().unwrap_or_default();
-            let transact_time = parsed.get(&60).cloned().unwrap_or_default();
-            let avg_px: f64 = parsed.get(&6).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let cum_qty: f64 = parsed.get(&14).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let last_liq: i32 = parsed.get(&851).and_then(|s| s.parse().ok()).unwrap_or(0);
-
-            let sec_type_str = match sec_type.as_str() {
-                "CS" | "COMMON" => "STK",
-                "FUT" => "FUT",
-                "OPT" => "OPT",
-                "FOR" | "CASH" => "CASH",
-                "IND" => "IND",
-                "FOP" => "FOP",
-                "WAR" => "WAR",
-                "BAG" => "BAG",
-                "BOND" => "BOND",
-                "CMDTY" => "CMDTY",
-                "NEWS" => "NEWS",
-                "FUND" => "FUND",
-                _ => &sec_type,
-            };
-
-            let order_type_str = match ord_type_tag {
-                "1" => "MKT", "2" => "LMT", "3" => "STP", "4" => "STP LMT",
-                "P" => "TRAIL", "5" => "MOC", "B" => "LOC", "J" => "MIT",
-                "K" => "MTL", "R" => "REL",
-                "TMIT" => "TRAIL MIT", "TLIT" => "TRAIL LIT", "E2M" => "PEG BEST", "PSVR" => "PASSV REL",
-                _ => ord_type_tag,
-            };
-
-            // As the reference: an unknown code is kept ("???"), not read
-            // as DAY; each report sets the order's time in force (ibx#307).
-            let tif_str = decode_tif(super::report_tif(&parsed));
-
-            let action = match parsed.get(&54).map(|s| s.as_str()) {
-                Some("1") => "BUY",
-                Some("2") => "SELL",
-                Some("5") => "SSHORT",
-                _ => if let Some(order) = context.order(clord_id) {
-                    match order.side {
-                        Side::Buy => "BUY",
-                        Side::Sell => "SELL",
-                        Side::ShortSell => "SSHORT",
-                    }
-                } else { "" },
-            };
-
-            let status_str = crate::client_core::order_status_str(status);
-
-            let resolved_con_id = if con_id != 0 {
-                con_id
-            } else if let Some(order) = context.order(clord_id) {
-                context.market.con_id(order.instrument).unwrap_or(0)
-            } else {
-                0
-            };
-
-            let contract = if let Some(view) = &combo_view {
-                // A combo order shows its combo, not the report's contract
-                // (55=IECombo) (ibx#470).
-                view.contract.clone()
-            } else if resolved_con_id != 0 {
-                if let Some(mut cached) = shared.reference.get_contract(resolved_con_id) {
-                    if !symbol.is_empty() { cached.symbol = symbol.clone(); }
-                    if !sec_type_str.is_empty() { cached.sec_type = sec_type_str.to_string(); }
-                    if !exchange.is_empty() { cached.exchange = exchange.clone(); }
-                    if !currency.is_empty() { cached.currency = currency.clone(); }
-                    if !local_symbol.is_empty() { cached.local_symbol = local_symbol.clone(); }
-                    cached
-                } else {
-                    api::Contract {
-                        con_id: resolved_con_id,
-                        symbol: symbol.clone(),
-                        sec_type: sec_type_str.to_string(),
-                        exchange: exchange.clone(),
-                        currency: currency.clone(),
-                        local_symbol: local_symbol.clone(),
-                        ..Default::default()
-                    }
-                }
-            } else {
-                api::Contract {
-                    symbol: symbol.clone(),
-                    sec_type: sec_type_str.to_string(),
-                    exchange: exchange.clone(),
-                    currency: currency.clone(),
-                    local_symbol: local_symbol.clone(),
-                    ..Default::default()
-                }
-            };
-
-            let (fb_action, fb_ord_type) = if let Some(ctx_order) = context.order(clord_id) {
-                let a = match ctx_order.side {
-                    crate::types::Side::Buy => "BUY",
-                    crate::types::Side::Sell | crate::types::Side::ShortSell => "SELL",
-                };
-                let o = match ctx_order.ord_type {
-                    b'1' => "MKT", b'2' => "LMT", b'3' => "STP", b'4' => "STP LMT",
-                    b'P' => "TRAIL", _ => "",
-                };
-                (a, o)
-            } else {
-                ("", "")
-            };
-
-            // Derive 3 order-dependent fields from FIX tags
-            let oca_type: i32 = match parsed.get(&6209).map(|s| s.as_str()) {
-                Some("CancelOnFillWBlock") => 1,
-                Some("ReduceOnFillWBlock") => 2,
-                Some("ReduceOnFillNonBlock") => 3,
-                Some("ReduceOnFillWBlockFromTotal") => 4,
-                _ => 3, // default
-            };
-            let algo_strategy = parsed.get(&847).cloned().unwrap_or_default();
-            // The price management flag the server echoes, 0 without it
-            // (ibx#492).
-            let use_price_mgmt_algo: i32 = i32::from(parsed.get(&8339).is_some_and(|v| v == "1"));
-            let trail_stop_price: f64 = parsed.get(&6117)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(f64::MAX);
-
-            // A TRAIL LIMIT report without its offset, limit price or stop
-            // price keeps the last ones (ib-agent#194, ibx#491).
-            let trail_limit = context.trail_limit_reported.get(&clord_id).copied();
-            let limit_price = match trail_limit {
-                Some(r) if limit_price == 0.0 && r.limit != 0 => r.limit as f64 / PRICE_SCALE as f64,
-                _ => limit_price,
-            };
-            let trail_stop_price = match trail_limit {
-                Some(r) if trail_stop_price == f64::MAX && r.stop != 0 => r.stop as f64 / PRICE_SCALE as f64,
-                _ => trail_stop_price,
-            };
-            let order = api::Order {
-                order_id: clord_id,
-                action: if action.is_empty() { fb_action.to_string() } else { action.to_string() },
-                total_quantity: total_qty,
-                order_type: if order_type_str.is_empty() { fb_ord_type.to_string() } else { order_type_str.to_string() },
-                lmt_price: limit_price,
-                aux_price: stop_px,
-                tif: tif_str.to_string(),
-                account: if account.is_empty() { account_id.to_string() } else { account.clone() },
-                perm_id,
-                parent_id: parent_order_id(parsed, context),
-                // Filled so far, not the quantity still working (ibx#309).
-                filled_quantity: cum_qty,
-                outside_rth,
-                clearing_intent,
-                auto_cancel_date,
-                submitter: account_id.to_string(),
-                oca_group: parsed.get(&583).cloned().unwrap_or_default(),
-                oca_type,
-                use_price_mgmt_algo,
-                trail_stop_price,
-                algo_strategy,
-                // The orderRef the server echoes (ibx#466).
-                order_ref: parsed.get(&6010).cloned().unwrap_or_default(),
-                // The cash quantity the server echoes in 152, which the
-                // reference reads into the order's cash quantity
-                // (`jexec.fq.<init>(dk, boolean)@2005-2120`, ibx#263).
-                cash_qty: parsed.get(&152).and_then(|s| s.parse().ok()).unwrap_or(0.0),
-                // A TRAIL LIMIT's offset as the server reports it (ib-agent#194).
-                lmt_price_offset: trail_limit.map_or(f64::MAX, |r| r.offset as f64 / PRICE_SCALE as f64),
-                // A combo's per-leg prices as reported (ibx#470).
-                order_combo_legs: shared.orders.combo_view(clord_id).map(|v| v.leg_prices).unwrap_or_default(),
-                // The order's API client (6119, 0 when absent) and order id.
-                client_id: parsed.get(&6119).and_then(|s| s.parse().ok()).unwrap_or(0),
-                ..Default::default()
-            };
+            let con_id = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let fallback_order = context.order(clord_id);
+            let fallback_con_id = fallback_order
+                .and_then(|order| context.market.con_id(order.instrument))
+                .unwrap_or(0);
+            let resolved_con_id = if con_id == 0 { fallback_con_id } else { con_id };
+            let mut info = super::report::project_report(
+                parsed,
+                super::report::ReportProjection {
+                    order_id: clord_id,
+                    parent_id: parent_order_id(parsed, context),
+                    status,
+                    account_id,
+                    fallback_order,
+                    fallback_con_id,
+                    cached_contract: shared.reference.get_contract(resolved_con_id),
+                    combo: combo_view.as_ref(),
+                    trail_limit: context.trail_limit_reported.get(&clord_id).copied(),
+                    combo_leg_prices: shared
+                        .orders
+                        .combo_view(clord_id)
+                        .map(|v| v.leg_prices)
+                        .unwrap_or_default(),
+                },
+            );
+            info.order.outside_rth |= shared.orders.get_order_info(clord_id).is_some_and(|i| i.order.outside_rth);
             if let Some(entry) = context.book.get(&clord_id) {
                 shared.orders.note_book(clord_id, entry.seq, context.book_peak);
             }
-
-            let completed_time = if matches!(status,
-                crate::types::OrderStatus::Filled |
-                crate::types::OrderStatus::Cancelled |
-                crate::types::OrderStatus::Rejected
-            ) {
-                parsed.get(&52).cloned().unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let completed_status = match status {
-                crate::types::OrderStatus::Filled => "Filled".to_string(),
-                crate::types::OrderStatus::Cancelled => "Cancelled".to_string(),
-                crate::types::OrderStatus::Rejected => {
-                    parsed.get(&58).cloned().unwrap_or_else(|| "Rejected".to_string())
-                }
-                _ => String::new(),
-            };
-
-            let order_state = api::OrderState {
-                status: status_str.to_string(),
-                commission_and_fees: commission,
-                completed_time,
-                completed_status,
-                ..Default::default()
-            };
-
-            let last_exec = api::Execution {
-                exec_id: exec_id.to_string(),
-                time: transact_time,
-                acct_number: account,
-                exchange: exec_exchange,
-                side: if let Some(o) = context.order(clord_id) {
-                    match o.side { Side::Buy => "BOT", Side::Sell | Side::ShortSell => "SLD" }.to_string()
-                } else { String::new() },
-                shares: last_shares as f64,
-                price: last_px,
-                order_id: clord_id,
-                cum_qty,
-                avg_price: avg_px,
-                last_liquidity: last_liq,
-                ..Default::default()
-            };
-
             if con_id != 0 {
-                shared.reference.cache_contract(con_id, contract.clone());
+                shared.reference.cache_contract(con_id, info.contract.clone());
             }
             if let Some((execution, exec)) = untracked_out.take() {
-                shared.orders.push_untracked_execution(contract.clone(), execution, exec);
+                shared.orders.push_untracked_execution(info.contract.clone(), execution, exec);
             }
-
-            shared.orders.push_order_info(clord_id, RichOrderInfo {
-                contract, order, order_state, last_exec,
-            });
+            shared.orders.push_order_info(clord_id, info);
         }
 
         if let Some((fill, mut exec)) = fill_out {

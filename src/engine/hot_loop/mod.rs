@@ -1,5 +1,6 @@
 pub mod farm;
 pub mod ccp;
+pub(crate) mod report;
 pub mod hmds;
 pub(crate) mod pool;
 pub mod order_builder;

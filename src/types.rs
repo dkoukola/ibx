@@ -866,6 +866,11 @@ impl OrderKind {
 /// Order request sent via control channel, processed by engine.
 #[derive(Debug, Clone)]
 pub enum OrderRequest {
+    /// Opt-in owned first-write authorization; clones cannot duplicate a send.
+    Guarded {
+        request: Box<OrderRequest>,
+        guard: crate::protocol::order_write::OrderWriteGuard,
+    },
     SubmitLimit {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1298,7 +1303,7 @@ impl OrderRequest {
             | Self::SubmitAdjustableStop { order_id, .. }
             | Self::SubmitEx { order_id, .. } => *order_id,
             Self::SubmitBracket { parent_id, .. } => *parent_id,
-            Self::SubmitWhatIf { request } => request.order_id(),
+            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.order_id(),
         }
     }
 
@@ -1307,7 +1312,7 @@ impl OrderRequest {
     pub fn new_order_ids(&self) -> Vec<OrderId> {
         match self {
             Self::SubmitBracket { parent_id, tp_id, sl_id, .. } => vec![*parent_id, *tp_id, *sl_id],
-            Self::SubmitWhatIf { request } => request.new_order_ids(),
+            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.new_order_ids(),
             _ if self.new_order_qty().is_some() => vec![self.order_id()],
             _ => Vec::new(),
         }
@@ -1318,7 +1323,7 @@ impl OrderRequest {
     pub fn new_order_qty(&self) -> Option<Qty> {
         match self {
             Self::Cancel { .. } | Self::CancelAll { .. } | Self::GlobalCancel | Self::Modify { .. } => None,
-            Self::SubmitWhatIf { request } => request.new_order_qty(),
+            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.new_order_qty(),
             Self::SubmitLimitFractional { qty, .. } => Some(*qty),
             Self::SubmitLimit { qty, .. }
             | Self::SubmitMarket { qty, .. }
@@ -1405,7 +1410,7 @@ impl OrderRequest {
             | Self::SubmitAdjustableStop { instrument, .. }
             | Self::SubmitEx { instrument, .. }
             | Self::SubmitBracket { instrument, .. } => Some(*instrument),
-            Self::SubmitWhatIf { request } => request.instrument(),
+            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.instrument(),
         }
     }
 
@@ -1453,7 +1458,7 @@ impl OrderRequest {
             | Self::SubmitAdjustableStop { instrument, .. }
             | Self::SubmitEx { instrument, .. }
             | Self::SubmitBracket { instrument, .. } => Some(instrument),
-            Self::SubmitWhatIf { request } => request.new_order_instrument_mut(),
+            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.new_order_instrument_mut(),
         }
     }
 
@@ -1466,7 +1471,9 @@ impl OrderRequest {
     /// the one every combo order takes (ibx#470).
     pub fn ex_instrument_mut(&mut self) -> Option<&mut InstrumentId> {
         match self {
-            Self::SubmitWhatIf { request } => request.ex_instrument_mut(),
+            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => {
+                request.ex_instrument_mut()
+            }
             Self::SubmitTrailingStopPctEx { instrument, .. }
             | Self::SubmitLimitEx { instrument, .. }
             | Self::SubmitEx { instrument, .. }
@@ -1481,7 +1488,9 @@ impl OrderRequest {
     pub fn new_order_side(&self) -> Option<(Side, Option<&OrderAttrs>)> {
         match self {
             Self::Cancel { .. } | Self::CancelAll { .. } | Self::GlobalCancel | Self::Modify { .. } => None,
-            Self::SubmitWhatIf { request } => request.new_order_side(),
+            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => {
+                request.new_order_side()
+            }
             Self::SubmitTrailingStopPctEx { side, attrs, .. }
             | Self::SubmitLimitEx { side, attrs, .. }
             | Self::SubmitEx { side, attrs, .. }
@@ -1536,7 +1545,9 @@ impl OrderRequest {
             | Self::SubmitMtl { .. } | Self::SubmitMktPrt { .. }
             | Self::SubmitMtlAuc { .. }
             | Self::SubmitTrailingStopPct { .. } | Self::SubmitTrailingStopPctEx { .. } => return None,
-            Self::SubmitWhatIf { request } => return request.off_grid_order(tick, signed),
+            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => {
+                return request.off_grid_order(tick, signed);
+            }
             Self::Modify { order_id, kind, .. } | Self::SubmitEx { order_id, kind, .. } => (*order_id, kind.grid_prices()),
             Self::SubmitLimit { order_id, price, .. }
             | Self::SubmitLimitGtc { order_id, price, .. }

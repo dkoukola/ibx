@@ -10,6 +10,51 @@ use super::{Contract, Order, TagValue, EClient};
 impl EClient {
     // ── Orders ──
 
+    /// The current auth-link identity, for qualification followed by a guarded
+    /// order. This does not establish reconciliation or trading readiness.
+    pub fn order_connection_identity(&self) -> Option<String> {
+        self.shared.orders.execution_history_request()
+    }
+
+    /// Queue a native order command with owned, single-use authorization at
+    /// its actual first socket write. Unlike `place_order`, this low-level
+    /// API does not optimistically add an order to the local API cache.
+    ///
+    /// The caller supplies a qualified native request and the identity used
+    /// for that qualification. Metadata parking preserves the guard; a changed
+    /// connection refuses it. Dropping the receipt cancels a still-unsent
+    /// command. `Written` means transport write completion, not acceptance.
+    /// The callback must not call back into this receipt or block on the engine.
+    pub fn send_order_guarded(
+        &self,
+        request: OrderRequest,
+        expected_connection: String,
+        authorize: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> Result<crate::protocol::order_write::OrderWriteReceipt, String> {
+        let shared = self.shared.clone();
+        let (guard, receipt) = crate::protocol::order_write::OrderWriteGuard::new(move || {
+            if !shared
+                .orders
+                .execution_history_request_matches(Some(&expected_connection))
+            {
+                return Err("order connection changed before first write".into());
+            }
+            authorize()?;
+            if !shared
+                .orders
+                .execution_history_request_matches(Some(&expected_connection))
+            {
+                return Err("order connection changed during authorization".into());
+            }
+            Ok(())
+        });
+        self.send(ControlCommand::Order(OrderRequest::Guarded {
+            request: Box::new(request),
+            guard,
+        }))?;
+        Ok(receipt)
+    }
+
     /// Place an order. Matches `placeOrder` in C++.
     pub fn place_order(&self, order_id: i64, contract: &Contract, order: &Order) -> Result<(), String> {
         if !ClientCore::ids_fit("place_order", &[order_id, contract.con_id]) { return Ok(()); }
