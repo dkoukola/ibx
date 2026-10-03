@@ -540,6 +540,9 @@ pub struct OrderState {
     /// Set from a lost auth link to the end of the order replay after the
     /// new logon: open-order requests wait for the replay (ibx#251).
     open_orders_held: AtomicBool,
+    /// The current U72 request and whether its matching end marker arrived.
+    /// None before a real request, or after the auth link is lost.
+    execution_history: Mutex<Option<(String, bool)>>,
     /// The combo of each combo order sent this session (ibx#470).
     combo_views: Mutex<HashMap<OrderId, ComboView>>,
 }
@@ -558,6 +561,7 @@ impl OrderState {
             completed_orders: Mutex::new(Vec::with_capacity(64)),
             order_cache: Mutex::new(HashMap::new()),
             open_orders_held: AtomicBool::new(false),
+            execution_history: Mutex::new(None),
         }
     }
 
@@ -572,6 +576,43 @@ impl OrderState {
     /// True while open-order requests wait for the order replay (ibx#251).
     pub fn open_orders_held(&self) -> bool {
         self.open_orders_held.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
+    pub fn begin_execution_history(&self, request: &str) {
+        *self.execution_history.lock().unwrap() = Some((request.to_string(), false));
+    }
+
+    #[doc(hidden)]
+    pub fn invalidate_execution_history(&self) {
+        *self.execution_history.lock().unwrap() = None;
+    }
+
+    /// Only the end of the outstanding broker request can release readers.
+    #[doc(hidden)]
+    pub fn complete_execution_history(&self, request: &str) {
+        if let Some((pending, complete)) = self.execution_history.lock().unwrap().as_mut()
+            && pending == request
+        {
+            *complete = true;
+        }
+    }
+
+    pub fn execution_history_completion(&self) -> Option<String> {
+        self.execution_history
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(_, complete)| *complete)
+            .map(|(request, _)| request.clone())
+    }
+
+    pub fn execution_history_matches(&self, request: &str) -> bool {
+        self.execution_history
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(current, complete)| *complete && current == request)
     }
 
     pub fn drain_fills(&self) -> Vec<Fill> {
@@ -1685,6 +1726,7 @@ impl SharedState {
     #[doc(hidden)]
     #[inline]
     pub fn set_connection_lost(&self) {
+        self.orders.invalidate_execution_history();
         self.connection_lost.store(true, Ordering::Release);
         self.notify();
     }

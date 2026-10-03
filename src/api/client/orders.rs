@@ -230,20 +230,47 @@ impl EClient {
     }
 
     /// Request execution reports. Matches `reqExecutions` in C++.
-    /// Replays stored executions (optionally filtered), firing `exec_details` +
-    /// `commission_and_fees_report` for each, then `exec_details_end`.
-    pub fn req_executions(&self, req_id: i64, filter: &ExecutionFilter, wrapper: &mut impl Wrapper) {
+    /// Queues a filtered replay for `process_msgs`, after initial/reconnect
+    /// execution history has completed. A reply interrupted by link loss can
+    /// repeat execution IDs after reconnect; no successful end is invented.
+    pub fn req_executions(
+        &self,
+        req_id: i64,
+        filter: &ExecutionFilter,
+        _wrapper: &mut impl Wrapper,
+    ) {
         if !crate::client_core::ClientCore::ids_fit("req_executions", &[req_id]) { return; }
+        self.core.queue_execution_request(req_id, filter);
+        self.shared.notify();
+    }
+
+    pub(super) fn answer_executions(
+        &self,
+        history: &str,
+        req_id: i64,
+        filter: &ExecutionFilter,
+        wrapper: &mut impl Wrapper,
+    ) {
         // No lock is held during the callbacks (ibx#265). As the reference:
         // every execution, then the commission reports, then the end.
         let execs = self.core.matching_executions(filter);
+        if !self.shared.orders.execution_history_matches(history) {
+            if self.is_connected() {
+                self.core.queue_execution_request(req_id, filter);
+            }
+            return;
+        }
         for se in &execs {
             wrapper.exec_details(req_id, &se.contract, &se.execution);
         }
         for report in execs.iter().filter_map(|se| se.commission_and_fees.as_ref()) {
             wrapper.commission_and_fees_report(report);
         }
-        wrapper.exec_details_end(req_id);
+        if self.shared.orders.execution_history_matches(history) {
+            wrapper.exec_details_end(req_id);
+        } else if self.is_connected() {
+            self.core.queue_execution_request(req_id, filter);
+        }
     }
 }
 

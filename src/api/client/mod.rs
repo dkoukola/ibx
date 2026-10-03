@@ -332,6 +332,7 @@ impl EClient {
     /// Disconnect from IB.  Sends `Shutdown` to the hot loop, waits for the
     /// background thread to exit, and marks the client as disconnected.
     pub fn disconnect(&self) {
+        self.shared.orders.invalidate_execution_history();
         let _ = self.control_tx.send(ControlCommand::Shutdown);
         if let Some(h) = self.thread.lock().unwrap().take() {
             let _ = h.join();

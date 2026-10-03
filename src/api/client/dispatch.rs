@@ -55,6 +55,7 @@ impl EClient {
         // before the order updates and answered after them, so the answer
         // has the replayed statuses (ibx#251).
         let released = self.core.released_open_orders(&self.shared);
+        let executions = self.core.released_execution_requests(&self.shared);
         // Fills → order_status + exec_details. The commission report comes
         // later, from its own server frame (ibx#471).
         for (fill, fill_exec) in self.shared.orders.drain_fills_with_exec() {
@@ -205,6 +206,11 @@ impl EClient {
 
         for _ in released {
             self.answer_open_orders(wrapper);
+        }
+        if let Some((history, requests)) = executions {
+            for (req_id, filter) in requests {
+                self.answer_executions(&history, req_id, &filter, wrapper);
+            }
         }
     }
 

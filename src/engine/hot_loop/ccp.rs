@@ -788,7 +788,7 @@ impl CcpState {
                     Ok(0) => {}
                     Err(e) => {
                         log::error!("CCP connection lost: {}", e);
-                        self.handle_disconnect(context, event_tx);
+                        self.handle_disconnect(context, shared, event_tx);
                         return;
                     }
                     Ok(_) => {
@@ -860,7 +860,7 @@ impl CcpState {
             if let Some(conn) = ccp_conn.as_mut() {
                 conn.shutdown();
             }
-            self.handle_disconnect(context, event_tx);
+            self.handle_disconnect(context, shared, event_tx);
         }
     }
 
@@ -1142,6 +1142,7 @@ impl CcpState {
         // (it carries the request id), and the end of the order status
         // replay (wildcard order id).
         if let Some(request) = parsed.get(&6556).filter(|r| !r.starts_with("PT.")) {
+            shared.orders.complete_execution_history(request);
             log::info!("ExecReport: end of trades request {}", request);
             return;
         }
@@ -3039,7 +3040,13 @@ impl CcpState {
         }
     }
 
-    pub(crate) fn handle_disconnect(&mut self, context: &mut Context, _event_tx: &Option<Sender<Event>>) {
+    pub(crate) fn handle_disconnect(
+        &mut self,
+        context: &mut Context,
+        shared: &SharedState,
+        _event_tx: &Option<Sender<Event>>,
+    ) {
+        shared.orders.invalidate_execution_history();
         self.disconnected = true;
         // The derivative answers go with the link, as in the reference
         // (ibx#440).
@@ -3074,6 +3081,7 @@ impl CcpState {
         ccp_conn: &mut Option<Connection>,
         hb: &mut HeartbeatState,
         account_id: &str,
+        shared: &SharedState,
     ) {
         *ccp_conn = Some(conn);
         self.disconnected = false;
@@ -3090,6 +3098,11 @@ impl CcpState {
             // The fills of the gap come only in the answer to this request
             // (ibx#399); they take the normal report path.
             let fill_up = self.fill_up_request(account_id, &ts);
+            let request = fill_up
+                .iter()
+                .find(|(tag, _)| *tag == 6556)
+                .expect("U72 request id");
+            shared.orders.begin_execution_history(&request.1);
             let fill_up: Vec<(u32, &str)> = fill_up.iter().map(|(t, v)| (*t, v.as_str())).collect();
             let _ = conn.send_fix(&fill_up);
             let _ = conn.send_fix(&[
@@ -4834,7 +4847,7 @@ mod tests {
         assert_eq!(strike_divided_by_100("1234.25"), "12.3425");
     }
 
-    fn socket_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+    pub(super) fn socket_pair() -> (std::net::TcpStream, std::net::TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
@@ -4843,7 +4856,7 @@ mod tests {
 
     /// Every message written to `server`, without the framing, sequence
     /// and time fields.
-    fn ccp_messages_sent(server: &mut std::net::TcpStream) -> Vec<String> {
+    pub(super) fn ccp_messages_sent(server: &mut std::net::TcpStream) -> Vec<String> {
         use std::io::Read;
         server.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
         let mut buf = Vec::new();
@@ -5608,7 +5621,7 @@ mod tests {
         ccp.send_matching_symbols_request(1, "AA", &mut conn, &mut hb, &shared);
         ccp.send_matching_symbols_request(2, "IB", &mut conn, &mut hb, &shared);
         assert_eq!(ccp.matching_permits, 0);
-        ccp.handle_disconnect(&mut context, &None);
+        ccp.handle_disconnect(&mut context, &shared, &None);
         assert_eq!(ccp.matching_permits, 1);
         ccp.disconnected = false;
         ccp.pump_matching_symbols(later, &mut conn, &mut hb, &shared);
@@ -5649,7 +5662,7 @@ mod tests {
     fn matching_symbols_cleared_silently_on_link_loss() {
         let (mut ccp, mut context, shared) = u186_test_state();
         ccp.pending_matching_symbols.push((1, 11));
-        ccp.handle_disconnect(&mut context, &None);
+        ccp.handle_disconnect(&mut context, &shared, &None);
         assert!(ccp.pending_matching_symbols.is_empty());
         assert!(shared.reference.drain_historical_errors().is_empty());
         assert!(shared.reference.drain_matching_symbols().is_empty());
@@ -6470,6 +6483,7 @@ mod tests {
 
 #[cfg(test)]
 mod reconnect_tests {
+    use super::tests::{ccp_messages_sent, socket_pair};
     use super::*;
 
     fn tag_order(msg: &[u8]) -> Vec<u32> {
@@ -6581,6 +6595,68 @@ mod reconnect_tests {
         assert!(ccp.status_replay_end_at.is_some(), "the status replay end is seen");
     }
 
+    #[test]
+    fn execution_history_reconnect_uses_only_its_current_wire_request() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let mut hb = HeartbeatState::new();
+        let mut active = None;
+        shared.orders.begin_execution_history("today4");
+        shared.orders.complete_execution_history("today4");
+        ccp.handle_disconnect(&mut context, &shared, &None);
+        assert!(shared.orders.execution_history_completion().is_none());
+        for request in ["today5", "todayfillup6"] {
+            let (client, mut server) = socket_pair();
+            ccp.reconnect(
+                Connection::new_raw(client).unwrap(),
+                &mut active,
+                &mut hb,
+                "DU1",
+                &shared,
+            );
+            let sent = ccp_messages_sent(&mut server);
+            let request_field = format!("6556={request}");
+            assert!(
+                sent.iter()
+                    .any(|message| message.split('|').any(|field| field == request_field))
+            );
+            let previous = if request == "today5" {
+                "today4"
+            } else {
+                "today5"
+            };
+            for wrong in [previous, "other", "PT.today5"] {
+                ccp.handle_exec_report(
+                    &frame(&[(6556, wrong)]),
+                    &mut context,
+                    &shared,
+                    &None,
+                    "DU1",
+                );
+                assert!(shared.orders.execution_history_completion().is_none());
+            }
+            ccp.handle_exec_report(
+                &frame(&[(6556, request)]),
+                &mut context,
+                &shared,
+                &None,
+                "DU1",
+            );
+            assert!(shared.orders.execution_history_matches(request));
+            ccp.handle_disconnect(&mut context, &shared, &None);
+            ccp.handle_exec_report(
+                &frame(&[(6556, request)]),
+                &mut context,
+                &shared,
+                &None,
+                "DU1",
+            );
+            assert!(shared.orders.execution_history_completion().is_none());
+            ccp.last_exec = Some(("fixture.01".into(), "20260930-19:04:31".into()));
+        }
+    }
+
     // Outside a reconnect the status replay end marks nothing.
     #[test]
     fn status_replay_end_outside_a_reconnect_marks_nothing() {
@@ -6604,7 +6680,7 @@ mod reconnect_tests {
             context.insert_order(crate::types::Order::new(id, instrument, Side::Buy, 1, 15 * PRICE_SCALE, b'2', b'0', 0));
             context.set_order_status_forced(id, status);
         }
-        ccp.handle_disconnect(&mut context, &None);
+        ccp.handle_disconnect(&mut context, &shared, &None);
         assert_eq!(context.order(90).unwrap().status, OrderStatus::Submitted);
         assert_eq!(context.order(91).unwrap().status, OrderStatus::PendingCancel);
         assert_eq!(context.order(92).unwrap().status, OrderStatus::PreSubmitted);
@@ -6623,7 +6699,7 @@ mod reconnect_tests {
         }
         context.set_order_status_forced(90, OrderStatus::Submitted);
         context.set_order_status_forced(91, OrderStatus::PendingCancel);
-        ccp.handle_disconnect(&mut context, &None);
+        ccp.handle_disconnect(&mut context, &shared, &None);
         ccp.awaiting_status_replay = true;
 
         let working = |id: &str| frame(&[(11, id), (20, "3"), (150, "0"), (39, "0"), (37, "57311390"),

@@ -1704,7 +1704,8 @@ impl HotLoop {
         if let Some(conn) = self.ccp_conn.as_mut() {
             conn.shutdown();
         }
-        self.ccp.handle_disconnect(&mut self.context, &self.event_tx);
+        self.ccp
+            .handle_disconnect(&mut self.context, &self.shared, &self.event_tx);
     }
 
     fn pin_to_core(core: usize) {
@@ -1893,7 +1894,13 @@ impl HotLoop {
     /// Replace the auth connection (after reconnection) and reconcile order state.
     pub fn reconnect_ccp(&mut self, mut conn: Connection) {
         conn.set_queued_writes(true);
-        self.ccp.reconnect(conn, &mut self.ccp_conn, &mut self.hb, &self.account_id);
+        self.ccp.reconnect(
+            conn,
+            &mut self.ccp_conn,
+            &mut self.hb,
+            &self.account_id,
+            &self.shared,
+        );
     }
 
     /// Set the market-data farm name used in the farm status messages.
