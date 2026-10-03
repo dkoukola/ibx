@@ -275,7 +275,7 @@ pub(super) fn project_report(
             | crate::types::OrderStatus::Cancelled
             | crate::types::OrderStatus::Rejected
     ) {
-        // The report's event time, not the later history-response send time.
+        // The effective event time can differ from the report's SendingTime.
         // Native eO.a(fb) selects 6699, then TransactTime, then SendingTime.
         parsed.get(&6699).or_else(|| parsed.get(&60)).or_else(|| parsed.get(&52))
             .cloned().unwrap_or_default()
