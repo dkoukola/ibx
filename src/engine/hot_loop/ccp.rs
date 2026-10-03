@@ -46,9 +46,6 @@ pub(crate) const NO_SECURITY_DEFINITION: &str = "No security definition has been
 /// after a reconnect burst still hits the window.
 const EXEC_ID_WINDOW: usize = 1024;
 
-/// Convert a FIX OrderID hex string (e.g. "00cf16ed.000225ed.69ca0941.0001") to a stable i64 permId.
-/// Uses FNV-1a hash of the first 3 dot-segments (the stable prefix) so that permId
-/// remains constant across modifications (the last segment increments on each modify).
 /// Extract the value of a single FIX tag from a raw message.
 /// `prefix` should include the tag number and `=` (e.g. `b"6256="`).
 fn extract_tag_value(msg: &[u8], prefix: &[u8]) -> Option<String> {
@@ -194,9 +191,7 @@ fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec_id: &str) 
 /// 0 for none.
 fn perm_id_of(parsed: &std::collections::HashMap<u32, String>) -> i64 {
     parsed.get(&11)
-        .map(|s| s.strip_prefix('C').unwrap_or(s))
-        .and_then(|s| s.split('.').next())
-        .and_then(|s| s.parse().ok())
+        .map(|s| perm_id_from_clord_id(s))
         .unwrap_or(0)
 }
 
@@ -271,6 +266,22 @@ fn parent_order_id(parsed: &std::collections::HashMap<u32, String>, context: &Co
     context.last_clord.iter()
         .find(|(_, clord)| same_id(clord))
         .map_or(id, |(&order_id, _)| order_id)
+}
+
+/// The broker permId is the numeric part of its ClOrdID (tag 11), before
+/// the modify/cancel version, not FIX OrderID (tag 37) or the local API id.
+/// Earlier cancel requests prefix that same identity with `C`.
+fn perm_id_from_clord_id(s: &str) -> i64 {
+    let id = s
+        .strip_prefix('C')
+        .unwrap_or(s)
+        .split('.')
+        .next()
+        .unwrap_or_default();
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return 0;
+    }
+    id.parse::<i64>().ok().filter(|id| *id > 0).unwrap_or(0)
 }
 
 pub(crate) struct CcpState {
@@ -1332,6 +1343,8 @@ impl CcpState {
             base.parse::<OrderId>().ok()
         }).unwrap_or(0);
         let mut clord_id = context.key_of(server_id);
+        let key_collision = !context.recovered_keys.contains_key(&server_id)
+            && context.server_ids.contains_key(&server_id);
 
         // An order this session does not hold, reported working: an order
         // of another session or client, put in the book so it can be
@@ -1355,8 +1368,10 @@ impl CcpState {
             _ => None,
         };
         let replayed_status = replayed_status
-            .filter(|_| context.order(clord_id).is_none() && context.finished_status(clord_id).is_none());
-        if let Some(replayed_status) = replayed_status {
+            .filter(|_| key_collision || (context.order(clord_id).is_none() && context.finished_status(clord_id).is_none()));
+        if !context.recovered_keys.contains_key(&server_id)
+            && (key_collision || replayed_status.is_some())
+        {
             // The API order id only names the order to the caller (ibx#466):
             // taken when no order of this session has it.
             let api_id = parsed.get(&6121).and_then(|s| s.parse::<OrderId>().ok())
@@ -1365,7 +1380,12 @@ impl CcpState {
             if let Some(api_id) = api_id {
                 context.bind_server_id(api_id, server_id);
                 clord_id = api_id;
+            } else if key_collision {
+                clord_id = context.reserve_recovered_order_id();
+                context.bind_server_id(clord_id, server_id);
             }
+        }
+        if let Some(replayed_status) = replayed_status {
             let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
             let side = match parsed.get(&54).map(|s| s.as_str()) {
                 Some("1") => Side::Buy,
@@ -1995,6 +2015,7 @@ impl CcpState {
                 clearing_intent,
                 auto_cancel_date,
                 submitter: account_id.to_string(),
+                oca_group: parsed.get(&583).cloned().unwrap_or_default(),
                 oca_type,
                 use_price_mgmt_algo,
                 trail_stop_price,
@@ -4067,6 +4088,33 @@ pub(crate) fn handle_position_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broker_perm_id_keeps_versions_and_never_invents_missing_identity() {
+        for clord in [
+            "1339547414",
+            "1339547414.0",
+            "1339547414.99",
+            "C1339547414.1",
+        ] {
+            assert_eq!(perm_id_from_clord_id(clord), 1_339_547_414);
+        }
+        for clord in [
+            "",
+            "*",
+            "C",
+            "0.1",
+            "-1.0",
+            "+1.0",
+            ".1",
+            "not-an-id",
+            "00cf16ed.000225ed.6ab75315.0001",
+            "9223372036854775808.0",
+        ] {
+            assert_eq!(perm_id_from_clord_id(clord), 0, "{clord}");
+        }
+        assert_eq!(perm_id_from_clord_id("9223372036854775807.0"), i64::MAX);
+    }
 
     // Regression for ibx#198: the fill-dedup set must NOT be wiped wholesale
     // when it reaches its cap. A recently-seen ExecID has to stay deduplicated
@@ -6240,6 +6288,158 @@ mod tests {
         other.insert(6121, "16".into());
         ccp.handle_exec_report(&other, &mut context, &shared, &None, "");
         assert!(context.order(900_002).is_some(), "kept under the server's id");
+    }
+
+    #[test]
+    fn recovered_server_and_api_id_collisions_keep_distinct_orders() {
+        for reverse in [false, true] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            let mut a = recovery_frame(900_001, 1_005);
+            a.insert(6121, "15".into());
+            a.insert(6010, "order-a".into());
+            let mut b = recovery_frame(15, 1_006);
+            b.insert(6121, "16".into());
+            b.insert(6010, "order-b".into());
+            let reports = if reverse { [&b, &a] } else { [&a, &b] };
+            for report in reports {
+                ccp.handle_exec_report(report, &mut context, &shared, &None, "DU1");
+            }
+            for (id, con_id, order_ref, clord) in [
+                (15, 1_005, "order-a", "900001.0"),
+                (16, 1_006, "order-b", "15.0"),
+            ] {
+                let order = context.order(id).expect("both orders remain tracked");
+                assert_eq!(context.market.con_id(order.instrument), Some(con_id));
+                let info = shared.orders.get_order_info(id).unwrap();
+                assert_eq!(info.order.order_ref, order_ref);
+                assert_eq!(context.last_clord.get(&id).map(String::as_str), Some(clord));
+            }
+            // The same replay and later reports must resolve by server identity,
+            // not by another recovered order's coincidentally equal API id.
+            for report in [&b, &a, &a, &b] {
+                ccp.handle_exec_report(report, &mut context, &shared, &None, "DU1");
+            }
+            b.insert(44, "2".into());
+            ccp.handle_exec_report(&b, &mut context, &shared, &None, "DU1");
+            assert_eq!(shared.orders.get_order_info(15).unwrap().order.lmt_price, 1.0);
+            assert_eq!(shared.orders.get_order_info(16).unwrap().order.lmt_price, 2.0);
+            a.insert(150, "4".into());
+            a.insert(39, "4".into());
+            ccp.handle_exec_report(&a, &mut context, &shared, &None, "DU1");
+            assert_eq!(context.finished_status(15), Some(crate::types::OrderStatus::Cancelled));
+            assert!(context.order(16).is_some());
+            assert_eq!(shared.orders.get_order_info(16).unwrap().order.order_ref, "order-b");
+        }
+    }
+
+    #[test]
+    fn recovered_id_collision_without_a_free_api_id_reserves_a_local_key() {
+        for api_id in [None, Some("15")] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            let mut a = recovery_frame(900_001, 1_005);
+            a.insert(6121, "15".into());
+            ccp.handle_exec_report(&a, &mut context, &shared, &None, "DU1");
+            let mut b = recovery_frame(15, 1_006);
+            if let Some(id) = api_id { b.insert(6121, id.into()); }
+            ccp.handle_exec_report(&b, &mut context, &shared, &None, "DU1");
+            let key = context.recovered_keys[&15];
+            assert_ne!(key, 15);
+            assert_ne!(key, 900_001);
+            assert_eq!(context.market.con_id(context.order(15).unwrap().instrument), Some(1_005));
+            assert_eq!(context.market.con_id(context.order(key).unwrap().instrument), Some(1_006));
+            assert_eq!(shared.orders.get_order_info(key).unwrap().order.order_id, key);
+            b.insert(6121, "16".into());
+            for report in [&b, &a, &b] {
+                ccp.handle_exec_report(report, &mut context, &shared, &None, "DU1");
+            }
+            assert_eq!(context.recovered_keys[&15], key, "a later API id cannot rename an established key");
+            assert!(context.order(16).is_none());
+            assert_eq!(context.last_clord.get(&key).map(String::as_str), Some("15.0"));
+            context.remove_order(key);
+            ccp.handle_exec_report(&b, &mut context, &shared, &None, "DU1");
+            assert_eq!(context.recovered_keys[&15], key, "recovery keeps the established caller identity");
+            assert!(context.order(key).is_some());
+            assert!(context.order(16).is_none());
+        }
+    }
+
+    #[test]
+    fn recovered_id_collisions_keep_wire_modify_cancel_and_reject_targets_separate() {
+        use crate::types::{OrderKind, OrderRequest, OrderStatus};
+        use std::sync::Arc;
+        for reverse in [false, true] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = Arc::new(SharedState::new());
+            let mut a = recovery_frame(900_001, 1_005);
+            a.insert(11, "900001.2".into());
+            a.insert(6121, "15".into());
+            let mut b = recovery_frame(15, 1_006);
+            b.insert(11, "15.7".into());
+            b.insert(6121, "16".into());
+            for report in if reverse { [&b, &a] } else { [&a, &b] } {
+                ccp.handle_exec_report(report, &mut context, &shared, &None, "DU1");
+            }
+            let parent = [(6107, "15.7".into())].into_iter().collect();
+            assert_eq!(parent_order_id(&parent, &context), 16);
+            let (client, mut server) = socket_pair();
+            let mut conn = Some(Connection::new_raw(client).unwrap());
+            let mut hb = HeartbeatState::new();
+            let modify = || OrderRequest::Modify {
+                new_order_id: 15, order_id: 15, qty: 1,
+                kind: OrderKind::Limit { price: 2 * PRICE_SCALE }, tif: b'1', attrs: Default::default(),
+            };
+            context.pending_orders.push(modify());
+            super::super::order_builder::drain_and_send_orders(&mut conn, &mut context, "DU1", &mut hb, false, &shared);
+            let sent = ccp_messages_sent(&mut server);
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].contains("11=900001.3|"), "{}", sent[0]);
+            assert!(sent[0].contains("41=900001.2|"), "{}", sent[0]);
+            let reject = pipe_frame("35=9|11=900001.3|41=900001.2|39=0|102=0|434=2|58=Rejected|");
+            ccp.process_ccp_message(&reject, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+            assert_eq!(context.modify_versions[&15], 2);
+            assert_eq!(context.modify_versions[&16], 0);
+            assert_eq!(context.last_clord[&15], "900001.2");
+            assert_eq!(context.last_clord[&16], "15.7");
+            assert_eq!(shared.orders.drain_cancel_rejects().last().unwrap().order_id, 15);
+            assert_eq!(ccp_messages_sent(&mut server), ["35=H|11=900001.2|55=*|54=*|6471=1|1=DU1"]);
+
+            context.pending_orders.push(modify());
+            super::super::order_builder::drain_and_send_orders(&mut conn, &mut context, "DU1", &mut hb, false, &shared);
+            assert_eq!(ccp_messages_sent(&mut server).len(), 1);
+            a.insert(11, "900001.3".into());
+            a.insert(150, "5".into());
+            a.insert(39, "5".into());
+            ccp.handle_exec_report(&a, &mut context, &shared, &None, "DU1");
+            assert_eq!(shared.orders.get_order_info(15).unwrap().contract.con_id, 1_005);
+            assert_eq!(shared.orders.get_order_info(16).unwrap().contract.con_id, 1_006);
+
+            context.pending_orders.push(OrderRequest::Cancel { order_id: 15 });
+            super::super::order_builder::drain_and_send_orders(&mut conn, &mut context, "DU1", &mut hb, false, &shared);
+            let sent = ccp_messages_sent(&mut server);
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].contains("11=900001.4|41=900001.3|"), "{}", sent[0]);
+            a.insert(11, "900001.4".into());
+            a.insert(150, "4".into());
+            a.insert(39, "4".into());
+            ccp.handle_exec_report(&a, &mut context, &shared, &None, "DU1");
+            assert_eq!(context.finished_status(15), Some(OrderStatus::Cancelled));
+            assert!(context.order(16).is_some());
+            context.pending_orders.push(OrderRequest::Cancel { order_id: 16 });
+            super::super::order_builder::drain_and_send_orders(&mut conn, &mut context, "DU1", &mut hb, false, &shared);
+            let sent = ccp_messages_sent(&mut server);
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].contains("11=15.8|41=15.7|"), "{}", sent[0]);
+            b.insert(11, "15.8".into());
+            b.insert(150, "4".into());
+            b.insert(39, "4".into());
+            ccp.handle_exec_report(&b, &mut context, &shared, &None, "DU1");
+            assert_eq!(context.finished_status(16), Some(OrderStatus::Cancelled));
+        }
     }
 
     // ibx#285: order ids are signed; an earlier session's order with a

@@ -439,6 +439,22 @@ impl Context {
         &self.account
     }
 
+    /// Reserve a caller-side key when a recovered server id and its API id
+    /// cannot name it without overwriting another order. The broker id stays
+    /// in recovered_keys/last_clord and is used for every wire operation.
+    pub(crate) fn reserve_recovered_order_id(&mut self) -> OrderId {
+        loop {
+            let id = self.next_order_id;
+            self.next_order_id += 1;
+            if id != 0 && !self.open_orders.contains_key(&id)
+                && !self.last_clord.contains_key(&id)
+                && !self.recovered_keys.values().any(|&key| key == id)
+            {
+                return id;
+            }
+        }
+    }
+
     // ── Order management (write to pre-allocated buffer) ──
 
     pub fn submit_limit(
