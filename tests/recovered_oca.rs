@@ -50,6 +50,7 @@ fn recover(fixture: &str, sequences: &[u64]) -> Vec<Order> {
     let client = EClient::from_parts(shared, tx, std::thread::spawn(|| {}), "DUXXXXXXX".into());
     let mut wrapper = Orders::default();
     client.req_all_open_orders(&mut wrapper);
+    client.process_msgs(&mut wrapper);
     assert_eq!(wrapper.ends, 1);
     wrapper.orders.sort_by_key(|order| order.order_id);
     wrapper.orders

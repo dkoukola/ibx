@@ -225,6 +225,7 @@ impl EClient {
     /// Disconnect from IB.
     fn disconnect(&self, py: Python<'_>) -> PyResult<()> {
         if let Some(shared) = self.shared.lock().unwrap().as_ref() {
+            shared.orders.set_open_orders_held(true);
             shared.orders.invalidate_execution_history();
         }
         let tx = self.control_tx.lock().unwrap().clone();

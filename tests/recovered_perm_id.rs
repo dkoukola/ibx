@@ -143,6 +143,7 @@ fn recovered_perm_id_matches_recorded_status_and_cancel_version() {
         );
         if fix_sequence == 2366 {
             client.req_all_open_orders(&mut observed);
+            client.process_msgs(&mut observed);
             assert_eq!(observed.open.len(), 1);
             assert_eq!(observed.open[0].perm_id, expected.1);
         } else {
@@ -173,6 +174,7 @@ fn recovered_bracket_perm_ids_are_broker_ids_not_local_aliases() {
             expected.1
         );
         client.req_all_open_orders(&mut observed);
+        client.process_msgs(&mut observed);
         assert!(
             observed
                 .open

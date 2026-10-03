@@ -1713,6 +1713,7 @@ impl ClientCore {
         self.execution_requests.lock().unwrap().clear();
         self.pending_commissions.lock().unwrap().clear();
         self.open_orders.lock().unwrap().clear();
+        self.held_open_orders.lock().unwrap().clear();
         self.what_if_orders.lock().unwrap().clear();
         // `finished_orders` and `highest_order_id` are kept: the server
         // still knows those orders after a reconnect, so their ids must not
@@ -3800,11 +3801,16 @@ impl ClientCore {
         if !shared.orders.open_orders_held() {
             return false;
         }
+        self.queue_open_orders(request);
+        true
+    }
+
+    /// At most one pending request per kind, answered after queued statuses.
+    pub fn queue_open_orders(&self, request: OpenOrdersRequest) {
         let mut held = self.held_open_orders.lock().unwrap();
         if !held.contains(&request) {
             held.push(request);
         }
-        true
     }
 
     /// The held open-order requests to answer now, in the order they were

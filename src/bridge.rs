@@ -807,6 +807,24 @@ impl OrderState {
             .is_some_and(|(current, complete)| *complete && current == request)
     }
 
+    /// The current auth-link history request, whether or not its reply ended.
+    pub fn execution_history_request(&self) -> Option<String> {
+        self.execution_history
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(request, _)| request.clone())
+    }
+
+    pub fn execution_history_request_matches(&self, request: Option<&str>) -> bool {
+        self.execution_history
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(current, _)| current.as_str())
+            == request
+    }
+
     pub fn drain_fills(&self) -> Vec<Fill> {
         self.fills.lock().unwrap().drain(..).map(|(fill, _)| fill).collect()
     }
@@ -2098,6 +2116,7 @@ impl SharedState {
     #[doc(hidden)]
     #[inline]
     pub fn set_connection_lost(&self) {
+        self.orders.set_open_orders_held(true);
         self.orders.invalidate_execution_history();
         self.connection_lost.store(true, Ordering::Release);
         self.notify();

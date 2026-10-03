@@ -220,3 +220,131 @@ fn history_loss_during_callbacks_waits_for_replacement_and_never_invents_end() {
     client.disconnect();
     assert!(shared.orders.execution_history_completion().is_none());
 }
+
+#[derive(Default)]
+struct OpenObserved {
+    orders: Vec<i64>,
+    ends: usize,
+    reconnect: Option<Arc<SharedState>>,
+}
+
+impl Wrapper for OpenObserved {
+    fn open_order(
+        &mut self,
+        id: i64,
+        _: &Contract,
+        _: &ibx::api::types::Order,
+        _: &ibx::api::types::OrderState,
+    ) {
+        self.orders.push(id);
+        if let Some(shared) = self.reconnect.take() {
+            shared.orders.set_open_orders_held(true);
+            shared.orders.invalidate_execution_history();
+            shared.orders.begin_execution_history("today5");
+            // The new open-order end can precede its independent U72 end.
+            shared.orders.set_open_orders_held(false);
+        }
+    }
+
+    fn open_order_end(&mut self) {
+        self.ends += 1;
+    }
+}
+
+fn open_row() -> Vec<u8> {
+    fix_build(
+        &[
+            (35, "8"),
+            (11, "1339547414.0"),
+            (6121, "7"),
+            (150, "0"),
+            (39, "0"),
+            (6008, "265598"),
+            (55, "AAPL"),
+            (54, "1"),
+            (38, "1"),
+            (44, "100"),
+            (40, "2"),
+        ],
+        1,
+    )
+}
+
+fn open_end() -> Vec<u8> {
+    fix_build(&[(35, "8"), (11, "*"), (55, "*"), (150, "0"), (39, "0")], 1)
+}
+
+#[test]
+fn gateway_open_orders_wait_for_their_own_initial_replay_not_execution_end() {
+    for has_order in [false, true] {
+        let shared = Arc::new(SharedState::new());
+        let (farm, _farm_peer) = connection();
+        let (mut ccp, _ccp_peer) = connection();
+        if has_order {
+            ccp.seed_buffer(&open_row());
+        }
+        let (mut engine, tx) = gateway().into_hot_loop(shared.clone(), None, farm, ccp, None, None);
+        let client = EClient::from_parts(
+            shared.clone(),
+            tx,
+            std::thread::spawn(|| {}),
+            "DUXXXXXXX".into(),
+        );
+        let mut observed = OpenObserved::default();
+        client.req_open_orders(&mut observed);
+        client.req_all_open_orders(&mut observed);
+        client.process_msgs(&mut observed);
+        assert_eq!(observed.ends, 0);
+        engine.poll_auth_for_test();
+        // An unrelated execution-history end must not release open orders.
+        engine.inject_ccp_message(&marker("wrong"));
+        client.process_msgs(&mut observed);
+        assert_eq!(observed.ends, 0);
+        assert!(observed.orders.is_empty());
+        engine.inject_ccp_message(&open_end());
+        assert!(shared.orders.execution_history_completion().is_none());
+        client.process_msgs(&mut observed);
+        assert_eq!(observed.ends, 2);
+        assert_eq!(observed.orders, if has_order { vec![7, 7] } else { vec![] });
+        engine.inject_ccp_message(&open_end());
+        client.process_msgs(&mut observed);
+        assert_eq!(observed.ends, 2);
+    }
+}
+
+#[test]
+fn open_order_callback_reconnect_cannot_end_an_old_snapshot_after_a_new_end() {
+    let shared = Arc::new(SharedState::new());
+    let mut engine = ibx::engine::hot_loop::HotLoop::new(shared.clone(), None, None);
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let client = EClient::from_parts(
+        shared.clone(),
+        tx,
+        std::thread::spawn(|| {}),
+        "DUXXXXXXX".into(),
+    );
+    shared.orders.begin_execution_history("today4");
+    engine.inject_ccp_message(&open_row());
+    let mut observed = OpenObserved {
+        reconnect: Some(shared.clone()),
+        ..Default::default()
+    };
+    client.req_open_orders(&mut observed);
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.orders, [7]);
+    assert_eq!(
+        observed.ends, 0,
+        "held false→true→false must not end old snapshot"
+    );
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.orders, [7, 7]);
+    assert_eq!(observed.ends, 1);
+    assert!(
+        shared.orders.execution_history_completion().is_none(),
+        "U72 completion is independent"
+    );
+    client.req_open_orders(&mut observed);
+    shared.set_connection_lost();
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.ends, 1, "terminal loss holds readers too");
+}
