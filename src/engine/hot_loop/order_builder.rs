@@ -1347,14 +1347,9 @@ pub(crate) fn drain_and_send_orders(
             }
             OrderRequest::Modify { new_order_id: _, order_id, qty, kind, tif, attrs } => {
                 let orig = context.order(order_id).copied();
-                let prev_ver = *context.modify_versions.get(&order_id).unwrap_or(&0);
-                let new_ver = prev_ver + 1;
-                context.modify_versions.insert(order_id, new_ver);
-                let clord_str = format!("{}.{}", order_id, new_ver);
                 // OrigClOrdID matches whatever the server last recorded for
                 // this order (which may pre-date the versioned scheme — ibx#179).
-                let orig_clord = context.last_clord.get(&order_id).cloned()
-                    .unwrap_or_else(|| format!("{}.{}", order_id, prev_ver));
+                let (orig_clord, clord_str) = next_order_clord(context, order_id);
                 // Pre-seed `last_clord` with what we're about to emit so a
                 // subsequent cancel before the modify-ack still references the
                 // right version.
@@ -1530,16 +1525,11 @@ fn combo_order_setup(
 /// cancel of one order, `ALL` for the global cancel. The new version and the
 /// cancel's id are recorded, so its reports are read as the cancel's.
 fn cancel_fields(context: &mut Context, account_id: &str, order_id: crate::types::OrderId, scope: &str) -> Vec<(u32, String)> {
-    let prev_ver = *context.modify_versions.get(&order_id).unwrap_or(&0);
-    let new_ver = prev_ver + 1;
-    context.modify_versions.insert(order_id, new_ver);
-    let clord = format!("{}.{}", order_id, new_ver);
     // OrigClOrdID must match exactly what the server has on record: the
     // string last seen on the wire (ibx#179 — orders recorded without a
     // `.{ver}` suffix), else the versioned scheme (a cancel right after
     // the place, before its ack).
-    let orig_clord = context.last_clord.get(&order_id).cloned()
-        .unwrap_or_else(|| format!("{}.{}", order_id, prev_ver));
+    let (orig_clord, clord) = next_order_clord(context, order_id);
     context.cancel_clord.insert(order_id, clord.clone());
 
     let mut fields = vec![
@@ -1561,6 +1551,19 @@ fn cancel_fields(context: &mut Context, account_id: &str, order_id: crate::types
     fields.push((6088, "Socket".to_string()));
     fields.push((6944, scope.to_string()));
     fields
+}
+
+/// Increment the broker's identity, not a recovered order's caller-side alias.
+fn next_order_clord(context: &mut Context, order_id: crate::types::OrderId) -> (String, String) {
+    let previous = *context.modify_versions.get(&order_id).unwrap_or(&0);
+    let original = context.last_clord.get(&order_id).cloned()
+        .unwrap_or_else(|| format!("{}.{}", order_id, previous));
+    let (base, observed_version) = original.split_once('.')
+        .map_or((original.as_str(), 0), |(base, version)| (base, version.parse::<u32>().unwrap_or(0)));
+    let version = previous.max(observed_version) + 1;
+    context.modify_versions.insert(order_id, version);
+    let next = format!("{}.{}", base, version);
+    (original, next)
 }
 
 /// The reference's answer to a cancel it does not send (ibx#464): the order
