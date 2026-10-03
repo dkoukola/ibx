@@ -5059,6 +5059,178 @@ fn req_positions_gives_2151_when_the_data_never_comes() {
     assert!(w.events.is_empty(), "the request ended");
 }
 
+struct PositionReconnect {
+    shared: Arc<SharedState>,
+    rows: Vec<(i64, i64, f64)>,
+    ends: Vec<i64>,
+    changed: bool,
+}
+
+impl PositionReconnect {
+    fn row(&mut self, request: i64, contract: &Contract, quantity: f64) {
+        self.rows.push((request, contract.con_id, quantity));
+        if !self.changed {
+            self.changed = true;
+            self.shared.portfolio.invalidate_position_snapshot();
+            self.shared.orders.invalidate_execution_history();
+            self.shared
+                .orders
+                .begin_execution_history("next-position-link");
+            self.shared
+                .portfolio
+                .set_position_info(aapl_position(2, PRICE_SCALE));
+            self.shared.portfolio.set_account_download_complete();
+        }
+    }
+}
+
+impl Wrapper for PositionReconnect {
+    fn position(&mut self, _account: &str, contract: &Contract, quantity: f64, _cost: f64) {
+        self.row(-1, contract, quantity);
+    }
+
+    fn position_end(&mut self) {
+        self.ends.push(-1);
+    }
+
+    fn position_multi(
+        &mut self,
+        request: i64,
+        _account: &str,
+        _model: &str,
+        contract: &Contract,
+        quantity: f64,
+        _cost: f64,
+    ) {
+        self.row(request, contract, quantity);
+    }
+
+    fn position_multi_end(&mut self, request: i64) {
+        self.ends.push(request);
+    }
+}
+
+#[test]
+fn position_snapshot_callback_reconnect_replays_without_stale_end() {
+    let (client, _rx, shared) = test_client();
+    shared
+        .portfolio
+        .set_position_info(aapl_position(1, PRICE_SCALE));
+    shared.portfolio.set_position_info(PositionInfo {
+        con_id: 756733,
+        position_fixed: QTY_SCALE,
+        ..Default::default()
+    });
+    shared.portfolio.set_account_download_complete();
+    let mut wrapper = PositionReconnect {
+        shared: shared.clone(),
+        rows: Vec::new(),
+        ends: Vec::new(),
+        changed: false,
+    };
+    client.req_positions(&mut wrapper);
+    assert_eq!(wrapper.rows, [(-1, 265598, 1.0)]);
+    assert!(wrapper.ends.is_empty());
+    assert!(shared.orders.execution_history_completion().is_none());
+    client.process_msgs(&mut wrapper);
+    assert_eq!(
+        wrapper.rows,
+        [(-1, 265598, 1.0), (-1, 265598, 2.0), (-1, 756733, 1.0)]
+    );
+    assert_eq!(wrapper.ends, [-1]);
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.ends, [-1]);
+}
+
+#[test]
+fn position_multi_callback_reconnect_replays_every_prepared_subscription() {
+    let (client, _rx, shared) = test_client();
+    shared
+        .portfolio
+        .set_position_info(aapl_position(1, PRICE_SCALE));
+    shared.portfolio.set_account_download_complete();
+    client.core.subscribe_positions_multi(1, "", "");
+    client.core.subscribe_positions_multi(2, "", "");
+    let mut wrapper = PositionReconnect {
+        shared: shared.clone(),
+        rows: Vec::new(),
+        ends: Vec::new(),
+        changed: false,
+    };
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.rows, [(1, 265598, 1.0)]);
+    assert!(wrapper.ends.is_empty());
+    client.process_msgs(&mut wrapper);
+    assert_eq!(
+        wrapper.rows,
+        [(1, 265598, 1.0), (1, 265598, 2.0), (2, 265598, 2.0)]
+    );
+    assert_eq!(wrapper.ends, [1, 2]);
+}
+
+#[test]
+fn position_subscriptions_wait_through_loss_and_replay_an_unchanged_image() {
+    let (client, _rx, shared) = test_client();
+    shared
+        .portfolio
+        .set_position_info(aapl_position(1, PRICE_SCALE));
+    shared.portfolio.set_account_download_complete();
+    let mut wrapper = RecordingWrapper::default();
+    client.req_positions(&mut wrapper);
+    assert_eq!(wrapper.events.len(), 2);
+    shared.portfolio.invalidate_position_snapshot();
+    shared.orders.invalidate_execution_history();
+    shared.orders.begin_execution_history("next-position-link");
+    wrapper.events.clear();
+    client.process_msgs(&mut wrapper);
+    assert!(wrapper.events.is_empty());
+    shared.portfolio.set_account_download_complete();
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.events.len(), 2);
+    assert_eq!(
+        wrapper.events.last().map(String::as_str),
+        Some("position_end")
+    );
+    assert!(shared.orders.execution_history_completion().is_none());
+    client.disconnect();
+    assert!(!shared.portfolio.account_download_complete());
+    wrapper.events.clear();
+    client.req_positions(&mut wrapper);
+    assert!(wrapper.events.is_empty());
+}
+
+#[test]
+fn position_multi_expiry_errors_survive_a_same_client_reconnect_callback() {
+    struct ReconnectOnError {
+        shared: Arc<SharedState>,
+        errors: Vec<(i64, i64)>,
+    }
+    impl Wrapper for ReconnectOnError {
+        fn error(&mut self, request: i64, code: i64, _message: &str, _extra: &str) {
+            self.errors.push((request, code));
+            self.shared
+                .orders
+                .begin_execution_history("next-position-link");
+        }
+    }
+    let (client, _rx, shared) = test_client();
+    client.core.subscribe_positions_multi(1, "", "");
+    client.core.subscribe_positions_multi(2, "", "");
+    client.process_msgs(&mut RecordingWrapper::default());
+    for subscription in client.core.positions_multi.lock().unwrap().iter_mut() {
+        subscription.backdate(crate::client_core::POSITIONS_WAIT);
+    }
+    let mut wrapper = ReconnectOnError {
+        shared,
+        errors: Vec::new(),
+    };
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.errors, [(1, 2151), (2, 2151)]);
+    assert!(client.core.positions_multi.lock().unwrap().is_empty());
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.errors, [(1, 2151), (2, 2151)]);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Multi-account requests (ibx#476)
 // ═══════════════════════════════════════════════════════════════════

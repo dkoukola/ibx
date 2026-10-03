@@ -439,6 +439,7 @@ pub struct AccountSummaryPlan {
 /// A running req_positions (ibx#477).
 pub struct PositionsSubscription {
     requested_at: std::time::Instant,
+    history: Option<String>,
     snapshot_sent: bool,
     /// Position and average cost last sent, by conId.
     sent: HashMap<i64, (Qty, Price)>,
@@ -455,7 +456,13 @@ impl PositionsSubscription {
 
 impl PositionsSubscription {
     fn new() -> Self {
-        Self { requested_at: std::time::Instant::now(), snapshot_sent: false, sent: HashMap::new(), generation: 0 }
+        Self {
+            requested_at: std::time::Instant::now(),
+            history: None,
+            snapshot_sent: false,
+            sent: HashMap::new(),
+            generation: 0,
+        }
     }
 }
 
@@ -464,22 +471,35 @@ impl PositionsSubscription {
 /// position or its average cost. Error 2151 when the data is not in after
 /// 30 s.
 fn advance_positions(sub: &mut PositionsSubscription, shared: &SharedState) -> Option<PositionsBatch> {
-    if !sub.snapshot_sent {
-        if !shared.portfolio.account_download_complete() {
-            if sub.requested_at.elapsed() >= POSITIONS_WAIT {
-                return Some(PositionsBatch {
-                    rows: Vec::new(), end: false,
-                    error: Some((2151, "Positions info is not available yet".into())),
-                });
-            }
-            return None;
+    let history = shared.orders.execution_history_request();
+    if sub.history != history {
+        sub.history.clone_from(&history);
+        sub.snapshot_sent = false;
+        sub.requested_at = std::time::Instant::now();
+    }
+    if !shared.portfolio.account_download_complete() {
+        if !sub.snapshot_sent && sub.requested_at.elapsed() >= POSITIONS_WAIT {
+            return Some(PositionsBatch {
+                history,
+                rows: Vec::new(),
+                end: false,
+                error: Some((2151, "Positions info is not available yet".into())),
+            });
         }
+        return None;
+    }
+    if !sub.snapshot_sent {
         sub.generation = shared.portfolio.position_generation();
         let mut rows = shared.portfolio.position_infos();
         rows.sort_by_key(|p| p.con_id);
         sub.sent = rows.iter().map(|p| (p.con_id, (p.position_fixed, p.avg_cost))).collect();
         sub.snapshot_sent = true;
-        return Some(PositionsBatch { rows, end: true, error: None });
+        return Some(PositionsBatch {
+            history,
+            rows,
+            end: true,
+            error: None,
+        });
     }
     let generation = shared.portfolio.position_generation();
     if generation == sub.generation {
@@ -493,7 +513,12 @@ fn advance_positions(sub: &mut PositionsSubscription, shared: &SharedState) -> O
     for p in &rows {
         sub.sent.insert(p.con_id, (p.position_fixed, p.avg_cost));
     }
-    (!rows.is_empty()).then_some(PositionsBatch { rows, end: false, error: None })
+    (!rows.is_empty()).then_some(PositionsBatch {
+        history,
+        rows,
+        end: false,
+        error: None,
+    })
 }
 
 /// A running req_positions_multi (ibx#476).
@@ -502,6 +527,13 @@ pub struct PositionsMultiSubscription {
     pub account: String,
     pub model_code: String,
     sub: PositionsSubscription,
+}
+
+#[cfg(test)]
+impl PositionsMultiSubscription {
+    pub(crate) fn backdate(&mut self, by: std::time::Duration) {
+        self.sub.backdate(by);
+    }
 }
 
 /// A running req_account_updates_multi (ibx#476).
@@ -528,6 +560,9 @@ pub struct AccountMultiBatch {
 
 /// Position rows to send for req_positions (ibx#477).
 pub struct PositionsBatch {
+    /// The existing connection-history request identity when these rows were read.
+    /// Its completion is unrelated to position-snapshot readiness.
+    pub history: Option<String>,
     pub rows: Vec<PositionInfo>,
     /// The snapshot: position_end follows the rows.
     pub end: bool,

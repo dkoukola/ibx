@@ -348,3 +348,60 @@ fn open_order_callback_reconnect_cannot_end_an_old_snapshot_after_a_new_end() {
     client.process_msgs(&mut observed);
     assert_eq!(observed.ends, 1, "terminal loss holds readers too");
 }
+
+#[derive(Default)]
+struct PositionsObserved {
+    rows: Vec<(i64, f64)>,
+    ends: usize,
+}
+
+impl Wrapper for PositionsObserved {
+    fn position(&mut self, _: &str, contract: &Contract, quantity: f64, _: f64) {
+        self.rows.push((contract.con_id, quantity));
+    }
+
+    fn position_end(&mut self) {
+        self.ends += 1;
+    }
+}
+
+#[test]
+fn gateway_position_snapshot_waits_for_buffered_account_image_even_when_empty() {
+    for has_position in [false, true] {
+        let shared = Arc::new(SharedState::new());
+        let (farm, _farm_peer) = connection();
+        let (mut ccp, _ccp_peer) = connection();
+        let mut fields = vec![(35, "U"), (6040, "75"), (1, "DUXXXXXXX"), (6544, "1")];
+        if has_position {
+            fields.extend([(146, "1"), (6008, "265598"), (6064, "2.5"), (6101, "100")]);
+        }
+        ccp.seed_buffer(&fix_build(&fields, 1));
+        let (mut engine, tx) = gateway().into_hot_loop(shared.clone(), None, farm, ccp, None, None);
+        let client = EClient::from_parts(
+            shared.clone(),
+            tx,
+            std::thread::spawn(|| {}),
+            "DUXXXXXXX".into(),
+        );
+        let mut observed = PositionsObserved::default();
+        client.req_positions(&mut observed);
+        client.process_msgs(&mut observed);
+        assert_eq!(observed.ends, 0, "buffered bytes have not been decoded");
+        engine.poll_auth_for_test();
+        assert!(shared.portfolio.account_download_complete());
+        client.process_msgs(&mut observed);
+        assert_eq!(observed.ends, 1);
+        assert_eq!(
+            observed.rows,
+            if has_position {
+                vec![(265598, 2.5)]
+            } else {
+                vec![]
+            }
+        );
+        client.process_msgs(&mut observed);
+        assert_eq!(observed.ends, 1);
+        client.disconnect();
+        assert!(!shared.portfolio.account_download_complete());
+    }
+}

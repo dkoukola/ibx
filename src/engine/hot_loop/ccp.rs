@@ -933,13 +933,20 @@ impl CcpState {
                 if let Some(comm) = parsed.get(&6040) {
                     match comm.as_str() {
                         "75" => {
-                            // Position + market price feed (init burst + after each fill)
-                            self.handle_position_feed(msg, ccp_conn, context, shared, event_tx, hb);
-                            shared.portfolio.set_account_download_complete();
+                            if let Some(images) = lightweight_positions(msg) {
+                                for image in images {
+                                    if image.account == account_id && image.model.is_empty() {
+                                        self.handle_position_feed(
+                                            image, ccp_conn, context, shared, event_tx, hb,
+                                        );
+                                    }
+                                }
+                            } else {
+                                log::warn!("Invalid lightweight position feed ignored");
+                            }
                         }
                         "77" => {
                             self.handle_account_summary(&parsed, context, shared);
-                            shared.portfolio.set_account_download_complete();
                         }
                         "143" => {
                             // P&L midnight seed — store for client-side daily P&L computation
@@ -3053,6 +3060,7 @@ impl CcpState {
         shared: &SharedState,
         _event_tx: &Option<Sender<Event>>,
     ) {
+        shared.portfolio.invalidate_position_snapshot();
         shared.orders.set_open_orders_held(true);
         shared.orders.invalidate_execution_history();
         self.disconnected = true;
@@ -3091,6 +3099,7 @@ impl CcpState {
         account_id: &str,
         shared: &SharedState,
     ) {
+        shared.portfolio.invalidate_position_snapshot();
         shared.orders.set_open_orders_held(true);
         shared.orders.invalidate_execution_history();
         *ccp_conn = Some(conn);
@@ -3115,6 +3124,16 @@ impl CcpState {
             shared.orders.begin_execution_history(&request.1);
             let fill_up: Vec<(u32, &str)> = fill_up.iter().map(|(t, v)| (*t, v.as_str())).collect();
             let _ = conn.send_fix(&fill_up);
+            // Repeat the initial main subscription after fill-up: an empty
+            // account selector, not a per-account/model subscription. Incoming
+            // snapshots are still filtered to the connected account above.
+            let _ = conn.send_fix(&[
+                (fix::TAG_MSG_TYPE, "U"),
+                (fix::TAG_SENDING_TIME, &ts),
+                (6040, "74"),
+                (1, ""),
+                (6544, "2"),
+            ]);
             let _ = conn.send_fix(&[
                 (fix::TAG_MSG_TYPE, "U"), (fix::TAG_SENDING_TIME, &ts),
                 (6040, "6"), (6036, "1"), (6095, account_id), (6529, "AR.3"),
@@ -3437,66 +3456,135 @@ fn handle_pnl_response(msg: &[u8], shared: &SharedState) {
     shared.portfolio.set_midnight_seeds(seeds);
 }
 
-/// Handle 6040=75 position + market price feed.
-/// Fires at init and after each fill. Contains repeating group: 146=count × (6008=conId, 6064=qty, 6101=avgCost).
-/// The wire only carries conId/qty/avgCost — no symbol/secType. For any held conId not yet in the
-/// reference cache, we issue an internal secdef request so the wrapper-facing Contract is populated
-/// by the time `req_positions` is called (#154).
+struct LightweightPositions<'a> {
+    account: &'a str,
+    model: &'a str,
+    snapshot: bool,
+    count: Option<usize>,
+    rows: Vec<PositionInfo>,
+}
+
+type LightweightRow = (i64, Qty, Price);
+
+fn finish_lightweight_row(image: &mut LightweightPositions<'_>, row: &mut Option<LightweightRow>) {
+    if let Some((con_id, quantity, avg_cost)) = row.take() {
+        image.rows.push(PositionInfo {
+            con_id,
+            position_fixed: quantity,
+            avg_cost,
+            ..Default::default()
+        });
+    }
+}
+
+/// U75 has per-account/model groups; 6544=1 marks a complete image. Empty
+/// snapshots omit 146 entirely (observed on the paper connection). A present
+/// count must match its group's rows; malformed frames never partially apply.
+fn lightweight_positions(msg: &[u8]) -> Option<Vec<LightweightPositions<'_>>> {
+    let text = std::str::from_utf8(msg).ok()?;
+    let mut images: Vec<LightweightPositions<'_>> = Vec::new();
+    let mut row = None;
+    for (tag, value) in text.split('\x01').filter_map(|part| part.split_once('=')) {
+        if tag == "1" {
+            if let Some(image) = images.last_mut() {
+                finish_lightweight_row(image, &mut row);
+            }
+            images.push(LightweightPositions {
+                account: value,
+                model: "",
+                snapshot: false,
+                count: None,
+                rows: Vec::new(),
+            });
+            continue;
+        }
+        let Some(image) = images.last_mut() else {
+            if matches!(tag, "6700" | "6544" | "146" | "6008" | "6064" | "6101") {
+                return None;
+            }
+            continue;
+        };
+        match tag {
+            "6700" => image.model = value,
+            "6544" => image.snapshot = value.parse::<u32>().ok()? == 1,
+            "146" => image.count = Some(value.parse().ok()?),
+            "6008" => {
+                finish_lightweight_row(image, &mut row);
+                let con_id = value.parse::<i64>().ok().filter(|id| *id > 0)?;
+                // Preserve IBX's existing omitted-field defaults. This is not
+                // Gateway equivalence: its absent average cost uses an unset
+                // sentinel; sparse-cost representation remains a separate gap.
+                row = Some((con_id, 0, 0));
+            }
+            "6064" => row.as_mut()?.1 = parse_qty(value)?,
+            "6101" => {
+                let scaled = value.parse::<f64>().ok()? * PRICE_SCALE as f64;
+                if !scaled.is_finite() || scaled < i64::MIN as f64 || scaled >= i64::MAX as f64 {
+                    return None;
+                }
+                row.as_mut()?.2 = scaled as Price;
+            }
+            _ => {}
+        }
+    }
+    if let Some(image) = images.last_mut() {
+        finish_lightweight_row(image, &mut row);
+    }
+    images
+        .iter()
+        .all(|image| {
+            image.count.is_none_or(|count| count == image.rows.len())
+                && image
+                    .rows
+                    .iter()
+                    .map(|row| row.con_id)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == image.rows.len()
+        })
+        .then_some(images)
+}
+
+/// Apply account-wide U75 snapshots and deltas, never a model's partial view.
+/// Contract metadata is fetched through the existing read-only secdef path.
 impl CcpState {
-    pub(crate) fn handle_position_feed(
+    fn handle_position_feed(
         &mut self,
-        msg: &[u8],
+        image: LightweightPositions<'_>,
         ccp_conn: &mut Option<Connection>,
         context: &mut Context,
         shared: &SharedState,
         event_tx: &Option<Sender<Event>>,
         hb: &mut HeartbeatState,
     ) {
-    let text = match std::str::from_utf8(msg) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-    // Parse repeating group by scanning for 6008= boundaries
-    let mut con_id: i64 = 0;
-    let mut qty: Qty = 0;
-    let mut avg_cost_raw: f64 = 0.0;
-    let mut count = 0;
-    for part in text.split('\x01') {
-        if let Some(v) = part.strip_prefix("6008=") {
-            // Flush previous position if any
-            if count > 0 && con_id != 0 {
-                let avg_cost = (avg_cost_raw * PRICE_SCALE as f64) as Price;
-                shared.portfolio.set_position_info(PositionInfo {
-                    con_id, position_fixed: qty, avg_cost, ..Default::default()
-                });
-                if let Some(instrument) = context.market.instrument_by_con_id(con_id) {
-                    shared.portfolio.set_position_fixed(instrument, qty);
-                    emit(event_tx, Event::PositionUpdate { instrument, con_id, position_fixed: qty, avg_cost });
-                }
-                self.auto_fetch_secdef_if_cold(con_id, ccp_conn, shared, hb);
+        let rows = shared
+            .portfolio
+            .apply_position_feed(image.rows, image.snapshot);
+        for row in rows {
+            let PositionInfo {
+                con_id,
+                position_fixed: quantity,
+                avg_cost,
+                ..
+            } = row;
+            if let Some(instrument) = context.market.instrument_by_con_id(con_id) {
+                context.set_position_fixed(instrument, quantity);
+                shared.portfolio.set_position_fixed(instrument, quantity);
+                emit(
+                    event_tx,
+                    Event::PositionUpdate {
+                        instrument,
+                        con_id,
+                        position_fixed: quantity,
+                        avg_cost,
+                    },
+                );
             }
-            con_id = v.parse().unwrap_or(0);
-            qty = 0;
-            avg_cost_raw = 0.0;
-            count += 1;
-        } else if let Some(v) = part.strip_prefix("6064=") {
-            qty = parse_qty(v).unwrap_or(0);
-        } else if let Some(v) = part.strip_prefix("6101=") {
-            avg_cost_raw = v.parse().unwrap_or(0.0);
+            self.auto_fetch_secdef_if_cold(con_id, ccp_conn, shared, hb);
         }
-    }
-    // Flush last position
-    if count > 0 && con_id != 0 {
-        let avg_cost = (avg_cost_raw * PRICE_SCALE as f64) as Price;
-        shared.portfolio.set_position_info(PositionInfo {
-            con_id, position_fixed: qty, avg_cost, ..Default::default()
-        });
-        if let Some(instrument) = context.market.instrument_by_con_id(con_id) {
-            shared.portfolio.set_position_fixed(instrument, qty);
-            emit(event_tx, Event::PositionUpdate { instrument, con_id, position_fixed: qty, avg_cost });
+        if image.snapshot {
+            shared.portfolio.set_account_download_complete();
         }
-        self.auto_fetch_secdef_if_cold(con_id, ccp_conn, shared, hb);
-    }
     }
 
     /// Issue an internal secdef request for `con_id` if the reference cache is cold and we
@@ -6193,9 +6281,24 @@ mod tests {
         assert_eq!(shared.portfolio.position_info(1005).unwrap().position_fixed, 5 * q / 2);
 
         let mut ccp = CcpState::new();
-        let feed = "8=FIX.4.1|35=U|6040=75|146=1|6008=1006|6064=0.25|6101=10|10=000|".replace('|', "\x01");
-        ccp.handle_position_feed(feed.as_bytes(), &mut None, &mut context, &shared, &None, &mut HeartbeatState::new());
-        assert_eq!(shared.portfolio.position_info(1006).unwrap().position_fixed, q / 4);
+        let feed = "8=FIX.4.1|35=U|6040=75|1=DU1|146=1|6008=1006|6064=0.25|6101=10|10=000|"
+            .replace('|', "\x01");
+        let image = lightweight_positions(feed.as_bytes())
+            .unwrap()
+            .pop()
+            .unwrap();
+        ccp.handle_position_feed(
+            image,
+            &mut None,
+            &mut context,
+            &shared,
+            &None,
+            &mut HeartbeatState::new(),
+        );
+        assert_eq!(
+            shared.portfolio.position_info(1006).unwrap().position_fixed,
+            q / 4
+        );
     }
 
     // ibx#250: a server reject reaches the caller as error 201 with the
@@ -6492,6 +6595,189 @@ mod tests {
 }
 
 #[cfg(test)]
+mod position_snapshot_tests {
+    use super::*;
+
+    fn receive(
+        ccp: &mut CcpState,
+        context: &mut Context,
+        shared: &SharedState,
+        comm: &str,
+        body: &str,
+    ) {
+        let message = format!("8=FIX.4.1|35=U|6040={comm}|{body}|").replace('|', "\x01");
+        ccp.process_ccp_message(
+            message.as_bytes(),
+            &mut None,
+            context,
+            shared,
+            &None,
+            &mut HeartbeatState::new(),
+            "DU1",
+        );
+    }
+
+    #[test]
+    fn position_snapshot_requires_own_account_wide_marker_not_values_or_model() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        for body in [
+            "1=OTHER|6544=1",
+            "1=DU1|6700=Core|6544=1",
+            "1=DU1|6700=OtherModel|6544=1",
+        ] {
+            receive(&mut ccp, &mut context, &shared, "75", body);
+            assert!(!shared.portfolio.account_download_complete());
+            assert!(shared.portfolio.position_infos().is_empty());
+        }
+        receive(&mut ccp, &mut context, &shared, "77", "1=DU1|9806=100");
+        assert!(!shared.portfolio.account_download_complete());
+        receive(
+            &mut ccp,
+            &mut context,
+            &shared,
+            "75",
+            "1=DU1|146=1|6008=42|6064=2.5|6101=10",
+        );
+        assert!(
+            !shared.portfolio.account_download_complete(),
+            "ordinary delta is not an end"
+        );
+        assert_eq!(
+            shared.portfolio.position_info(42).unwrap().position_fixed,
+            5 * QTY_SCALE / 2
+        );
+        // Exact empty envelope observed on the paper connection: no 146 or rows.
+        receive(&mut ccp, &mut context, &shared, "75", "1=DU1|6544=1");
+        assert!(shared.portfolio.account_download_complete());
+        assert_eq!(
+            shared.portfolio.position_info(42).unwrap().position_fixed,
+            0
+        );
+    }
+
+    #[test]
+    fn position_snapshot_replaces_absent_positions_without_rebooking_fills() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let first = context.register_instrument(42);
+        let second = context.register_instrument(43);
+        let shared = SharedState::new();
+        shared.portfolio.set_position_info(PositionInfo {
+            con_id: 42,
+            symbol: "KEPT".into(),
+            ..Default::default()
+        });
+        receive(
+            &mut ccp,
+            &mut context,
+            &shared,
+            "75",
+            "1=DU1|6544=1|146=2|6008=42|6064=2|6101=10|6008=43|6064=-1|6101=20",
+        );
+        assert_eq!(context.position_fixed(first), 2 * QTY_SCALE);
+        assert_eq!(context.position_fixed(second), -QTY_SCALE);
+        context.set_position_fixed(first, i64::MIN);
+        ccp.handle_disconnect(&mut context, &shared, &None);
+        assert!(!shared.portfolio.account_download_complete());
+        receive(
+            &mut ccp,
+            &mut context,
+            &shared,
+            "75",
+            "1=DU1|6544=1|146=1|6008=43|6064=3|6101=21",
+        );
+        let cleared = shared.portfolio.position_info(42).unwrap();
+        assert_eq!(
+            (
+                cleared.position_fixed,
+                cleared.avg_cost,
+                cleared.symbol.as_str()
+            ),
+            (0, 0, "KEPT")
+        );
+        assert_eq!(context.position_fixed(first), 0);
+        assert_eq!(shared.portfolio.position_fixed(first), 0);
+        assert_eq!(context.position_fixed(second), 3 * QTY_SCALE);
+        let generation = shared.portfolio.position_generation();
+        receive(
+            &mut ccp,
+            &mut context,
+            &shared,
+            "75",
+            "1=DU1|6544=1|146=1|6008=43|6064=3|6101=21",
+        );
+        assert_eq!(shared.portfolio.position_generation(), generation);
+        assert_eq!(context.position_fixed(second), 3 * QTY_SCALE);
+        assert!(
+            shared.orders.drain_fills_with_exec().is_empty(),
+            "a snapshot never fabricates executions"
+        );
+        shared.set_connection_lost();
+        assert!(!shared.portfolio.account_download_complete());
+    }
+
+    #[test]
+    fn position_snapshot_preserves_legacy_omitted_numeric_defaults() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        receive(
+            &mut ccp,
+            &mut context,
+            &shared,
+            "75",
+            "1=DU1|6544=1|146=3|6008=42|6064=2|6008=43|6101=10|6008=44",
+        );
+        assert!(shared.portfolio.account_download_complete());
+        let row = |id| shared.portfolio.position_info(id).unwrap();
+        assert_eq!(
+            (row(42).position_fixed, row(42).avg_cost),
+            (2 * QTY_SCALE, 0)
+        );
+        assert_eq!(
+            (row(43).position_fixed, row(43).avg_cost),
+            (0, 10 * PRICE_SCALE)
+        );
+        assert_eq!((row(44).position_fixed, row(44).avg_cost), (0, 0));
+    }
+
+    #[test]
+    fn position_snapshot_scopes_counts_and_rejects_malformed_frames_atomically() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        for body in [
+            "1=DU1|6544=1|146=1",
+            "1=DU1|6544=1|146=0|6008=42|6064=1|6101=10",
+            "1=DU1|6544=1|146=2|6008=42|6064=1|6101=10|6008=43|6064=2|6101=invalid",
+            "1=DU1|6544=1|146=1|6008=42|6064=invalid|6101=10",
+            "1=DU1|6544=1|146=1|6008=42|6064=1|6101=NaN",
+            "1=DU1|6544=1|146=2|6008=42|6064=1|6101=10|6008=42|6064=2|6101=11",
+            "1=DU1|6544=1|146=1|6008=42|6064=1|6101=10|1=OTHER|6544=1|146=1",
+        ] {
+            receive(&mut ccp, &mut context, &shared, "75", body);
+            assert!(!shared.portfolio.account_download_complete(), "{body}");
+            assert!(shared.portfolio.position_infos().is_empty(), "{body}");
+        }
+        receive(
+            &mut ccp,
+            &mut context,
+            &shared,
+            "75",
+            "1=OTHER|6544=1|146=1|6008=42|6064=99|6101=1|1=DU1|6544=1|146=1|6008=43|6064=2|6101=10|1=DU1|6700=Core|6544=1|146=1|6008=43|6064=1|6101=10",
+        );
+        assert!(shared.portfolio.account_download_complete());
+        assert!(shared.portfolio.position_info(42).is_none());
+        assert_eq!(
+            shared.portfolio.position_info(43).unwrap().position_fixed,
+            2 * QTY_SCALE
+        );
+    }
+}
+
+#[cfg(test)]
 mod reconnect_tests {
     use super::tests::{ccp_messages_sent, socket_pair};
     use super::*;
@@ -6627,6 +6913,12 @@ mod reconnect_tests {
             );
             let sent = ccp_messages_sent(&mut server);
             let request_field = format!("6556={request}");
+            let position_request = sent
+                .iter()
+                .find(|message| message.contains("6040=74|"))
+                .unwrap();
+            assert_eq!(position_request, "35=U|6040=74|1=|6544=2");
+            assert!(!shared.portfolio.account_download_complete());
             assert!(
                 sent.iter()
                     .any(|message| message.split('|').any(|field| field == request_field))
