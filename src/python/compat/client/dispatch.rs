@@ -194,6 +194,7 @@ impl EClient {
             })
         };
         if engine_stopped {
+            shared.orders.invalidate_execution_history();
             self.connected.store(false, Ordering::Release);
         }
 
@@ -207,6 +208,7 @@ impl EClient {
         // before the order updates and answered after them, so the answer
         // has the replayed statuses (ibx#251).
         let released = self.core.released_open_orders(shared);
+        let execution_requests = self.core.released_execution_requests(shared);
 
         // Drain fills -> execDetails + orderStatus. The commission report
         // comes later, from its own server frame (ibx#471).
@@ -355,6 +357,14 @@ impl EClient {
                     self.repeat_order_report(py, order_id, &last)?;
                 }
                 self.send_commission_report(py, &cr)?;
+            }
+        }
+
+        if let Some((history_id, requests)) = execution_requests {
+            for (req_id, filter) in requests {
+                if let Err(e) = self.answer_executions(py, shared, &history_id, req_id, &filter) {
+                    callback_raised(py, "exec_details", e)?;
+                }
             }
         }
 

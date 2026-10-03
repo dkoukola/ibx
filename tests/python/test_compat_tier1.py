@@ -258,6 +258,8 @@ def test_req_executions_empty():
     client = EClient(w)
     client._test_connect()
     client.req_executions(1)
+    assert w.events == []
+    client._test_dispatch_once()
     assert ("exec_details_end", 1) in w.events
 
 
@@ -267,6 +269,7 @@ def test_req_executions_only_end():
     client = EClient(w)
     client._test_connect()
     client.req_executions(1)
+    client._test_dispatch_once()
     assert len([e for e in w.events if e[0] == "exec_details"]) == 0
     assert len([e for e in w.events if e[0] == "exec_details_end"]) == 1
 
@@ -277,6 +280,7 @@ def test_req_executions_with_filter():
     client = EClient(w)
     client._test_connect()
     client.req_executions(1, None)  # filter=None is valid
+    client._test_dispatch_once()
     assert ("exec_details_end", 1) in w.events
 
 
@@ -592,6 +596,7 @@ def test_full_ibapi_app_pattern_with_tier1():
     app.client.req_current_time()
     app.client.req_open_orders()
     app.client.req_executions(1)
+    app.client._test_dispatch_once()
 
     assert len(app.events) == 3
     assert app.events[0][0] == "current_time"

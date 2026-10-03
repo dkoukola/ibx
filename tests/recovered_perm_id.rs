@@ -184,7 +184,9 @@ fn recovered_bracket_perm_ids_are_broker_ids_not_local_aliases() {
 
 #[test]
 fn untracked_execution_keeps_the_recorded_broker_perm_id() {
-    let (mut engine, client, _) = fixture();
+    let (mut engine, client, shared) = fixture();
+    shared.orders.begin_execution_history("fixture");
+    shared.orders.complete_execution_history("fixture");
     let expected = reference_status(FILL, 13819);
     assert_eq!(expected, (42, 1_947_378_957));
     engine.inject_ccp_message(&record(FILL, 13816, "fix_in"));
@@ -192,6 +194,7 @@ fn untracked_execution_keeps_the_recorded_broker_perm_id() {
     client.process_msgs(&mut observed);
     assert!(observed.executions.is_empty(), "no invented live callback");
     client.req_executions(1, &ExecutionFilter::default(), &mut observed);
+    client.process_msgs(&mut observed);
     assert_eq!(observed.executions.len(), 1);
     let execution = &observed.executions[0];
     assert_eq!((execution.order_id, execution.perm_id), expected);

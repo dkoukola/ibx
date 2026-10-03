@@ -2684,6 +2684,9 @@ impl Gateway {
                 misc_urls: self.misc_urls.clone(),
             });
         }
+        // connect sent U72 today4 and seeded its raw replies in ccp_conn.
+        // Establish the barrier before the hot loop can consume those bytes.
+        shared.orders.begin_execution_history("today4");
         let mut hot_loop = HotLoop::new(shared, event_tx, core_id);
         hot_loop.set_control_rx(rx);
         hot_loop.set_account_id(self.account_id.clone());

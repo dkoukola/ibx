@@ -1248,6 +1248,7 @@ pub struct ClientCore {
 
     // Execution replay store
     pub executions: Mutex<Vec<StoredExecution>>,
+    execution_requests: Mutex<Vec<(i64, ExecutionFilter)>>,
     // The API client id given at connect (0 in the Rust client, which has
     // none): the clientId of this client's executions (ibx#474).
     pub client_id: AtomicI64,
@@ -1648,6 +1649,7 @@ impl ClientCore {
             account_stream: Mutex::new(AccountStream::default()),
             last_portfolio: Mutex::new(None),
             executions: Mutex::new(Vec::new()),
+            execution_requests: Mutex::new(Vec::new()),
             client_id: AtomicI64::new(0),
             rth_dropped: Mutex::new(HashSet::new()),
             discarded: Mutex::new(HashSet::new()),
@@ -1708,6 +1710,7 @@ impl ClientCore {
         *self.account_stream.lock().unwrap() = AccountStream::default();
         *self.last_portfolio.lock().unwrap() = None;
         self.executions.lock().unwrap().clear();
+        self.execution_requests.lock().unwrap().clear();
         self.pending_commissions.lock().unwrap().clear();
         self.open_orders.lock().unwrap().clear();
         self.what_if_orders.lock().unwrap().clear();
@@ -3323,6 +3326,24 @@ impl ClientCore {
     }
 
     // ── Execution replay store ──
+
+    pub fn queue_execution_request(&self, req_id: i64, filter: &ExecutionFilter) {
+        self.execution_requests
+            .lock()
+            .unwrap()
+            .push((req_id, filter.clone()));
+    }
+
+    /// Sample completion before draining rows: an end arriving during the
+    /// drain must wait for the next pass, which consumes every preceding row.
+    pub fn released_execution_requests(
+        &self,
+        shared: &SharedState,
+    ) -> Option<(String, Vec<(i64, ExecutionFilter)>)> {
+        let request = shared.orders.execution_history_completion()?;
+        let pending = std::mem::take(&mut *self.execution_requests.lock().unwrap());
+        Some((request, pending))
+    }
 
     /// Store an execution for `req_executions`. Returns the commission
     /// report that came before it, to send after `exec_details`.

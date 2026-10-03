@@ -2,6 +2,7 @@
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use std::sync::atomic::Ordering;
 
 use crate::api::types::{
     Contract as ApiContract, Order as ApiOrder, ExecutionFilter,
@@ -239,7 +240,8 @@ impl EClient {
         Ok(())
     }
 
-    /// Request execution reports.
+    /// Queue execution reports until the current server history has ended.
+    /// Replies are delivered by the event dispatch loop.
     #[pyo3(signature = (req_id, exec_filter=None))]
     fn req_executions(&self, py: Python<'_>, req_id: i64, exec_filter: Option<Py<PyAny>>) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
@@ -265,56 +267,8 @@ impl EClient {
             ExecutionFilter::default()
         };
 
-        // No lock is held during the callbacks (ibx#265). As the reference:
-        // every execution, then the commission reports, then the end.
-        let execs = self.core.matching_executions(&filter);
-        for se in &execs {
-            let c_py = Py::new(py, Contract::from_api(py, &se.contract)?)?.into_any();
-
-            let exec_obj = Execution {
-                exec_id: se.execution.exec_id.clone(),
-                time: se.execution.time.clone(),
-                acct_number: se.execution.acct_number.clone(),
-                exchange: se.execution.exchange.clone(),
-                side: se.execution.side.clone(),
-                shares: se.execution.shares,
-                price: se.execution.price,
-                perm_id: se.execution.perm_id,
-                client_id: se.execution.client_id,
-                order_id: se.execution.order_id,
-                liquidation: se.execution.liquidation,
-                cum_qty: se.execution.cum_qty,
-                avg_price: se.execution.avg_price,
-                order_ref: se.execution.order_ref.clone(),
-                ev_rule: se.execution.ev_rule.clone(),
-                ev_multiplier: se.execution.ev_multiplier,
-                model_code: se.execution.model_code.clone(),
-                last_liquidity: se.execution.last_liquidity,
-                pending_price_revision: se.execution.pending_price_revision,
-                submitter: String::new(),
-            };
-            let exec_py = Py::new(py, exec_obj)?.into_any();
-
-            self.wrapper.call_method(
-                py, "exec_details",
-                (req_id, &c_py, &exec_py),
-                None,
-            )?;
-        }
-        // The report exists once the server's commission frame came (ibx#471).
-        for cr in execs.iter().filter_map(|se| se.commission_and_fees.as_ref()) {
-            let report = CommissionAndFeesReport {
-                exec_id: cr.exec_id.clone(),
-                commission_and_fees: cr.commission_and_fees,
-                currency: cr.currency.clone(),
-                realized_pnl: cr.realized_pnl,
-                yield_amount: cr.yield_amount,
-                yield_redemption_date: cr.yield_redemption_date.clone(),
-            };
-            let report_py = Py::new(py, report)?.into_any();
-            self.wrapper.call_method1(py, "commission_and_fees_report", (&report_py,))?;
-        }
-        self.wrapper.call_method1(py, "exec_details_end", (req_id,))?;
+        self.core.queue_execution_request(req_id, &filter);
+        self.shared_state()?.notify();
         Ok(())
     }
 
@@ -367,6 +321,91 @@ impl EClient {
 }
 
 impl EClient {
+    fn requeue_execution_if_current(
+        &self,
+        shared: &std::sync::Arc<SharedState>,
+        req_id: i64,
+        filter: &ExecutionFilter,
+    ) {
+        let current = self.shared.lock().unwrap();
+        if self.connected.load(Ordering::Acquire)
+            && current
+                .as_ref()
+                .is_some_and(|active| std::sync::Arc::ptr_eq(active, shared))
+        {
+            self.core.queue_execution_request(req_id, filter);
+        }
+    }
+
+    pub(crate) fn answer_executions(
+        &self,
+        py: Python<'_>,
+        shared: &std::sync::Arc<SharedState>,
+        history_id: &str,
+        req_id: i64,
+        filter: &ExecutionFilter,
+    ) -> PyResult<()> {
+        // No lock is held during the callbacks (ibx#265). As the reference:
+        // every execution, then the commission reports, then the end.
+        let execs = self.core.matching_executions(filter);
+        if !shared.orders.execution_history_matches(history_id) {
+            self.requeue_execution_if_current(shared, req_id, filter);
+            return Ok(());
+        }
+        for se in &execs {
+            let c_py = Py::new(py, Contract::from_api(py, &se.contract)?)?.into_any();
+
+            let exec_obj = Execution {
+                exec_id: se.execution.exec_id.clone(),
+                time: se.execution.time.clone(),
+                acct_number: se.execution.acct_number.clone(),
+                exchange: se.execution.exchange.clone(),
+                side: se.execution.side.clone(),
+                shares: se.execution.shares,
+                price: se.execution.price,
+                perm_id: se.execution.perm_id,
+                client_id: se.execution.client_id,
+                order_id: se.execution.order_id,
+                liquidation: se.execution.liquidation,
+                cum_qty: se.execution.cum_qty,
+                avg_price: se.execution.avg_price,
+                order_ref: se.execution.order_ref.clone(),
+                ev_rule: se.execution.ev_rule.clone(),
+                ev_multiplier: se.execution.ev_multiplier,
+                model_code: se.execution.model_code.clone(),
+                last_liquidity: se.execution.last_liquidity,
+                pending_price_revision: se.execution.pending_price_revision,
+                submitter: String::new(),
+            };
+            let exec_py = Py::new(py, exec_obj)?.into_any();
+
+            self.wrapper.call_method(
+                py, "exec_details",
+                (req_id, &c_py, &exec_py),
+                None,
+            )?;
+        }
+        // The report exists once the server's commission frame came (ibx#471).
+        for cr in execs.iter().filter_map(|se| se.commission_and_fees.as_ref()) {
+            let report = CommissionAndFeesReport {
+                exec_id: cr.exec_id.clone(),
+                commission_and_fees: cr.commission_and_fees,
+                currency: cr.currency.clone(),
+                realized_pnl: cr.realized_pnl,
+                yield_amount: cr.yield_amount,
+                yield_redemption_date: cr.yield_redemption_date.clone(),
+            };
+            let report_py = Py::new(py, report)?.into_any();
+            self.wrapper.call_method1(py, "commission_and_fees_report", (&report_py,))?;
+        }
+        if shared.orders.execution_history_matches(history_id) {
+            self.wrapper.call_method1(py, "exec_details_end", (req_id,))?;
+        } else {
+            self.requeue_execution_if_current(shared, req_id, filter);
+        }
+        Ok(())
+    }
+
     /// The open orders, each as open_order then order_status, then the end
     /// of the list.
     pub(crate) fn answer_open_orders(&self, py: Python<'_>, shared: &SharedState, request: crate::client_core::OpenOrdersRequest) -> PyResult<()> {

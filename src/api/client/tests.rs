@@ -52,6 +52,10 @@ fn connect_caches_reconnect_credentials() {
 /// Helper: create a test EClient backed by SharedState + channel.
 fn test_client() -> (EClient, crossbeam_channel::Receiver<ControlCommand>, Arc<SharedState>) {
     let shared = Arc::new(SharedState::new());
+    // Most dispatcher fixtures start after a completed synthetic history.
+    // Real Gateway handoff instead installs pending today4 before its bytes.
+    shared.orders.begin_execution_history("fixture");
+    shared.orders.complete_execution_history("fixture");
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = std::thread::spawn(|| {});
     let client = EClient::from_parts(shared.clone(), tx, handle, "DU123".into());
@@ -4537,6 +4541,7 @@ fn commission_report_comes_from_the_commission_frame() {
 
     let mut w = RecordingWrapper::default();
     client.req_executions(1, &crate::api::types::ExecutionFilter::default(), &mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, [
         "exec_details:1:BOT:100",
         "commission:0000e0d5.6ab5f36f.01.01:1.0003:USD",
@@ -4585,6 +4590,7 @@ fn an_untracked_execution_is_returned_by_req_executions_only() {
 
     let mut w = RecordingWrapper::default();
     client.req_executions(1, &crate::api::types::ExecutionFilter::default(), &mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, [
         "exec_details:1:BOT:100",
         "commission:0000e0d5.6ab5f36f.01.01:1.0003:USD",
@@ -4624,6 +4630,7 @@ fn req_executions_without_a_commission_report_sends_the_execution_only() {
     client.process_msgs(&mut RecordingWrapper::default());
     let mut w = RecordingWrapper::default();
     client.req_executions(1, &crate::api::types::ExecutionFilter::default(), &mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, ["exec_details:1:BOT:100", "exec_details_end:1"]);
 }
 
@@ -4657,6 +4664,7 @@ fn req_executions_sends_executions_then_reports_with_no_lock_held() {
     }
     let mut w = Reentrant { core: &client.core, events: Vec::new() };
     client.req_executions(1, &crate::api::types::ExecutionFilter::default(), &mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, [
         "exec:0000e0d5.6ab5f36f.01.01:true",
         "exec:0000e0d5.6ab5f370.01.01:true",
@@ -4664,6 +4672,80 @@ fn req_executions_sends_executions_then_reports_with_no_lock_held() {
         "commission:0000e0d5.6ab5f370.01.01:true",
         "end:1",
     ]);
+}
+
+#[test]
+fn execution_history_end_arriving_after_row_drain_waits_for_next_pass() {
+    let (client, _rx, shared) = test_client();
+    shared.orders.begin_execution_history("today4");
+    struct LateHistory {
+        shared: Arc<SharedState>,
+        rows: Vec<i64>,
+        ends: Vec<i64>,
+    }
+    impl Wrapper for LateHistory {
+        fn error(&mut self, _: i64, _: i64, _: &str, _: &str) {
+            self.shared.orders.push_untracked_execution(
+                Contract::default(),
+                crate::api::types::Execution {
+                    exec_id: "late-row".into(),
+                    ..Default::default()
+                },
+                crate::bridge::FillExec::default(),
+            );
+            self.shared.orders.complete_execution_history("today4");
+        }
+        fn exec_details(&mut self, req_id: i64, _: &Contract, _: &crate::api::types::Execution) {
+            self.rows.push(req_id);
+        }
+        fn exec_details_end(&mut self, req_id: i64) {
+            self.ends.push(req_id);
+        }
+    }
+    let mut observed = LateHistory {
+        shared: shared.clone(),
+        rows: Vec::new(),
+        ends: Vec::new(),
+    };
+    client.req_executions(7, &Default::default(), &mut observed);
+    // error callbacks follow the untracked-row drain, deterministically
+    // simulating a broker row+end arriving just after that drain.
+    shared.orders.push_order_error(1, 1, "fixture".into());
+    client.process_msgs(&mut observed);
+    assert!(observed.rows.is_empty());
+    assert!(observed.ends.is_empty());
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.rows, [7]);
+    assert_eq!(observed.ends, [7]);
+}
+
+#[test]
+fn execution_history_loss_after_capture_prevents_the_first_reply_callback() {
+    let (client, _rx, shared) = test_client();
+    struct LoseHistory {
+        shared: Arc<SharedState>,
+        ends: Vec<i64>,
+    }
+    impl Wrapper for LoseHistory {
+        fn error(&mut self, _: i64, _: i64, _: &str, _: &str) {
+            self.shared.orders.invalidate_execution_history();
+        }
+        fn exec_details_end(&mut self, req_id: i64) {
+            self.ends.push(req_id);
+        }
+    }
+    let mut observed = LoseHistory {
+        shared: shared.clone(),
+        ends: Vec::new(),
+    };
+    client.req_executions(7, &Default::default(), &mut observed);
+    shared.orders.push_order_error(1, 1, "fixture".into());
+    client.process_msgs(&mut observed);
+    assert!(observed.ends.is_empty());
+    shared.orders.begin_execution_history("today5");
+    shared.orders.complete_execution_history("today5");
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.ends, [7]);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -4733,6 +4815,7 @@ fn exec_details_of_an_own_order_takes_the_tracked_order_ref() {
 fn filter_count(client: &EClient, filter: crate::api::types::ExecutionFilter) -> usize {
     let mut w = ExecRecorder::default();
     client.req_executions(3, &filter, &mut w);
+    client.process_msgs(&mut w);
     w.execs.len()
 }
 

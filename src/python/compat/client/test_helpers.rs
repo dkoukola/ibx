@@ -23,6 +23,10 @@ impl EClient {
             return Err(PyRuntimeError::new_err("Already connected"));
         }
         let shared = Arc::new(SharedState::new());
+        shared.orders.begin_execution_history("python-test-history");
+        shared
+            .orders
+            .complete_execution_history("python-test-history");
         let (tx, rx) = match control_capacity {
             Some(n) => crossbeam_channel::bounded(n),
             None => crossbeam_channel::unbounded(),
@@ -621,6 +625,23 @@ impl EClient {
         shared.portfolio.set_position_info(PositionInfo {
             con_id, position_fixed: position * QTY_SCALE, avg_cost: (avg_cost * ps) as i64, ..Default::default()
         });
+        Ok(())
+    }
+
+    /// Start the exact history request that a test will later complete.
+    #[doc(hidden)]
+    fn _test_begin_execution_history(&self, request_id: &str) -> PyResult<()> {
+        self.shared_state()?
+            .orders
+            .begin_execution_history(request_id);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    fn _test_complete_execution_history(&self, request_id: &str) -> PyResult<()> {
+        self.shared_state()?
+            .orders
+            .complete_execution_history(request_id);
         Ok(())
     }
 
