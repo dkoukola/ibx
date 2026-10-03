@@ -62,14 +62,20 @@ impl EClient {
 
     /// Rows of the running multi-account requests (ibx#476).
     pub(crate) fn dispatch_multi(&self, py: Python<'_>, shared: &Arc<SharedState>) -> PyResult<()> {
+        if !self.position_client_current(shared) {
+            return Ok(());
+        }
         let own = self.account();
         for batch in self.core.prepare_account_multi(shared) {
             let account = if batch.account.is_empty() { own.as_str() } else { batch.account.as_str() };
             for row in &batch.rows {
+                if !self.account_snapshot_current(shared, &batch.request) {
+                    break;
+                }
                 call_wrapper!(self.wrapper, py, "account_update_multi",
                     (batch.req_id, account, batch.model_code.as_str(), row.key.as_str(), row.value.as_str(), row.currency.as_str()));
             }
-            if batch.end {
+            if batch.end && self.account_snapshot_current(shared, &batch.request) {
                 call_wrapper!(self.wrapper, py, "account_update_multi_end", (batch.req_id,));
             }
         }
@@ -171,6 +177,10 @@ impl EClient {
                 .is_some_and(|current| Arc::ptr_eq(current, shared))
     }
 
+    fn account_snapshot_current(&self, shared: &Arc<SharedState>, request: &str) -> bool {
+        self.position_client_current(shared) && shared.portfolio.account_image_matches(request)
+    }
+
     fn position_connection_current(
         &self,
         shared: &Arc<SharedState>,
@@ -256,6 +266,7 @@ impl EClient {
         if engine_stopped {
             shared.orders.set_open_orders_held(true);
             shared.portfolio.invalidate_position_snapshot();
+            shared.portfolio.invalidate_account_image();
             shared.orders.invalidate_execution_history();
             self.connected.store(false, Ordering::Release);
         }
@@ -947,14 +958,26 @@ impl EClient {
         // Account updates (ibx#475): values, portfolio rows each followed by
         // the account time, the time after the batch, and for the first image
         // the end, once per subscription.
+        if !self.position_client_current(shared) {
+            return Ok(());
+        }
         if let Some(batch) = self.core.prepare_account_updates(shared) {
             let account_name = self.account();
             for field in &batch.fields {
+                if !self.account_snapshot_current(shared, &batch.request) {
+                    return Ok(());
+                }
                 call_wrapper!(self.wrapper, py, "update_account_value", (field.key.as_str(), field.value.as_str(), field.currency.as_str(), account_name.as_str()));
             }
 
+            if !self.account_snapshot_current(shared, &batch.request) {
+                return Ok(());
+            }
             let portfolio = self.core.prepare_portfolio_updates(shared);
             for entry in &portfolio {
+                if !self.account_snapshot_current(shared, &batch.request) {
+                    return Ok(());
+                }
                 let ac = self.core.position_contract(entry.con_id, shared);
                 let mut c = crate::python::compat::contract::Contract::default();
                 c.con_id = ac.con_id;
@@ -970,13 +993,18 @@ impl EClient {
                 call_wrapper!(self.wrapper, py, "update_portfolio",
                     (&c_py, entry.position, entry.market_price, entry.market_value,
                      entry.avg_cost, entry.unrealized_pnl, entry.realized_pnl, account_name.as_str()));
+                if !self.account_snapshot_current(shared, &batch.request) {
+                    return Ok(());
+                }
                 call_wrapper!(self.wrapper, py, "update_account_time", (batch.time.as_str(),));
             }
 
-            if !batch.fields.is_empty() || !portfolio.is_empty() {
+            if (!batch.fields.is_empty() || !portfolio.is_empty())
+                && self.account_snapshot_current(shared, &batch.request)
+            {
                 call_wrapper!(self.wrapper, py, "update_account_time", (batch.time.as_str(),));
             }
-            if batch.download_end {
+            if batch.download_end && self.account_snapshot_current(shared, &batch.request) {
                 call_wrapper!(self.wrapper, py, "account_download_end", (account_name.as_str(),));
             }
         }

@@ -333,6 +333,7 @@ impl EClient {
     /// background thread to exit, and marks the client as disconnected.
     pub fn disconnect(&self) {
         self.shared.portfolio.invalidate_position_snapshot();
+        self.shared.portfolio.invalidate_account_image();
         self.shared.orders.set_open_orders_held(true);
         self.shared.orders.invalidate_execution_history();
         let _ = self.control_tx.send(ControlCommand::Shutdown);

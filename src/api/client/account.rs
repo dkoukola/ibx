@@ -203,12 +203,18 @@ impl EClient {
 
     /// Rows of the running multi-account requests (ibx#476).
     pub(crate) fn dispatch_multi(&self, wrapper: &mut impl Wrapper) {
+        if !self.is_connected() {
+            return;
+        }
         for batch in self.core.prepare_account_multi(&self.shared) {
             let account = if batch.account.is_empty() { self.account_id.as_str() } else { batch.account.as_str() };
             for row in &batch.rows {
+                if !self.account_snapshot_current(&batch.request) {
+                    break;
+                }
                 wrapper.account_update_multi(batch.req_id, account, &batch.model_code, &row.key, &row.value, &row.currency);
             }
-            if batch.end {
+            if batch.end && self.account_snapshot_current(&batch.request) {
                 wrapper.account_update_multi_end(batch.req_id);
             }
         }
@@ -243,6 +249,10 @@ impl EClient {
                 wrapper.position_multi_end(req_id);
             }
         }
+    }
+
+    pub(crate) fn account_snapshot_current(&self, request: &str) -> bool {
+        self.is_connected() && self.shared.portfolio.account_image_matches(request)
     }
 
     /// Read account state snapshot.

@@ -23,6 +23,7 @@ impl EClient {
             return Err(PyRuntimeError::new_err("Already connected"));
         }
         let shared = Arc::new(SharedState::new());
+        shared.portfolio.begin_account_image("AR.1");
         shared.orders.begin_execution_history("python-test-history");
         shared
             .orders
@@ -615,6 +616,18 @@ impl EClient {
         self.shared_state()?
             .portfolio
             .invalidate_position_snapshot();
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    fn _test_begin_account_image(&self, request: &str) -> PyResult<()> {
+        self.shared_state()?.portfolio.begin_account_image(request);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    fn _test_invalidate_account_image(&self) -> PyResult<()> {
+        self.shared_state()?.portfolio.invalidate_account_image();
         Ok(())
     }
 

@@ -275,7 +275,10 @@ pub(super) fn project_report(
             | crate::types::OrderStatus::Cancelled
             | crate::types::OrderStatus::Rejected
     ) {
-        parsed.get(&52).cloned().unwrap_or_default()
+        // The report's event time, not the later history-response send time.
+        // Native eO.a(fb) selects 6699, then TransactTime, then SendingTime.
+        parsed.get(&6699).or_else(|| parsed.get(&60)).or_else(|| parsed.get(&52))
+            .cloned().unwrap_or_default()
     } else {
         String::new()
     };
@@ -409,7 +412,7 @@ mod tests {
         assert_eq!(projected.order.cash_qty, 501.25);
         assert_eq!(projected.order.filled_quantity, 2.0);
         assert_eq!(projected.order.use_price_mgmt_algo, 1);
-        assert_eq!(projected.order_state.completed_time, "20261003-10:01:00");
+        assert_eq!(projected.order_state.completed_time, "20261003-10:00:00");
         assert_eq!(projected.order_state.completed_status, "Cancelled");
         assert_eq!(projected.order_state.commission_and_fees, 1.25);
         assert_eq!(projected.last_exec.exec_id, "fixture.exec.1");
@@ -425,6 +428,47 @@ mod tests {
             format!("{projected:?}"),
             format!("{:?}", project_report(&report, input()))
         );
+    }
+
+    #[test]
+    fn completed_time_uses_native_event_time_precedence_only_for_terminal_orders() {
+        let mut report: HashMap<u32, String> = [
+            (52, "20260102-12:03:24"),
+            (60, "20260102-12:02:53"),
+            (6699, "20260102-12:02:52"),
+        ].into_iter().map(|(tag, value)| (tag, value.to_string())).collect();
+        for status in [OrderStatus::Filled, OrderStatus::Cancelled, OrderStatus::Rejected] {
+            assert_eq!(project_report(&report, ReportProjection { status, ..input() })
+                .order_state.completed_time, "20260102-12:02:52");
+        }
+        assert_eq!(project_report(&report, ReportProjection { status: OrderStatus::Submitted, ..input() })
+            .order_state.completed_time, "");
+        report.remove(&6699);
+        assert_eq!(project_report(&report, input()).order_state.completed_time, "20260102-12:02:53");
+        report.remove(&60);
+        assert_eq!(project_report(&report, input()).order_state.completed_time, "20260102-12:03:24");
+        report.remove(&52);
+        assert_eq!(project_report(&report, input()).order_state.completed_time, "");
+    }
+
+    #[test]
+    fn captured_completed_history_preserves_identity_terms_and_event_time() {
+        // Direct paper STANDARD H reply captured after an acknowledged cancel.
+        // Identifiers and dates are sanitized; data rows have no query tag.
+        let fixture = include_str!("../../../tests/fixtures/completed_history/paper_cancelled.jsonl");
+        let row: serde_json::Value = serde_json::from_str(fixture.lines().next().unwrap()).unwrap();
+        let wire = row["fix"].as_str().unwrap().replace('|', "\x01");
+        let report = crate::protocol::fix::fix_parse(wire.as_bytes());
+        assert!(!report.contains_key(&6556));
+        assert_eq!(report.get(&20).map(String::as_str), Some("3"));
+        let projected = project_report(&report, input());
+        assert_eq!(projected.order.perm_id, 1_234_567_890);
+        assert_eq!(projected.order.order_ref, "sanitized-paper-history-fixture");
+        assert_eq!(projected.contract.con_id, 265598);
+        assert_eq!(projected.order.total_quantity, 1.0);
+        assert_eq!(projected.order.lmt_price, 1.0);
+        assert_eq!(projected.order_state.completed_time, "20260102-12:02:53");
+        assert_eq!(projected.order_state.completed_status, "Cancelled");
     }
 
     #[test]

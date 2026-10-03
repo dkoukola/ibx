@@ -63,6 +63,55 @@ fn gateway() -> Gateway {
     }
 }
 
+#[test]
+fn initial_buffered_account_image_waits_for_exact_end() {
+    let shared = Arc::new(SharedState::new());
+    let (farm, _farm_peer) = connection();
+    let (mut ccp, _ccp_peer) = connection();
+    let mut initial = fix_build(
+        &[
+            (35, "UT"),
+            (6529, "AR.1"),
+            (8001, "AccountType"),
+            (8004, "INDIVIDUAL"),
+        ],
+        1,
+    );
+    initial.extend(fix_build(&[(35, "EB"), (6529, "AR.9")], 2));
+    ccp.seed_buffer(&initial);
+    let (mut engine, tx) = gateway().into_hot_loop(shared.clone(), None, farm, ccp, None, None);
+    let client = EClient::from_parts(
+        shared.clone(),
+        tx,
+        std::thread::spawn(|| {}),
+        "DUXXXXXXX".into(),
+    );
+    #[derive(Default)]
+    struct Account {
+        rows: usize,
+        ends: usize,
+    }
+    impl Wrapper for Account {
+        fn update_account_value(&mut self, _: &str, _: &str, _: &str, _: &str) {
+            self.rows += 1;
+        }
+        fn account_download_end(&mut self, _: &str) {
+            self.ends += 1;
+        }
+    }
+    let mut observed = Account::default();
+    client.req_account_updates(true, "");
+    engine.poll_auth_for_test();
+    assert_eq!(shared.portfolio.account_rows().rows.len(), 1);
+    client.process_msgs(&mut observed);
+    assert_eq!((observed.rows, observed.ends), (0, 0));
+    engine.inject_ccp_message(&fix_build(&[(35, "EB"), (6529, "AR.1")], 3));
+    client.process_msgs(&mut observed);
+    assert_eq!((observed.rows, observed.ends), (1, 1));
+    client.process_msgs(&mut observed);
+    assert_eq!((observed.rows, observed.ends), (1, 1));
+}
+
 fn marker(request: &str) -> Vec<u8> {
     fix_build(
         &[(35, "8"), (6556, request), (32, "*"), (150, "0"), (39, "0")],

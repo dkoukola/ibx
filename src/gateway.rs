@@ -2376,6 +2376,7 @@ impl Gateway {
         // connect sent U72 today4 and seeded its raw replies in ccp_conn.
         // Establish the barrier before the hot loop can consume those bytes.
         shared.orders.begin_execution_history("today4");
+        shared.portfolio.begin_account_image("AR.1");
         shared.orders.set_open_orders_held(true);
         let mut hot_loop = HotLoop::new(shared, event_tx, core_id);
         hot_loop.ccp.awaiting_status_replay =
