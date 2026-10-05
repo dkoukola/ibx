@@ -169,6 +169,7 @@ fn all_values(msg: &[u8], tag: u32) -> impl Iterator<Item = &str> {
 fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec_id: &str) -> crate::bridge::FillExec {
     let tag = |t: u32| parsed.get(&t).filter(|s| !s.is_empty());
     crate::bridge::FillExec {
+        stale_order_state: false,
         exec_id: exec_id.to_string(),
         time_secs: tag(6699).or_else(|| tag(60)).or_else(|| tag(52))
             .and_then(|s| fix_utc_to_unix_secs(s)),
@@ -296,6 +297,7 @@ pub(crate) struct CcpState {
     /// The group of each account summary subscription, which its cancel
     /// restates (ibx#486).
     pub(crate) summary_groups: std::collections::HashMap<String, String>,
+    pub(super) completed_history: super::completed_history::HistoryRequests,
     pub(crate) seen_exec_ids: HashSet<String>,
     /// Insertion order for `seen_exec_ids`, oldest at the front. Used to evict
     /// one entry at a time once the dedup window is full, instead of clearing
@@ -721,6 +723,7 @@ impl CcpState {
     pub(crate) fn new() -> Self {
         Self {
             summary_groups: std::collections::HashMap::new(),
+            completed_history: super::completed_history::HistoryRequests::default(),
             seen_exec_ids: HashSet::with_capacity(256),
             exec_id_order: VecDeque::with_capacity(256),
             commission_revisions: std::collections::HashMap::with_capacity(256),
@@ -1298,9 +1301,22 @@ impl CcpState {
     ) {
         // This client's id, for whose reports are given to it.
         context.api_client_id = shared.reference.api_client_id();
+        // Preview replies are not order history, even while a STANDARD query
+        // is active and their wire status happens to be 20=3.
+        let what_if_clord = parsed.get(&11).is_some_and(|c| context.what_ifs.contains_key(c.as_str()));
+        let what_if_flag = parsed.get(&6091).and_then(|v| v.parse::<i64>().ok()).is_some_and(|v| v > 0);
+        if what_if_clord || what_if_flag {
+            Self::handle_what_if(parsed, context, shared, event_tx);
+            return;
+        }
         // End markers are not orders (ibx#399): the end of a trades reply
         // (it carries the request id), and the end of the order status
         // replay (wildcard order id).
+        let history = self.completed_history.classify(parsed, shared, account_id);
+        if history == super::completed_history::HistoryReport::End {
+            return;
+        }
+        self.completed_history.status_reply(parsed);
         if let Some(request) = parsed.get(&6556).filter(|r| !r.starts_with("PT.")) {
             shared.orders.complete_execution_history(request);
             log::info!("ExecReport: end of trades request {}", request);
@@ -1329,16 +1345,6 @@ impl CcpState {
         // a client used, for its next valid id (ibx#466).
         note_reported_order_id(parsed, shared);
 
-        // A what-if reply goes to the preview, before anything reads the
-        // frame as an order: by the ClOrdID the preview was sent under, or
-        // by a positive preview flag, as the reference routes it (ibx#462).
-        let what_if_clord = parsed.get(&11).is_some_and(|c| context.what_ifs.contains_key(c.as_str()));
-        let what_if_flag = parsed.get(&6091).and_then(|v| v.parse::<i64>().ok()).is_some_and(|v| v > 0);
-        if what_if_clord || what_if_flag {
-            Self::handle_what_if(parsed, context, shared, event_tx);
-            return;
-        }
-
         // Orders are looked up by the server's order id, the part of the
         // ClOrdID before its version, as the reference does (ibx#466). An
         // order of an earlier session is kept under the API order id its
@@ -1351,8 +1357,57 @@ impl CcpState {
             base.parse::<OrderId>().ok()
         }).unwrap_or(0);
         let mut clord_id = context.key_of(server_id);
+
+        // Native history collection is a side tap. Its untagged status rows
+        // can also be live reports of an order placed before/during the query.
+        // Establish broker identity before allocating aliases or changing any
+        // current order. A matching caller order ID alone is not an identity.
         let key_collision = !context.recovered_keys.contains_key(&server_id)
             && context.server_ids.contains_key(&server_id);
+        let previous = shared.orders.get_order_info(clord_id)
+            .filter(|info| server_id > 0 && info.order.perm_id == server_id
+                && parsed.get(&1).is_none_or(|account| info.order.account == *account));
+        let report_account = parsed.get(&1).map(String::as_str)
+            .or_else(|| previous.as_ref().map(|info| info.order.account.as_str())).unwrap_or(account_id);
+        let collect_history = history == super::completed_history::HistoryReport::Row && report_account == account_id;
+        let known_current = previous.is_some() || (context.order(clord_id).is_some()
+            && !key_collision
+            && context.last_clord.get(&clord_id).map_or(clord_id == server_id,
+                |id| perm_id_from_clord_id(id) == server_id));
+        if history == super::completed_history::HistoryReport::Row && !known_current {
+            if collect_history { self.completed_history.collect(parsed, account_id, None); }
+            return;
+        }
+        let cancelled = matches!(parsed.get(&39).map(String::as_str), Some("4" | "C"));
+        let incoming_revision = super::report::report_revision(parsed);
+        let state_admitted = !previous.as_ref().is_some_and(|info| super::report::stale_report(
+            incoming_revision, super::report::report_time(parsed),
+            info.report_revision, info.report_time.as_deref(), cancelled));
+        let is_status_report = parsed.get(&20).is_some_and(|value| value == "3");
+        let cancelled_snapshot = cancelled || (is_status_report && parsed.get(&39).is_some_and(|status| status == "8"));
+        let empty_status_order = is_status_report && parsed.get(&39).is_some_and(|status| status == "8")
+            && parsed.get(&38).and_then(|quantity| parse_qty(quantity)).is_some_and(|quantity| quantity == 0);
+        // The status-only NoSuchOrder response reports placeholder zeros.
+        // Resolve its effective totals once for both status and rich delivery.
+        let retained_totals = empty_status_order.then(|| previous.as_ref().map_or_else(
+            || (context.order(clord_id).map_or(0, |order| order.filled_fixed), 0.0),
+            |info| ((info.order.filled_quantity * QTY_SCALE as f64).round() as Qty, info.last_exec.avg_price)));
+        // A stale print still belongs to execution accounting. A snapshot never
+        // does, even if it includes the last print's ID, quantity and price.
+        let real_print = !is_status_report
+            && matches!(parsed.get(&150).map(String::as_str), Some("F" | "1" | "2"))
+            && parsed.get(&32).and_then(|value| parse_qty(value)).is_some_and(|qty| qty > 0);
+        if !state_admitted && !real_print {
+            if collect_history {
+                // Rejection by the live order clock must not erase requested
+                // terminal history. A complete newer terminal snapshot wins;
+                // otherwise the historical lifecycle stays query-local.
+                let terminal = previous.as_ref().filter(|info|
+                    matches!(info.order_state.status.as_str(), "Filled" | "Cancelled" | "Inactive"));
+                self.completed_history.collect(parsed, account_id, terminal);
+            }
+            return;
+        }
 
         // An order this session does not hold, reported working: an order
         // of another session or client, put in the book so it can be
@@ -1376,8 +1431,8 @@ impl CcpState {
             _ => None,
         };
         let replayed_status = replayed_status
-            .filter(|_| key_collision || (context.order(clord_id).is_none() && context.finished_status(clord_id).is_none()));
-        if !context.recovered_keys.contains_key(&server_id)
+            .filter(|_| state_admitted && (key_collision || (context.order(clord_id).is_none() && context.finished_status(clord_id).is_none())));
+        if state_admitted && !context.recovered_keys.contains_key(&server_id)
             && (key_collision || replayed_status.is_some())
         {
             // The API order id only names the order to the caller (ibx#466):
@@ -1489,14 +1544,17 @@ impl CcpState {
             s.starts_with('C') || context.cancel_clord.get(&clord_id) == Some(s)
         });
         if let Some(raw_clord) = parsed.get(&11) {
-            if !is_cancel_request && raw_clord != "*" {
+            let older_than_sent = history == super::completed_history::HistoryReport::Row
+                && context.last_clord.get(&clord_id).and_then(|id| id.split_once('.'))
+                    .and_then(|(_, revision)| revision.parse::<u32>().ok())
+                    .zip(incoming_revision).is_some_and(|(sent, incoming)| incoming < sent);
+            if state_admitted && !is_cancel_request && !cancelled_snapshot && !older_than_sent && raw_clord != "*" {
                 context.last_clord.insert(clord_id, raw_clord.clone());
             }
         }
 
         // FIX20=3 restates an order, including its last print; it is not
         // another execution. This also applies to the combo-leg path.
-        let is_status_report = parsed.get(&20).map(|s| s.as_str()) == Some("3");
 
         // A fill of an order of this session in the trades reply after a
         // reconnect, that is a fill made while the link was lost: the
@@ -1529,6 +1587,7 @@ impl CcpState {
                 }
                 return;
             }
+            if state_admitted {
             let qty = |tag: u32| parsed.get(&tag).and_then(|s| parse_qty(s));
             let px = |tag: u32| parsed.get(&tag).and_then(|s| s.parse::<f64>().ok())
                 .map(|v| (v * PRICE_SCALE as f64).round() as i64);
@@ -1547,6 +1606,7 @@ impl CcpState {
                 vec![f64::MAX; legs]
             };
             shared.orders.set_combo_leg_prices(clord_id, reported);
+            }
         }
 
         let ord_status = parsed.get(&39).map(|s| s.as_str()).unwrap_or("");
@@ -1570,9 +1630,26 @@ impl CcpState {
                 parsed.get(&103).map(|s| s.as_str()).unwrap_or(""));
         }
 
+        // Native bracket acknowledgements can omit 6107 before or after a
+        // full status. Absence is not a clear.
+        // Keep only a parent already reported for this same broker order;
+        // never infer a parent from local intent, an OCA group or a reused
+        // API key. An explicit empty/zero/malformed link remains authoritative.
+        let (parent_id, parent_id_known) = if parsed.contains_key(&6107) {
+            (parent_order_id(parsed, context), true)
+        } else {
+            // A full status establishes a root when it has no link. A first
+            // sparse acknowledgement establishes neither root nor child.
+            (
+                previous.as_ref().map_or(0, |info| info.order.parent_id),
+                parsed.get(&20).is_some_and(|value| value == "3")
+                    || previous.as_ref().is_some_and(|info| info.parent_id_known),
+            )
+        };
+
         // The parent and OCA group the server gives for a held order, as
         // the reference's book keeps them for its global cancel.
-        if context.order(clord_id).is_some() && (parsed.contains_key(&6107) || parsed.contains_key(&583)) {
+        if state_admitted && context.order(clord_id).is_some() && (parsed.contains_key(&6107) || parsed.contains_key(&583)) {
             let parent = parsed.contains_key(&6107).then(|| parent_order_id(parsed, context)).filter(|&p| p > 0);
             let group = parsed.get(&583).map(String::as_str);
             context.set_links(clord_id, parent, group);
@@ -1580,10 +1657,9 @@ impl CcpState {
 
         // A bracket key on a report: kept for an order that has none, and
         // the next bracket group goes past it, as the reference (ibx#248).
-        if let Some(key) = parsed.get(&6531).and_then(|k| crate::engine::bracket::BracketKey::parse(k)) {
-            let parent = parent_order_id(parsed, context);
+        if state_admitted && let Some(key) = parsed.get(&6531).and_then(|k| crate::engine::bracket::BracketKey::parse(k)) {
             if context.order(clord_id).is_some() {
-                context.brackets().reported(clord_id, (parent > 0).then_some(parent), key);
+                context.brackets().reported(clord_id, (parent_id > 0).then_some(parent_id), key);
             } else {
                 context.bracket_groups = context.bracket_groups.max(key.group);
             }
@@ -1657,10 +1733,12 @@ impl CcpState {
         // The replay after a reconnect answers a status request for every
         // working order: its status is set as the server gives it, as for
         // a single status request (ibx#251).
-        let replayed = is_status_report && self.awaiting_status_replay.is_some();
+        let replayed = state_admitted && is_status_report && self.awaiting_status_replay.is_some();
         let queried = replayed || (is_status_report && !context.status_queries.is_empty()
             && context.status_queries.remove(&clord_id));
-        let change = if queried {
+        let change = if !state_admitted {
+            crate::engine::context::StatusChange::Stale
+        } else if queried {
             context.apply_queried_status(clord_id, status)
         } else {
             context.apply_order_status(clord_id, status)
@@ -1690,7 +1768,7 @@ impl CcpState {
         // The limit offset, limit price and stop price the server reports
         // for a TRAIL LIMIT (6370, 44, 6117): the offset is restated on its
         // replace (ib-agent#194), the stop moves with the market (ibx#491).
-        if context.order(clord_id).is_some() {
+        if state_admitted && context.order(clord_id).is_some() {
             let reported = |tag: u32| parsed.get(&tag).and_then(|s| s.parse::<f64>().ok())
                 .map(|v| (v * PRICE_SCALE as f64).round() as i64);
             let stop = reported(6117);
@@ -1722,7 +1800,7 @@ impl CcpState {
         // "Order Message:\nBUY 1 AAPL NASDAQ.NMS\nWarning: your order will
         // not be placed at the exchange until ..."). The other types (PRICECAP
         // in the capture) did not reach the API.
-        if parsed.get(&6360).map(|s| s.as_str()) == Some("TIME") && context.order(clord_id).is_some() && owned {
+        if state_admitted && parsed.get(&6360).map(|s| s.as_str()) == Some("TIME") && context.order(clord_id).is_some() && owned {
             if let Some(text) = parsed.get(&6361).filter(|t| !t.is_empty()) {
                 if self.order_messages_sent.insert((clord_id, text.clone())) {
                     let message = order_message_399(parsed, text, context, clord_id, shared, combo_view.as_ref().map(|v| &v.contract));
@@ -1779,6 +1857,7 @@ impl CcpState {
                     Side::Sell | Side::ShortSell => -last_shares,
                 };
                 let mut exec = fill_exec_of(parsed, exec_id);
+                exec.stale_order_state = !state_admitted;
                 // The fill of a combo moves no position: its legs' fills do
                 // (ibx#470). Its execution shows the combo contract without
                 // its legs (captured 30/09/2026).
@@ -1826,12 +1905,11 @@ impl CcpState {
         if report_status && !had_fill {
             if let Some(order) = context.order(clord_id).copied() {
                 let perm_id: i64 = perm_id_of(parsed);
-                let parent_id = parent_order_id(parsed, context);
-                // Average fill price rides on status reports too (ibx#315).
-                let avg_px = parsed.get(&6).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
                 // Filled so far as the server counts it (tag 14): an order
                 // recovered at session start has no prints in this session.
-                let filled = parsed.get(&14).and_then(|s| parse_qty(s)).unwrap_or(order.filled_fixed);
+                let (filled, avg_px) = retained_totals.unwrap_or_else(|| (
+                    parsed.get(&14).and_then(|s| parse_qty(s)).unwrap_or(order.filled_fixed),
+                    parsed.get(&6).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0)));
                 // A cancel or a reject reports 151=0; the reference's
                 // remaining stays what was not filled (every four-leg
                 // recording of 26/09 to 02/10/2026: Cancelled and Inactive
@@ -1857,7 +1935,9 @@ impl CcpState {
         }
 
         // Projection is shared; only this live path publishes accounting.
-        {
+        // A late NoSuchOrder reply can follow retirement of the last rich
+        // terminal row. Its placeholder order is not new identity evidence.
+        if state_admitted && (!empty_status_order || previous.is_some()) {
             let con_id = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
             let fallback_order = context.order(clord_id);
             let fallback_con_id = fallback_order
@@ -1868,7 +1948,7 @@ impl CcpState {
                 parsed,
                 super::report::ReportProjection {
                     order_id: clord_id,
-                    parent_id: parent_order_id(parsed, context),
+                    parent_id,
                     status,
                     account_id,
                     fallback_order,
@@ -1887,6 +1967,48 @@ impl CcpState {
             if let Some(entry) = context.book.get(&clord_id) {
                 shared.orders.note_book(clord_id, entry.seq, context.book_peak);
             }
+            info.parent_id_known = parent_id_known;
+            if let Some(previous) = &previous {
+                if cancelled_snapshot {
+                    // Native cancellation updates state, not amended terms.
+                    // Explicit cumulative quantity/fees remain authoritative.
+                    let filled = info.order.filled_quantity;
+                    let reported_con_id = info.contract.con_id;
+                    info.contract = previous.contract.clone();
+                    if parsed.contains_key(&6008) { info.contract.con_id = reported_con_id; }
+                    let reported_order = info.order;
+                    info.order = previous.order.clone();
+                    info.order.parent_id = parent_id;
+                    // Preserve explicit identity/link changes, including a
+                    // contradictory reference; absence alone retains them.
+                    if parsed.contains_key(&6010) { info.order.order_ref = reported_order.order_ref; }
+                    if parsed.contains_key(&583) {
+                        info.order.oca_group = reported_order.oca_group;
+                        info.order.oca_type = reported_order.oca_type;
+                    }
+                    // The NoSuchOrder 20=3/39=8 response has placeholder zero
+                    // order/fill quantities, not an authoritative fill image.
+                    if cancelled && parsed.contains_key(&14) { info.order.filled_quantity = filled; }
+                    if !cancelled && !parsed.contains_key(&6107) {
+                        info.parent_id_known = previous.parent_id_known;
+                    }
+                    if let Some((filled, average)) = retained_totals {
+                        info.order.filled_quantity = filled as f64 / QTY_SCALE as f64;
+                        info.last_exec = previous.last_exec.clone();
+                        info.last_exec.cum_qty = info.order.filled_quantity;
+                        info.last_exec.avg_price = average;
+                    }
+                    if !parsed.contains_key(&12) {
+                        info.order_state.commission_and_fees = previous.order_state.commission_and_fees;
+                    }
+                    info.report_revision = info.report_revision.max(previous.report_revision);
+                }
+                if info.report_time.is_none() { info.report_time = previous.report_time.clone(); }
+                if info.report_revision.is_none() { info.report_revision = previous.report_revision; }
+            }
+            if collect_history {
+                self.completed_history.collect(parsed, account_id, Some(&info));
+            }
             if con_id != 0 {
                 shared.reference.cache_contract(con_id, info.contract.clone());
             }
@@ -1894,6 +2016,8 @@ impl CcpState {
                 shared.orders.push_untracked_execution(info.contract.clone(), execution, exec);
             }
             shared.orders.push_order_info(clord_id, info);
+        } else if let (Some(previous), Some((execution, exec))) = (&previous, untracked_out.take()) {
+            shared.orders.push_untracked_execution(previous.contract.clone(), execution, exec);
         }
 
         if let Some((fill, mut exec)) = fill_out {
@@ -1919,7 +2043,7 @@ impl CcpState {
             shared.orders.push_order_notice(clord_id, code, text);
         }
 
-        if matches!(status,
+        if state_admitted && matches!(status,
             crate::types::OrderStatus::Filled |
             crate::types::OrderStatus::Cancelled |
             crate::types::OrderStatus::Rejected
@@ -2183,11 +2307,20 @@ impl CcpState {
             }
             None => 0,
         };
-        if let Some(conn) = ccp_conn.as_mut() {
+        if self.completed_history.active() {
+            self.completed_history.defer_status(lowered);
+        } else if let Some(conn) = ccp_conn.as_mut() {
             let now = chrono_free_timestamp();
             match conn.send_fix(&order_status_request(&lowered, account_id, &now)) {
-                Ok(()) => hb.last_ccp_sent = Instant::now(),
-                Err(e) => log::warn!("CancelReject: status request for order {} not sent: {}", oid, e),
+                Ok(()) => {
+                    self.completed_history.sent_status(&lowered);
+                    hb.last_ccp_sent = Instant::now();
+                }
+                Err(e) => {
+                    log::warn!("CancelReject: status request for order {} not sent: {}", oid, e);
+                    conn.shutdown();
+                    self.handle_disconnect(context, shared, event_tx);
+                }
             }
         }
 
@@ -3166,6 +3299,7 @@ impl CcpState {
         _event_tx: &Option<Sender<Event>>,
     ) {
         shared.portfolio.invalidate_account_image();
+        self.completed_history.disconnected(shared);
         shared.portfolio.invalidate_position_snapshot();
         shared.orders.set_open_orders_held(true);
         shared.orders.invalidate_execution_history();
@@ -4507,6 +4641,312 @@ mod tests {
     }
 
     #[test]
+    fn captured_bracket_parent_survives_sparse_ack_in_public_callbacks() {
+        #[derive(Default)]
+        struct Parents {
+            open: Vec<i64>,
+            status: Vec<i64>,
+        }
+        impl crate::api::Wrapper for Parents {
+            fn open_order(
+                &mut self,
+                _: i64,
+                _: &api::Contract,
+                order: &api::Order,
+                _: &api::OrderState,
+            ) {
+                self.open.push(order.parent_id);
+            }
+            fn order_status(
+                &mut self,
+                _: i64,
+                _: &str,
+                _: f64,
+                _: f64,
+                _: f64,
+                _: i64,
+                parent: i64,
+                _: f64,
+                _: i64,
+                _: &str,
+                _: f64,
+            ) {
+                self.status.push(parent);
+            }
+        }
+        for (capture, parent, child) in [
+            (
+                include_str!("../../../tests/fixtures/gw1040/scenarios/20260926/bracket.jsonl"),
+                1_339_547_416,
+                1_339_547_417,
+            ),
+            (
+                include_str!("../../../tests/fixtures/gw1040/scenarios/20260926b/bracket.jsonl"),
+                1_770_530_829,
+                1_770_530_830,
+            ),
+        ] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let instrument = context.register_instrument(265598);
+            context.insert_order(crate::types::Order::new(
+                child,
+                instrument,
+                Side::Sell,
+                1,
+                110 * PRICE_SCALE,
+                b'2',
+                b'0',
+                0,
+            ));
+            let shared = std::sync::Arc::new(SharedState::new());
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let client = crate::api::EClient::from_parts(
+                shared.clone(),
+                tx,
+                std::thread::spawn(|| {}),
+                "DU1".into(),
+            );
+            let mut wrapper = Parents::default();
+            let mut sequence = Vec::new();
+            for line in capture.lines() {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                if row["leg"] != "fix_in" {
+                    continue;
+                }
+                let fields: std::collections::HashMap<u32, String> = row["fields"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|pair| {
+                        (
+                            pair[0].as_str().unwrap().parse().unwrap(),
+                            pair[1].as_str().unwrap().into(),
+                        )
+                    })
+                    .collect();
+                if fields.get(&35).map(String::as_str) != Some("8")
+                    || fields.get(&11) != Some(&format!("{child}.0"))
+                    || !matches!(fields.get(&39).map(String::as_str), Some("A" | "0"))
+                {
+                    continue;
+                }
+                sequence.push((fields[&20].clone(), fields.contains_key(&6107)));
+                ccp.handle_exec_report(&fields, &mut context, &shared, &None, "DU1");
+                client.process_msgs(&mut wrapper);
+                assert_eq!(
+                    shared.orders.get_order_info(child).unwrap().order.parent_id,
+                    parent
+                );
+                assert_eq!(wrapper.open.last(), Some(&parent));
+                assert_eq!(wrapper.status.last(), Some(&parent));
+            }
+            assert_eq!(
+                sequence,
+                [("3".into(), true), ("0".into(), false), ("3".into(), true)]
+            );
+            assert_eq!(wrapper.open, [parent; 3]);
+            assert_eq!(wrapper.status, [parent; 3]);
+            client.disconnect();
+        }
+    }
+
+    #[derive(Default)]
+    struct ParentReadinessCallbacks {
+        parents: Vec<i64>,
+        statuses: Vec<String>,
+        executions: Vec<api::Execution>,
+        ends: usize,
+    }
+
+    impl crate::api::Wrapper for ParentReadinessCallbacks {
+        fn open_order(&mut self, _: i64, _: &api::Contract, order: &api::Order, _: &api::OrderState) {
+            self.parents.push(order.parent_id);
+        }
+        fn order_status(
+            &mut self, _: i64, status: &str, _: f64, _: f64, _: f64,
+            _: i64, _: i64, _: f64, _: i64, _: &str, _: f64,
+        ) {
+            self.statuses.push(status.into());
+        }
+        fn exec_details(&mut self, _: i64, _: &api::Contract, execution: &api::Execution) {
+            self.executions.push(execution.clone());
+        }
+        fn open_order_end(&mut self) {
+            self.ends += 1;
+        }
+    }
+
+    fn parent_readiness_client(shared: &std::sync::Arc<SharedState>) -> crate::api::EClient {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        crate::api::EClient::from_parts(shared.clone(), tx, std::thread::spawn(|| {}), "DU1".into())
+    }
+
+    // The native paper flow also sends ACK before full status. Neither OCA nor
+    // locally submitted intent establishes the absent parent in that ACK.
+    #[test]
+    fn parent_readiness_ack_first_keeps_status_live_and_holds_snapshot_end() {
+        for reconnect in [false, true] {
+            for parent in [None, Some("15.0")] {
+                let (mut ccp, mut context, shared) = ord_status_test_state();
+                let shared = std::sync::Arc::new(shared);
+                let client = parent_readiness_client(&shared);
+                let mut observed = ParentReadinessCallbacks::default();
+                let mut report = exec_report_frame(&[
+                    (20, "0"), (39, "0"), (150, "0"), (583, "15"), (151, "1"),
+                ]);
+                ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+                assert!(!shared.orders.get_order_info(42).unwrap().parent_id_known);
+                if reconnect {
+                    shared.orders.set_open_orders_held(true);
+                }
+                client.req_open_orders(&mut observed);
+                client.process_msgs(&mut observed);
+                assert_eq!(observed.statuses, ["PreSubmitted"]);
+                assert!(observed.parents.is_empty());
+                assert_eq!(observed.ends, 0);
+                shared.orders.set_open_orders_held(false);
+                client.process_msgs(&mut observed);
+                assert_eq!(observed.ends, 0, "replay end alone cannot complete a partial snapshot");
+                report.insert(20, "3".into());
+                if let Some(parent) = parent {
+                    report.insert(6107, parent.into());
+                }
+                ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+                client.process_msgs(&mut observed);
+                let expected = if parent.is_some() { 15 } else { 0 };
+                assert_eq!(observed.parents, [expected, expected]);
+                assert_eq!(observed.ends, 1);
+                assert!(shared.orders.get_order_info(42).unwrap().parent_id_known);
+                client.process_msgs(&mut observed);
+                assert_eq!(observed.ends, 1);
+                client.disconnect();
+            }
+        }
+    }
+
+    #[test]
+    fn parent_readiness_explicit_zero_empty_or_malformed_link_is_not_hidden() {
+        for parent in ["0", "", "not-a-parent"] {
+            let (mut ccp, mut context, shared) = ord_status_test_state();
+            let shared = std::sync::Arc::new(shared);
+            let client = parent_readiness_client(&shared);
+            let mut observed = ParentReadinessCallbacks::default();
+            let report = exec_report_frame(&[(20, "0"), (39, "0"), (150, "0"), (6107, parent)]);
+            ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+            client.req_open_orders(&mut observed);
+            client.process_msgs(&mut observed);
+            assert_eq!(observed.parents, [0, 0]);
+            assert_eq!(observed.ends, 1);
+            assert!(shared.orders.get_order_info(42).unwrap().parent_id_known);
+            client.disconnect();
+        }
+    }
+
+    #[test]
+    fn parent_readiness_does_not_delay_true_fills_or_terminal_snapshot_completion() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        let shared = std::sync::Arc::new(shared);
+        let client = parent_readiness_client(&shared);
+        let mut observed = ParentReadinessCallbacks::default();
+        let fill = exec_report_frame(&[
+            (20, "0"), (39, "2"), (150, "F"), (17, "parent-unknown-fill"),
+            (31, "100"), (32, "1"), (14, "1"), (151, "0"), (6, "100"),
+        ]);
+        ccp.handle_exec_report(&fill, &mut context, &shared, &None, "DU1");
+        assert!(!shared.orders.get_order_info(42).unwrap().parent_id_known);
+        assert_eq!(context.position_fixed(0), crate::types::QTY_SCALE);
+        client.req_open_orders(&mut observed);
+        client.process_msgs(&mut observed);
+        assert_eq!(observed.executions.len(), 1);
+        assert_eq!(observed.executions[0].exec_id, "parent-unknown-fill");
+        assert_eq!(observed.executions[0].shares, 1.0);
+        assert_eq!(observed.statuses, ["Filled"]);
+        assert!(observed.parents.is_empty());
+        assert_eq!(observed.ends, 1);
+        client.disconnect();
+    }
+
+    #[test]
+    fn parent_readiness_cancel_releases_a_waiting_snapshot_without_inventing_a_parent() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        let shared = std::sync::Arc::new(shared);
+        let client = parent_readiness_client(&shared);
+        let mut observed = ParentReadinessCallbacks::default();
+        let mut report = exec_report_frame(&[(20, "0"), (39, "0"), (150, "0")]);
+        ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+        client.req_open_orders(&mut observed);
+        client.process_msgs(&mut observed);
+        assert_eq!(observed.ends, 0);
+        report.insert(39, "4".into());
+        report.insert(150, "4".into());
+        ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+        client.process_msgs(&mut observed);
+        assert_eq!(observed.statuses, ["PreSubmitted", "Cancelled"]);
+        assert!(observed.parents.is_empty());
+        assert_eq!(observed.ends, 1);
+        client.disconnect();
+    }
+
+    #[test]
+    fn explicit_parent_clear_does_not_reuse_previous_parent() {
+        for value in ["", "0", "not-a-parent"] {
+            let (mut ccp, mut context, shared) = ord_status_test_state();
+            let mut report = exec_report_frame(&[(20, "3"), (39, "A"), (150, "A"), (6107, "15.0")]);
+            ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+            assert_eq!(
+                shared.orders.get_order_info(42).unwrap().order.parent_id,
+                15
+            );
+            report.insert(6107, value.into());
+            ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+            assert_eq!(shared.orders.get_order_info(42).unwrap().order.parent_id, 0);
+            assert_eq!(
+                shared
+                    .orders
+                    .drain_order_updates()
+                    .last()
+                    .unwrap()
+                    .parent_id,
+                0
+            );
+            report.remove(&6107);
+            ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+            assert_eq!(shared.orders.get_order_info(42).unwrap().order.parent_id, 0);
+        }
+    }
+
+    #[test]
+    fn sparse_parent_never_inherits_from_another_broker_order_with_the_same_local_key() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        let mut report = exec_report_frame(&[(20, "3"), (39, "A"), (150, "A"), (6107, "15.0")]);
+        ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+        assert_eq!(
+            shared.orders.get_order_info(42).unwrap().order.parent_id,
+            15
+        );
+        context.recovered_keys.insert(99, 42);
+        context.last_clord.insert(42, "99.0".into());
+        report.insert(11, "99.0".into());
+        report.insert(20, "0".into());
+        report.remove(&6107);
+        ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+        let info = shared.orders.get_order_info(42).unwrap();
+        assert_eq!(info.order.perm_id, 99);
+        assert_eq!(info.order.parent_id, 0);
+        assert!(!info.parent_id_known);
+        assert_eq!(
+            shared
+                .orders
+                .drain_order_updates()
+                .last()
+                .unwrap()
+                .parent_id,
+            0
+        );
+    }
+
+    #[test]
     fn ord_status_new_unrouted_is_presubmitted() {
         let (mut ccp, mut context, shared) = ord_status_test_state();
         // 39=0, no ExDestination, exec ref "NONE" — waiting, not yet routed.
@@ -4799,6 +5239,43 @@ mod tests {
         assert_eq!(context.finished_status(1626578655), Some(crate::types::OrderStatus::Cancelled));
         let info = shared.orders.get_order_info(1626578655).unwrap();
         assert_eq!(info.order_state.status, "Cancelled");
+        assert_eq!(info.contract.con_id, 265598);
+        assert_eq!(info.order.total_quantity, 1.0);
+        assert_eq!(info.order.lmt_price, 509.62);
+        assert_eq!(info.order.account, "DU1");
+        assert_eq!(info.order.parent_id, 1626578654);
+        assert_eq!(info.order.oca_group, "1626578654");
+
+        // The same captured status-only response must not erase later known
+        // amended terms, a reference, or cumulative fills. An explicit
+        // contradictory reference is still surfaced, never hidden by retention.
+        let mut amended = info.clone();
+        amended.order.lmt_price = 510.0;
+        amended.order.filled_quantity = 0.5;
+        amended.order.order_ref = "known-child-reference".into();
+        shared.orders.push_order_info(1626578655, amended);
+        ccp.process_ccp_message(&answer, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        let retained = shared.orders.get_order_info(1626578655).unwrap();
+        assert_eq!(retained.order.lmt_price, 510.0);
+        assert_eq!(retained.order.filled_quantity, 0.5);
+        assert_eq!(retained.order.order_ref, "known-child-reference");
+        assert_eq!(retained.order.parent_id, 1626578654);
+        assert_eq!(retained.order.oca_group, "1626578654");
+        let mut contradictory = fix::fix_parse(&answer);
+        contradictory.insert(6010, "different-reference".into());
+        contradictory.insert(6107, "0".into());
+        contradictory.insert(583, String::new());
+        ccp.handle_exec_report(&contradictory, &mut context, &shared, &None, "DU1");
+        let explicit = shared.orders.get_order_info(1626578655).unwrap();
+        assert_eq!(explicit.order.order_ref, "different-reference");
+        assert_eq!(explicit.order.parent_id, 0);
+        assert!(explicit.order.oca_group.is_empty());
+        let mut unknown_parent = explicit;
+        unknown_parent.parent_id_known = false;
+        shared.orders.push_order_info(1626578655, unknown_parent);
+        ccp.process_ccp_message(&answer, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        assert!(!shared.orders.get_order_info(1626578655).unwrap().parent_id_known,
+            "NoSuchOrder is not a full snapshot establishing a missing parent link");
     }
 
     // ibx#252: a refused cancel of a working order changes neither its

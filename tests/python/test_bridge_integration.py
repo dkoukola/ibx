@@ -630,6 +630,9 @@ class TestReqCompletedOrdersOrderState:
             commission_and_fees=2.50,
         )
         c.req_completed_orders(False)
+        assert not any(e[0].startswith("completed_order") for e in w.events)
+        c._test_publish_completed_history(None)
+        c._test_dispatch_once()
 
         completed_events = [e for e in w.events if e[0] == "completed_order"]
         assert len(completed_events) == 1, f"expected 1 completed_order, got {completed_events}"

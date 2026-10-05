@@ -863,6 +863,18 @@ impl OrderKind {
     }
 }
 
+/// One priced leg of a native protected bracket. `price` is a limit price
+/// for entry/take-profit legs and a trigger price for the stop-loss leg.
+/// The bracket supplies parent links and OCA type 3; other attributes are
+/// retained independently for each leg and can be reused for a later Modify.
+#[derive(Debug, Clone)]
+pub struct ProtectedOrderLeg {
+    pub order_id: OrderId,
+    pub price: Price,
+    pub tif: u8,
+    pub attrs: OrderAttrs,
+}
+
 /// Order request sent via control channel, processed by engine.
 #[derive(Debug, Clone)]
 pub enum OrderRequest {
@@ -1025,6 +1037,23 @@ pub enum OrderRequest {
         entry_price: Price,
         take_profit: Price,
         stop_loss: Price,
+    },
+    /// Limit entry, mandatory stop, and optional take-profit with independent
+    /// leg attributes. Parent/OCA links are assigned by the encoder. Combos
+    /// are not supported. If outside-RTH cannot be honored for any leg, the
+    /// whole request is refused before sending the entry.
+    ///
+    /// Use with Guarded to prepare every frame before one authorization at
+    /// the first socket write. This is NOT broker atomicity or transmit=false
+    /// staging: the server may process the parent before its children.
+    SubmitProtectedBracket {
+        instrument: InstrumentId,
+        side: Side,
+        /// Whole units, like SubmitEx (not QTY_SCALE fixed-point).
+        qty: u32,
+        entry: Box<ProtectedOrderLeg>,
+        stop_loss: Box<ProtectedOrderLeg>,
+        take_profit: Option<Box<ProtectedOrderLeg>>,
     },
     /// Extended limit order with optional attributes (display size, hidden, GAT, GTD).
     SubmitLimitEx {
@@ -1303,6 +1332,7 @@ impl OrderRequest {
             | Self::SubmitAdjustableStop { order_id, .. }
             | Self::SubmitEx { order_id, .. } => *order_id,
             Self::SubmitBracket { parent_id, .. } => *parent_id,
+            Self::SubmitProtectedBracket { entry, .. } => entry.order_id,
             Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.order_id(),
         }
     }
@@ -1311,6 +1341,9 @@ impl OrderRequest {
     /// cancel or a replace, the three orders of a bracket.
     pub fn new_order_ids(&self) -> Vec<OrderId> {
         match self {
+            Self::SubmitProtectedBracket { entry, stop_loss, take_profit, .. } =>
+                std::iter::once(entry.order_id).chain(std::iter::once(stop_loss.order_id))
+                    .chain(take_profit.iter().map(|leg| leg.order_id)).collect(),
             Self::SubmitBracket { parent_id, tp_id, sl_id, .. } => vec![*parent_id, *tp_id, *sl_id],
             Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.new_order_ids(),
             _ if self.new_order_qty().is_some() => vec![self.order_id()],
@@ -1325,6 +1358,7 @@ impl OrderRequest {
             Self::Cancel { .. } | Self::CancelAll { .. } | Self::GlobalCancel | Self::Modify { .. } => None,
             Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.new_order_qty(),
             Self::SubmitLimitFractional { qty, .. } => Some(*qty),
+            Self::SubmitProtectedBracket { qty, .. } => Some(*qty as Qty * QTY_SCALE),
             Self::SubmitLimit { qty, .. }
             | Self::SubmitMarket { qty, .. }
             | Self::SubmitStop { qty, .. }
@@ -1409,7 +1443,8 @@ impl OrderRequest {
             | Self::SubmitLimitFractional { instrument, .. }
             | Self::SubmitAdjustableStop { instrument, .. }
             | Self::SubmitEx { instrument, .. }
-            | Self::SubmitBracket { instrument, .. } => Some(*instrument),
+            | Self::SubmitBracket { instrument, .. }
+            | Self::SubmitProtectedBracket { instrument, .. } => Some(*instrument),
             Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.instrument(),
         }
     }
@@ -1419,6 +1454,7 @@ impl OrderRequest {
     /// modify, a cancel-all and a global cancel.
     pub fn new_order_instrument_mut(&mut self) -> Option<&mut InstrumentId> {
         match self {
+            Self::SubmitProtectedBracket { instrument, .. } => Some(instrument),
             Self::Cancel { .. } | Self::Modify { .. } | Self::CancelAll { .. } | Self::GlobalCancel => None,
             Self::SubmitLimit { instrument, .. }
             | Self::SubmitMarket { instrument, .. }
@@ -1487,6 +1523,7 @@ impl OrderRequest {
     /// None for a cancel or a replace. A bracket gives its parent's side.
     pub fn new_order_side(&self) -> Option<(Side, Option<&OrderAttrs>)> {
         match self {
+            Self::SubmitProtectedBracket { side, entry, .. } => Some((*side, Some(&entry.attrs))),
             Self::Cancel { .. } | Self::CancelAll { .. } | Self::GlobalCancel | Self::Modify { .. } => None,
             Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => {
                 request.new_order_side()
@@ -1581,6 +1618,18 @@ impl OrderRequest {
             Self::SubmitBracket { parent_id, tp_id, sl_id, entry_price, take_profit, stop_loss, .. } => {
                 return [(*parent_id, [*entry_price, 0]), (*tp_id, [*take_profit, 0]), (*sl_id, [0, *stop_loss])]
                     .into_iter().find(|(_, prices)| off(prices)).map(|(id, _)| id);
+            }
+            Self::SubmitProtectedBracket {
+                entry,
+                stop_loss,
+                take_profit,
+                ..
+            } => {
+                return std::iter::once(entry)
+                    .chain(std::iter::once(stop_loss))
+                    .chain(take_profit.iter())
+                    .find(|leg| off(&[leg.price]))
+                    .map(|leg| leg.order_id);
             }
         };
         off(&checked.1).then_some(checked.0)
@@ -1983,6 +2032,14 @@ pub struct ContractLookup {
 /// Commands sent from the control plane to the hot loop via SPSC channel.
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
+    /// A fresh, isolated STANDARD completed-order history query. The connection
+    /// is the U72 request identity captured when the caller requested it.
+    RequestCompletedOrders {
+        connection: String,
+        api_only: bool,
+        start: String,
+        end: String,
+    },
     /// A historical-data request for a contract with no conId (ibx#427):
     /// the contract is looked up first. With exactly one contract found,
     /// `request` is sent with its conId; otherwise the request gets error

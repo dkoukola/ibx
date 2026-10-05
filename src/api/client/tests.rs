@@ -4757,6 +4757,7 @@ fn execution_history_loss_after_capture_prevents_the_first_reply_callback() {
 /// pm0925-fill-BUY, time 20260925-08:49:54 UTC, routed to ARCA.
 fn captured_fill_exec() -> crate::bridge::FillExec {
     crate::bridge::FillExec {
+        stale_order_state: false,
         exec_id: "0000e0d5.6ab5f36f.01.01".into(),
         time_secs: Some(1790326194),
         exchange: "ARCA".into(),
@@ -4776,6 +4777,37 @@ impl Wrapper for ExecRecorder {
     fn exec_details(&mut self, req_id: i64, _c: &Contract, e: &crate::api::types::Execution) {
         self.execs.push((req_id, e.clone()));
     }
+}
+
+#[test]
+fn stale_print_delivers_execution_without_completing_newer_working_order() {
+    #[derive(Default)]
+    struct Recorder { executions: usize, statuses: usize, opens: usize }
+    impl Wrapper for Recorder {
+        fn exec_details(&mut self, _: i64, _: &Contract, _: &crate::api::types::Execution) { self.executions += 1; }
+        fn open_order(&mut self, _: i64, _: &Contract, _: &Order, _: &crate::api::types::OrderState) { self.opens += 1; }
+        fn order_status(&mut self, _: i64, _: &str, _: f64, _: f64, _: f64, _: i64, _: i64, _: f64, _: i64, _: &str, _: f64) {
+            self.statuses += 1;
+        }
+    }
+    let (client, _rx, shared) = test_client();
+    client.core.track_order(7, spy(), Order {
+        order_id: 7, action: "BUY".into(), total_quantity: 3.0,
+        order_type: "LMT".into(), lmt_price: 2.0, ..Default::default()
+    }, 0);
+    let mut fill = aapl_fill(7);
+    fill.remaining_fixed = 0; // The old one-share revision had finished.
+    shared.orders.push_fill_with_exec(fill, crate::bridge::FillExec {
+        stale_order_state: true, ..captured_fill_exec()
+    });
+    let mut recorder = Recorder::default();
+    client.process_msgs(&mut recorder);
+    assert_eq!(recorder.executions, 1);
+    assert_eq!(recorder.statuses, 0);
+    assert_eq!(recorder.opens, 0);
+    let rows = client.core.prepare_open_orders(&shared).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.order.total_quantity, 3.0);
 }
 
 #[test]

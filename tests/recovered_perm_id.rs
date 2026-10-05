@@ -131,6 +131,11 @@ fn recovered_perm_id_matches_recorded_status_and_cancel_version() {
         let expected = reference_status(LIMIT, api_sequence);
         assert_eq!(expected, (1, 1_339_547_414));
         engine.inject_ccp_message(&record(LIMIT, fix_sequence, "fix_in"));
+        if fix_sequence == 2366 {
+            // The ACK has no parent metadata; its captured full status
+            // establishes that this recovered order is a root.
+            engine.inject_ccp_message(&record(LIMIT, 2360, "fix_in"));
+        }
         client.process_msgs(&mut observed);
         assert_eq!(
             shared
@@ -150,7 +155,15 @@ fn recovered_perm_id_matches_recorded_status_and_cancel_version() {
             assert_eq!(observed.statuses.last(), Some(&expected));
         }
     }
-    client.req_completed_orders(&mut observed);
+    // Fresh completed queries no longer read the live archive. Inject a
+    // separately completed broker answer to exercise callback identity.
+    shared.orders.begin_execution_history("fixture");
+    shared.orders.complete_execution_history("fixture");
+    shared.orders.push_completed_history_reply(ibx::bridge::CompletedHistoryReply {
+        connection: "fixture".into(),
+        result: Ok(vec![shared.orders.get_order_info(1).unwrap()]),
+    });
+    client.process_msgs(&mut observed);
     assert_eq!(observed.completed.len(), 1);
     assert_eq!(observed.completed[0].perm_id, 1_339_547_414);
 }
@@ -163,6 +176,9 @@ fn recovered_bracket_perm_ids_are_broker_ids_not_local_aliases() {
         let expected = reference_status(BRACKET, api_sequence);
         assert_ne!(expected.0, expected.1);
         engine.inject_ccp_message(&record(BRACKET, fix_sequence, "fix_in"));
+        if fix_sequence == 2642 {
+            engine.inject_ccp_message(&record(BRACKET, 2627, "fix_in"));
+        }
         client.process_msgs(&mut observed);
         assert_eq!(
             shared

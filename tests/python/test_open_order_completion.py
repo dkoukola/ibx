@@ -23,6 +23,32 @@ def connected(reports):
     return client
 
 
+def test_stale_print_delivers_execution_without_completing_newer_order():
+    class Prints(Orders):
+        def __init__(self):
+            super().__init__()
+            self.executions = []
+            self.statuses = []
+
+        def exec_details(self, request_id, contract, execution):
+            self.executions.append(execution)
+
+        def order_status(self, *args):
+            self.statuses.append(args)
+
+    reports = Prints()
+    client = connected(reports)
+    client._test_track_order(7, 0, "AAA", "BUY", 3.0, 100.0)
+    client._test_push_fill(0, 7, "BUY", 99.0, 1, 0, stale_order_state=True)
+    client._test_dispatch_once()
+    assert len(reports.executions) == 1
+    assert reports.rows == [] and reports.statuses == []
+    client.req_open_orders()
+    client._test_dispatch_once()
+    assert len(reports.rows) == 1 and reports.rows[0][1] != "Filled"
+    client.disconnect()
+
+
 def test_open_order_reply_drains_terminal_status_even_after_wire_end():
     reports = Orders()
     client = connected(reports)
@@ -105,4 +131,37 @@ def test_open_order_queued_requests_do_not_survive_engine_stop():
     client._test_dispatch_once()
     assert reports.rows == [] and reports.ends == 0
     assert not client.is_connected()
+    client.disconnect()
+
+
+def test_native_partial_parent_waits_then_preserves_child_snapshot_identity():
+    class Children(Orders):
+        def open_order(self, order_id, contract, order, state):
+            self.rows.append((order_id, order.parent_id, order.oca_group, order.order_ref))
+
+    reports = Children()
+    client = EClient(reports)
+    client._test_connect()
+    client._test_push_parent_row(8, 0, False, "PreSubmitted")
+    client.req_open_orders()
+    client._test_dispatch_once()
+    assert reports.rows == [] and reports.ends == 0
+    client._test_push_parent_row(8, 7, True, "PreSubmitted")
+    client._test_dispatch_once()
+    assert reports.rows == [(8, 7, "bracket-group", "child-ref")]
+    assert reports.ends == 1
+    client.disconnect()
+
+
+def test_native_partial_terminal_row_does_not_hold_snapshot_end():
+    reports = Orders()
+    client = EClient(reports)
+    client._test_connect()
+    client._test_push_parent_row(8, 0, False, "PreSubmitted")
+    client.req_open_orders()
+    client._test_dispatch_once()
+    assert reports.ends == 0
+    client._test_push_parent_row(8, 0, False, "Cancelled")
+    client._test_dispatch_once()
+    assert reports.rows == [] and reports.ends == 1
     client.disconnect()

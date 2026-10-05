@@ -6,6 +6,26 @@ use crate::bridge::{ComboView, RichOrderInfo};
 use crate::engine::context::TrailLimitReported;
 use crate::types::{Order, OrderStatus, PRICE_SCALE, Side};
 use std::collections::HashMap;
+
+pub(super) fn report_revision(fields: &HashMap<u32, String>) -> Option<u32> {
+    let clord = fields.get(&11)?;
+    clord.split_once('.').map_or(Some(0), |(_, version)| version.parse().ok())
+}
+
+pub(super) fn report_time(fields: &HashMap<u32, String>) -> Option<&str> {
+    fields.get(&6699).or_else(|| fields.get(&60)).or_else(|| fields.get(&52)).map(String::as_str)
+}
+
+/// Native dR checks event time before ClOrd revision; only a cancellation may
+/// carry an older revision. This admits order state, never execution accounting.
+pub(super) fn stale_report(
+    version: Option<u32>, time: Option<&str>,
+    previous_version: Option<u32>, previous_time: Option<&str>, cancelled: bool,
+) -> bool {
+    matches!((time, previous_time), (Some(time), Some(previous)) if time < previous)
+        || (!cancelled && matches!((version, previous_version), (Some(version), Some(previous)) if version < previous))
+}
+
 pub(super) struct ReportProjection<'a> {
     pub order_id: i64,
     pub parent_id: i64,
@@ -242,6 +262,8 @@ pub(super) fn project_report(
         lmt_price: limit_price,
         aux_price: stop_px,
         tif: tif_str.to_string(),
+        good_till_date: parsed.get(&126).map(|time| format!("{} UTC", time.replace('-', " ")))
+            .or_else(|| parsed.get(&432).cloned()).unwrap_or_default(),
         account: if account.is_empty() {
             account_id.to_string()
         } else {
@@ -333,6 +355,10 @@ pub(super) fn project_report(
         order,
         order_state,
         last_exec,
+        parent_id_known: parsed.contains_key(&6107)
+            || parsed.get(&20).is_some_and(|value| value == "3"),
+        report_revision: report_revision(parsed),
+        report_time: report_time(parsed).map(str::to_owned),
     }
 }
 

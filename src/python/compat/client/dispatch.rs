@@ -177,21 +177,54 @@ impl EClient {
 
     /// open_order for an order after a server report (ibx#473).
     fn send_open_order(&self, py: Python<'_>, order_id: OrderId, view: &crate::client_core::OrderView) -> PyResult<()> {
+        self.send_order_view(py, order_id, view, false)
+    }
+
+    fn send_order_view(&self, py: Python<'_>, order_id: OrderId, view: &crate::client_core::OrderView, completed: bool) -> PyResult<()> {
         // A combo's contract with its legs (ibx#470).
         let c = Contract::from_api(py, &view.contract)?;
         // The order as the Rust client's openOrder shows it (ibx#487), a
         // combo's per-leg prices and routing with it (ibx#470).
         let mut o = Order::from_api(py, &view.order)?;
         o.order_id = order_id;
-        let mut state = OrderState::default();
-        state.status = view.state.status.clone();
-        state.commission_and_fees = view.state.commission_and_fees;
-        state.completed_time = view.state.completed_time.clone();
-        state.completed_status = view.state.completed_status.clone();
+        let state = OrderState::from_api(py, &view.state)?;
         let c_py = Py::new(py, c)?.into_any();
         let o_py = Py::new(py, o)?.into_any();
         let state_py = Py::new(py, state)?.into_any();
-        call_wrapper!(self.wrapper, py, "open_order", (order_id, &c_py, &o_py, &state_py));
+        if completed {
+            call_wrapper!(self.wrapper, py, "completed_order", (&c_py, &o_py, &state_py));
+        } else {
+            call_wrapper!(self.wrapper, py, "open_order", (order_id, &c_py, &o_py, &state_py));
+        }
+        Ok(())
+    }
+
+    fn dispatch_completed_history(&self, py: Python<'_>, shared: &Arc<SharedState>) -> PyResult<()> {
+        for reply in shared.orders.drain_completed_history_replies() {
+            let current = || self.position_client_current(shared)
+                && shared.orders.execution_history_matches(&reply.connection);
+            let rows = match reply.result {
+                Ok(rows) => rows,
+                Err(message) => {
+                    call_wrapper!(self.wrapper, py, "error", (-1, 10159, message.as_str(), ""));
+                    continue;
+                }
+            };
+            for row in rows {
+                if !current() { break; }
+                let order_id = row.order.order_id;
+                let view = crate::client_core::OrderView {
+                    contract: row.contract, order: row.order, state: row.order_state,
+                    last_fill_price: 0.0, client_id: 0,
+                };
+                self.send_order_view(py, order_id, &view, true)?;
+            }
+            if current() {
+                call_wrapper!(self.wrapper, py, "completed_orders_end", ());
+            } else {
+                call_wrapper!(self.wrapper, py, "error", (-1, 10159, "Completed-order history connection changed during delivery", ""));
+            }
+        }
         Ok(())
     }
 
@@ -277,6 +310,7 @@ impl EClient {
         let open_history = shared.orders.execution_history_request();
         let released = self.core.released_open_orders(shared);
         let execution_requests = self.core.released_execution_requests(shared);
+        let retired = shared.orders.completed_retirement_candidates();
 
         // Drain fills -> execDetails + orderStatus. The commission report
         // comes later, from its own server frame (ibx#471).
@@ -369,6 +403,7 @@ impl EClient {
             if let Some(cr) = early_report {
                 self.send_commission_report(py, &cr)?;
             }
+            if fill_exec.stale_order_state { continue; }
 
             // The execution first, then openOrder and orderStatus for every
             // report of a known order, as the reference (ibx#473; captured
@@ -478,6 +513,8 @@ impl EClient {
                 callback_raised(py, "open_order", e)?;
             }
         }
+        self.dispatch_completed_history(py, shared)?;
+        shared.orders.retire_local_completed_orders(retired);
 
         // Requests that joined a subscription, and subscriptions the
         // server rejected (ibx#444, ibx#447).

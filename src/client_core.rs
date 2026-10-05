@@ -877,6 +877,14 @@ pub fn order_status_str(status: OrderStatus) -> &'static str {
     }
 }
 
+pub(crate) fn valid_completed_history_range(start: &str, end: &str) -> bool {
+    let parse = |value: &str| {
+        if value.len() != 17 { return None; }
+        jiff::civil::DateTime::strptime("%Y%m%d-%H:%M:%S", value).ok()
+    };
+    matches!((parse(start), parse(end)), (Some(start), Some(end)) if start <= end)
+}
+
 // ── Execution storage ──
 
 /// Buy or sell from an API side string: `BUY` / `BOT` buy, `SELL` / `SLD` /
@@ -3615,8 +3623,8 @@ impl ClientCore {
                 (t.contract, order, t.last_fill_price, client_id)
             }
             // An order the server reported: its own client id.
-            (None, Some(i)) => { let client_id = i.order.client_id as i64; (i.contract, i.order, 0.0, client_id) }
-            (None, None) => return None,
+            (None, Some(i)) if i.parent_id_known => { let client_id = i.order.client_id as i64; (i.contract, i.order, 0.0, client_id) }
+            (None, _) => return None,
         };
         let bag = contract.sec_type.eq_ignore_ascii_case("BAG");
         let mut contract = if contract.con_id != 0 && !bag {
@@ -3871,10 +3879,26 @@ impl ClientCore {
     /// Collect open orders: merge local tracking with shared state.
     /// Returns (order_id, contract, order, status, filled, remaining) for non-terminal orders.
     pub fn collect_open_orders(&self, shared: &SharedState) -> Vec<(OrderId, TrackedOrder)> {
+        self.collect_open_order_rows(shared, shared.orders.drain_open_orders(), false)
+            .expect("identity collection does not wait for parent metadata")
+    }
+
+    /// Prepare a coherent callback snapshot. A native order's first sparse
+    /// acknowledgement is not evidence that it has no parent. Keep the existing
+    /// request queued until the captured working rows have authoritative links.
+    pub(crate) fn prepare_open_orders(&self, shared: &SharedState) -> Option<Vec<(OrderId, TrackedOrder)>> {
+        self.collect_open_order_rows(shared, shared.orders.drain_open_orders(), true)
+    }
+
+    fn collect_open_order_rows(
+        &self,
+        shared: &SharedState,
+        shared_orders: Vec<(OrderId, crate::bridge::RichOrderInfo)>,
+        require_known_parent: bool,
+    ) -> Option<Vec<(OrderId, TrackedOrder)>> {
         let mut result: Vec<(OrderId, TrackedOrder)> = Vec::new();
 
-        // Drain shared order cache first to enrich local tracking
-        let shared_orders = shared.orders.drain_open_orders();
+        // Enrich local tracking from the same captured broker rows.
         {
             let mut orders = self.open_orders.lock().unwrap();
             for (oid, info) in &shared_orders {
@@ -3936,6 +3960,9 @@ impl ClientCore {
                 continue;
             }
             if !result.iter().any(|(id, _)| *id == oid) {
+                if require_known_parent && !info.parent_id_known {
+                    return None;
+                }
                 let contract = if info.contract.con_id != 0 {
                     shared.reference.get_contract(info.contract.con_id).unwrap_or(info.contract)
                 } else {
@@ -3955,7 +3982,7 @@ impl ClientCore {
             }
         }
 
-        result
+        Some(result)
     }
 
     /// The answer to an open-order request, as the reference lists it
@@ -3966,10 +3993,19 @@ impl ClientCore {
     /// (`jextend.cu.b(List)@149`: `pe.T() == clientId`). Each with the
     /// order id and client id the reference shows.
     pub fn open_orders_listing(&self, shared: &SharedState, request: OpenOrdersRequest) -> Vec<(OrderId, TrackedOrder, i64)> {
+        self.list_open_order_rows(shared, request, self.collect_open_orders(shared))
+    }
+
+    pub(crate) fn prepare_open_orders_listing(&self, shared: &SharedState, request: OpenOrdersRequest) -> Option<Vec<(OrderId, TrackedOrder, i64)>> {
+        let orders = self.prepare_open_orders(shared)?;
+        Some(self.list_open_order_rows(shared, request, orders))
+    }
+
+    fn list_open_order_rows(&self, shared: &SharedState, request: OpenOrdersRequest, orders: Vec<(OrderId, TrackedOrder)>) -> Vec<(OrderId, TrackedOrder, i64)> {
         let me = self.client_id.load(Ordering::Relaxed);
         let tracked: HashSet<OrderId> = self.open_orders.lock().unwrap().keys().copied().collect();
         let mut out: Vec<(OrderId, TrackedOrder, i64, (usize, u64))> = Vec::new();
-        for (oid, mut t) in self.collect_open_orders(shared) {
+        for (oid, mut t) in orders {
             let client_id = if tracked.contains(&oid) { me } else { t.order.client_id as i64 };
             if request == OpenOrdersRequest::Open && client_id != me {
                 continue;
@@ -6065,6 +6101,48 @@ mod tests {
         let once = ["All|Currency|USD|USD", "All|CashBalance|10.75|USD", "All|AccruedCash|2.00|USD",
             "All|Currency|BASE|BASE", "All|CashBalance|10.50|BASE", "All|AccruedCash|1.00|BASE", "end"];
         assert_eq!(lines, [once, once].concat());
+    }
+
+    #[test]
+    fn open_order_parent_readiness_uses_the_captured_rows_not_the_latest_cache() {
+        let core = ClientCore::new();
+        let shared = SharedState::new();
+        let mut info = crate::bridge::RichOrderInfo {
+            contract: ApiContract::default(),
+            order: ApiOrder { order_id: 7, perm_id: 7, ..Default::default() },
+            order_state: ApiOrderState { status: "PreSubmitted".into(), ..Default::default() },
+            last_exec: ApiExecution::default(),
+            parent_id_known: false,
+            report_revision: None,
+            report_time: None,
+        };
+        shared.orders.push_order_info(7, info.clone());
+        let captured = shared.orders.drain_open_orders();
+        info.parent_id_known = true;
+        info.order.parent_id = 6;
+        shared.orders.push_order_info(7, info);
+        assert!(core.collect_open_order_rows(&shared, captured, true).is_none());
+        let ready = core.prepare_open_orders(&shared).unwrap();
+        assert_eq!(ready[0].1.order.parent_id, 6);
+    }
+
+    #[test]
+    fn tracked_order_template_does_not_wait_for_parent_readiness() {
+        let core = ClientCore::new();
+        let shared = SharedState::new();
+        let order = ApiOrder { order_id: 7, parent_id: 6, total_quantity: 1.0, ..Default::default() };
+        core.track_order(7, ApiContract::default(), order, 0);
+        shared.orders.push_order_info(7, crate::bridge::RichOrderInfo {
+            contract: ApiContract::default(),
+            order: ApiOrder { order_id: 7, perm_id: 7, ..Default::default() },
+            order_state: ApiOrderState { status: "PreSubmitted".into(), ..Default::default() },
+            last_exec: ApiExecution::default(),
+            parent_id_known: false,
+            report_revision: None,
+            report_time: None,
+        });
+        assert_eq!(core.order_view(7, &shared, "PreSubmitted").unwrap().order.parent_id, 6);
+        assert_eq!(core.prepare_open_orders(&shared).unwrap()[0].1.order.parent_id, 6);
     }
 
     // ibx#251: a request is held only while the order replay is pending,

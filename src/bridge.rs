@@ -11,7 +11,7 @@
 //! - External callers read snapshots and poll events without blocking the hot loop.
 
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use std::collections::HashMap;
 use crate::control::historical::{HistoricalBar, HistoricalResponse, HeadTimestampResponse};
@@ -31,6 +31,19 @@ pub struct RichOrderInfo {
     pub order_state: api::OrderState,
     /// Last execution details from this order's exec reports.
     pub last_exec: api::Execution,
+    /// The broker established the parent link (including no parent). Sparse
+    /// acknowledgements can precede that metadata; this is not an all-terms flag.
+    pub parent_id_known: bool,
+    /// Native report authority, distinct from a locally requested modification.
+    pub report_revision: Option<u32>,
+    pub report_time: Option<String>,
+}
+
+/// A fresh broker-history answer, owned by the auth-link request that produced it.
+#[derive(Debug)]
+pub struct CompletedHistoryReply {
+    pub connection: String,
+    pub result: Result<Vec<RichOrderInfo>, String>,
 }
 
 /// What a fill report says about its execution, beyond the `Fill` numbers
@@ -38,6 +51,9 @@ pub struct RichOrderInfo {
 /// the same batch keep their own values.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FillExec {
+    /// The print is new accounting, but its order snapshot failed the native
+    /// revision/time guard. Dispatch executions without stale order callbacks.
+    pub stale_order_state: bool,
     /// Server execution id (tag 17).
     pub exec_id: String,
     /// Execution time, Unix seconds: tag 6699, else 60, else 52.
@@ -652,9 +668,10 @@ pub struct OrderState {
     order_notices: Mutex<Vec<(i64, i64, String)>>,
     error_tap: ErrorTap,
     what_if_responses: Mutex<Vec<WhatIfResponse>>,
-    completed_orders: Mutex<Vec<CompletedOrder>>,
+    completed_orders: Mutex<Vec<(CompletedOrder, Option<Arc<RichOrderInfo>>)>>,
+    completed_history_replies: Mutex<Vec<CompletedHistoryReply>>,
     /// Enriched order info from CCP exec reports (order_id -> RichOrderInfo).
-    order_cache: Mutex<HashMap<OrderId, RichOrderInfo>>,
+    order_cache: Mutex<HashMap<OrderId, Arc<RichOrderInfo>>>,
     /// Set from the logon, or from a lost auth link, to the end of the order
     /// replay of the logon: open-order requests wait for the replay (ibx#251).
     open_orders_held: AtomicBool,
@@ -697,6 +714,7 @@ impl OrderState {
             error_tap: ErrorTap::default(),
             what_if_responses: Mutex::new(Vec::with_capacity(8)),
             completed_orders: Mutex::new(Vec::with_capacity(64)),
+            completed_history_replies: Mutex::new(Vec::new()),
             order_cache: Mutex::new(HashMap::new()),
             open_orders_held: AtomicBool::new(false),
             login_orders_end: AtomicBool::new(false),
@@ -867,18 +885,51 @@ impl OrderState {
     }
 
     pub fn drain_completed_orders(&self) -> Vec<CompletedOrder> {
-        self.completed_orders.lock().unwrap().drain(..).collect()
+        self.completed_orders.lock().unwrap().drain(..).map(|(order, _)| order).collect()
+    }
+
+    #[doc(hidden)]
+    pub fn push_completed_history_reply(&self, reply: CompletedHistoryReply) {
+        self.completed_history_replies.lock().unwrap().push(reply);
+    }
+
+    #[doc(hidden)]
+    pub fn drain_completed_history_replies(&self) -> Vec<CompletedHistoryReply> {
+        self.completed_history_replies.lock().unwrap().drain(..).collect()
+    }
+
+    /// Take retirement candidates BEFORE draining live callbacks. Completion
+    /// publication follows its fill/status publication on the producer thread.
+    #[doc(hidden)]
+    pub fn completed_retirement_candidates(&self) -> Vec<(OrderId, Arc<RichOrderInfo>)> {
+        if self.completed_history_replies.lock().unwrap().is_empty() { return Vec::new(); }
+        self.completed_orders.lock().unwrap().drain(..)
+            .filter_map(|(order, info)| info.map(|info| (order.order_id, info))).collect()
+    }
+
+    /// Retire only the precise published snapshot whose preceding callbacks
+    /// were drained, never a later fill/reused-ID update racing with delivery.
+    #[doc(hidden)]
+    pub fn retire_local_completed_orders(&self, completed: Vec<(OrderId, Arc<RichOrderInfo>)>) {
+        let mut cache = self.order_cache.lock().unwrap();
+        for (id, published) in completed {
+            if cache.get(&id).is_some_and(|info| Arc::ptr_eq(info, &published)
+                && matches!(info.order_state.status.as_str(), "Filled" | "Cancelled" | "Inactive"))
+            {
+                cache.remove(&id);
+            }
+        }
     }
 
     /// Snapshot enriched entries whose latest status is an open IB state.
     /// Terminal entries (Filled / Cancelled / Inactive / etc.) are filtered out
     /// so `req_open_orders` does not leak historical orders that are still cached
-    /// for `req_completed_orders` lookups.
+    /// as local callback metadata, not as evidence for a fresh history query.
     pub fn drain_open_orders(&self) -> Vec<(OrderId, RichOrderInfo)> {
         let lock = self.order_cache.lock().unwrap();
         lock.iter()
             .filter(|(_, v)| crate::client_core::is_open_status(&v.order_state.status))
-            .map(|(&k, v)| (k, v.clone()))
+            .map(|(&k, v)| (k, (**v).clone()))
             .collect()
     }
 
@@ -900,7 +951,7 @@ impl OrderState {
 
     /// Get enriched order info by order_id.
     pub fn get_order_info(&self, order_id: OrderId) -> Option<RichOrderInfo> {
-        self.order_cache.lock().unwrap().get(&order_id).cloned()
+        self.order_cache.lock().unwrap().get(&order_id).map(|info| (**info).clone())
     }
 
     /// Remove an enriched entry. Called after a completed order has been
@@ -965,11 +1016,12 @@ impl OrderState {
     }
 
     #[doc(hidden)] pub fn push_completed_order(&self, order: CompletedOrder) {
-        self.completed_orders.lock().unwrap().push(order);
+        let info = self.order_cache.lock().unwrap().get(&order.order_id).cloned();
+        self.completed_orders.lock().unwrap().push((order, info));
     }
 
     #[doc(hidden)] pub fn push_order_info(&self, order_id: OrderId, info: RichOrderInfo) {
-        self.order_cache.lock().unwrap().insert(order_id, info);
+        self.order_cache.lock().unwrap().insert(order_id, Arc::new(info));
     }
 }
 

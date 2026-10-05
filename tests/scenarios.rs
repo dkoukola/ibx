@@ -948,37 +948,51 @@ fn mixed_all_data_types_single_process() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn req_completed_orders_drains_and_dispatches() {
-    let (client, _rx, shared) = test_client();
-
+fn req_completed_orders_requests_fresh_history_not_local_archive() {
+    let (client, rx, shared) = test_client();
+    shared.orders.begin_execution_history("today4");
+    shared.orders.complete_execution_history("today4");
     shared.orders.push_completed_order(CompletedOrder {
         order_id: 100, instrument: 0, status: OrderStatus::Filled,
-        filled_qty_fixed: (50) as i64 * ibx::types::QTY_SCALE, timestamp_ns: 1000,
+        filled_qty_fixed: 50 * QTY_SCALE, timestamp_ns: 1000,
     });
-    shared.orders.push_completed_order(CompletedOrder {
-        order_id: 200, instrument: 0, status: OrderStatus::Cancelled,
-        filled_qty_fixed: (0) as i64 * ibx::types::QTY_SCALE, timestamp_ns: 2000,
-    });
-
     let mut w = RecordingWrapper::default();
     client.req_completed_orders(&mut w);
-
-    assert_eq!(w.events.iter().filter(|e| *e == "completed_order").count(), 2);
-    assert!(w.events.iter().any(|e| e == "completed_orders_end"));
-
-    // Second call should return empty (already drained)
+    assert!(w.events.is_empty());
+    assert!(matches!(rx.recv().unwrap(), ControlCommand::RequestCompletedOrders { api_only: false, .. }));
+    client.process_msgs(&mut w);
+    assert!(w.events.is_empty(), "local archive is not a broker end");
+    shared.orders.push_completed_history_reply(ibx::bridge::CompletedHistoryReply {
+        connection: "today4".into(), result: Ok(Vec::new()),
+    });
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, vec!["completed_orders_end"]);
+    assert!(shared.orders.drain_completed_orders().is_empty(), "old local archive is retired");
     w.events.clear();
     client.req_completed_orders(&mut w);
-    assert_eq!(w.events.iter().filter(|e| *e == "completed_order").count(), 0);
-    assert!(w.events.iter().any(|e| e == "completed_orders_end"));
+    assert!(w.events.is_empty());
+    assert!(matches!(rx.recv().unwrap(), ControlCommand::RequestCompletedOrders { .. }));
 }
 
 #[test]
-fn req_completed_orders_empty_still_fires_end() {
-    let (client, _rx, _shared) = test_client();
+fn req_completed_orders_failure_or_connection_change_never_fires_end() {
+    let (client, _rx, shared) = test_client();
+    shared.orders.begin_execution_history("today4");
+    shared.orders.complete_execution_history("today4");
     let mut w = RecordingWrapper::default();
-    client.req_completed_orders(&mut w);
-    assert_eq!(w.events, vec!["completed_orders_end"]);
+    shared.orders.push_completed_history_reply(ibx::bridge::CompletedHistoryReply {
+        connection: "today4".into(), result: Err("timed out".into()),
+    });
+    client.process_msgs(&mut w);
+    assert!(!w.events.iter().any(|event| event == "completed_orders_end"));
+    shared.orders.push_completed_history_reply(ibx::bridge::CompletedHistoryReply {
+        connection: "today4".into(), result: Ok(Vec::new()),
+    });
+    shared.orders.begin_execution_history("today5");
+    shared.orders.complete_execution_history("today5");
+    w.events.clear();
+    client.process_msgs(&mut w);
+    assert!(!w.events.iter().any(|event| event == "completed_orders_end"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════

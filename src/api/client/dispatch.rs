@@ -51,6 +51,7 @@ impl EClient {
     // ── Order / Fill Dispatch ──
 
     fn dispatch_orders(&self, wrapper: &mut impl Wrapper) {
+        let retired = self.shared.orders.completed_retirement_candidates();
         // Open-order requests held while the auth link was lost: taken
         // before the order updates and answered after them, so the answer
         // has the replayed statuses (ibx#251).
@@ -121,6 +122,7 @@ impl EClient {
             if let Some(report) = self.core.push_execution(-1, c, exec, fill_exec.time_secs) {
                 wrapper.commission_and_fees_report(&report);
             }
+            if fill_exec.stale_order_state { continue; }
 
             // openOrder then orderStatus for every report of a known order
             // (ibx#473).
@@ -260,6 +262,8 @@ impl EClient {
                 self.answer_executions(&history, req_id, &filter, wrapper);
             }
         }
+        self.answer_completed_orders(wrapper);
+        self.shared.orders.retire_local_completed_orders(retired);
     }
 
     /// openOrder (not for a cancel) and orderStatus of an order update

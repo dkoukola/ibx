@@ -120,6 +120,7 @@ impl Default for Contract {
     }
 }
 
+
 #[pymethods]
 impl Contract {
     #[new]

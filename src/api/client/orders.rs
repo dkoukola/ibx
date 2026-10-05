@@ -235,7 +235,12 @@ impl EClient {
         history: Option<&str>,
         wrapper: &mut impl Wrapper,
     ) {
-        let orders = self.core.open_orders_listing(&self.shared, request);
+        let Some(orders) = self.core.prepare_open_orders_listing(&self.shared, request) else {
+            if self.is_connected() {
+                self.core.queue_open_orders(request);
+            }
+            return;
+        };
         if !self.open_order_snapshot_current(history) {
             if self.is_connected() {
                 self.core.queue_open_orders(request);
@@ -272,38 +277,62 @@ impl EClient {
 
     // ── Completed Orders ──
 
-    /// Request completed orders. Matches `reqCompletedOrders` in C++.
-    /// Immediately delivers all archived completed orders, then calls `completed_orders_end`.
+    /// Request today's completed orders from the broker, asynchronously.
+    /// Results arrive through `process_msgs`; failure never emits a successful end.
     pub fn req_completed_orders(&self, wrapper: &mut impl Wrapper) {
-        for order in self.shared.orders.drain_completed_orders() {
-            let status_str = crate::client_core::order_status_str(order.status);
-            if let Some(info) = self.shared.orders.get_order_info(order.order_id) {
-                let mut state = info.order_state;
-                state.status = status_str.into();
-                // Enrich contract with secdef cache at read time
-                let contract = if info.contract.con_id != 0 {
-                    self.core.get_contract(info.contract.con_id, &self.shared).unwrap_or(info.contract)
-                } else {
-                    info.contract
-                };
-                // The order as the reference shows it (its unset values).
-                let mut order = info.order;
-                crate::client_core::reported_unset_values(&mut order);
-                wrapper.completed_order(&contract, &order, &state);
-            } else {
-                let contract = Contract::default();
-                let api_order = Order { order_id: order.order_id, ..Default::default() };
-                let state = crate::api::types::OrderState {
-                    status: status_str.into(),
-                    ..Default::default()
-                };
-                wrapper.completed_order(&contract, &api_order, &state);
-            }
-            // Bound `order_cache` growth: terminal entries are no longer needed
-            // once delivered through `completed_order`.
-            self.shared.orders.remove_order_info(order.order_id);
+        self.req_completed_orders_filtered(false, wrapper);
+    }
+
+    /// Like `req_completed_orders`, optionally restricted to API-origin orders.
+    pub fn req_completed_orders_filtered(&self, api_only: bool, wrapper: &mut impl Wrapper) {
+        let end = crate::config::chrono_free_timestamp();
+        let start = format!("{}-00:00:00", &end[..8]);
+        self.req_completed_orders_range(&start, &end, api_only, wrapper);
+    }
+
+    /// Fresh completed-order history over an explicit inclusive UTC interval.
+    ///
+    /// Times must be `YYYYMMDD-HH:MM:SS`. The broker controls history retention;
+    /// this API does not claim the interval predates that retention boundary.
+    pub fn req_completed_orders_range(
+        &self, start: &str, end: &str, api_only: bool, wrapper: &mut impl Wrapper,
+    ) {
+        if !crate::client_core::valid_completed_history_range(start, end) {
+            wrapper.error(-1, 321, "Invalid completed-order UTC history interval", "");
+            return;
         }
-        wrapper.completed_orders_end();
+        let Some(connection) = self.shared.orders.execution_history_request().filter(|_| self.is_connected()) else {
+            wrapper.error(-1, 504, "Not connected", "");
+            return;
+        };
+        if let Err(message) = self.send(ControlCommand::RequestCompletedOrders {
+            connection, api_only, start: start.to_string(), end: end.to_string(),
+        }) {
+            wrapper.error(-1, 10159, &message, "");
+        }
+    }
+
+    pub(super) fn answer_completed_orders(&self, wrapper: &mut impl Wrapper) {
+        for reply in self.shared.orders.drain_completed_history_replies() {
+            let current = || self.is_connected()
+                && self.shared.orders.execution_history_matches(&reply.connection);
+            let rows = match reply.result {
+                Ok(rows) => rows,
+                Err(message) => {
+                    wrapper.error(-1, 10159, &message, "");
+                    continue;
+                }
+            };
+            for row in rows {
+                if !current() { break; }
+                wrapper.completed_order(&row.contract, &row.order, &row.order_state);
+            }
+            if current() {
+                wrapper.completed_orders_end();
+            } else {
+                wrapper.error(-1, 10159, "Completed-order history connection changed during delivery", "");
+            }
+        }
     }
 
     // ── Executions ──

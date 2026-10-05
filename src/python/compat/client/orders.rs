@@ -270,51 +270,30 @@ impl EClient {
         Ok(())
     }
 
-    /// Request completed orders.
+    /// Request today's completed orders from a fresh broker query.
     #[pyo3(signature = (api_only=false))]
     fn req_completed_orders(&self, py: Python<'_>, api_only: bool) -> PyResult<()> {
-        if let Some(r) = self.not_connected(-1) { return r; }
-        let _ = api_only;
-        if let Some(shared) = self.shared.lock().unwrap().clone() {
-            let completed = shared.orders.drain_completed_orders();
-            for co in &completed {
-                let status_str = crate::client_core::order_status_str(co.status);
-                let rich_info = shared.orders.get_order_info(co.order_id);
+        let end = crate::config::chrono_free_timestamp();
+        let start = format!("{}-00:00:00", &end[..8]);
+        self.req_completed_orders_range(py, &start, &end, api_only)
+    }
 
-                // Build OrderState iso with Rust API path (api/client/orders.rs:101-125):
-                // start from rich_info.order_state when available, override status with the
-                // canonical status_str, fall back to defaults otherwise.
-                let state = if let Some(info) = rich_info.as_ref() {
-                    let mut s = super::super::contract::OrderState::from_api(py, &info.order_state)?;
-                    s.status = status_str.into();
-                    s
-                } else {
-                    let mut s = super::super::contract::OrderState::default();
-                    s.status = status_str.into();
-                    s
-                };
-                let state_py = Py::new(py, state)?.into_any();
-
-                let tracked = self.core.open_orders.lock().unwrap().get(&co.order_id)
-                    .map(|o| (o.contract.clone(), o.order.clone()));
-                // The order as the reference shows it (its unset values).
-                if let Some((c, mut o)) = tracked.or_else(|| rich_info.map(|info| (info.contract, info.order))) {
-                    crate::client_core::reported_unset_values(&mut o);
-                    let c_py = Py::new(py, Contract::from_api(py, &c)?)?.into_any();
-                    let o_py = Py::new(py, Order::from_api(py, &o)?)?.into_any();
-                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, &state_py))?;
-                } else {
-                    let c_py = Py::new(py, Contract::default())?.into_any();
-                    let o_py = Py::new(py, Order::default())?.into_any();
-                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, &state_py))?;
-                }
-                // Bound `order_cache` growth: terminal entries are no longer
-                // needed once delivered through `completed_order`.
-                shared.orders.remove_order_info(co.order_id);
-            }
-            self.wrapper.call_method0(py, "completed_orders_end")?;
+    /// Fresh history over an inclusive UTC YYYYMMDD-HH:MM:SS interval.
+    #[pyo3(signature = (start, end, api_only=false))]
+    fn req_completed_orders_range(&self, py: Python<'_>, start: &str, end: &str, api_only: bool) -> PyResult<()> {
+        if let Some(result) = self.not_connected(-1) { return result; }
+        if !crate::client_core::valid_completed_history_range(start, end) {
+            self.wrapper.call_method1(py, "error", (-1, 321, "Invalid completed-order UTC history interval", ""))?;
+            return Ok(());
         }
-        Ok(())
+        let shared = self.shared_state()?;
+        let Some(connection) = shared.orders.execution_history_request() else {
+            self.wrapper.call_method1(py, "error", (-1, 504, "Not connected", ""))?;
+            return Ok(());
+        };
+        send_cmd(py, &self.tx()?, ControlCommand::RequestCompletedOrders {
+            connection, api_only, start: start.to_string(), end: end.to_string(),
+        })
     }
 }
 
@@ -413,7 +392,10 @@ impl EClient {
         request: crate::client_core::OpenOrdersRequest,
         history: Option<&str>,
     ) -> PyResult<()> {
-        let orders = self.core.open_orders_listing(shared, request);
+        let Some(orders) = self.core.prepare_open_orders_listing(shared, request) else {
+            self.requeue_open_orders_if_current(shared, request);
+            return Ok(());
+        };
         if !self.open_order_snapshot_current(shared, history) {
             self.requeue_open_orders_if_current(shared, request);
             return Ok(());

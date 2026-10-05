@@ -1,6 +1,7 @@
 pub mod farm;
 pub mod ccp;
 pub(crate) mod report;
+mod completed_history;
 pub mod hmds;
 pub(crate) mod pool;
 pub mod order_builder;
@@ -960,6 +961,10 @@ impl HotLoop {
             &mut self.ccp_conn, &mut self.context, &self.shared,
             &self.event_tx, &mut self.hb, &self.account_id,
         );
+        self.ccp.progress_completed_history(
+            &mut self.ccp_conn, &mut self.context, &self.shared,
+            &self.event_tx, &mut self.hb, &self.account_id,
+        );
         self.ccp.sweep_pending_schedule_pairs(&self.shared, &self.event_tx);
         self.ccp.sweep_scanner_enrichments(&self.shared);
         self.ccp.sweep_contract_details(&self.shared, &self.event_tx, &mut self.ccp_conn, &mut self.hb);
@@ -1414,6 +1419,9 @@ impl HotLoop {
             .collect();
         for cmd in cmds {
             match cmd {
+                ControlCommand::RequestCompletedOrders { connection, api_only, start, end } => {
+                    self.ccp.completed_history.queue(connection, api_only, start, end);
+                }
                 ControlCommand::Subscribe { con_id, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier, mode_9887, snapshot, reply_tx } => {
                     // No conId: resolved first, as the reference (ibx#278).
                     let key = (con_id != 0).then_some(con_id);

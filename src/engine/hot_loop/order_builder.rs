@@ -182,7 +182,7 @@ pub(crate) fn drain_and_send_orders(
         };
         if what_if && matches!(order_req, OrderRequest::Cancel { .. } | OrderRequest::CancelAll { .. }
             | OrderRequest::GlobalCancel | OrderRequest::Modify { .. } | OrderRequest::SubmitBracket { .. }
-            | OrderRequest::SubmitWhatIf { .. })
+            | OrderRequest::SubmitProtectedBracket { .. } | OrderRequest::SubmitWhatIf { .. })
         {
             log::warn!("What-if of order {} dropped: only a single new order can be previewed", oid);
             continue;
@@ -220,6 +220,24 @@ pub(crate) fn drain_and_send_orders(
             context.rth_parked.push(rewrap(order_req));
             continue;
         }
+        // Resolve every leg's metadata before admitting any of the batch.
+        // Reuse the ordinary extended encoder and its contract rules.
+        let protected = if matches!(order_req, OrderRequest::SubmitProtectedBracket { .. }) {
+            match prepare_protected_bracket(&order_req, context, conn, hb, shared) {
+                Ok(Some(legs)) => legs,
+                Ok(None) => {
+                    context.rth_parked.push(rewrap(order_req));
+                    continue;
+                }
+                Err((id, message)) => {
+                    shared.orders.push_order_error(id, 321, message.into());
+                    refuse_guard();
+                    continue;
+                }
+            }
+        } else {
+            Vec::new()
+        };
         // A quantity that is not whole: refused with 10243 and nothing
         // sent, as the reference refuses it for an API client (ib-agent#192
         // B3). Sent with the API client fields of every new order, it was
@@ -534,6 +552,44 @@ pub(crate) fn drain_and_send_orders(
             OrderRequest::SubmitEx { order_id, instrument, side, qty, kind, tif, attrs } => {
                 send_order_ex(conn, context, account_id, order_id, instrument, side, qty,
                     kind, tif, &attrs)
+            }
+            OrderRequest::SubmitProtectedBracket {
+                entry,
+                stop_loss,
+                take_profit,
+                ..
+            } => {
+                // Allocate all keys before the parent so its first frame
+                // identifies the same bracket as every child and replace.
+                context
+                    .brackets()
+                    .attach_child(entry.order_id, stop_loss.order_id);
+                if let Some(take_profit) = take_profit {
+                    context
+                        .brackets()
+                        .attach_child(entry.order_id, take_profit.order_id);
+                }
+                protected.into_iter().try_for_each(|(leg, price_mgmt)| {
+                    let OrderRequest::SubmitEx {
+                        order_id,
+                        instrument,
+                        side,
+                        qty,
+                        kind,
+                        tif,
+                        attrs,
+                    } = leg
+                    else {
+                        unreachable!("protected legs use the extended encoder")
+                    };
+                    context.price_mgmt_send = price_mgmt;
+                    if order_id != entry.order_id {
+                        context.short_sale_send = None;
+                    }
+                    send_order_ex(
+                        conn, context, account_id, order_id, instrument, side, qty, kind, tif, &attrs,
+                    )
+                })
             }
             OrderRequest::SubmitMarket { order_id, instrument, side, qty } => {
                 context.insert_order(crate::types::Order::new(
@@ -2131,8 +2187,14 @@ fn push_bracket_key(
     order_id: crate::types::OrderId,
     attrs: &crate::types::OrderAttrs,
 ) {
-    if attrs.parent_id <= 0 || context.what_if_send.is_some() { return; }
-    let key = context.brackets().attach_child(attrs.parent_id, order_id);
+    if context.what_if_send.is_some() { return; }
+    let key = if attrs.parent_id > 0 {
+        context.brackets().attach_child(attrs.parent_id, order_id)
+    } else if let Some(key) = context.bracket_keys.get(&order_id) {
+        *key
+    } else {
+        return;
+    };
     fields.push((6531, key.to_string()));
 }
 
@@ -2953,9 +3015,118 @@ fn request_order_ids(req: &OrderRequest) -> Vec<crate::types::OrderId> {
             sl_id,
             ..
         } => vec![*parent_id, *tp_id, *sl_id],
+        OrderRequest::SubmitProtectedBracket {
+            entry,
+            stop_loss,
+            take_profit,
+            ..
+        } => std::iter::once(entry.order_id)
+            .chain(std::iter::once(stop_loss.order_id))
+            .chain(take_profit.iter().map(|leg| leg.order_id))
+            .collect(),
         OrderRequest::CancelAll { .. } | OrderRequest::GlobalCancel => Vec::new(),
         other => vec![other.order_id()],
     }
+}
+
+/// Fully resolve an ordinary bracket before signing any entry bytes. A
+/// protected request must not silently lose a requested session attribute.
+type PreparedProtectedBracket = Result<Option<Vec<(OrderRequest, bool)>>, (OrderId, &'static str)>;
+
+fn prepare_protected_bracket(
+    req: &OrderRequest,
+    context: &mut Context,
+    conn: &mut Connection,
+    hb: &mut HeartbeatState,
+    shared: &Arc<SharedState>,
+) -> PreparedProtectedBracket {
+    use crate::types::OrderKind;
+    let OrderRequest::SubmitProtectedBracket {
+        instrument,
+        side,
+        qty,
+        entry,
+        stop_loss,
+        take_profit,
+    } = req
+    else {
+        unreachable!("only protected brackets are prepared here")
+    };
+    let ids = request_order_ids(req);
+    if *qty == 0
+        || ids
+            .iter()
+            .enumerate()
+            .any(|(i, id)| *id <= 0 || ids[..i].contains(id))
+    {
+        return Err((
+            entry.order_id,
+            "protected bracket requires positive quantity and distinct positive order IDs",
+        ));
+    }
+    let exit_side = match side {
+        Side::Buy => Side::Sell,
+        Side::Sell | Side::ShortSell => Side::Buy,
+    };
+    let mut prepared = Vec::with_capacity(ids.len());
+    for (leg, kind, side, parent_id) in
+        std::iter::once((entry, OrderKind::Limit { price: entry.price }, *side, 0))
+            .chain(std::iter::once((
+                stop_loss,
+                OrderKind::Stop {
+                    stop_price: stop_loss.price,
+                },
+                exit_side,
+                entry.order_id,
+            )))
+            .chain(take_profit.iter().map(|leg| {
+                (
+                    leg,
+                    OrderKind::Limit { price: leg.price },
+                    exit_side,
+                    entry.order_id,
+                )
+            }))
+    {
+        if leg.attrs.combo.is_some() {
+            return Err((
+                leg.order_id,
+                "protected bracket does not support combo orders",
+            ));
+        }
+        let mut attrs = leg.attrs.clone();
+        attrs.parent_id = parent_id;
+        attrs.oca_group = 0;
+        attrs.oca_group_str.clear();
+        attrs.oca_type = if parent_id == 0 { 0 } else { 3 };
+        let mut request = OrderRequest::SubmitEx {
+            order_id: leg.order_id,
+            instrument: *instrument,
+            side,
+            qty: *qty,
+            kind,
+            tif: leg.tif,
+            attrs,
+        };
+        if !apply_outside_rth(&mut request, context, conn, hb, shared) {
+            return Ok(None);
+        }
+        if request
+            .new_order_side()
+            .and_then(|(_, attrs)| attrs)
+            .is_some_and(|attrs| attrs.outside_rth != leg.attrs.outside_rth)
+        {
+            return Err((
+                leg.order_id,
+                "protected bracket outside-RTH requirement cannot be honored",
+            ));
+        }
+        let Some(price_mgmt) = price_mgmt_flag(&request, context, conn, hb) else {
+            return Ok(None);
+        };
+        prepared.push((request, price_mgmt));
+    }
+    Ok(Some(prepared))
 }
 
 /// The OCA group of a new order, None when it has none.
@@ -3846,6 +4017,296 @@ mod tests {
             qty: 1,
             price: 100 * P,
         }
+    }
+
+    fn protected_bracket(take_profit: bool) -> OrderRequest {
+        let leg = |id, price, tif, reference: &str| crate::types::ProtectedOrderLeg {
+            order_id: id,
+            price,
+            tif,
+            attrs: crate::types::OrderAttrs {
+                order_ref: reference.into(),
+                ..Default::default()
+            },
+        };
+        OrderRequest::SubmitProtectedBracket {
+            instrument: 0,
+            side: Side::Buy,
+            qty: 2,
+            entry: Box::new(leg(10, 100 * P, b'0', "entry")),
+            stop_loss: Box::new(leg(11, 90 * P, b'1', "stop")),
+            take_profit: take_profit.then(|| Box::new(leg(12, 110 * P, b'1', "profit"))),
+        }
+    }
+
+    #[test]
+    fn protected_bracket_preserves_independent_legs_and_optional_profit() {
+        for take_profit in [false, true] {
+            let frames = wire_frames(
+                protected_bracket(take_profit),
+                if take_profit { 3 } else { 2 },
+            );
+            assert_eq!(tag(&frames[0], 6010), Some("entry"));
+            assert_eq!(tag(&frames[0], 44), Some("100.00"));
+            assert_eq!(tag(&frames[0], 59), Some("0"));
+            assert_eq!(tag(&frames[0], 54), Some("1"));
+            assert!(tag(&frames[0], 6107).is_none());
+            assert!(tag(&frames[0], 583).is_none());
+            assert_eq!(tag(&frames[1], 6010), Some("stop"));
+            assert_eq!(tag(&frames[1], 40), Some("3"));
+            assert_eq!(tag(&frames[1], 99), Some("90.00"));
+            assert_eq!(tag(&frames[1], 6117), Some("90.00"));
+            if take_profit {
+                assert_eq!(tag(&frames[2], 6010), Some("profit"));
+                assert_eq!(tag(&frames[2], 40), Some("2"));
+                assert_eq!(tag(&frames[2], 44), Some("110.00"));
+            }
+            let parent_key = key_of(&frames[0]).unwrap();
+            assert_eq!(parent_key.child, 0);
+            for (i, frame) in frames.iter().enumerate() {
+                assert_eq!(tag(frame, 38), Some("2"));
+                let key = key_of(frame).unwrap();
+                assert_eq!((key.group, key.rgb), (parent_key.group, parent_key.rgb));
+                assert_eq!(key.child, i as u32);
+                if i > 0 {
+                    assert_eq!(tag(frame, 54), Some("2"));
+                    assert_eq!(tag(frame, 59), Some("1"));
+                    assert_eq!(tag(frame, 6107), Some("10.0"));
+                    assert_eq!(tag(frame, 583), Some("10"));
+                    assert_eq!(tag(frame, 6209), Some(BRACKET_CHILD_OCA_TYPE));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn protected_bracket_short_entry_exits_buy_without_short_sale_attributes() {
+        for side in [Side::Sell, Side::ShortSell] {
+            let mut request = protected_bracket(true);
+            if let OrderRequest::SubmitProtectedBracket {
+                side: entry_side,
+                entry,
+                ..
+            } = &mut request
+            {
+                *entry_side = side;
+                entry.attrs.clearing_intent = "Away".into();
+                entry.attrs.short_sale.slot = 1;
+            }
+            let frames = wire_frames(request, 3);
+            assert_eq!(tag(&frames[0], 54), Some(fix_side(side)));
+            if side == Side::ShortSell {
+                assert_eq!(tag(&frames[0], 6086), Some("1"));
+            }
+            for frame in &frames[1..] {
+                assert_eq!(tag(frame, 54), Some("1"));
+                assert!(tag(frame, 6086).is_none());
+                assert!(tag(frame, 114).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_protected_bracket_refuses_bad_third_leg_before_authorization() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        for combo in [false, true] {
+            let (mut context, shared, mut conn, mut server) = guarded_fixture();
+            let mut request = protected_bracket(true);
+            if let OrderRequest::SubmitProtectedBracket {
+                take_profit: Some(profit),
+                ..
+            } = &mut request
+            {
+                if combo {
+                    profit.attrs.combo = Some(Box::default());
+                } else {
+                    profit.order_id = 10;
+                }
+            }
+            let (guard, receipt) = OrderWriteGuard::new(|| panic!("bad third leg authorized"));
+            context.pending_orders.push(OrderRequest::Guarded {
+                request: Box::new(request),
+                guard,
+            });
+            assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+            assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+            assert!(context.order(10).is_none());
+            assert!(context.bracket_keys.is_empty());
+            assert!(shared.orders.drain_order_errors().iter().any(|(_, code, _)| *code == 321));
+        }
+    }
+
+    #[test]
+    fn guarded_protected_bracket_authorizes_once_and_restores_every_leg_on_refusal() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for authorized in [false, true] {
+            for take_profit in [false, true] {
+                let (mut context, shared, mut conn, mut server) = guarded_fixture();
+                let (groups, rng) = (context.bracket_groups, context.bracket_rng);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let count = calls.clone();
+                let (guard, receipt) = OrderWriteGuard::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if authorized {
+                        Ok(())
+                    } else {
+                        Err("refused".into())
+                    }
+                });
+                let request = OrderRequest::Guarded {
+                    request: Box::new(protected_bracket(take_profit)),
+                    guard,
+                };
+                context.pending_orders.push(request.clone());
+                context.pending_orders.push(request);
+                let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                if authorized {
+                    assert_eq!(frames.len(), if take_profit { 3 } else { 2 });
+                    assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::Written));
+                } else {
+                    assert!(frames.is_empty());
+                    assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+                    for id in [10, 11, 12] {
+                        assert!(context.order(id).is_none());
+                        assert!(!context.modify_versions.contains_key(&id));
+                    }
+                    assert!(context.bracket_keys.is_empty());
+                    assert!(context.bracket_next_child.is_empty());
+                    assert_eq!((context.bracket_groups, context.bracket_rng), (groups, rng));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_protected_bracket_encoding_failure_cannot_send_a_naked_entry() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        for take_profit in [false, true] {
+            for fail_after in 1..if take_profit { 3 } else { 2 } {
+                let (mut context, shared, mut conn, mut server) = guarded_fixture();
+                conn.as_mut().unwrap().fail_order_batch_after(fail_after);
+                let (guard, receipt) =
+                    OrderWriteGuard::new(|| panic!("partial bracket authorized"));
+                context.pending_orders.push(OrderRequest::Guarded {
+                    request: Box::new(protected_bracket(take_profit)),
+                    guard,
+                });
+                assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+                assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+                for id in [10, 11, 12] {
+                    assert!(context.order(id).is_none());
+                }
+                assert!(context.bracket_keys.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn protected_bracket_waits_for_child_metadata_and_honors_receipt_cancellation() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        let mut request = protected_bracket(true);
+        if let OrderRequest::SubmitProtectedBracket {
+            take_profit: Some(profit),
+            ..
+        } = &mut request
+        {
+            profit.attrs.outside_rth = true;
+        }
+        let (guard, receipt) = OrderWriteGuard::new(|| panic!("cancelled parked bracket"));
+        context.pending_orders.push(OrderRequest::Guarded {
+            request: Box::new(request),
+            guard,
+        });
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(tag(&frames[0], 35), Some("c"));
+        assert!(
+            context.order(10).is_none(),
+            "parent waits for child metadata"
+        );
+        assert_eq!(receipt.cancel(), OrderWriteOutcome::NotSent);
+        for lookup in &mut context.rth_lookups {
+            lookup.2 = Instant::now();
+        }
+        sweep_rth_lookups(&mut context);
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert!(context.bracket_keys.is_empty());
+    }
+
+    #[test]
+    fn protected_bracket_refuses_unsupported_stop_session_before_entry() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        context.rth_types.insert(
+            (265598, "BEST".into()),
+            crate::engine::outside_rth::RthTypes {
+                market_type: "USSTK".into(),
+                sec_type: "STK".into(),
+                rth: true,
+                ..Default::default()
+            },
+        );
+        let mut request = protected_bracket(false);
+        if let OrderRequest::SubmitProtectedBracket { stop_loss, .. } = &mut request {
+            stop_loss.attrs.outside_rth = true;
+        }
+        let (guard, receipt) = OrderWriteGuard::new(|| panic!("unsupported protection authorized"));
+        context.pending_orders.push(OrderRequest::Guarded {
+            request: Box::new(request),
+            guard,
+        });
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+        assert!(context.order(10).is_none());
+        assert!(
+            shared
+                .orders
+                .drain_order_errors()
+                .iter()
+                .any(|(id, code, _)| *id == 11 && *code == 321)
+        );
+    }
+
+    #[test]
+    fn protected_bracket_leg_replace_keeps_reference_expiry_and_bracket_identity() {
+        let mut request = protected_bracket(true);
+        let attrs = if let OrderRequest::SubmitProtectedBracket {
+            take_profit: Some(profit),
+            ..
+        } = &mut request
+        {
+            profit.tif = b'6';
+            profit.attrs.good_till = 1_791_079_200;
+            profit.attrs.clone()
+        } else {
+            unreachable!()
+        };
+        let (frames, _) = session_frames(
+            |_| {},
+            vec![
+                request,
+                OrderRequest::Modify {
+                    new_order_id: 12,
+                    order_id: 12,
+                    qty: 1,
+                    kind: crate::types::OrderKind::Limit { price: 111 * P },
+                    tif: b'6',
+                    attrs,
+                },
+            ],
+            4,
+        );
+        assert_eq!(tag(&frames[3], 35), Some("G"));
+        assert_eq!(tag(&frames[3], 41), Some("12.0"));
+        assert_eq!(tag(&frames[3], 6010), Some("profit"));
+        assert_eq!(tag(&frames[3], 59), Some("6"));
+        assert_eq!(tag(&frames[3], 126), tag(&frames[2], 126));
+        assert_eq!(tag(&frames[3], 6531), tag(&frames[2], 6531));
+        assert_eq!(tag(&frames[3], 44), Some("111.00"));
+        assert_eq!(tag(&frames[3], 38), Some("1"));
     }
 
     #[test]
