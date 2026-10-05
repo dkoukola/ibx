@@ -84,6 +84,15 @@ pub(crate) fn fix_utc_to_unix_secs(s: &str) -> Option<i64> {
     Some(days * 86400 + hh * 3600 + mm * 60 + ss)
 }
 
+fn commission_is_today(time: Option<&str>, now_ms: i64, zone: &jiff::tz::TimeZone) -> bool {
+    let report_day = time.and_then(fix_utc_to_unix_secs)
+        .and_then(|time| jiff::Timestamp::from_second(time).ok())
+        .map(|time| time.to_zoned(zone.clone()).date());
+    let today = jiff::Timestamp::from_millisecond(now_ms)
+        .ok().map(|time| time.to_zoned(zone.clone()).date());
+    report_day.is_some() && report_day == today
+}
+
 /// Text of warning 399 for an order message (ibx#465): "Order Message:
 /// {action} {quantity} {symbol} {exchange}
 /// {text}", three lines (the API
@@ -166,7 +175,7 @@ fn all_values(msg: &[u8], tag: u32) -> impl Iterator<Item = &str> {
 }
 
 /// What a fill report says about its execution beyond the fill numbers.
-fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec_id: &str) -> crate::bridge::FillExec {
+pub(super) fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec_id: &str) -> crate::bridge::FillExec {
     let tag = |t: u32| parsed.get(&t).filter(|s| !s.is_empty());
     crate::bridge::FillExec {
         stale_order_state: false,
@@ -298,6 +307,7 @@ pub(crate) struct CcpState {
     /// restates (ibx#486).
     pub(crate) summary_groups: std::collections::HashMap<String, String>,
     pub(super) completed_history: super::completed_history::HistoryRequests,
+    pub(super) execution_ranges: super::execution_history::ExecutionRequests,
     pub(crate) seen_exec_ids: HashSet<String>,
     /// Insertion order for `seen_exec_ids`, oldest at the front. Used to evict
     /// one entry at a time once the dedup window is full, instead of clearing
@@ -724,6 +734,7 @@ impl CcpState {
         Self {
             summary_groups: std::collections::HashMap::new(),
             completed_history: super::completed_history::HistoryRequests::default(),
+            execution_ranges: super::execution_history::ExecutionRequests::default(),
             seen_exec_ids: HashSet::with_capacity(256),
             exec_id_order: VecDeque::with_capacity(256),
             commission_revisions: std::collections::HashMap::with_capacity(256),
@@ -838,10 +849,23 @@ impl CcpState {
     /// 25/09/2026, 25 ms after the fill). A frame with neither the
     /// commission nor tag 8189 is dropped, like the reference.
     fn handle_commission_report(&mut self, parsed: &std::collections::HashMap<u32, String>, shared: &SharedState) {
+        self.execution_ranges.commission(parsed);
         let Some(exec_id) = parsed.get(&17).filter(|s| !s.is_empty()) else {
             log::debug!("Commission report without an execution id: dropped");
             return;
         };
+        // Native aK.a(dr) routes tag 52 through d2.j (UTC -> default
+        // zone) into per-day storage. bc.a(a1,false) delivers only today's
+        // known execution; historical fees have no 8080/request marker.
+        // gh.eB initializes that day zone from TimeZone.getDefault(). Reuse
+        // the SDK's existing local-zone/server-offset clock convention.
+        let zone = jiff::tz::TimeZone::system();
+        if !commission_is_today(parsed.get(&52).map(String::as_str), shared.reference.clock().now_ms(), &zone) {
+            log::debug!("Commission report for {}: outside today's report store", exec_id);
+            return;
+        }
+        // ClientCore::apply_commission already waits for the corresponding
+        // execution. Do not drop a today's fee that arrives before its fill.
         let commission = parsed.get(&6378).and_then(|s| s.parse::<f64>().ok());
         if commission.is_none() && !parsed.contains_key(&8189) {
             log::debug!("Commission report for {} without a commission: dropped", exec_id);
@@ -1307,6 +1331,12 @@ impl CcpState {
         let what_if_flag = parsed.get(&6091).and_then(|v| v.parse::<i64>().ok()).is_some_and(|v| v > 0);
         if what_if_clord || what_if_flag {
             Self::handle_what_if(parsed, context, shared, event_tx);
+            return;
+        }
+        // Native 8080 marks historical reports: ExecReportMgr stores them in
+        // dated history without applying them to live orders or positions.
+        // Ordinary live prints are only side-tapped, never consumed here.
+        if self.execution_ranges.report(parsed, shared, account_id) {
             return;
         }
         // End markers are not orders (ibx#399): the end of a trades reply
@@ -3300,6 +3330,7 @@ impl CcpState {
     ) {
         shared.portfolio.invalidate_account_image();
         self.completed_history.disconnected(shared);
+        self.execution_ranges.disconnected(shared);
         shared.portfolio.invalidate_position_snapshot();
         shared.orders.set_open_orders_held(true);
         shared.orders.invalidate_execution_history();
@@ -4194,6 +4225,9 @@ mod tests {
             (35u32, "U"), (6040, "60"), (17, "0000e0d5.6ab5f36f.01.01"), (37, "1"),
             (6381, "USD"), (6378, "1.0003"), (6099, "0"),
         ].iter().map(|(t, v)| (*t, v.to_string())).collect();
+        // The native frame also carries UTC sending time; keep the fixture
+        // on the current report-store day rather than its capture date.
+        m.insert(52, chrono_free_timestamp().to_string());
         for (tag, val) in pairs {
             m.insert(*tag, val.to_string());
         }
@@ -4250,6 +4284,32 @@ mod tests {
         frame.remove(&6378);
         ccp.handle_commission_report(&frame, &shared);
         assert!(shared.orders.drain_commission_reports().is_empty());
+    }
+
+    #[test]
+    fn execution_range_commission_day_uses_local_date_not_utc_date() {
+        let zone = jiff::tz::TimeZone::get("America/New_York").unwrap();
+        let now = fix_utc_to_unix_secs("20261005-01:00:00").unwrap() * 1000;
+        assert!(commission_is_today(Some("20261004-23:00:00"), now, &zone));
+        assert!(!commission_is_today(Some("20261004-03:00:00"), now, &zone));
+        assert!(!commission_is_today(None, now, &zone));
+        assert!(!commission_is_today(Some("invalid"), now, &zone));
+    }
+
+    #[test]
+    fn execution_range_commission_before_live_execution_reaches_existing_pending_store() {
+        let mut ccp = CcpState::new();
+        let shared = SharedState::new();
+        ccp.handle_commission_report(&commission_frame(&[]), &shared);
+        let reports = shared.orders.drain_commission_reports();
+        assert_eq!(reports.len(), 1);
+        let core = crate::client_core::ClientCore::new();
+        assert!(!core.apply_commission(&reports[0]));
+        let attached = core.push_execution(-1, api::Contract::default(), api::Execution {
+            exec_id: reports[0].exec_id.clone(), ..Default::default()
+        }, None).unwrap();
+        assert_eq!(attached.exec_id, reports[0].exec_id);
+        assert!(shared.portfolio.realized_since_seed().is_empty());
     }
 
     #[test]

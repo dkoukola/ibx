@@ -2032,6 +2032,14 @@ pub struct ContractLookup {
 /// Commands sent from the control plane to the hot loop via SPSC channel.
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
+    /// Fresh executions over an explicit UTC interval, isolated from live accounting.
+    RequestExecutionsRange {
+        connection: String,
+        req_id: i64,
+        start: String,
+        end: String,
+        filter: crate::api::types::ExecutionFilter,
+    },
     /// A fresh, isolated STANDARD completed-order history query. The connection
     /// is the U72 request identity captured when the caller requested it.
     RequestCompletedOrders {

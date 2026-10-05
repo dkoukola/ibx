@@ -342,7 +342,7 @@ impl EClient {
         // No-op: single-client engine, all orders are auto-bound.
     }
 
-    /// Request execution reports. Matches `reqExecutions` in C++.
+    /// Replay the session's cached execution reports. Matches `reqExecutions` in C++.
     /// Queues a filtered replay for `process_msgs`, after initial/reconnect
     /// execution history has completed. A reply interrupted by link loss can
     /// repeat execution IDs after reconnect; no successful end is invented.
@@ -355,6 +355,49 @@ impl EClient {
         if !crate::client_core::ClientCore::ids_fit("req_executions", &[req_id]) { return; }
         self.core.queue_execution_request(req_id, filter);
         self.shared.notify();
+    }
+
+    /// Fresh broker executions over an inclusive UTC `YYYYMMDD-HH:MM:SS` interval.
+    /// Results arrive asynchronously through `process_msgs`. Historical rows do
+    /// not change live orders/positions or populate the legacy session cache.
+    /// A failed/interrupted request reports an error, never a successful end.
+    /// Broker retention is not extended or inferred by this API.
+    pub fn req_executions_range(&self, req_id: i64, start: &str, end: &str,
+        filter: &ExecutionFilter, wrapper: &mut impl Wrapper) {
+        if !crate::client_core::ClientCore::ids_fit("req_executions_range", &[req_id]) { return; }
+        if !crate::client_core::valid_completed_history_range(start, end) {
+            wrapper.error(req_id, 321, "Invalid execution UTC history interval", "");
+            return;
+        }
+        let Some(connection) = self.shared.orders.execution_history_request().filter(|_| self.is_connected()) else {
+            wrapper.error(req_id, 504, "Not connected", "");
+            return;
+        };
+        if let Err(message) = self.send(ControlCommand::RequestExecutionsRange {
+            connection, req_id, start: start.into(), end: end.into(), filter: filter.clone(),
+        }) {
+            wrapper.error(req_id, 10159, &message, "");
+        }
+    }
+
+    pub(super) fn answer_execution_ranges(&self, wrapper: &mut impl Wrapper) {
+        for reply in self.shared.orders.drain_execution_range_replies() {
+            let current = || self.is_connected() && self.shared.orders.execution_history_matches(&reply.connection);
+            let rows = match reply.result {
+                Ok(rows) => rows,
+                Err(message) => { wrapper.error(reply.req_id, 10159, &message, ""); continue; }
+            };
+            for row in &rows {
+                if !current() { break; }
+                wrapper.exec_details(reply.req_id, &row.contract, &row.execution);
+            }
+            for commission in rows.iter().filter_map(|row| row.commission_and_fees.as_ref()) {
+                if !current() { break; }
+                wrapper.commission_and_fees_report(commission);
+            }
+            if current() { wrapper.exec_details_end(reply.req_id); }
+            else { wrapper.error(reply.req_id, 10159, "Execution history connection changed during delivery", ""); }
+        }
     }
 
     pub(super) fn answer_executions(

@@ -263,6 +263,7 @@ impl EClient {
             }
         }
         self.answer_completed_orders(wrapper);
+        self.answer_execution_ranges(wrapper);
         self.shared.orders.retire_local_completed_orders(retired);
     }
 

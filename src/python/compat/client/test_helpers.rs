@@ -706,6 +706,19 @@ impl EClient {
         Ok(())
     }
 
+    /// Inject a broker reply for offline bridge tests (not a broker query).
+    #[doc(hidden)]
+    fn _test_publish_execution_range(&self, req_id: i64, error: Option<String>) -> PyResult<()> {
+        let shared = self.shared_state()?;
+        let connection = shared.orders.execution_history_request().unwrap_or_default();
+        let result = match error {
+            Some(error) => Err(error),
+            None => Ok(self.core.matching_executions(&Default::default())),
+        };
+        shared.orders.push_execution_range_reply(crate::bridge::ExecutionHistoryReply { connection, req_id, result });
+        Ok(())
+    }
+
     /// Run ONE iteration of the event dispatch loop.
     #[doc(hidden)]
     fn _test_dispatch_once(&self, py: Python<'_>) -> PyResult<()> {

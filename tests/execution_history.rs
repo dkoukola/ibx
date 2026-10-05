@@ -1,5 +1,6 @@
 //! Execution snapshots use the explicit U72 completion, never an idle gap.
 use std::net::{TcpListener, TcpStream};
+use std::io::Read;
 use std::sync::Arc;
 
 use ibx::api::types::{Contract, Execution, ExecutionFilter};
@@ -148,6 +149,61 @@ struct Observed {
     rows: Vec<(i64, String)>,
     ends: Vec<i64>,
     invalidate: Option<Arc<SharedState>>,
+}
+
+#[test]
+fn fresh_execution_range_queries_wire_and_does_not_rebook_history() {
+    let shared = Arc::new(SharedState::new());
+    let (farm, _farm_peer) = connection();
+    let (mut ccp, mut peer) = connection();
+    ccp.seed_buffer(&marker("today4"));
+    let (mut engine, tx) = gateway().into_hot_loop(shared.clone(), None, farm, ccp, None, None);
+    let client = EClient::from_parts(shared.clone(), tx, std::thread::spawn(|| {}), "DUXXXXXXX".into());
+    let mut observed = Observed::default();
+    client.req_executions_range(19, "20260929-00:00:00", "20261001-00:00:00", &ExecutionFilter::default(), &mut observed);
+    client.process_msgs(&mut observed);
+    assert!(observed.ends.is_empty());
+    engine.poll_once();
+    engine.poll_auth_for_test();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+    let mut wire = [0u8; 4096];
+    let count = peer.read(&mut wire).unwrap();
+    let request = ibx::protocol::fix::fix_parse(&wire[..count]);
+    assert_eq!(request.get(&6040).map(String::as_str), Some("72"));
+    assert_eq!(request.get(&6536).map(String::as_str), Some("20260929-00:00:00"));
+    assert_eq!(request.get(&6537).map(String::as_str), Some("20261001-00:00:00"));
+    let request_id = request[&6556].clone();
+    let mut history = ibx::protocol::fix::fix_parse(&fill());
+    history.insert(8080, "1".into());
+    history.insert(1, "DUXXXXXXX".into());
+    let history: Vec<_> = history.iter().filter(|(tag, _)| ![8, 9, 10, 34].contains(tag)).map(|(tag, value)| (*tag, value.as_str())).collect();
+    engine.inject_ccp_message(&fix_build(&history, 2));
+    engine.inject_ccp_message(&marker("wrong"));
+    client.process_msgs(&mut observed);
+    assert!(observed.rows.is_empty());
+    assert!(observed.ends.is_empty());
+    assert!(shared.orders.drain_untracked_executions().is_empty());
+    assert!(shared.orders.drain_fills_with_exec().is_empty());
+    engine.inject_ccp_message(&marker(&request_id));
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.rows, [(19, "history-execution.01".into())]);
+    assert_eq!(observed.ends, [19]);
+    // Neither the requested result nor a repeated query is answered from
+    // the legacy session cache.
+    client.req_executions(20, &ExecutionFilter::default(), &mut observed);
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.rows.len(), 1);
+    assert_eq!(observed.ends, [19, 20]);
+    client.req_executions_range(21, "20260929-00:00:00", "20261001-00:00:00", &ExecutionFilter::default(), &mut observed);
+    engine.poll_once();
+    engine.poll_auth_for_test();
+    let count = peer.read(&mut wire).unwrap();
+    let second = ibx::protocol::fix::fix_parse(&wire[..count]);
+    assert_ne!(second[&6556], request_id);
+    engine.inject_ccp_message(&marker(&second[&6556]));
+    client.process_msgs(&mut observed);
+    assert_eq!(observed.rows.len(), 1);
+    assert_eq!(observed.ends, [19, 20, 21]);
 }
 
 impl Wrapper for Observed {

@@ -11,7 +11,7 @@ use crate::client_core::{ClientCore, ModifyPlan};
 use crate::bridge::SharedState;
 use crate::types::*;
 use super::{send_cmd, EClient};
-use super::super::contract::{Contract, Order, CommissionAndFeesReport, Execution};
+use super::super::contract::{Contract, Order, Execution};
 
 #[pymethods]
 impl EClient {
@@ -270,6 +270,33 @@ impl EClient {
         Ok(())
     }
 
+    /// Fresh broker execution history over an explicit inclusive UTC interval.
+    #[pyo3(signature = (req_id, start, end, exec_filter=None))]
+    fn req_executions_range(&self, py: Python<'_>, req_id: i64, start: &str, end: &str, exec_filter: Option<Py<PyAny>>) -> PyResult<()> {
+        if let Some(result) = self.not_connected(req_id) { return result; }
+        if !ClientCore::ids_fit("req_executions_range", &[req_id]) { return Ok(()); }
+        if !crate::client_core::valid_completed_history_range(start, end) {
+            self.wrapper.call_method1(py, "error", (req_id, 321, "Invalid execution UTC history interval", ""))?;
+            return Ok(());
+        }
+        let shared = self.shared_state()?;
+        let Some(connection) = shared.orders.execution_history_request() else {
+            self.wrapper.call_method1(py, "error", (req_id, 504, "Not connected", ""))?;
+            return Ok(());
+        };
+        let filter = if let Some(object) = exec_filter {
+            let get = |name: &str| object.getattr(py, pyo3::types::PyString::new(py, name))
+                .and_then(|value| value.extract::<String>(py)).unwrap_or_default();
+            ExecutionFilter { symbol: get("symbol"), sec_type: get("secType"), exchange: get("exchange"),
+                side: get("side"), acct_code: get("acctCode"), time: get("time"),
+                client_id: object.getattr(py, pyo3::types::PyString::new(py, "clientId"))
+                    .and_then(|value| value.extract::<i64>(py)).unwrap_or(0), }
+        } else { ExecutionFilter::default() };
+        send_cmd(py, &self.tx()?, ControlCommand::RequestExecutionsRange {
+            connection, req_id, start: start.into(), end: end.into(), filter,
+        })
+    }
+
     /// Request today's completed orders from a fresh broker query.
     #[pyo3(signature = (api_only=false))]
     fn req_completed_orders(&self, py: Python<'_>, api_only: bool) -> PyResult<()> {
@@ -329,7 +356,21 @@ impl EClient {
             self.requeue_execution_if_current(shared, req_id, filter);
             return Ok(());
         }
-        for se in &execs {
+        self.send_execution_rows(py, req_id, &execs)?;
+        // The report exists once the server's commission frame came (ibx#471).
+        for cr in execs.iter().filter_map(|se| se.commission_and_fees.as_ref()) {
+            self.send_commission_report(py, cr)?;
+        }
+        if shared.orders.execution_history_matches(history_id) {
+            self.wrapper.call_method1(py, "exec_details_end", (req_id,))?;
+        } else {
+            self.requeue_execution_if_current(shared, req_id, filter);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn send_execution_rows(&self, py: Python<'_>, req_id: i64, rows: &[crate::client_core::StoredExecution]) -> PyResult<()> {
+        for se in rows {
             let c_py = Py::new(py, Contract::from_api(py, &se.contract)?)?.into_any();
 
             let exec_obj = Execution {
@@ -361,24 +402,6 @@ impl EClient {
                 (req_id, &c_py, &exec_py),
                 None,
             )?;
-        }
-        // The report exists once the server's commission frame came (ibx#471).
-        for cr in execs.iter().filter_map(|se| se.commission_and_fees.as_ref()) {
-            let report = CommissionAndFeesReport {
-                exec_id: cr.exec_id.clone(),
-                commission_and_fees: cr.commission_and_fees,
-                currency: cr.currency.clone(),
-                realized_pnl: cr.realized_pnl,
-                yield_amount: cr.yield_amount,
-                yield_redemption_date: cr.yield_redemption_date.clone(),
-            };
-            let report_py = Py::new(py, report)?.into_any();
-            self.wrapper.call_method1(py, "commission_and_fees_report", (&report_py,))?;
-        }
-        if shared.orders.execution_history_matches(history_id) {
-            self.wrapper.call_method1(py, "exec_details_end", (req_id,))?;
-        } else {
-            self.requeue_execution_if_current(shared, req_id, filter);
         }
         Ok(())
     }

@@ -25,7 +25,7 @@ const SMART_COMBO: i64 = 28812380;
 type Frame = Vec<(u32, String)>;
 
 /// The CCP frames of a recorded scenario: (leg, fields without the
-/// header, sequence, time and checksum).
+/// header, sequence and checksum; outgoing times are not compared).
 fn fixture(name: &str) -> Vec<(String, Frame)> {
     let path = format!("{}/tests/fixtures/gw1040/scenarios/{}", env!("CARGO_MANIFEST_DIR"), name);
     let text = std::fs::read_to_string(&path).unwrap();
@@ -36,7 +36,7 @@ fn fixture(name: &str) -> Vec<(String, Frame)> {
         let Some(fields) = rec["fields"].as_array() else { continue };
         let frame: Frame = fields.iter().filter_map(|f| {
             let tag: u32 = f[0].as_str()?.parse().ok()?;
-            (!FRAMING.contains(&tag)).then(|| (tag, f[1].as_str().unwrap_or("").to_string()))
+            (!FRAMING.contains(&tag) || (tag == 52 && rec["leg"] == "fix_in")).then(|| (tag, f[1].as_str().unwrap_or("").to_string()))
         }).collect();
         out.push((rec["leg"].as_str().unwrap().to_string(), frame));
     }
@@ -245,6 +245,11 @@ impl Session {
             }
             let refs: Vec<(u32, &str)> = fields.iter().map(|(t, v)| (*t, v.as_str())).collect();
             let msg = crate::protocol::fix::fix_build(&refs, 1);
+            // Replay on the captured server day. The native fee router uses
+            // tag 52 to keep archival fees out of today's live accounting.
+            if let Some(time) = tag(f, 52).and_then(ccp::fix_utc_to_unix_secs) {
+                self.engine.shared.reference.clock().set(time * 1000 - crate::control::logon::local_now_ms());
+            }
             self.engine.inject_ccp_message(&msg);
             self.run();
         }
