@@ -273,7 +273,7 @@ impl EClient {
         Ok(())
     }
 
-    fn send_commission_report(&self, py: Python<'_>, cr: &ApiCommissionAndFeesReport) -> PyResult<()> {
+    pub(crate) fn send_commission_report(&self, py: Python<'_>, cr: &ApiCommissionAndFeesReport) -> PyResult<()> {
         let report = CommissionAndFeesReport {
             exec_id: cr.exec_id.clone(),
             commission_and_fees: cr.commission_and_fees,
@@ -503,6 +503,23 @@ impl EClient {
             }
         }
         self.dispatch_completed_history(py, shared)?;
+        for reply in shared.orders.drain_execution_range_replies() {
+            let current = || self.position_client_current(shared) && shared.orders.execution_history_matches(&reply.connection);
+            let rows = match reply.result {
+                Ok(rows) => rows,
+                Err(message) => { call_wrapper!(self.wrapper, py, "error", (reply.req_id, 10159, message.as_str(), "")); continue; }
+            };
+            for row in &rows {
+                if !current() { break; }
+                self.send_execution_rows(py, reply.req_id, std::slice::from_ref(row))?;
+            }
+            for commission in rows.iter().filter_map(|row| row.commission_and_fees.as_ref()) {
+                if !current() { break; }
+                self.send_commission_report(py, commission)?;
+            }
+            if current() { call_wrapper!(self.wrapper, py, "exec_details_end", (reply.req_id,)); }
+            else { call_wrapper!(self.wrapper, py, "error", (reply.req_id, 10159, "Execution history connection changed during delivery", "")); }
+        }
         shared.orders.retire_local_completed_orders(retired);
 
         // Requests that joined a subscription, and subscriptions the

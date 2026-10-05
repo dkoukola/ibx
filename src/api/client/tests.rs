@@ -63,6 +63,51 @@ fn test_client() -> (EClient, crossbeam_channel::Receiver<ControlCommand>, Arc<S
     (client, rx, shared)
 }
 
+#[test]
+fn execution_range_validates_interval_and_owns_filter_and_connection() {
+    let (client, rx, _) = test_client();
+    let mut wrapper = RecordingWrapper::default();
+    client.req_executions_range(71, "20260230-00:00:00", "20261005-00:00:00", &Default::default(), &mut wrapper);
+    assert!(rx.try_recv().is_err());
+    assert!(wrapper.events.iter().any(|event| event.starts_with("error:71:321:")));
+    let mut filter = crate::api::types::ExecutionFilter { symbol: "AAPL".into(), ..Default::default() };
+    client.req_executions_range(72, "20261003-00:00:00", "20261005-00:00:00", &filter, &mut wrapper);
+    filter.symbol = "MSFT".into();
+    match rx.try_recv().unwrap() {
+        ControlCommand::RequestExecutionsRange { connection, req_id, filter, start, end } => {
+            assert_eq!(connection, "fixture");
+            assert_eq!(req_id, 72);
+            assert_eq!(filter.symbol, "AAPL");
+            assert_eq!(start, "20261003-00:00:00");
+            assert_eq!(end, "20261005-00:00:00");
+        }
+        _ => panic!("wrong command"),
+    }
+}
+
+#[test]
+fn execution_range_changed_connection_during_callback_stops_rows_and_end() {
+    let (client, _rx, shared) = test_client();
+    struct Replace { shared: Arc<SharedState>, rows: usize, ends: usize, errors: usize }
+    impl Wrapper for Replace {
+        fn exec_details(&mut self, _: i64, _: &Contract, _: &crate::api::types::Execution) {
+            self.rows += 1;
+            self.shared.orders.begin_execution_history("replacement");
+            self.shared.orders.complete_execution_history("replacement");
+        }
+        fn exec_details_end(&mut self, _: i64) { self.ends += 1; }
+        fn error(&mut self, _: i64, _: i64, _: &str, _: &str) { self.errors += 1; }
+    }
+    let row = crate::client_core::StoredExecution { req_id: 5, contract: Contract::default(),
+        execution: Default::default(), time_secs: None, commission_and_fees: None };
+    shared.orders.push_execution_range_reply(crate::bridge::ExecutionHistoryReply {
+        connection: "fixture".into(), req_id: 5, result: Ok(vec![row.clone(), row]),
+    });
+    let mut wrapper = Replace { shared: shared.clone(), rows: 0, ends: 0, errors: 0 };
+    client.process_msgs(&mut wrapper);
+    assert_eq!((wrapper.rows, wrapper.ends, wrapper.errors), (1, 0, 1));
+}
+
 /// Helper: SPY contract.
 fn spy() -> Contract {
     Contract { con_id: 756733, symbol: "SPY".into(), ..Default::default() }

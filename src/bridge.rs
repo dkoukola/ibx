@@ -46,6 +46,13 @@ pub struct CompletedHistoryReply {
     pub result: Result<Vec<RichOrderInfo>, String>,
 }
 
+#[derive(Debug)]
+pub struct ExecutionHistoryReply {
+    pub connection: String,
+    pub req_id: i64,
+    pub result: Result<Vec<crate::client_core::StoredExecution>, String>,
+}
+
 /// What a fill report says about its execution, beyond the `Fill` numbers
 /// (ibx#471 ibx#474). Carried with each fill, so two fills of one order in
 /// the same batch keep their own values.
@@ -552,6 +559,7 @@ pub struct OrderState {
     what_if_responses: Mutex<Vec<WhatIfResponse>>,
     completed_orders: Mutex<Vec<(CompletedOrder, Option<Arc<RichOrderInfo>>)>>,
     completed_history_replies: Mutex<Vec<CompletedHistoryReply>>,
+    execution_range_replies: Mutex<Vec<ExecutionHistoryReply>>,
     /// Enriched order info from CCP exec reports (order_id -> RichOrderInfo).
     order_cache: Mutex<HashMap<OrderId, Arc<RichOrderInfo>>>,
     /// Set from a lost auth link to the end of the order replay after the
@@ -577,6 +585,7 @@ impl OrderState {
             what_if_responses: Mutex::new(Vec::with_capacity(8)),
             completed_orders: Mutex::new(Vec::with_capacity(64)),
             completed_history_replies: Mutex::new(Vec::new()),
+            execution_range_replies: Mutex::new(Vec::new()),
             order_cache: Mutex::new(HashMap::new()),
             open_orders_held: AtomicBool::new(false),
             execution_history: Mutex::new(None),
@@ -699,6 +708,14 @@ impl OrderState {
     #[doc(hidden)]
     pub fn drain_completed_history_replies(&self) -> Vec<CompletedHistoryReply> {
         self.completed_history_replies.lock().unwrap().drain(..).collect()
+    }
+
+    pub fn push_execution_range_reply(&self, reply: ExecutionHistoryReply) {
+        self.execution_range_replies.lock().unwrap().push(reply);
+    }
+
+    pub fn drain_execution_range_replies(&self) -> Vec<ExecutionHistoryReply> {
+        std::mem::take(&mut *self.execution_range_replies.lock().unwrap())
     }
 
     /// Take retirement candidates BEFORE draining live callbacks. Completion

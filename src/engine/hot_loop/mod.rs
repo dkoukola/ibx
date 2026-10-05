@@ -2,6 +2,7 @@ pub mod farm;
 pub mod ccp;
 pub(crate) mod report;
 mod completed_history;
+mod execution_history;
 pub mod hmds;
 pub(crate) mod pool;
 pub mod order_builder;
@@ -795,6 +796,10 @@ impl HotLoop {
             &mut self.ccp_conn, &mut self.context, &self.shared,
             &self.event_tx, &mut self.hb, &self.account_id,
         );
+        self.ccp.progress_execution_history(
+            &mut self.ccp_conn, &mut self.context, &self.shared,
+            &self.event_tx, &mut self.hb, &self.account_id,
+        );
         self.ccp.sweep_pending_schedule_pairs(&self.shared, &self.event_tx);
         self.ccp.sweep_scanner_enrichments(&self.shared);
         self.ccp.sweep_contract_details(&self.shared, &self.event_tx, &mut self.ccp_conn, &mut self.hb);
@@ -1171,6 +1176,12 @@ impl HotLoop {
             .collect();
         for cmd in cmds {
             match cmd {
+                ControlCommand::RequestExecutionsRange { connection, req_id, start, end, filter } => {
+                    if let Err(reply) = self.ccp.execution_ranges.queue(connection, req_id, start, end, filter) {
+                        self.shared.orders.push_execution_range_reply(reply);
+                        self.shared.notify();
+                    }
+                }
                 ControlCommand::RequestCompletedOrders { connection, api_only, start, end } => {
                     self.ccp.completed_history.queue(connection, api_only, start, end);
                 }
@@ -1559,6 +1570,7 @@ impl HotLoop {
                     let msgs = self.farm.stop_all_news();
                     self.send_farm_messages(msgs);
                     self.running = false;
+                    self.ccp.execution_ranges.disconnected(&self.shared);
                     self.shared.set_connection_lost();
                     emit(&self.event_tx, Event::Disconnected);
                 }
@@ -1569,6 +1581,7 @@ impl HotLoop {
         if sender_dropped && self.running {
             log::warn!("Control channel disconnected — shutting down hot loop");
             self.running = false;
+            self.ccp.execution_ranges.disconnected(&self.shared);
             self.shared.set_connection_lost();
             emit(&self.event_tx, Event::Disconnected);
         }
