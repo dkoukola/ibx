@@ -141,10 +141,10 @@ impl EClient {
 
     /// Push a fill into SharedState.
     #[doc(hidden)]
-    #[pyo3(signature = (instrument, order_id, side, price, qty, remaining, commission=0.0))]
+    #[pyo3(signature = (instrument, order_id, side, price, qty, remaining, commission=0.0, stale_order_state=false))]
     fn _test_push_fill(
         &self, instrument: u32, order_id: OrderId, side: &str,
-        price: f64, qty: i64, remaining: i64, commission: f64,
+        price: f64, qty: i64, remaining: i64, commission: f64, stale_order_state: bool,
     ) -> PyResult<()> {
         let shared = self.shared_state()?;
         let s = match side {
@@ -155,13 +155,13 @@ impl EClient {
         };
         let ps = PRICE_SCALE as f64;
         // The tests pass whole shares; fills are fixed-point.
-        shared.orders.push_fill(Fill {
+        shared.orders.push_fill_with_exec(Fill {
             cum_qty_fixed: 0, avg_price: 0,
             instrument, order_id, side: s,
             price: (price * ps) as i64, qty_fixed: qty * QTY_SCALE, remaining_fixed: remaining * QTY_SCALE,
             commission: (commission * ps) as i64,
             timestamp_ns: 100,
-        });
+        }, crate::bridge::FillExec { stale_order_state, ..Default::default() });
         Ok(())
     }
 
@@ -182,6 +182,28 @@ impl EClient {
     #[doc(hidden)]
     fn _test_set_open_orders_held(&self, held: bool) -> PyResult<()> {
         self.shared_state()?.orders.set_open_orders_held(held);
+        Ok(())
+    }
+
+    /// Seed a broker-only row, including the parent metadata's readiness.
+    #[doc(hidden)]
+    fn _test_push_parent_row(&self, order_id: OrderId, parent_id: OrderId, known: bool, status: &str) -> PyResult<()> {
+        self.shared_state()?.orders.push_order_info(order_id, crate::bridge::RichOrderInfo {
+            contract: crate::api::types::Contract::default(),
+            order: crate::api::types::Order {
+                order_id,
+                parent_id,
+                perm_id: order_id,
+                oca_group: "bracket-group".into(),
+                order_ref: "child-ref".into(),
+                ..Default::default()
+            },
+            order_state: crate::api::types::OrderState { status: status.into(), ..Default::default() },
+            last_exec: crate::api::types::Execution::default(),
+            parent_id_known: known,
+            report_revision: None,
+            report_time: None,
+        });
         Ok(())
     }
 
@@ -240,6 +262,9 @@ impl EClient {
             order_id, instrument, status: st, filled_qty_fixed: filled_qty * QTY_SCALE, timestamp_ns: 100,
         });
         shared.orders.push_order_info(order_id, crate::bridge::RichOrderInfo {
+            parent_id_known: true,
+            report_revision: None,
+            report_time: None,
             contract: ApiContract {
                 symbol: symbol.to_string(),
                 sec_type: "STK".into(),
@@ -671,6 +696,20 @@ impl EClient {
         self.shared_state()?
             .orders
             .complete_execution_history(request_id);
+        Ok(())
+    }
+
+    /// Run ONE iteration of the event dispatch loop.
+    #[doc(hidden)]
+    fn _test_publish_completed_history(&self, error: Option<String>) -> PyResult<()> {
+        let shared = self.shared_state()?;
+        let connection = shared.orders.execution_history_request().unwrap_or_default();
+        let result = match error {
+            Some(message) => Err(message),
+            None => Ok(shared.orders.drain_completed_orders().into_iter()
+                .filter_map(|order| shared.orders.get_order_info(order.order_id)).collect()),
+        };
+        shared.orders.push_completed_history_reply(crate::bridge::CompletedHistoryReply { connection, result });
         Ok(())
     }
 

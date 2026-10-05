@@ -246,133 +246,30 @@ impl EClient {
         Ok(())
     }
 
-    /// Request completed orders.
+    /// Request today's completed orders from a fresh broker query.
     #[pyo3(signature = (api_only=false))]
     fn req_completed_orders(&self, py: Python<'_>, api_only: bool) -> PyResult<()> {
-        if let Some(r) = self.not_connected(-1) { return r; }
-        let _ = api_only;
-        if let Some(shared) = self.shared.lock().unwrap().clone() {
-            let completed = shared.orders.drain_completed_orders();
-            for co in &completed {
-                let status_str = crate::client_core::order_status_str(co.status);
-                let rich_info = shared.orders.get_order_info(co.order_id);
+        let end = crate::config::chrono_free_timestamp();
+        let start = format!("{}-00:00:00", &end[..8]);
+        self.req_completed_orders_range(py, &start, &end, api_only)
+    }
 
-                // Build OrderState iso with Rust API path (api/client/orders.rs:101-125):
-                // start from rich_info.order_state when available, override status with the
-                // canonical status_str, fall back to defaults otherwise.
-                let state = if let Some(info) = rich_info.as_ref() {
-                    let s = &info.order_state;
-                    let allocations: Vec<super::super::contract::OrderAllocation> = s
-                        .order_allocations.iter().map(|a| {
-                            super::super::contract::OrderAllocation {
-                                account: a.account.clone(),
-                                position: a.position.clone(),
-                                position_desired: a.position_desired.clone(),
-                                position_after: a.position_after.clone(),
-                                desired_alloc_qty: a.desired_alloc_qty.clone(),
-                                allowed_alloc_qty: a.allowed_alloc_qty.clone(),
-                                is_monetary: a.is_monetary,
-                            }
-                        }).collect();
-                    super::super::contract::OrderState {
-                        status: status_str.into(),
-                        init_margin_before: s.init_margin_before.clone(),
-                        maint_margin_before: s.maint_margin_before.clone(),
-                        equity_with_loan_before: s.equity_with_loan_before.clone(),
-                        init_margin_change: s.init_margin_change.clone(),
-                        maint_margin_change: s.maint_margin_change.clone(),
-                        equity_with_loan_change: s.equity_with_loan_change.clone(),
-                        init_margin_after: s.init_margin_after.clone(),
-                        maint_margin_after: s.maint_margin_after.clone(),
-                        equity_with_loan_after: s.equity_with_loan_after.clone(),
-                        commission_and_fees: s.commission_and_fees,
-                        min_commission_and_fees: s.min_commission_and_fees,
-                        max_commission_and_fees: s.max_commission_and_fees,
-                        commission_and_fees_currency: s.commission_and_fees_currency.clone(),
-                        warning_text: s.warning_text.clone(),
-                        completed_time: s.completed_time.clone(),
-                        completed_status: s.completed_status.clone(),
-                        margin_currency: s.margin_currency.clone(),
-                        init_margin_before_outside_rth: s.init_margin_before_outside_rth,
-                        maint_margin_before_outside_rth: s.maint_margin_before_outside_rth,
-                        equity_with_loan_before_outside_rth: s.equity_with_loan_before_outside_rth,
-                        init_margin_change_outside_rth: s.init_margin_change_outside_rth,
-                        maint_margin_change_outside_rth: s.maint_margin_change_outside_rth,
-                        equity_with_loan_change_outside_rth: s.equity_with_loan_change_outside_rth,
-                        init_margin_after_outside_rth: s.init_margin_after_outside_rth,
-                        maint_margin_after_outside_rth: s.maint_margin_after_outside_rth,
-                        equity_with_loan_after_outside_rth: s.equity_with_loan_after_outside_rth,
-                        suggested_size: s.suggested_size.clone(),
-                        reject_reason: s.reject_reason.clone(),
-                        order_allocations: allocations,
-                    }
-                } else {
-                    let mut s = super::super::contract::OrderState::default();
-                    s.status = status_str.into();
-                    s
-                };
-                let state_py = Py::new(py, state)?.into_any();
-
-                let tracked = self.core.open_orders.lock().unwrap().get(&co.order_id).map(|o| {
-                    (Contract {
-                        con_id: o.contract.con_id,
-                        symbol: o.contract.symbol.clone(),
-                        sec_type: o.contract.sec_type.clone(),
-                        exchange: o.contract.exchange.clone(),
-                        currency: o.contract.currency.clone(),
-                        ..Default::default()
-                    }, {
-                        let mut ord = Order::default();
-                        ord.order_id = o.order.order_id;
-                        ord.action = o.order.action.clone();
-                        ord.total_quantity = o.order.total_quantity;
-                        ord.order_type = o.order.order_type.clone();
-                        ord.lmt_price = o.order.lmt_price;
-                        ord.aux_price = o.order.aux_price;
-                        ord.tif = o.order.tif.clone();
-                        ord.account = o.order.account.clone();
-                        ord.perm_id = o.order.perm_id;
-                        ord
-                    })
-                });
-                if let Some((c, o)) = tracked {
-                    let c_py = Py::new(py, c)?.into_any();
-                    let o_py = Py::new(py, o)?.into_any();
-                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, &state_py))?;
-                } else if let Some(info) = rich_info {
-                    let c = Contract {
-                        con_id: info.contract.con_id,
-                        symbol: info.contract.symbol,
-                        sec_type: info.contract.sec_type,
-                        exchange: info.contract.exchange,
-                        currency: info.contract.currency,
-                        ..Default::default()
-                    };
-                    let mut o = Order::default();
-                    o.order_id = info.order.order_id;
-                    o.action = info.order.action;
-                    o.total_quantity = info.order.total_quantity;
-                    o.order_type = info.order.order_type;
-                    o.lmt_price = info.order.lmt_price;
-                    o.aux_price = info.order.aux_price;
-                    o.tif = info.order.tif;
-                    o.account = info.order.account;
-                    o.perm_id = info.order.perm_id;
-                    let c_py = Py::new(py, c)?.into_any();
-                    let o_py = Py::new(py, o)?.into_any();
-                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, &state_py))?;
-                } else {
-                    let c_py = Py::new(py, Contract::default())?.into_any();
-                    let o_py = Py::new(py, Order::default())?.into_any();
-                    self.wrapper.call_method1(py, "completed_order", (&c_py, &o_py, &state_py))?;
-                }
-                // Bound `order_cache` growth: terminal entries are no longer
-                // needed once delivered through `completed_order`.
-                shared.orders.remove_order_info(co.order_id);
-            }
-            self.wrapper.call_method0(py, "completed_orders_end")?;
+    /// Fresh history over an inclusive UTC YYYYMMDD-HH:MM:SS interval.
+    #[pyo3(signature = (start, end, api_only=false))]
+    fn req_completed_orders_range(&self, py: Python<'_>, start: &str, end: &str, api_only: bool) -> PyResult<()> {
+        if let Some(result) = self.not_connected(-1) { return result; }
+        if !crate::client_core::valid_completed_history_range(start, end) {
+            self.wrapper.call_method1(py, "error", (-1, 321, "Invalid completed-order UTC history interval", ""))?;
+            return Ok(());
         }
-        Ok(())
+        let shared = self.shared_state()?;
+        let Some(connection) = shared.orders.execution_history_request() else {
+            self.wrapper.call_method1(py, "error", (-1, 504, "Not connected", ""))?;
+            return Ok(());
+        };
+        send_cmd(py, &self.tx()?, ControlCommand::RequestCompletedOrders {
+            connection, api_only, start: start.to_string(), end: end.to_string(),
+        })
     }
 }
 
@@ -477,7 +374,10 @@ impl EClient {
         request: crate::client_core::OpenOrdersRequest,
         history: Option<&str>,
     ) -> PyResult<()> {
-        let orders = self.core.collect_open_orders(shared);
+        let Some(orders) = self.core.prepare_open_orders(shared) else {
+            self.requeue_open_orders_if_current(shared, request);
+            return Ok(());
+        };
         if !self.open_order_snapshot_current(shared, history) {
             self.requeue_open_orders_if_current(shared, request);
             return Ok(());
@@ -495,6 +395,9 @@ impl EClient {
             o.tif = tracked.order.tif.clone();
             o.account = tracked.order.account.clone();
             o.perm_id = tracked.order.perm_id;
+            o.parent_id = tracked.order.parent_id;
+            o.oca_group = tracked.order.oca_group.clone();
+            o.order_ref = tracked.order.order_ref.clone();
             o.oca_type = tracked.order.oca_type;
             o.use_price_mgmt_algo = (tracked.order.use_price_mgmt_algo != i32::MAX).then_some(tracked.order.use_price_mgmt_algo != 0);
             o.trail_stop_price = tracked.order.trail_stop_price;

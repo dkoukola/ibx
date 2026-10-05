@@ -58,7 +58,9 @@ fn recover(fixture: &str, sequences: &[u64]) -> Vec<Order> {
 
 #[test]
 fn recovered_named_oca_group_is_reported_without_local_order_tracking() {
-    let orders = recover(OCA, &[2717, 2740]);
+    // ACKs alone omit parent authority. Supply the captured full snapshots
+    // too; both arrival orders occur on the native wire.
+    let orders = recover(OCA, &[2717, 2711, 2740, 2730]);
     assert_eq!(orders.len(), 2);
     assert_eq!((orders[0].order_id, orders[1].order_id), (6, 7));
     for order in orders {
@@ -73,7 +75,7 @@ fn recovered_named_oca_group_is_reported_without_local_order_tracking() {
 #[test]
 fn recovered_bracket_group_keeps_server_name_separate_from_api_parent_id() {
     // Replay the parent before its children, as a cold-start order snapshot.
-    let orders = recover(BRACKET, &[2642, 2632, 2637]);
+    let orders = recover(BRACKET, &[2642, 2627, 2632, 2637]);
     assert_eq!(orders.len(), 3);
     assert_eq!(orders[0].order_id, 3);
     assert!(orders[0].oca_group.is_empty());
@@ -87,7 +89,7 @@ fn recovered_bracket_group_keeps_server_name_separate_from_api_parent_id() {
 
 #[test]
 fn recovered_order_without_oca_does_not_invent_a_group() {
-    let orders = recover(BRACKET, &[2642]);
+    let orders = recover(BRACKET, &[2642, 2627]);
     assert_eq!(orders.len(), 1);
     assert!(orders[0].oca_group.is_empty());
     assert_eq!(orders[0].parent_id, 0);

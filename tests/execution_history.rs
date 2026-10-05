@@ -308,6 +308,9 @@ fn open_row() -> Vec<u8> {
             (6121, "7"),
             (150, "0"),
             (39, "0"),
+            // A full replay snapshot establishes parent metadata, including
+            // an absent root link. A sparse acknowledgement does not.
+            (20, "3"),
             (6008, "265598"),
             (55, "AAPL"),
             (54, "1"),
@@ -349,7 +352,10 @@ fn gateway_open_orders_wait_for_their_own_initial_replay_not_execution_end() {
         engine.inject_ccp_message(&marker("wrong"));
         client.process_msgs(&mut observed);
         assert_eq!(observed.ends, 0);
-        assert!(observed.orders.is_empty());
+        // The full replay row also emits its normal live notification. The
+        // two requested snapshots remain held until their own replay end.
+        assert_eq!(observed.orders, if has_order { vec![7] } else { vec![] });
+        observed.orders.clear();
         engine.inject_ccp_message(&open_end());
         assert!(shared.orders.execution_history_completion().is_none());
         client.process_msgs(&mut observed);

@@ -112,6 +112,55 @@ impl Default for Contract {
     }
 }
 
+impl OrderState {
+    pub(crate) fn from_api(s: &crate::api::types::OrderState) -> Self {
+        let allocations: Vec<OrderAllocation> = s
+            .order_allocations.iter().map(|a| {
+                OrderAllocation {
+                    account: a.account.clone(),
+                    position: a.position.clone(),
+                    position_desired: a.position_desired.clone(),
+                    position_after: a.position_after.clone(),
+                    desired_alloc_qty: a.desired_alloc_qty.clone(),
+                    allowed_alloc_qty: a.allowed_alloc_qty.clone(),
+                    is_monetary: a.is_monetary,
+                }
+            }).collect();
+        OrderState {
+            status: s.status.clone(),
+            init_margin_before: s.init_margin_before.clone(),
+            maint_margin_before: s.maint_margin_before.clone(),
+            equity_with_loan_before: s.equity_with_loan_before.clone(),
+            init_margin_change: s.init_margin_change.clone(),
+            maint_margin_change: s.maint_margin_change.clone(),
+            equity_with_loan_change: s.equity_with_loan_change.clone(),
+            init_margin_after: s.init_margin_after.clone(),
+            maint_margin_after: s.maint_margin_after.clone(),
+            equity_with_loan_after: s.equity_with_loan_after.clone(),
+            commission_and_fees: s.commission_and_fees,
+            min_commission_and_fees: s.min_commission_and_fees,
+            max_commission_and_fees: s.max_commission_and_fees,
+            commission_and_fees_currency: s.commission_and_fees_currency.clone(),
+            warning_text: s.warning_text.clone(),
+            completed_time: s.completed_time.clone(),
+            completed_status: s.completed_status.clone(),
+            margin_currency: s.margin_currency.clone(),
+            init_margin_before_outside_rth: s.init_margin_before_outside_rth,
+            maint_margin_before_outside_rth: s.maint_margin_before_outside_rth,
+            equity_with_loan_before_outside_rth: s.equity_with_loan_before_outside_rth,
+            init_margin_change_outside_rth: s.init_margin_change_outside_rth,
+            maint_margin_change_outside_rth: s.maint_margin_change_outside_rth,
+            equity_with_loan_change_outside_rth: s.equity_with_loan_change_outside_rth,
+            init_margin_after_outside_rth: s.init_margin_after_outside_rth,
+            maint_margin_after_outside_rth: s.maint_margin_after_outside_rth,
+            equity_with_loan_after_outside_rth: s.equity_with_loan_after_outside_rth,
+            suggested_size: s.suggested_size.clone(),
+            reject_reason: s.reject_reason.clone(),
+            order_allocations: allocations,
+        }
+    }
+}
+
 #[pymethods]
 impl Contract {
     #[new]
