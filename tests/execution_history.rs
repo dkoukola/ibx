@@ -152,6 +152,33 @@ struct Observed {
 }
 
 #[test]
+fn fresh_execution_range_waits_for_the_current_startup_replay_end() {
+    let shared = Arc::new(SharedState::new());
+    let (farm, _farm_peer) = connection();
+    let (ccp, mut peer) = connection();
+    let (mut engine, tx) = gateway().into_hot_loop(shared.clone(), None, farm, ccp, None, None);
+    let client = EClient::from_parts(shared.clone(), tx, std::thread::spawn(|| {}), "DUXXXXXXX".into());
+    let mut observed = Observed::default();
+    client.req_executions_range(19, "20260929-00:00:00", "20261001-00:00:00", &ExecutionFilter::default(), &mut observed);
+    peer.set_read_timeout(Some(std::time::Duration::from_millis(20))).unwrap();
+    let mut wire = [0u8; 4096];
+    for marker_id in [None, Some("wrong")] {
+        if let Some(id) = marker_id {
+            engine.inject_ccp_message(&marker(id));
+        }
+        engine.poll_once();
+        engine.poll_auth_for_test();
+        assert!(peer.read(&mut wire).is_err(), "no U72 before this connection's initial end");
+    }
+    engine.inject_ccp_message(&marker("today4"));
+    engine.poll_once();
+    engine.poll_auth_for_test();
+    let count = peer.read(&mut wire).unwrap();
+    let request = ibx::protocol::fix::fix_parse(&wire[..count]);
+    assert_eq!(request.get(&6040).map(String::as_str), Some("72"));
+}
+
+#[test]
 fn fresh_execution_range_queries_wire_and_does_not_rebook_history() {
     let shared = Arc::new(SharedState::new());
     let (farm, _farm_peer) = connection();

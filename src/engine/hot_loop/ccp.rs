@@ -1334,9 +1334,9 @@ impl CcpState {
             Self::handle_what_if(parsed, context, shared, event_tx);
             return;
         }
-        // Native 8080 marks historical reports: ExecReportMgr stores them in
-        // dated history without applying them to live orders or positions.
-        // Ordinary live prints are only side-tapped, never consumed here.
+        // Dated 8080 reports and in-range possible resends answering an
+        // explicit execution query are read-only history. Other live prints
+        // are only side-tapped, never consumed here.
         if self.execution_ranges.report(parsed, shared, account_id) {
             return;
         }

@@ -106,7 +106,8 @@ impl ExecutionRequests {
         }
     }
 
-    /// Returns true only for historical rows and our exact request end.
+    /// Consume dated history, in-range possible resends of an active explicit
+    /// query, and its exact end. Other live reports continue through accounting.
     pub(super) fn report(
         &mut self,
         fields: &HashMap<u32, String>,
@@ -138,13 +139,18 @@ impl ExecutionRequests {
             }
             return true;
         }
-        if active.timed_out
-            || fields.get(&20).map(String::as_str) == Some("3")
+        if fields.get(&20).map(String::as_str) == Some("3")
             || fields.get(&1).is_some_and(|value| value != account)
             || !matches!(fields.get(&150).map(String::as_str), Some("F" | "1" | "2"))
         {
             return historical;
         }
+        // A real paper U72 reply has 97=Y but neither 8080 nor a row-level
+        // request ID. It must not rebook a fill already present in the U75
+        // position image. PossResend is not globally historical: apply this
+        // only to rows admitted to this explicit query's existing interval.
+        let possible_resend = fields.get(&97).map(String::as_str) == Some("Y");
+        let mut consumed = historical;
         match project_execution(fields, account, active.request.req_id) {
             Ok(row) => {
                 let time = fill_exec_of(fields, &row.execution.exec_id)
@@ -154,6 +160,10 @@ impl ExecutionRequests {
                     && time <= active.request.end_secs
                     && row.execution.acct_number == account
                 {
+                    consumed |= possible_resend;
+                    if active.timed_out {
+                        return consumed;
+                    }
                     let (base, revision) = split_exec_revision(&row.execution.exec_id);
                     if active
                         .rows
@@ -164,9 +174,14 @@ impl ExecutionRequests {
                     }
                 }
             }
-            Err(message) => active.failure = Some(message),
+            Err(message) => {
+                if !active.timed_out {
+                    active.failure = Some(message);
+                }
+                consumed |= possible_resend;
+            }
         }
-        historical
+        consumed
     }
 
     pub(super) fn commission(&mut self, fields: &HashMap<u32, String>) {
@@ -490,6 +505,154 @@ mod tests {
                 .map(|(tag, value)| (tag, value.into()))
                 .collect(),
         );
+    }
+
+    fn captured_paper_replay() -> Vec<Vec<(u32, String)>> {
+        include_str!("../../../tests/fixtures/execution_history/paper_u72_replayed_fill.jsonl")
+            .lines()
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                serde_json::from_value(row["fields"].clone()).unwrap()
+            })
+            .collect()
+    }
+
+    fn deliver_captured(
+        ccp: &mut CcpState,
+        context: &mut Context,
+        shared: &SharedState,
+        fields: &[(u32, String)],
+    ) {
+        let fields: Vec<_> = fields.iter().map(|(tag, value)| (*tag, value.as_str())).collect();
+        ccp.process_ccp_message(&fix::fix_build(&fields, 1), &mut None, context, shared,
+            &None, &mut HeartbeatState::new(), "DU123456");
+    }
+
+    #[test]
+    fn execution_range_captured_replay_does_not_double_the_broker_position() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let instrument = context.register_instrument(265598);
+        let capture = captured_paper_replay();
+        for image in &capture[..2] {
+            deliver_captured(&mut ccp, &mut context, &shared, image);
+        }
+        assert_eq!(shared.portfolio.position_info(265598).unwrap().position_fixed, QTY_SCALE);
+        for _ in 0..2 {
+            let mut request = active();
+            let end = "20261006-04:00:00";
+            request.active.as_mut().unwrap().request.end = end.into();
+            request.active.as_mut().unwrap().request.end_secs =
+                super::super::ccp::fix_utc_to_unix_secs(end).unwrap();
+            ccp.execution_ranges = request;
+            for message in &capture[2..] {
+                deliver_captured(&mut ccp, &mut context, &shared, message);
+            }
+            let rows = shared.orders.drain_execution_range_replies().pop().unwrap().result.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].execution.shares, 1.0);
+            assert_eq!(rows[0].execution.order_ref, "paper-execution-history-fixture");
+            assert_eq!(shared.portfolio.position_info(265598).unwrap().position_fixed, QTY_SCALE);
+            assert_eq!(context.position_fixed(instrument), QTY_SCALE);
+            assert!(shared.orders.drain_fills_with_exec().is_empty());
+            assert!(shared.orders.drain_untracked_executions().is_empty());
+            assert!(shared.portfolio.money_since_seed().is_empty());
+            assert!(shared.portfolio.realized_since_seed().is_empty());
+            assert!(ccp.last_exec.is_none());
+        }
+    }
+
+    #[test]
+    fn execution_range_keeps_live_fills_and_out_of_range_resends_in_accounting() {
+        for replay_flag in [None, Some("N"), Some("Y")] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            let instrument = context.register_instrument(265598);
+            ccp.execution_ranges = active();
+            let mut live = row("live.01", false);
+            if let Some(flag) = replay_flag {
+                live.insert(97, flag.into());
+            }
+            if replay_flag == Some("Y") {
+                live.insert(60, "20261005-12:00:01".into());
+            }
+            deliver(&mut ccp, &mut context, &shared, &live);
+            assert_eq!(context.position_fixed(instrument), QTY_SCALE / 2);
+            assert_eq!(shared.portfolio.position_info(265598).unwrap().position_fixed, QTY_SCALE / 2);
+            assert_eq!(shared.portfolio.money_since_seed().get(&265598), Some(&-50.0));
+            assert_eq!(shared.orders.drain_untracked_executions().len(), 1);
+            end(&mut ccp, &mut context, &shared);
+            let rows = shared.orders.drain_execution_range_replies().pop().unwrap().result.unwrap();
+            assert_eq!(rows.len(), usize::from(replay_flag != Some("Y")));
+        }
+    }
+
+    #[test]
+    fn execution_range_resend_is_not_global_and_does_not_consume_status_or_other_accounts() {
+        let shared = SharedState::new();
+        let mut replay = row("replay.01", false);
+        replay.insert(97, "Y".into());
+        let mut inactive = ExecutionRequests::default();
+        assert!(!inactive.report(&replay, &shared, "DU123456"));
+        for (tag, value) in [(20, "3"), (1, "DU654321")] {
+            let mut request = active();
+            let mut unrelated = replay.clone();
+            unrelated.insert(tag, value.into());
+            unrelated.remove(&6008);
+            assert!(!request.report(&unrelated, &shared, "DU123456"));
+            assert!(request.active.as_ref().unwrap().failure.is_none());
+            assert!(request.active.as_ref().unwrap().rows.is_empty());
+        }
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let instrument = context.register_instrument(265598);
+        deliver(&mut ccp, &mut context, &shared, &replay);
+        assert_eq!(context.position_fixed(instrument), QTY_SCALE / 2);
+        assert_eq!(shared.orders.drain_untracked_executions().len(), 1);
+    }
+
+    #[test]
+    fn execution_range_resends_keep_partial_fill_corrections_without_live_accounting() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        ccp.execution_ranges = active();
+        for (execution_id, shares) in [("partial.01", "0.5"), ("partial.02", "0.75"), ("partial.01", "0.5")] {
+            let mut replay = row(execution_id, false);
+            replay.insert(97, "Y".into());
+            replay.insert(32, shares.into());
+            replay.insert(14, shares.into());
+            deliver(&mut ccp, &mut context, &shared, &replay);
+        }
+        end(&mut ccp, &mut context, &shared);
+        let rows = shared.orders.drain_execution_range_replies().pop().unwrap().result.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].execution.exec_id, "partial.02");
+        assert_eq!(rows[0].execution.shares, 0.75);
+        assert!(shared.portfolio.position_infos().is_empty());
+        assert!(shared.portfolio.money_since_seed().is_empty());
+        assert!(shared.orders.drain_untracked_executions().is_empty());
+    }
+
+    #[test]
+    fn execution_range_timeout_quarantines_in_range_resends_until_exact_end() {
+        let shared = SharedState::new();
+        let mut request = active();
+        request.active.as_mut().unwrap().timed_out = true;
+        let mut replay = row("replay.01", false);
+        replay.insert(97, "Y".into());
+        assert!(request.report(&replay, &shared, "DU123456"));
+        assert!(request.active.as_ref().unwrap().rows.is_empty());
+        let mut marker = HashMap::from([(32, "*".into()), (6556, "wrong".into())]);
+        assert!(!request.report(&marker, &shared, "DU123456"));
+        assert!(request.active.is_some());
+        marker.insert(6556, "range1".into());
+        assert!(request.report(&marker, &shared, "DU123456"));
+        assert!(request.active.is_none());
+        assert!(shared.orders.drain_execution_range_replies().is_empty());
+        assert!(!request.report(&replay, &shared, "DU123456"));
     }
 
     #[test]
