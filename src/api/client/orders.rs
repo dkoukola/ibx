@@ -348,6 +348,15 @@ impl EClient {
     /// not change live orders/positions or populate the legacy session cache.
     /// A failed/interrupted request reports an error, never a successful end.
     /// Broker retention is not extended or inferred by this API.
+    ///
+    /// While this explicit query is active, execution-shaped `97=Y`
+    /// (PossResend) rows inside its account/time interval are query-local even
+    /// without `8080`. Startup/reconnect replay outside the query and live
+    /// rows without that flag keep their normal accounting behavior.
+    /// Native replies lack per-row request IDs: a genuinely live possible
+    /// resend within the same interval cannot be distinguished from a query
+    /// reply. Use a frozen past end and reconcile authoritative positions with
+    /// executions; a future end or same-second boundary can remain ambiguous.
     pub fn req_executions_range(&self, req_id: i64, start: &str, end: &str,
         filter: &ExecutionFilter, wrapper: &mut impl Wrapper) {
         if !crate::client_core::ClientCore::ids_fit("req_executions_range", &[req_id]) { return; }
