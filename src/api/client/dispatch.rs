@@ -81,6 +81,9 @@ impl EClient {
             };
             let (c, mut exec) = if let Some(info) = self.shared.orders.get_order_info(fill.order_id) {
                 let mut ex = info.last_exec;
+                if ex.order_ref.is_empty() {
+                    ex.order_ref = info.order.order_ref;
+                }
                 ex.perm_id = perm_id;
                 ex.side = side_str.into();
                 ex.shares = shares_f;

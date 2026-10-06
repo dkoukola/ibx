@@ -541,6 +541,29 @@ mod tests {
     }
 
     #[test]
+    fn execution_range_order_ref_comes_from_the_fresh_row_not_the_live_cache() {
+        for reference in [None, Some(""), Some("history-reference")] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            deliver(&mut ccp, &mut context, &shared, &row("live.01", false));
+            assert_eq!(shared.orders.get_order_info(42).unwrap().order.order_ref, "fixture-ref");
+            ccp.execution_ranges = active();
+            let mut historical = row("history.01", true);
+            historical.remove(&6010);
+            if let Some(reference) = reference {
+                historical.insert(6010, reference.into());
+            }
+            deliver(&mut ccp, &mut context, &shared, &historical);
+            end(&mut ccp, &mut context, &shared);
+            let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+            let rows = reply.result.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].execution.order_ref, reference.unwrap_or_default());
+        }
+    }
+
+    #[test]
     fn execution_range_exact_end_and_fresh_empty_answer() {
         let shared = SharedState::new();
         let mut requests = active();

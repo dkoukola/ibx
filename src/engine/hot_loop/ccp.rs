@@ -191,6 +191,7 @@ pub(super) fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec
         model_code: tag(6700).cloned().unwrap_or_default(),
         order_ref: tag(6010).cloned().unwrap_or_default(),
         last_liquidity: tag(851).and_then(|s| s.parse().ok()).unwrap_or(0),
+        order_ref_present: parsed.contains_key(&6010),
         combo: None,
         other_client: false,
         replayed: parsed.get(&97).is_some_and(|v| v == "Y"),
@@ -1999,6 +2000,11 @@ impl CcpState {
             }
             info.parent_id_known = parent_id_known;
             if let Some(previous) = &previous {
+                // Sparse reports omit the reference. Keep broker-observed
+                // identity, but never hide an explicitly changed or empty tag.
+                if !parsed.contains_key(&6010) {
+                    info.order.order_ref = previous.order.order_ref.clone();
+                }
                 if cancelled_snapshot {
                     // Native cancellation updates state, not amended terms.
                     // Explicit cumulative quantity/fees remain authoritative.
@@ -4659,6 +4665,31 @@ mod tests {
             m.insert(*tag, val.to_string());
         }
         m
+    }
+
+    #[test]
+    fn a_fill_retains_order_ref_only_when_the_tag_is_absent() {
+        for reference in [None, Some(""), Some("changed-reference")] {
+            let (mut ccp, mut context, shared) = ord_status_test_state();
+            let accepted = exec_report_frame(&[
+                (39, "0"), (150, "0"), (6010, "broker-reference"),
+            ]);
+            ccp.handle_exec_report(&accepted, &mut context, &shared, &None, "DU1");
+            let mut fill = exec_report_frame(&[
+                (39, "2"), (150, "2"), (17, "fixture.01"),
+                (32, "1"), (31, "100"), (14, "1"), (151, "0"), (6, "100"),
+            ]);
+            if let Some(reference) = reference {
+                fill.insert(6010, reference.into());
+            }
+            ccp.handle_exec_report(&fill, &mut context, &shared, &None, "DU1");
+            assert_eq!(shared.orders.get_order_info(42).unwrap().order.order_ref,
+                reference.unwrap_or("broker-reference"));
+            let fills = shared.orders.drain_fills_with_exec();
+            assert_eq!(fills.len(), 1);
+            assert_eq!(fills[0].1.order_ref_present, reference.is_some());
+            assert_eq!(fills[0].1.order_ref, reference.unwrap_or_default());
+        }
     }
 
     // ibx#329: the parent id came from the OCA group, so every order of an
