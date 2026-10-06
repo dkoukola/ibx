@@ -73,6 +73,8 @@ pub struct FillExec {
     pub model_code: String,
     /// Tag 6010.
     pub order_ref: String,
+    /// Whether tag 6010 was present, including an explicitly empty reference.
+    pub order_ref_present: bool,
     /// A report of a combo order (ibx#470): the contract its execution
     /// shows, and for a leg report the leg's own execution values.
     pub combo: Option<Box<ComboExec>>,

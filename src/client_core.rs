@@ -2593,13 +2593,13 @@ impl ClientCore {
         if !fe.model_code.is_empty() {
             ex.model_code = fe.model_code.clone();
         }
-        ex.order_ref = if !fe.order_ref.is_empty() {
-            fe.order_ref.clone()
-        } else {
-            self.open_orders.lock().unwrap().get(&order_id)
-                .map(|t| t.order.order_ref.clone())
-                .unwrap_or_default()
-        };
+        if fe.order_ref_present || !fe.order_ref.is_empty() {
+            ex.order_ref = fe.order_ref.clone();
+        } else if ex.order_ref.is_empty()
+            && let Some(tracked) = self.open_orders.lock().unwrap().get(&order_id)
+        {
+            ex.order_ref = tracked.order.order_ref.clone();
+        }
     }
 
     /// Attach a commission report to its stored execution (a higher revision

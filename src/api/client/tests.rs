@@ -4636,6 +4636,7 @@ fn captured_fill_exec() -> crate::bridge::FillExec {
         client_id: 250,
         model_code: String::new(),
         order_ref: "pm0925-fill-BUY".into(),
+        order_ref_present: true,
         combo: None,
     }
 }
@@ -4706,12 +4707,58 @@ fn exec_details_of_an_own_order_takes_the_tracked_order_ref() {
         order_ref: "t1".into(), ..Default::default()
     };
     client.place_order(7, &spy(), &order).unwrap();
-    let exec = crate::bridge::FillExec { client_id: 0, order_ref: String::new(), ..captured_fill_exec() };
+    let exec = crate::bridge::FillExec { client_id: 0, order_ref: String::new(), order_ref_present: false, ..captured_fill_exec() };
     shared.orders.push_fill_with_exec(aapl_fill(7), exec);
     let mut w = ExecRecorder::default();
     client.process_msgs(&mut w);
     assert_eq!(w.execs[0].1.order_ref, "t1");
     assert_eq!(w.execs[0].1.client_id, 0, "the Rust client has no client id");
+}
+
+#[test]
+fn exec_details_without_an_api_template_keeps_the_broker_order_ref() {
+    let (client, _rx, shared) = test_client();
+    shared.orders.push_order_info(7, crate::bridge::RichOrderInfo {
+        contract: spy(),
+        order: Order { order_ref: "broker-reference".into(), ..Default::default() },
+        order_state: Default::default(),
+        last_exec: Default::default(),
+        parent_id_known: true,
+        report_revision: None,
+        report_time: None,
+    });
+    shared.orders.push_fill_with_exec(aapl_fill(7), crate::bridge::FillExec {
+        order_ref: String::new(), order_ref_present: false, ..captured_fill_exec()
+    });
+    let mut wrapper = ExecRecorder::default();
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.execs[0].1.order_ref, "broker-reference");
+    let mut replay = ExecRecorder::default();
+    client.req_executions(3, &Default::default(), &mut replay);
+    client.process_msgs(&mut replay);
+    assert_eq!(replay.execs[0].1.order_ref, "broker-reference");
+}
+
+#[test]
+fn fill_order_ref_preserves_known_identity_but_honors_explicit_empty_or_changed_tags() {
+    let (client, _rx, _) = test_client();
+    client.core.track_order(7, spy(), Order {
+        order_ref: "local-template-reference".into(), ..Default::default()
+    }, 0);
+    for (reference, present, expected) in [
+        ("", false, "broker-reference"),
+        ("", true, ""),
+        ("changed-reference", true, "changed-reference"),
+        ("injected-reference", false, "injected-reference"),
+    ] {
+        let mut execution = crate::api::types::Execution {
+            order_ref: "broker-reference".into(), ..Default::default()
+        };
+        client.core.apply_fill_exec(&mut execution, &crate::bridge::FillExec {
+            order_ref: reference.into(), order_ref_present: present, ..Default::default()
+        }, 7);
+        assert_eq!(execution.order_ref, expected);
+    }
 }
 
 fn filter_count(client: &EClient, filter: crate::api::types::ExecutionFilter) -> usize {

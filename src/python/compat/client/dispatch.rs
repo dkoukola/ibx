@@ -346,6 +346,8 @@ impl EClient {
             let avg_price = fill.average_price() as f64 / PRICE_SCALE_F;
 
             let rich_info = shared.orders.get_order_info(fill.order_id);
+            let order_ref = rich_info.as_ref()
+                .map(|info| info.order.order_ref.clone()).unwrap_or_default();
             // Build api-level contract for shared storage
             let api_contract = self.core.open_orders.lock().unwrap()
                 .get(&fill.order_id).map(|o| o.contract.clone())
@@ -367,6 +369,7 @@ impl EClient {
                 order_id: fill.order_id,
                 cum_qty,
                 avg_price,
+                order_ref,
                 ..Default::default()
             };
             self.core.apply_fill_exec(&mut api_exec, &fill_exec, fill.order_id);
