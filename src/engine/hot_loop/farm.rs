@@ -538,7 +538,17 @@ impl FarmState {
         let mut traded = [0u64; crate::types::MAX_INSTRUMENTS / 64];
 
         // Phase 1: Apply all ticks to internal quotes before publishing.
+        let mut close_block = false;
         for tick in &ticks {
+            if tick.first {
+                close_block = tick.tick_type == tick_decoder::O_CLOSE_PRICE;
+            }
+            // Delayed quote streams also send unflagged close blocks. Their
+            // type 20 is the close date, not the last-trade epoch base. Keep
+            // the wire stats flag intact and use this block's price context.
+            if close_block && tick.tick_type == tick_decoder::O_TIMESTAMP_BASE {
+                continue;
+            }
             let route = match context.market.route_farm_tag(self.rx_farm, tick.server_tag) {
                 Some(r) => r,
                 None => continue,
@@ -1914,6 +1924,102 @@ mod tests {
         assert_eq!(q.last, 25_501 * PRICE_SCALE / 100);
         assert_eq!(q.low, 0);
         assert_eq!(q.timestamp_ns, 1_790_159_186 * 1_000_000_000);
+    }
+
+    // PEP delayed quote stream, captured 08/10/2026. These are the exact
+    // five 35=P bodies only: no authentication, account or FIX signatures.
+    // Both last-trade and close blocks have a clear stats flag on this
+    // quote route. Type 20 in the close block is a date, not a time base.
+    #[test]
+    fn captured_delayed_quote_close_date_preserves_trade_timestamp() {
+        let bodies: Vec<String> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/delayed_quote_timestamp_20261008.json"
+        ))).unwrap();
+        let shared = SharedState::new();
+        let mut farm = FarmState::new();
+        farm.rx_farm = 2;
+        let mut context = Context::new();
+        let id = context.market.register(11017);
+        context.market.register_farm_tag(2, 49971, id, 0.01);
+        assert!(!context.market.route_farm_tag(2, 49971).unwrap().trade);
+        let expected = [1_791_472_649, 1_791_472_659, 1_791_472_669, 1_791_472_669, 1_791_472_679];
+        assert_eq!(bodies.len(), expected.len());
+        for (body, seconds) in bodies.iter().zip(expected) {
+            let body = hex::decode(body).unwrap();
+            let bit_count = u16::from_be_bytes([body[0], body[1]]) as usize;
+            assert_eq!(body.len(), 2 + bit_count.div_ceil(8), "body only, without trailing metadata");
+            let mut msg = b"8=O\x0135=P\x01".to_vec();
+            msg.extend_from_slice(&body);
+            farm.handle_tick_data(&msg, &mut context, &shared, &None);
+            let quote = shared.market.quote(id);
+            assert_eq!(quote.timestamp_ns, seconds * 1_000_000_000);
+            assert!(quote.bid > 0 && quote.ask > 0 && quote.last > 0 && quote.close > 0);
+        }
+    }
+
+    #[test]
+    fn close_block_timestamp_is_not_a_trade_time_in_either_order_or_route() {
+        for trade in [false, true] {
+            for stats in [false, true] {
+                for close_first in [false, true] {
+                    let shared = SharedState::new();
+                    let mut farm = FarmState::new();
+                    let mut context = Context::new();
+                    let id = context.market.register(265598);
+                    if trade {
+                        context.market.register_trade_tag(0, 77, id, 0.01);
+                    } else {
+                        context.market.register_farm_tag(0, 77, id, 0.01);
+                    }
+                    // Even an epoch-shaped value belongs to the close block;
+                    // the distinction is structural, not a numeric heuristic.
+                    let close: Block = (stats, 77, &[(3, 100), (20, 1_790_159_999)]);
+                    let last: Block = (false, 77, &[(2, 101), (20, 1_790_159_184), (21, 5)]);
+                    let blocks = if close_first { [close, last] } else { [last, close] };
+                    farm.handle_tick_data(&tick_message(&blocks), &mut context, &shared, &None);
+                    let quote = shared.market.quote(id);
+                    assert_eq!(quote.timestamp_ns, 1_790_159_189 * 1_000_000_000,
+                        "trade={trade}, stats={stats}, close_first={close_first}");
+                    assert_eq!(quote.close, PRICE_SCALE);
+                    assert_eq!(quote.last, 101 * PRICE_SCALE / 100);
+                    // A later trade delta is still based on the epoch base.
+                    let next = tick_message(&[(false, 77, &[(2, 102), (21, 8)])]);
+                    farm.handle_tick_data(&next, &mut context, &shared, &None);
+                    assert_eq!(shared.market.quote(id).timestamp_ns, 1_790_159_192 * 1_000_000_000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_block_context_resets_between_blocks_tags_and_messages() {
+        let shared = SharedState::new();
+        let mut farm = FarmState::new();
+        let mut context = Context::new();
+        let first = context.market.register(265598);
+        let second = context.market.register(11017);
+        context.market.register_farm_tag(0, 77, first, 0.01);
+        context.market.register_trade_tag(0, 88, second, 0.01);
+        let message = tick_message(&[
+            (false, 77, &[(3, 100), (20, 20_261_007)]),
+            (false, 77, &[(20, 1_790_159_184)]),
+            (false, 77, &[(3, 101), (20, 20_261_007)]),
+            (false, 88, &[(20, 1_790_159_200)]),
+            (false, 999, &[(3, 102), (20, 20_261_007)]),
+            (false, 88, &[(20, 1_790_159_300)]),
+            (false, 77, &[(3, 103), (20, 20_261_007)]),
+        ]);
+        farm.handle_tick_data(&message, &mut context, &shared, &None);
+        assert_eq!(shared.market.quote(first).timestamp_ns, 1_790_159_184 * 1_000_000_000);
+        assert_eq!(shared.market.quote(second).timestamp_ns, 1_790_159_300 * 1_000_000_000);
+        // No block state leaks from the prior message ending with a close.
+        let next = tick_message(&[(false, 77, &[(20, 1_790_159_400), (21, 2)])]);
+        farm.handle_tick_data(&next, &mut context, &shared, &None);
+        assert_eq!(shared.market.quote(first).timestamp_ns, 1_790_159_402 * 1_000_000_000);
+        // An explicit daily-stats block still cannot replace that base.
+        let stats = tick_message(&[(true, 77, &[(20, 20_261_008)])]);
+        farm.handle_tick_data(&stats, &mut context, &shared, &None);
+        assert_eq!(shared.market.quote(first).timestamp_ns, 1_790_159_402 * 1_000_000_000);
     }
 
     /// Subscribe EUR.USD, ack its two entries in the given order (bid/ask
