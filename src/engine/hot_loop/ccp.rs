@@ -1440,6 +1440,42 @@ impl CcpState {
             return;
         }
 
+        // A working order is PreSubmitted until the server reports routing.
+        // Use the same classification for recovery and subsequent updates.
+        let working = || {
+            let routed = parsed.get(&100).is_some_and(|s| !s.is_empty())
+                || parsed.get(&198).is_some_and(|s| s != "NONE" && !s.is_empty());
+            if routed {
+                crate::types::OrderStatus::Submitted
+            } else {
+                crate::types::OrderStatus::PreSubmitted
+            }
+        };
+
+        let replaced_totals = if state_admitted && is_status_report && server_id > 0
+            && parsed.get(&150).map(String::as_str) == Some("5")
+            && parsed.get(&39).map(String::as_str) == Some("5")
+            && matches!(parsed.get(&54).map(String::as_str), Some("1" | "2" | "5"))
+        {
+            parsed.get(&38).and_then(|s| parse_qty(s))
+                .zip(parsed.get(&14).and_then(|s| parse_qty(s)))
+                .zip(parsed.get(&151).and_then(|s| parse_qty(s)))
+                .filter(|((total, filled), leaves)| *total > 0 && *filled >= 0 && *leaves > 0
+                    && filled.checked_add(*leaves) == Some(*total))
+        } else { None };
+        let is_replaced_snapshot = replaced_totals.is_some();
+        // A terminal order has left open_orders, but its existing tombstone
+        // still wins over a late working image with equal/missing time. Scope
+        // that authority to the broker identity, not a colliding caller key.
+        if is_replaced_snapshot && context.finished_status(clord_id).is_some()
+            && context.last_clord.get(&clord_id).map(|id| perm_id_from_clord_id(id)) == Some(server_id)
+        {
+            if collect_history {
+                self.completed_history.collect(parsed, account_id, previous.as_ref());
+            }
+            return;
+        }
+
         // An order this session does not hold, reported working: an order
         // of another session or client, put in the book so it can be
         // cancelled, by its id or by a global cancel, and its reports reach
@@ -1451,11 +1487,8 @@ impl CcpState {
         // was left out when only 150=0 39=0 was taken (paper 04/10/2026:
         // 10147 on their cancel, nothing sent by a global cancel).
         let replayed_status = match parsed.get(&39).map(|s| s.as_str()) {
-            Some("0" | "5") => {
-                let routed = parsed.get(&100).is_some_and(|s| !s.is_empty())
-                    || parsed.get(&198).is_some_and(|s| s != "NONE" && !s.is_empty());
-                Some(if routed { crate::types::OrderStatus::Submitted } else { crate::types::OrderStatus::PreSubmitted })
-            }
+            Some("0") => Some(working()),
+            Some("5") if is_replaced_snapshot => Some(working()),
             Some("A") => Some(crate::types::OrderStatus::PreSubmitted),
             Some("1") => Some(crate::types::OrderStatus::PartiallyFilled),
             Some("6" | "D") => Some(crate::types::OrderStatus::PendingCancel),
@@ -1702,15 +1735,6 @@ impl CcpState {
         // shows up on the same exec report as a non-empty ExDestination
         // (tag 100) plus an exec ref (tag 198) other than "NONE"; before
         // routing both are absent/"NONE". Captured in ib-agent#162 (ibx#210).
-        let working = || {
-            let routed = parsed.get(&100).is_some_and(|s| !s.is_empty())
-                || parsed.get(&198).is_some_and(|s| s != "NONE" && !s.is_empty());
-            if routed {
-                crate::types::OrderStatus::Submitted
-            } else {
-                crate::types::OrderStatus::PreSubmitted
-            }
-        };
         let status = match ord_status {
             "0" => working(),
             // Replaced: back to working, by the same routing rule. The
@@ -6738,6 +6762,264 @@ mod tests {
             (6008, con_id.to_string()), (55, "TEST".into()), (54, "1".into()),
             (38, "1".into()), (44, "1".into()), (40, "2".into()), (59, "1".into()),
         ].into_iter().collect()
+    }
+
+    // Sanitized shape of the paper account's two protective orders at cold
+    // startup: the server restates a working replacement, not a New ack.
+    fn replaced_recovery_frame(order_id: OrderId, stop: bool) -> std::collections::HashMap<u32, String> {
+        let mut report = recovery_frame(order_id, 265_598);
+        for (tag, value) in [
+            (1, "DU1"), (20, "3"), (150, "5"), (39, "5"), (55, "AAPL"),
+            (54, "2"), (14, "0"), (151, "1"), (6107, "900001.0"),
+            (583, "900001"), (6209, "3"), (6010, "recovered-protection"),
+        ] {
+            report.insert(tag, value.into());
+        }
+        report.insert(40, if stop { "3" } else { "2" }.into());
+        report.insert(if stop { 99 } else { 44 }, if stop { "328.38" } else { "338.4" }.into());
+        report.insert(6531, if stop { "7/1/-6183061" } else { "7/2/-6183061" }.into());
+        if !stop {
+            report.insert(100, "SMART".into());
+            report.insert(198, "fixture-route".into());
+        }
+        report
+    }
+
+    #[test]
+    fn cold_replaced_protection_is_recovered_for_guarded_modify_without_booking_fills() {
+        use crate::protocol::order_write::{OrderWriteGuard, OrderWriteOutcome};
+        use crate::types::{OrderKind, OrderRequest, OrderStatus};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        for api_id in [None, Some("15")] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = Arc::new(SharedState::new());
+            let stop = replaced_recovery_frame(900_002, true);
+            let mut profit = replaced_recovery_frame(900_003, false);
+            if let Some(id) = api_id { profit.insert(6121, id.into()); }
+            for report in [&stop, &profit] {
+                ccp.handle_exec_report(report, &mut context, &shared, &None, "DU1");
+            }
+            let key = if api_id.is_some() { 15 } else { 900_003 };
+            let info = shared.orders.get_order_info(key).expect("broker order projected");
+            assert_eq!(info.order_state.status, "Submitted");
+            assert_eq!(info.order.perm_id, 900_003);
+            assert_eq!(info.order.parent_id, 900_001);
+            assert_eq!(info.order.oca_group, "900001");
+            assert_eq!(info.order.oca_type, 3);
+            let order = context.order(key).expect("working replacement recovered in hot loop");
+            assert_eq!(order.side, Side::Sell);
+            assert_eq!(order.qty_fixed, QTY_SCALE);
+            assert_eq!(order.filled_fixed, 0);
+            assert_eq!(order.status, OrderStatus::Submitted);
+            assert_eq!(context.market.con_id(order.instrument), Some(265_598));
+            assert_eq!(context.position_fixed(order.instrument), 0);
+            assert_eq!(context.order(900_002).unwrap().status, OrderStatus::PreSubmitted);
+            assert!(shared.orders.drain_fills().is_empty());
+            assert_eq!(context.bracket_keys[&key].to_string(), "7/2/-6183061");
+            assert_eq!(context.last_clord[&key], "900003.0");
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let called = calls.clone();
+            let (guard, receipt) = OrderWriteGuard::new(move || {
+                called.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            context.pending_orders.push(OrderRequest::Guarded {
+                request: Box::new(OrderRequest::Modify {
+                    new_order_id: key, order_id: key, qty: 1,
+                    kind: OrderKind::Limit { price: 333 * PRICE_SCALE + 4 * PRICE_SCALE / 100 },
+                    tif: b'1', attrs: info.order.attrs(),
+                }),
+                guard,
+            });
+            let (client, mut server) = socket_pair();
+            let mut conn = Some(Connection::new_raw(client).unwrap());
+            super::super::order_builder::drain_and_send_orders(
+                &mut conn, &mut context, "DU1", &mut HeartbeatState::new(), false, &shared);
+            let frames = ccp_messages_sent(&mut server);
+            assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::Written));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(frames.len(), 1);
+            for field in ["35=G|", "11=900003.1|", "41=900003.0|", "54=2|", "38=1|",
+                "44=333.04|", "6008=265598|", "6010=recovered-protection|", "6531=7/2/-6183061|"] {
+                assert!(frames[0].contains(field), "missing {field}: {}", frames[0]);
+            }
+            // The existing replace encoder identifies the retained bracket
+            // by its key, rather than submitting fresh parent/OCA linkage.
+            let retained = shared.orders.get_order_info(key).unwrap();
+            assert_eq!(retained.order.parent_id, info.order.parent_id);
+            assert_eq!(retained.order.oca_group, info.order.oca_group);
+            assert_eq!(retained.order.oca_type, info.order.oca_type);
+            assert_eq!(context.order(900_002).unwrap().qty_fixed, QTY_SCALE);
+            assert!(shared.orders.drain_order_errors().is_empty());
+        }
+    }
+
+    #[test]
+    fn replaced_status_recovery_seeds_cumulative_quantity_without_an_execution() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let mut report = replaced_recovery_frame(900_003, false);
+        for (tag, value) in [(38, "10"), (14, "4"), (151, "6")] {
+            report.insert(tag, value.into());
+        }
+        for _ in 0..2 {
+            ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+            let order = context.order(900_003).expect("working replacement recovered");
+            assert_eq!(order.qty_fixed, 10 * QTY_SCALE);
+            assert_eq!(order.filled_fixed, 4 * QTY_SCALE);
+            assert_eq!(shared.orders.get_order_info(900_003).unwrap().order.filled_quantity, 4.0);
+            assert_eq!(context.position_fixed(order.instrument), 0);
+            assert!(shared.orders.drain_fills().is_empty());
+        }
+        // The next real print adds only its own quantity to the seeded total.
+        for (tag, value) in [(20, "0"), (150, "1"), (39, "1"), (14, "5"),
+            (151, "5"), (17, "next-print"), (32, "1"), (31, "338.4"), (6, "338.4")] {
+            report.insert(tag, value.into());
+        }
+        ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+        let order = context.order(900_003).unwrap();
+        assert_eq!(order.filled_fixed, 5 * QTY_SCALE);
+        assert_eq!(context.position_fixed(order.instrument), -QTY_SCALE);
+        let fills = shared.orders.drain_fills();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].qty_fixed, QTY_SCALE);
+        assert_eq!(fills[0].cum_qty_fixed, 5 * QTY_SCALE);
+    }
+
+    #[test]
+    fn replaced_recovery_requires_broker_identity_side_and_working_totals() {
+        for (tag, value) in [(11, "0.0"), (11, "unknown"), (11, "-1.0"),
+            (54, ""), (54, "unknown"), (38, "0"), (14, "-1"), (14, "2"),
+            (151, "0"), (151, "2"), (151, "unknown")] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            let mut report = replaced_recovery_frame(900_003, false);
+            report.insert(tag, value.into());
+            ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+            assert!(context.open_orders_for(0).is_empty(), "tag{tag}={value}");
+            assert!(context.recovered_keys.is_empty());
+            assert!(shared.orders.drain_fills().is_empty());
+        }
+    }
+
+    #[test]
+    fn replaced_order_from_history_alone_is_not_live_recovery() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        shared.orders.begin_execution_history("connection");
+        shared.orders.complete_execution_history("connection");
+        ccp.completed_history.queue("connection".into(), false, "20261005-00:00:00".into(), "20261006-00:00:00".into());
+        let (client, mut server) = socket_pair();
+        let mut conn = Some(Connection::new_raw(client).unwrap());
+        ccp.progress_completed_history(&mut conn, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
+        assert!(ccp.completed_history.active());
+        assert_eq!(ccp_messages_sent(&mut server).len(), 1);
+        ccp.handle_exec_report(&replaced_recovery_frame(900_003, false), &mut context, &shared, &None, "DU1");
+        assert!(context.order(900_003).is_none());
+        assert!(shared.orders.get_order_info(900_003).is_none());
+        assert!(shared.orders.drain_fills().is_empty());
+    }
+
+    #[test]
+    fn replaced_recovery_cannot_resurrect_a_finished_broker_order() {
+        use crate::protocol::order_write::{OrderWriteGuard, OrderWriteOutcome};
+        use crate::types::{OrderKind, OrderRequest, OrderStatus};
+        use std::sync::Arc;
+
+        for retire_rich in [false, true] {
+            for timestamp in [None, Some("20261006-12:00:00")] {
+                let mut ccp = CcpState::new();
+                let mut context = Context::new();
+                let shared = Arc::new(SharedState::new());
+                let mut working = replaced_recovery_frame(900_003, false);
+                working.insert(6121, "15".into());
+                if let Some(time) = timestamp { working.insert(60, time.into()); }
+                ccp.handle_exec_report(&working, &mut context, &shared, &None, "DU1");
+                let mut cancelled = working.clone();
+                cancelled.insert(150, "4".into());
+                cancelled.insert(39, "4".into());
+                ccp.handle_exec_report(&cancelled, &mut context, &shared, &None, "DU1");
+                assert_eq!(context.finished_status(15), Some(OrderStatus::Cancelled));
+                assert!(context.order(15).is_none());
+                if retire_rich { shared.orders.remove_order_info(15); }
+
+                // Native timestamps have second precision: equal revision and
+                // time cannot establish that a working image supersedes the
+                // same broker order's terminal status. Missing time cannot either.
+                ccp.handle_exec_report(&working, &mut context, &shared, &None, "DU1");
+                assert!(context.order(15).is_none(), "late replacement resurrected terminal order");
+                assert_eq!(context.finished_status(15), Some(OrderStatus::Cancelled));
+                if retire_rich {
+                    assert!(shared.orders.get_order_info(15).is_none());
+                } else {
+                    assert_eq!(shared.orders.get_order_info(15).unwrap().order_state.status, "Cancelled");
+                }
+                assert!(shared.orders.drain_fills().is_empty());
+
+                let (guard, receipt) = OrderWriteGuard::new(|| panic!("terminal order reached first-write authorization"));
+                context.pending_orders.push(OrderRequest::Guarded {
+                    request: Box::new(OrderRequest::Modify {
+                        new_order_id: 15, order_id: 15, qty: 1,
+                        kind: OrderKind::Limit { price: 333 * PRICE_SCALE },
+                        tif: b'1', attrs: Default::default(),
+                    }),
+                    guard,
+                });
+                let (client, mut server) = socket_pair();
+                let mut conn = Some(Connection::new_raw(client).unwrap());
+                super::super::order_builder::drain_and_send_orders(
+                    &mut conn, &mut context, "DU1", &mut HeartbeatState::new(), false, &shared);
+                assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+                assert!(ccp_messages_sent(&mut server).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_recovery_does_not_confuse_another_orders_terminal_api_key_with_broker_identity() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let mut first = replaced_recovery_frame(900_003, false);
+        first.insert(6121, "15".into());
+        ccp.handle_exec_report(&first, &mut context, &shared, &None, "DU1");
+        first.insert(150, "4".into());
+        first.insert(39, "4".into());
+        ccp.handle_exec_report(&first, &mut context, &shared, &None, "DU1");
+        shared.orders.remove_order_info(15);
+        let mut second = replaced_recovery_frame(15, false);
+        second.insert(6121, "16".into());
+        ccp.handle_exec_report(&second, &mut context, &shared, &None, "DU1");
+        assert!(context.order(15).is_none());
+        assert_eq!(context.last_clord[&16], "15.0");
+        assert_eq!(context.recovered_keys[&15], 16);
+        assert!(context.order(16).is_some());
+        assert_eq!(shared.orders.get_order_info(16).unwrap().order.perm_id, 15);
+    }
+
+    #[test]
+    fn replaced_recovery_does_not_insert_terminal_or_unqueried_replacements() {
+        for (exec_type, status, transaction) in [
+            ("2", "2", "3"), ("4", "4", "3"), ("8", "8", "3"),
+            ("5", "5", "0"), ("5", "D", "3"), ("5", "E", "3"),
+        ] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            let mut report = replaced_recovery_frame(900_003, false);
+            for (tag, value) in [(150, exec_type), (39, status), (20, transaction)] {
+                report.insert(tag, value.into());
+            }
+            ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+            assert!(context.order(900_003).is_none(), "150={exec_type} 39={status} 20={transaction}");
+            assert!(shared.orders.drain_fills().is_empty());
+        }
     }
 
     // ibx#492: openOrder reads the price management flag the server
