@@ -439,12 +439,20 @@ impl Reducer {
                     .and_then(|v| v.parse::<f64>().ok())
                     .filter(|v| v.is_finite())
             };
+            // A native OCA reduction can cancel an unfilled order with an
+            // explicit zero current total (paper STANDARD reply, 2026-10-08).
+            // Preserve that broker value, not an invented original quantity.
+            // Missing totals, fills, and every non-cancel status still fail.
+            let zero_quantity_cancel = fields.get(&39).map(String::as_str) == Some("4")
+                && number(38) == Some(0.0)
+                && number(14) == Some(0.0)
+                && number(151) == Some(0.0);
             if row.known.is_none()
                 && (!fields
                     .get(&6008)
                     .and_then(|v| v.parse::<i64>().ok())
                     .is_some_and(|v| v > 0)
-                    || !number(38).is_some_and(|v| v > 0.0)
+                    || !(number(38).is_some_and(|v| v > 0.0) || zero_quantity_cancel)
                     || !matches!(fields.get(&54).map(String::as_str), Some("1" | "2" | "5"))
                     || !fields.get(&15).is_some_and(|v| !v.is_empty())
                     || !fields
@@ -503,7 +511,9 @@ impl Reducer {
                 || projected.contract.sec_type == "BAG"
                 || !matches!(order.action.as_str(), "BUY" | "SELL" | "SSHORT")
                 || !order.total_quantity.is_finite()
-                || order.total_quantity <= 0.0
+                || order.total_quantity < 0.0
+                || (order.total_quantity == 0.0
+                    && !(zero_quantity_cancel && order.filled_quantity == 0.0))
                 || !order.filled_quantity.is_finite()
                 || order.filled_quantity < 0.0
                 || (row.status == OrderStatus::Filled && order.filled_quantity <= 0.0)
@@ -599,6 +609,126 @@ mod tests {
             row.insert(tag, value);
         }
         row
+    }
+
+    fn zero_quantity_oca_cancel() -> HashMap<u32, String> {
+        // Relevant fields from a fresh paper STANDARD reply on 2026-10-08:
+        // the OCA peer filled and this previously working one-share stop was
+        // cancelled with total/cumulative/leaves all zero. Identities and
+        // prices are synthetic; zero is the current broker total, not one.
+        let mut row = capture()[1].clone();
+        for (tag, value) in [
+            (20, "3"),
+            (150, "4"),
+            (39, "4"),
+            (38, "0"),
+            (14, "0"),
+            (151, "0"),
+            (40, "3"),
+            (99, "100"),
+            (54, "2"),
+            (583, "fixture.oca"),
+            (6209, "ReduceOnFillNonBlock"),
+            (6107, "1234567890001.0"),
+        ] {
+            row.insert(tag, value.into());
+        }
+        row.remove(&44);
+        row
+    }
+
+    #[test]
+    fn completed_oca_cancel_preserves_explicit_zero_current_quantity() {
+        let mut state = active();
+        let shared = SharedState::new();
+        assert_eq!(
+            state.report(&zero_quantity_oca_cancel(), &shared, "DU123456"),
+            HistoryReport::Row
+        );
+        assert_eq!(
+            state.report(&capture()[2], &shared, "DU123456"),
+            HistoryReport::End
+        );
+        let result = shared
+            .orders
+            .drain_completed_history_replies()
+            .remove(0)
+            .result
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].order_state.status, "Cancelled");
+        assert_eq!(result[0].order.total_quantity, 0.0);
+        assert_eq!(result[0].order.filled_quantity, 0.0);
+        assert_eq!(result[0].order.order_type, "STP");
+        assert_eq!(result[0].order.aux_price, 100.0);
+        assert_eq!(result[0].order.oca_group, "fixture.oca");
+        assert_eq!(result[0].order.oca_type, 3);
+        assert_eq!(result[0].order.parent_id, 1_234_567_890_001);
+        assert!(result[0].parent_id_known);
+        assert!(shared.orders.drain_fills().is_empty());
+        assert!(shared.orders.drain_order_updates().is_empty());
+        assert!(shared.orders.drain_open_orders().is_empty());
+    }
+
+    #[test]
+    fn completed_zero_quantity_requires_explicit_unfilled_cancellation() {
+        for (tag, value) in [
+            (38, None),
+            (38, Some("-1")),
+            (38, Some("NaN")),
+            (38, Some("inf")),
+            (14, None),
+            (14, Some("1")),
+            (14, Some("-1")),
+            (14, Some("NaN")),
+            (151, None),
+            (151, Some("1")),
+            (151, Some("-1")),
+            (151, Some("NaN")),
+            (39, Some("2")),
+            (39, Some("8")),
+            (39, Some("C")),
+            (6008, None),
+            (15, None),
+            (167, Some("BAG")),
+            (54, Some("0")),
+            (99, None),
+            (8302, Some("1")),
+        ] {
+            let mut row = zero_quantity_oca_cancel();
+            row.remove(&tag);
+            if let Some(value) = value {
+                row.insert(tag, value.into());
+            }
+            let mut reducer = Reducer::default();
+            reducer.push(&row, "DU123456");
+            assert!(reducer.finish(false).is_err(), "accepted {tag}={value:?}");
+        }
+    }
+
+    #[test]
+    fn completed_zero_quantity_cancel_keeps_known_terms_without_reopening_order() {
+        let (mut ccp, mut context, shared) = live_context();
+        deliver(
+            &mut ccp,
+            &mut context,
+            &shared,
+            &working_row(0, "20260102-12:30:00"),
+        );
+        ccp.completed_history = active();
+        let mut cancel = zero_quantity_oca_cancel();
+        cancel.insert(11, "42.0".into());
+        cancel.insert(60, "20260102-12:40:00".into());
+        deliver(&mut ccp, &mut context, &shared, &cancel);
+        assert!(context.order(42).is_none());
+        assert_eq!(context.finished_status(42), Some(OrderStatus::Cancelled));
+        let result = finish_query(&mut ccp, &mut context, &shared);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].order_state.status, "Cancelled");
+        assert_eq!(result[0].order.total_quantity, 3.0);
+        assert_eq!(result[0].order.filled_quantity, 0.0);
+        assert!(context.order(42).is_none());
+        assert!(shared.orders.drain_fills().is_empty());
     }
 
     fn live_context() -> (CcpState, Context, SharedState) {
