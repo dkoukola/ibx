@@ -49,6 +49,8 @@ fn recover(fixture: &str, sequences: &[u64]) -> Vec<Order> {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let client = EClient::from_parts(shared, tx, std::thread::spawn(|| {}), "DUXXXXXXX".into());
     let mut wrapper = Orders::default();
+    client.process_msgs(&mut wrapper);
+    wrapper.orders.clear();
     client.req_all_open_orders(&mut wrapper);
     client.process_msgs(&mut wrapper);
     assert_eq!(wrapper.ends, 1);

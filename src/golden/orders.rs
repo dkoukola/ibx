@@ -116,7 +116,14 @@ pub(crate) fn replay_orders(fx: &Fixture) -> OrderReplay {
                         }
                     }
                 }
-                if known { s.send_ccp(&rebuild_text(&f)); } else { unsent.push(r.seq); }
+                if known {
+                    // Run on the recorded broker day: archival commissions
+                    // must not be admitted into today's live accounting.
+                    if let Some(time) = tag(&f, 52).and_then(crate::engine::hot_loop::ccp::fix_utc_to_unix_secs) {
+                        s.shared.reference.clock().set(time * 1000 - crate::control::logon::local_now_ms());
+                    }
+                    s.send_ccp(&rebuild_text(&f));
+                } else { unsent.push(r.seq); }
             }
             _ => {}
         }

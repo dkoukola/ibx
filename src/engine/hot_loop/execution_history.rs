@@ -582,7 +582,8 @@ mod tests {
             assert_eq!(context.position_fixed(instrument), QTY_SCALE / 2);
             assert_eq!(shared.portfolio.position_info(265598).unwrap().position_fixed, QTY_SCALE / 2);
             assert_eq!(shared.portfolio.money_since_seed().get(&265598), Some(&-50.0));
-            assert_eq!(shared.orders.drain_untracked_executions().len(), 1);
+            assert_eq!(shared.orders.drain_fills_with_exec().len(), 1);
+            assert!(shared.orders.drain_untracked_executions().is_empty());
             end(&mut ccp, &mut context, &shared);
             let rows = shared.orders.drain_execution_range_replies().pop().unwrap().result.unwrap();
             assert_eq!(rows.len(), usize::from(replay_flag != Some("Y")));
@@ -610,7 +611,8 @@ mod tests {
         let instrument = context.register_instrument(265598);
         deliver(&mut ccp, &mut context, &shared, &replay);
         assert_eq!(context.position_fixed(instrument), QTY_SCALE / 2);
-        assert_eq!(shared.orders.drain_untracked_executions().len(), 1);
+        assert_eq!(shared.orders.drain_fills_with_exec().len(), 1);
+        assert!(shared.orders.drain_untracked_executions().is_empty());
     }
 
     #[test]

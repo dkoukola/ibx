@@ -1145,6 +1145,7 @@ mod tests {
     fn guarded_batch_partial_write_cancel_and_connection_loss_never_replay() {
         use super::super::order_write::OrderWriteOutcome;
         let (mut conn, mut server) = loopback();
+        conn_output(&mut conn).set_write_capacity(Some(256 * 1024));
         let (guard, receipt) = OrderWriteGuard::new(|| Ok(()));
         guard.claim();
         conn.begin_order_batch().unwrap();

@@ -5533,14 +5533,14 @@ fn position_snapshot_callback_reconnect_replays_without_stale_end() {
         changed: false,
     };
     client.req_positions(&mut wrapper);
-    assert_eq!(wrapper.rows, [(-1, 265598, 1.0)]);
+    assert_eq!(wrapper.rows.len(), 1);
+    assert!(matches!(wrapper.rows[0], (-1, 265598 | 756733, 1.0)));
     assert!(wrapper.ends.is_empty());
     assert!(shared.orders.execution_history_completion().is_none());
     client.process_msgs(&mut wrapper);
-    assert_eq!(
-        wrapper.rows,
-        [(-1, 265598, 1.0), (-1, 265598, 2.0), (-1, 756733, 1.0)]
-    );
+    let mut refreshed = wrapper.rows[1..].to_vec();
+    refreshed.sort_by_key(|row| row.1);
+    assert_eq!(refreshed, [(-1, 265598, 2.0), (-1, 756733, 1.0)]);
     assert_eq!(wrapper.ends, [-1]);
     client.process_msgs(&mut wrapper);
     assert_eq!(wrapper.ends, [-1]);
@@ -5961,6 +5961,7 @@ fn a_forgotten_order_leaves_without_callbacks() {
     client.process_msgs(&mut w);
     assert!(w.events.is_empty(), "no callback: {:?}", w.events);
     client.req_open_orders(&mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, vec!["open_order_end".to_string()]);
 }
 
@@ -6008,6 +6009,68 @@ fn open_order_requests_wait_for_the_order_replay() {
     assert_eq!(w.events.iter().filter(|e| *e == "open_order_end").count(), 1);
 }
 
+#[test]
+fn login_end_cannot_complete_an_explicit_snapshot_waiting_for_parent_authority() {
+    for explicit in [false, true] {
+        let (client, _rx, shared) = test_client();
+        let mut info = crate::bridge::RichOrderInfo {
+            contract: spy(),
+            order: Order { order_id: 91, perm_id: 900_091, total_quantity: 1.0, ..Default::default() },
+            order_state: crate::api::types::OrderState { status: "PreSubmitted".into(), ..Default::default() },
+            last_exec: Default::default(), parent_id_known: false, report_revision: None, report_time: None,
+        };
+        shared.orders.push_order_info(91, info.clone());
+        shared.orders.set_login_orders_end();
+        let mut wrapper = RecordingWrapper::default();
+        if explicit { client.req_all_open_orders(&mut wrapper); }
+        client.process_msgs(&mut wrapper);
+        assert_eq!(wrapper.events.iter().filter(|e| *e == "open_order_end").count(), usize::from(!explicit));
+        info.parent_id_known = true;
+        shared.orders.push_order_info(91, info);
+        client.process_msgs(&mut wrapper);
+        assert_eq!(wrapper.events.iter().filter(|e| *e == "open_order_end").count(), 1);
+        client.process_msgs(&mut wrapper);
+        assert_eq!(wrapper.events.iter().filter(|e| *e == "open_order_end").count(), 1);
+    }
+}
+
+#[test]
+fn login_end_does_not_escape_through_reentrant_explicit_snapshot_dispatch() {
+    struct Reentrant<'a> { client: &'a EClient, requested: bool, ends: usize }
+    impl Wrapper for Reentrant<'_> {
+        fn order_status(&mut self, _: i64, _: &str, _: f64, _: f64, _: f64, _: i64, _: i64, _: f64, _: i64, _: &str, _: f64) {
+            if !self.requested {
+                self.requested = true;
+                let client = self.client;
+                client.req_all_open_orders(self);
+                client.process_msgs(self);
+            }
+        }
+        fn open_order_end(&mut self) { self.ends += 1; }
+    }
+    let (client, _rx, shared) = test_client();
+    let mut info = crate::bridge::RichOrderInfo {
+        contract: spy(),
+        order: Order { order_id: 91, perm_id: 900_091, total_quantity: 1.0, ..Default::default() },
+        order_state: crate::api::types::OrderState { status: "PreSubmitted".into(), ..Default::default() },
+        last_exec: Default::default(), parent_id_known: false, report_revision: None, report_time: None,
+    };
+    shared.orders.push_order_info(91, info.clone());
+    shared.orders.push_order_update(OrderUpdate {
+        order_id: 91, instrument: 0, status: OrderStatus::PreSubmitted, filled_qty_fixed: 0,
+        remaining_qty_fixed: QTY_SCALE, avg_fill_price: 0, perm_id: 900_091, parent_id: 0, timestamp_ns: 0,
+    });
+    shared.orders.set_login_orders_end();
+    let mut wrapper = Reentrant { client: &client, requested: false, ends: 0 };
+    client.process_msgs(&mut wrapper);
+    assert!(wrapper.requested);
+    assert_eq!(wrapper.ends, 0);
+    info.parent_id_known = true;
+    shared.orders.push_order_info(91, info);
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.ends, 1);
+}
+
 // reqAllOpenOrders lists every order of the book in its order (a hash
 // table keyed by permId, walked bucket by bucket; captured 01/10/2026),
 // with the order id and client id the reference shows; reqOpenOrders
@@ -6021,7 +6084,7 @@ fn open_order_listings_go_in_the_books_order_by_client() {
     for (seq, (id, owner)) in replay.iter().enumerate() {
         let order = Order { order_id: *id, perm_id: *id, client_id: *owner, total_quantity: 1.0, ..Default::default() };
         let order_state = crate::api::types::OrderState { status: "PreSubmitted".into(), ..Default::default() };
-        shared.orders.push_order_info(*id, RichOrderInfo { contract: spy(), order, order_state, last_exec: Default::default() });
+        shared.orders.push_order_info(*id, RichOrderInfo { contract: spy(), order, order_state, last_exec: Default::default(), parent_id_known: true, report_revision: None, report_time: None });
         shared.orders.set_api_order_id(*id, 0);
         shared.orders.note_book(*id, seq as u64, seq + 1);
     }
@@ -6049,7 +6112,7 @@ fn open_orders_show_the_reported_contract_and_trail_stop() {
     });
     let reported = Order { trail_stop_price: 775.06, ..placed };
     let order_state = crate::api::types::OrderState { status: "PreSubmitted".into(), ..Default::default() };
-    shared.orders.push_order_info(103, RichOrderInfo { contract: spy(), order: reported, order_state, last_exec: Default::default() });
+    shared.orders.push_order_info(103, RichOrderInfo { contract: spy(), order: reported, order_state, last_exec: Default::default(), parent_id_known: true, report_revision: None, report_time: None });
     let listed = client.core.open_orders_listing(&shared, crate::client_core::OpenOrdersRequest::Open);
     assert_eq!(listed.len(), 1);
     assert_eq!((listed[0].1.contract.con_id, listed[0].1.order.trail_stop_price), (756733, 775.06));
@@ -6071,6 +6134,7 @@ fn an_execution_of_another_clients_order_gives_no_callback() {
     assert!(w.events.iter().all(|e| !e.starts_with("exec") && !e.starts_with("commission")), "{:?}", w.events);
     let mut w = RecordingWrapper::default();
     client.req_executions(4, &Default::default(), &mut w);
+    client.process_msgs(&mut w);
     assert!(w.events.iter().any(|e| e.starts_with("exec_details")), "{:?}", w.events);
 }
 

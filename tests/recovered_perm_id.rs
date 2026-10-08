@@ -147,6 +147,7 @@ fn recovered_perm_id_matches_recorded_status_and_cancel_version() {
             expected.1
         );
         if fix_sequence == 2366 {
+            observed.open.clear();
             client.req_all_open_orders(&mut observed);
             client.process_msgs(&mut observed);
             assert_eq!(observed.open.len(), 1);

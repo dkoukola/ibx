@@ -1571,12 +1571,10 @@ impl CcpState {
                 if let Some(entry) = context.book.get_mut(&clord_id) {
                     entry.owner = Some(parsed.get(&6119).and_then(|s| s.parse().ok()).unwrap_or(0));
                 }
-                // The API order id the client sees: the report's, 0 for
-                // none (captured 01/10/2026: openOrder orderId 0).
-                let api_id = report_api_order_id(parsed);
-                if api_id != clord_id {
-                    shared.orders.set_api_order_id(clord_id, api_id);
-                }
+                // Expose the collision-safe caller key chosen above. Replacing
+                // it with a duplicate (or absent/zero) reported API id would
+                // make a subsequent cancel target another order or no order.
+                // The broker identity remains available separately as permId.
                 log::info!("CCP recovery: inserted orderId={} sym={:?} side={:?} qty={} px={}",
                     clord_id, parsed.get(&55), side, qty as f64 / QTY_SCALE as f64,
                     limit_price_i64 as f64 / PRICE_SCALE as f64);
@@ -6835,7 +6833,7 @@ mod tests {
                 guard,
             });
             let (client, mut server) = socket_pair();
-            let mut conn = Some(Connection::new_raw(client).unwrap());
+            let mut conn = Some(Connection::new_mem(client));
             super::super::order_builder::drain_and_send_orders(
                 &mut conn, &mut context, "DU1", &mut HeartbeatState::new(), false, &shared);
             let frames = ccp_messages_sent(&mut server);
@@ -6916,7 +6914,7 @@ mod tests {
         shared.orders.complete_execution_history("connection");
         ccp.completed_history.queue("connection".into(), false, "20261005-00:00:00".into(), "20261006-00:00:00".into());
         let (client, mut server) = socket_pair();
-        let mut conn = Some(Connection::new_raw(client).unwrap());
+        let mut conn = Some(Connection::new_mem(client));
         ccp.progress_completed_history(&mut conn, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
         assert!(ccp.completed_history.active());
         assert_eq!(ccp_messages_sent(&mut server).len(), 1);
@@ -6972,7 +6970,7 @@ mod tests {
                     guard,
                 });
                 let (client, mut server) = socket_pair();
-                let mut conn = Some(Connection::new_raw(client).unwrap());
+                let mut conn = Some(Connection::new_mem(client));
                 super::super::order_builder::drain_and_send_orders(
                     &mut conn, &mut context, "DU1", &mut HeartbeatState::new(), false, &shared);
                 assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
@@ -7007,7 +7005,7 @@ mod tests {
     fn replaced_recovery_does_not_insert_terminal_or_unqueried_replacements() {
         for (exec_type, status, transaction) in [
             ("2", "2", "3"), ("4", "4", "3"), ("8", "8", "3"),
-            ("5", "5", "0"), ("5", "D", "3"), ("5", "E", "3"),
+            ("5", "5", "0"), ("5", "E", "3"),
         ] {
             let mut ccp = CcpState::new();
             let mut context = Context::new();
@@ -7020,6 +7018,18 @@ mod tests {
             assert!(context.order(900_003).is_none(), "150={exec_type} 39={status} 20={transaction}");
             assert!(shared.orders.drain_fills().is_empty());
         }
+    }
+
+    #[test]
+    fn pending_cancel_snapshot_recovers_an_open_order_without_a_fill() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let mut report = replaced_recovery_frame(900_003, false);
+        report.insert(39, "D".into());
+        ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+        assert_eq!(context.order(900_003).unwrap().status, crate::types::OrderStatus::PendingCancel);
+        assert!(shared.orders.drain_fills().is_empty());
     }
 
     // ibx#492: openOrder reads the price management flag the server
@@ -7120,6 +7130,59 @@ mod tests {
     }
 
     #[test]
+    fn recovered_api_listing_keeps_collision_safe_cancel_targets() {
+        use crate::api::{EClient, Wrapper};
+        use crate::protocol::order_write::OrderWriteOutcome;
+        use std::sync::Arc;
+        #[derive(Default)]
+        struct Listed(Vec<(i64, i64)>);
+        impl Wrapper for Listed {
+            fn open_order(&mut self, id: i64, _: &api::Contract, order: &api::Order, _: &api::OrderState) {
+                self.0.push((id, order.perm_id));
+                assert_eq!(id, order.order_id);
+            }
+        }
+        let mut context = Context::new();
+        let mut ccp = CcpState::new();
+        let shared = Arc::new(SharedState::new());
+        shared.orders.begin_execution_history("initial");
+        shared.orders.complete_execution_history("initial");
+        for (server, api_id) in [(900_001, Some(42)), (42, Some(42)), (900_002, None), (900_003, Some(43))] {
+            let mut report = recovery_frame(server, 265_598);
+            if let Some(api_id) = api_id { report.insert(6121, api_id.to_string()); }
+            report.insert(20, "3".into());
+            ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+        }
+        let recovered_key = context.key_of(42);
+        assert_ne!(recovered_key, 42);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let client = EClient::from_parts(shared.clone(), tx, std::thread::spawn(|| {}), "DU1".into());
+        let mut listed = Listed::default();
+        client.process_msgs(&mut listed);
+        listed.0.clear();
+        client.req_all_open_orders(&mut listed);
+        client.process_msgs(&mut listed);
+        assert_eq!(listed.0.len(), 4);
+        assert!(listed.0.contains(&(42, 900_001)));
+        assert!(listed.0.contains(&(recovered_key, 42)), "distinct broker orders need distinct usable API keys");
+        assert!(listed.0.contains(&(900_002, 900_002)), "an absent reported API id still has a usable caller key");
+        assert!(listed.0.contains(&(43, 900_003)), "a free reported API id is retained");
+        let (transport, mut peer) = socket_pair();
+        let mut conn = Some(Connection::new_mem(transport));
+        for (caller, server) in [(recovered_key, 42), (900_002, 900_002), (43, 900_003)] {
+            let receipt = client.send_order_guarded(crate::types::OrderRequest::Cancel { order_id: caller }, "initial".into(), || Ok(())).unwrap();
+            let crate::types::ControlCommand::Order(request) = rx.recv().unwrap() else { panic!("order command") };
+            context.pending_orders.push(request);
+            super::super::order_builder::drain_and_send_orders(&mut conn, &mut context, "DU1", &mut HeartbeatState::new(), false, &shared);
+            assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::Written));
+            let frames = ccp_messages_sent(&mut peer);
+            assert_eq!(frames.len(), 1);
+            assert!(frames[0].contains(&format!("11={server}.1|41={server}.0|")), "cancel uses the observed order's broker identity");
+        }
+        assert_eq!(context.order(42).unwrap().status, crate::types::OrderStatus::PreSubmitted);
+    }
+
+    #[test]
     fn recovered_id_collision_without_a_free_api_id_reserves_a_local_key() {
         for api_id in [None, Some("15")] {
             let mut ccp = CcpState::new();
@@ -7172,7 +7235,7 @@ mod tests {
             let parent = [(6107, "15.7".into())].into_iter().collect();
             assert_eq!(parent_order_id(&parent, &context), 16);
             let (client, mut server) = socket_pair();
-            let mut conn = Some(Connection::new_raw(client).unwrap());
+            let mut conn = Some(Connection::new_mem(client));
             let mut hb = HeartbeatState::new();
             let modify = || OrderRequest::Modify {
                 new_order_id: 15, order_id: 15, qty: 1,
@@ -7187,7 +7250,7 @@ mod tests {
             let reject = pipe_frame("35=9|11=900001.3|41=900001.2|39=0|102=0|434=2|58=Rejected|");
             ccp.process_ccp_message(&reject, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
             assert_eq!(context.modify_versions[&15], 2);
-            assert_eq!(context.modify_versions[&16], 0);
+            assert_eq!(context.modify_versions[&16], 7);
             assert_eq!(context.last_clord[&15], "900001.2");
             assert_eq!(context.last_clord[&16], "15.7");
             assert_eq!(shared.orders.drain_cancel_rejects().last().unwrap().order_id, 15);
@@ -7352,8 +7415,8 @@ mod tests {
                         if terminal { "Filled" } else { "Submitted" }
                     );
                     let updates = shared.orders.drain_order_updates();
-                    assert_eq!(updates.len(), usize::from(tracked));
-                    if tracked {
+                    assert_eq!(updates.len(), usize::from(tracked || !terminal));
+                    if tracked || !terminal {
                         assert_eq!(updates[0].filled_qty_fixed, 100 * QTY_SCALE);
                         assert_eq!(
                             updates[0].remaining_qty_fixed,
@@ -7853,16 +7916,16 @@ mod tests {
     // The permId is the id part of the ClOrdID, as the reference
     // (captured 01/10/2026: permId 1790865742870063 for
     // 11=1790865742870063.0); an order of another session with no 6121 is
-    // shown with order id 0.
+    // keeps a unique, cancellable caller key when no API id is reported.
     #[test]
-    fn perm_id_is_the_clordid_id_and_no_6121_shows_order_id_0() {
+    fn perm_id_is_the_clordid_id_and_no_6121_keeps_a_cancellable_key() {
         let mut ccp = CcpState::new();
         let mut context = Context::new();
         let shared = SharedState::new();
         ccp.handle_exec_report(&report_of(REPLAY_NOT_ROUTED), &mut context, &shared, &None, "");
         let updates = shared.orders.drain_order_updates();
         assert_eq!(updates[0].perm_id, 1790862363895062);
-        assert_eq!(shared.orders.api_order_id(1790862363895062), 0);
+        assert_eq!(shared.orders.api_order_id(1790862363895062), 1790862363895062);
         let info = shared.orders.get_order_info(1790862363895062).unwrap();
         assert_eq!((info.order.perm_id, info.order.client_id), (1790862363895062, 0));
         assert_eq!(shared.orders.book_place(1790862363895062), (Some(0), 1));
@@ -8666,7 +8729,7 @@ mod reconnect_tests {
         for (request, account_request) in [("today5", "AR.5"), ("todayfillup6", "AR.6")] {
             let (client, mut server) = socket_pair();
             ccp.reconnect(
-                Connection::new_raw(client).unwrap(),
+                Connection::new_mem(client),
                 &mut active,
                 &mut hb,
                 "DU1",

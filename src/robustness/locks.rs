@@ -90,6 +90,8 @@ impl Wrapper for Reentrant {
 /// callbacks seen.
 fn session(disconnect_on: &'static str) -> Vec<&'static str> {
     let shared = Arc::new(SharedState::new());
+    shared.orders.begin_execution_history("lock-fixture");
+    shared.orders.complete_execution_history("lock-fixture");
     let (farm, _farm) = Peer::pair();
     let (ccp, _ccp) = Peer::pair();
     let (mut engine, control) = HotLoop::with_connections(

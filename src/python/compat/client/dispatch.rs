@@ -309,6 +309,8 @@ impl EClient {
         // has the replayed statuses (ibx#251).
         let open_history = shared.orders.execution_history_request();
         let released = self.core.released_open_orders(shared);
+        // Own the connect-burst marker before callbacks can reenter dispatch.
+        let login_orders_end = shared.orders.take_login_orders_end();
         let execution_requests = self.core.released_execution_requests(shared);
         let retired = shared.orders.completed_retirement_candidates();
 
@@ -505,7 +507,8 @@ impl EClient {
 
         // The working orders the logon replay listed are followed by the
         // end of the list, as the Rust client (ibx#487).
-        if shared.orders.take_login_orders_end()
+        let no_pending_open_orders = self.core.held_open_orders.lock().unwrap().is_empty();
+        if login_orders_end && released.is_empty() && no_pending_open_orders
             && !self.core.open_orders_listing(shared, crate::client_core::OpenOrdersRequest::Open).is_empty()
         {
             self.wrapper.call_method0(py, "open_order_end")?;

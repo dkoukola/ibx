@@ -7087,6 +7087,7 @@ mod tests {
         shared.orders.push_order_info(60, crate::bridge::RichOrderInfo {
             contract: ApiContract::default(), order: lmt(100.0),
             order_state: Default::default(), last_exec: Default::default(),
+            parent_id_known: true, report_revision: None, report_time: None,
         });
         assert!(core.refusal_for_order_id(60, &lmt(100.0), &shared).is_none());
     }

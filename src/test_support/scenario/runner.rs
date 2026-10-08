@@ -1029,6 +1029,11 @@ impl Run<'_> {
                 }
                 if known {
                     let f = self.renumber(link, f);
+                    // Replay on the captured broker day, including the
+                    // commission router's current-session accounting fence.
+                    if let Some(time) = tag(&f, 52).and_then(crate::engine::hot_loop::ccp::fix_utc_to_unix_secs) {
+                        self.links.shared.reference.clock().set(time * 1000 - crate::control::logon::local_now_ms());
+                    }
                     self.send(link, &rebuild_text(&f));
                 } else {
                     self.out.unsent.push((r.seq, r.conn.clone()));

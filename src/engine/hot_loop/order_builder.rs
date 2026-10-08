@@ -342,9 +342,9 @@ pub(crate) fn drain_and_send_orders(
         // A stock order directed away from SMART: discarded by the
         // reference's redirect precaution unless it is bypassed (ibx#486).
         if !what_if {
-            match redirect_precaution(&order_req, context, conn, hb, shared) {
+            match redirect_precaution(&order_req, context, conn, hb, shared, guard.is_none()) {
                 Some(false) => { context.rth_parked.push(rewrap(order_req)); continue; }
-                Some(true) => continue,
+                Some(true) => { refuse_guard(); continue; }
                 None => {}
             }
         }
@@ -1912,7 +1912,13 @@ fn global_cancel(
         }
     }
     context.rth_parked = parked.into_iter()
-        .filter(|r| !request_order_ids(r).iter().any(|id| ended.contains(id)))
+        .filter(|r| {
+            let removed = request_order_ids(r).iter().any(|id| ended.contains(id));
+            if removed && let OrderRequest::Guarded { guard, .. } = r {
+                guard.refuse_unprepared();
+            }
+            !removed
+        })
         .collect();
     let mut pending: Vec<(OrderId, OrderRequest)> = context.api_pending.drain().collect();
     pending.sort_by_key(|(id, _)| *id);
@@ -1968,6 +1974,12 @@ fn global_cancel(
 /// prices unset (`jextend.dL.a(Collection, String)`; captured 25/09/2026
 /// and in i105_combo_directed of 26/09/2026). Their ids.
 fn api_cancelled(context: &Context, shared: &Arc<SharedState>, req: &OrderRequest) -> Vec<OrderId> {
+    // A guarded command that never reached admission has no broker state.
+    // Settle the shared guard, including any retained copies of the request.
+    if let OrderRequest::Guarded { guard, .. } = req {
+        guard.refuse_unprepared();
+        return request_order_ids(req);
+    }
     let Some(qty) = req.new_order_qty() else { return Vec::new() };
     let bracket = matches!(req, OrderRequest::SubmitBracket { .. });
     let parent = match req {
@@ -2008,7 +2020,13 @@ fn api_cancel(context: &mut Context, shared: &Arc<SharedState>, order_id: OrderI
     let Some(at) = waiting else { return false };
     let req = context.rth_parked.remove(at);
     api_cancelled(context, shared, &req);
-    context.rth_parked.retain(|r| !request_order_ids(r).contains(&order_id));
+    context.rth_parked.retain(|r| {
+        let removed = request_order_ids(r).contains(&order_id);
+        if removed && let OrderRequest::Guarded { guard, .. } = r {
+            guard.refuse_unprepared();
+        }
+        !removed
+    });
     true
 }
 
@@ -3267,8 +3285,10 @@ pub(crate) fn order_contract_reply(context: &mut Context, shared: &SharedState, 
         for r in refused {
             let oid = r.order_id();
             shared.orders.push_order_error(oid, crate::engine::combo::NO_DEFINITION.0, crate::engine::combo::NO_DEFINITION.1.to_string());
-            if !matches!(r, OrderRequest::SubmitWhatIf { .. }) {
-                context.api_pending.insert(oid, r);
+            match r {
+                OrderRequest::Guarded { guard, .. } => guard.refuse_unprepared(),
+                OrderRequest::SubmitWhatIf { .. } => {}
+                _ => { context.api_pending.insert(oid, r); }
             }
         }
         context.market.unregister(slot);
@@ -3308,6 +3328,7 @@ fn redirect_precaution(
     conn: &mut Connection,
     hb: &mut HeartbeatState,
     shared: &Arc<SharedState>,
+    synthesize_discard: bool,
 ) -> Option<bool> {
     if context.bypass_redirect_warning || req.combo().is_some()
         || matches!(req, OrderRequest::SubmitBracket { .. } | OrderRequest::CancelAll { .. })
@@ -3332,7 +3353,8 @@ fn redirect_precaution(
             let (code, text) = redirect_warning(shown);
             log::warn!("Order {} discarded: directed to {} (redirect precaution)", oid, exchange);
             shared.orders.push_order_error(oid, code, text);
-            shared.orders.push_order_update(OrderUpdate {
+            if synthesize_discard {
+                shared.orders.push_order_update(OrderUpdate {
                 order_id: oid,
                 instrument,
                 status: OrderStatus::Cancelled,
@@ -3342,8 +3364,9 @@ fn redirect_precaution(
                 perm_id: oid,
                 parent_id: req.new_order_side().and_then(|(_, a)| a).map_or(0, |a| a.parent_id),
                 timestamp_ns: context.now_ns(),
-            });
-            shared.orders.push_order_notice(oid, 201, "Order rejected - reason:Order was discarded.".into());
+                });
+                shared.orders.push_order_notice(oid, 201, "Order rejected - reason:Order was discarded.".into());
+            }
             Some(true)
         }
     }
@@ -4071,8 +4094,8 @@ mod tests {
                 if i > 0 {
                     assert_eq!(tag(frame, 54), Some("2"));
                     assert_eq!(tag(frame, 59), Some("1"));
-                    assert_eq!(tag(frame, 6107), Some("10.0"));
-                    assert_eq!(tag(frame, 583), Some("10"));
+                    assert_eq!(tag(frame, 6107), tag(&frames[0], 11));
+                    assert_eq!(tag(frame, 583), Some(FIRST.to_string()).as_deref());
                     assert_eq!(tag(frame, 6209), Some(BRACKET_CHILD_OCA_TYPE));
                 }
             }
@@ -4300,7 +4323,7 @@ mod tests {
             4,
         );
         assert_eq!(tag(&frames[3], 35), Some("G"));
-        assert_eq!(tag(&frames[3], 41), Some("12.0"));
+        assert_eq!(tag(&frames[3], 41), tag(&frames[2], 11));
         assert_eq!(tag(&frames[3], 6010), Some("profit"));
         assert_eq!(tag(&frames[3], 59), Some("6"));
         assert_eq!(tag(&frames[3], 126), tag(&frames[2], 126));
@@ -4343,8 +4366,11 @@ mod tests {
         ] {
             let (mut context, shared, mut conn, mut server) = guarded_fixture();
             context.insert_order(order(7, 3, OrderStatus::PartiallyFilled));
-            context.last_clord.insert(7, "7.4".into());
+            context.last_clord.insert(7, "700.4".into());
             context.modify_versions.insert(7, 4);
+            context.bind_server_id(7, 700);
+            let original_book = context.book.get(&7).cloned().unwrap();
+            let original_peak = context.book_peak;
             let (groups, rng) = (context.bracket_groups, context.bracket_rng);
             let (guard, receipt) = OrderWriteGuard::new(|| Err("durable admission refused".into()));
             context.pending_orders.push(OrderRequest::Guarded {
@@ -4361,13 +4387,20 @@ mod tests {
                 context.order(7).unwrap().filled_fixed,
                 3 * crate::types::QTY_SCALE
             );
-            assert_eq!(context.last_clord.get(&7).map(String::as_str), Some("7.4"));
+            assert_eq!(context.last_clord.get(&7).map(String::as_str), Some("700.4"));
             assert_eq!(context.modify_versions.get(&7), Some(&4));
             assert!(context.cancel_clord.is_empty());
             assert!(context.trail_limit_reported.is_empty());
             assert!(context.bracket_keys.is_empty());
             assert!(context.bracket_next_child.is_empty());
             assert_eq!((context.bracket_groups, context.bracket_rng), (groups, rng));
+            assert_eq!(context.server_ids.len(), 1);
+            assert_eq!(context.server_id(7), 700);
+            assert_eq!(context.key_of(700), 7);
+            assert_eq!(context.recovered_keys.len(), 1);
+            assert_eq!(context.book.len(), 1);
+            assert_eq!(context.book.get(&7), Some(&original_book));
+            assert_eq!(context.book_peak, original_peak);
             for id in [10, 11, 12] {
                 assert!(context.order(id).is_none());
                 assert!(!context.modify_versions.contains_key(&id));
@@ -4377,6 +4410,86 @@ mod tests {
                 "no fabricated rejection/pending cancel"
             );
         }
+    }
+
+    #[test]
+    fn guarded_redirect_refusal_finishes_retained_clone_without_broker_status() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        context.bypass_redirect_warning = false;
+        context.market.set_routing(0, "STK", "ISLAND");
+        context.rth_types.insert((265598, "ISLAND".into()), crate::engine::outside_rth::RthTypes {
+            rth: true, sec_type: "STK".into(), smart: true, ..Default::default()
+        });
+        let (guard, receipt) = OrderWriteGuard::new(|| panic!("refused redirect cannot authorize"));
+        let retained = OrderRequest::Guarded { request: Box::new(guarded_limit(10)), guard };
+        context.pending_orders.push(retained.clone());
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+        assert!(shared.orders.drain_order_updates().is_empty());
+        assert!(shared.orders.drain_order_notices().is_empty());
+        assert_eq!(shared.orders.drain_order_errors()[0].1, 10311);
+        context.pending_orders.push(retained);
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert!(context.order(10).is_none());
+    }
+
+    #[test]
+    fn locally_cancelled_guarded_order_settles_every_retained_clone() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        for global in [false, true] {
+            let (mut context, shared, mut conn, mut server) = guarded_fixture();
+            let (guard, receipt) = OrderWriteGuard::new(|| Ok(()));
+            let retained = OrderRequest::Guarded { request: Box::new(guarded_limit(10)), guard };
+            context.rth_parked.push(retained.clone());
+            let (modify_guard, modify_receipt) = OrderWriteGuard::new(|| Ok(()));
+            let retained_modify = OrderRequest::Guarded {
+                request: Box::new(OrderRequest::Modify {
+                    new_order_id: 10, order_id: 10, qty: 2,
+                    kind: crate::types::OrderKind::Limit { price: 101 * P }, tif: b'0', attrs: Default::default(),
+                }), guard: modify_guard,
+            };
+            context.rth_parked.push(retained_modify.clone());
+            context.pending_orders.push(if global { OrderRequest::GlobalCancel } else { OrderRequest::Cancel { order_id: 10 } });
+            assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+            assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+            assert_eq!(modify_receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+            assert!(context.rth_parked.is_empty());
+            assert!(shared.orders.drain_order_updates().is_empty());
+            context.pending_orders.push(retained);
+            context.pending_orders.push(retained_modify);
+            assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+            assert!(context.order(10).is_none());
+        }
+    }
+
+    #[test]
+    fn guarded_failed_symbol_lookup_settles_without_retaining_pending_order() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        let slot = context.market.try_register_unresolved().unwrap();
+        context.market.set_symbol(slot, "UNKNOWN".into());
+        context.market.set_routing(slot, "STK", "SMART");
+        let (guard, receipt) = OrderWriteGuard::new(|| panic!("failed contract cannot authorize"));
+        let retained = OrderRequest::Guarded {
+            request: Box::new(OrderRequest::SubmitLimit {
+                order_id: 10, instrument: slot, side: Side::Buy, qty: 1, price: 100 * P,
+            }), guard,
+        };
+        context.pending_orders.push(retained.clone());
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(tag(&frames[0], 35), Some("c"));
+        assert_eq!(receipt.outcome(), None);
+        let request = tag(&frames[0], 320).unwrap();
+        let empty = format!("8=FIX.4.1|35=d|320={request}|322=*|323=4|6038=Y|6019=0|6344=0|").replace('|', "\x01");
+        assert!(order_contract_reply(&mut context, &shared, request, empty.as_bytes()));
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+        assert!(context.api_pending.is_empty());
+        assert!(context.rth_parked.is_empty());
+        assert!(shared.orders.drain_order_updates().is_empty());
+        context.pending_orders.push(retained);
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
     }
 
     #[test]
@@ -4411,9 +4524,9 @@ mod tests {
         assert_eq!(
             frames
                 .iter()
-                .map(|frame| tag(frame, 11).unwrap())
+                .map(|frame| tag(frame, 11).unwrap().to_string())
                 .collect::<Vec<_>>(),
-            ["10.0", "11.0", "12.0"]
+            [10, 11, 12].map(|id| format!("{}.0", context.server_id(id)))
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::Written));

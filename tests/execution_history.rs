@@ -19,6 +19,9 @@ fn connection() -> (Connection, TcpStream) {
 fn gateway() -> Gateway {
     Gateway {
         account_id: "DUXXXXXXX".into(),
+        managed_accounts: vec!["DUXXXXXXX".into()],
+        use_ssl: true,
+        ssl_farms: String::new(),
         session_token: Default::default(),
         server_session_id: String::new(),
         settings_object_key: String::new(),

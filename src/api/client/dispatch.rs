@@ -57,6 +57,8 @@ impl EClient {
         // has the replayed statuses (ibx#251).
         let open_history = self.shared.orders.execution_history_request();
         let released = self.core.released_open_orders(&self.shared);
+        // Own the connect-burst marker before callbacks can reenter dispatch.
+        let login_orders_end = self.shared.orders.take_login_orders_end();
         let executions = self.core.released_execution_requests(&self.shared);
         // Fills → order_status + exec_details. The commission report comes
         // later, from its own server frame (ibx#471).
@@ -215,7 +217,10 @@ impl EClient {
         // The working orders of this client the logon replay listed are
         // followed by the end of the list, as the reference's connect
         // burst; no end when it listed none (`jextend.dL.bq()`, ibx#487).
-        if self.shared.orders.take_login_orders_end()
+        // An unsolicited end must not complete an explicit snapshot that
+        // still waits for authoritative parent metadata or a current replay.
+        let no_pending_open_orders = self.core.held_open_orders.lock().unwrap().is_empty();
+        if login_orders_end && released.is_empty() && no_pending_open_orders
             && !self.core.open_orders_listing(&self.shared, crate::client_core::OpenOrdersRequest::Open).is_empty()
         {
             wrapper.open_order_end();

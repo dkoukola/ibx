@@ -252,7 +252,24 @@ fn pnl_and_pnl_single() {
 // reqAllOpenOrders then lists none.
 #[test]
 fn global_cancel_of_orders_of_earlier_sessions() {
-    let o = check("20261001/global_cancel_replayed", orders());
+    // The fork exposes distinct cancellable caller keys, whereas Gateway
+    // shows zero for every order whose report has no API id. All other
+    // callback fields and all eight native cancel frames stay exact.
+    let o = replay(&load_scenario("20261001/global_cancel_replayed"), &orders());
+    assert_eq!(o.frame_error, None);
+    let ids: std::collections::HashSet<_> = o.ours.iter()
+        .filter(|line| line.starts_with("openOrder|"))
+        .map(|line| line.split('|').nth(1).unwrap().parse::<i64>().unwrap()).collect();
+    assert_eq!(ids.len(), 8);
+    assert!(ids.iter().all(|id| *id != 0));
+    let normalize = |line: &str| {
+        let mut fields: Vec<_> = line.split('|').collect();
+        if matches!(fields[0], "openOrder" | "orderStatus") { fields[1] = "0"; }
+        fields.join("|")
+    };
+    let ours: Vec<_> = o.ours.iter().map(|line| normalize(line)).collect();
+    let theirs: Vec<_> = o.theirs.iter().map(|(_, line)| normalize(line)).collect();
+    ibx::test_support::scenario::assert_same_callbacks(&ours, &theirs);
     assert_eq!(o.frames_compared, 8, "the 8 cancels");
     assert_eq!(o.theirs.len(), 18);
 }
@@ -448,8 +465,14 @@ fn session_start_first_client() {
     let core = |f: &Fields| f.iter().any(|(t, v)| *t == 6700 && v == "Core");
     let keep = |l: &str| !(l.starts_with("error|-1|2172|") || l.starts_with("pnl|") || l.starts_with("pnlSingle|")
         || l.starts_with("error|9831|2150|"));
-    let o = replay(&load_scenario("20261007/session_start"),
-        &Options::default().compare(&[ORDER, SUBSCRIPTION]).skip_frame(core).keep(keep));
+    // The recorded logon precedes the API session. Recreate the exact
+    // account-image and execution-replay requests Gateway normally arms.
+    let mut links = ibx::test_support::scenario::Links::new();
+    links.shared.portfolio.begin_account_image("AR.3");
+    links.shared.orders.begin_execution_history("today4");
+    let mut driver = ibx::test_support::scenario::RustDriver::new(&links);
+    let o = ibx::test_support::scenario::run(&load_scenario("20261007/session_start"),
+        &Options::default().compare(&[ORDER, SUBSCRIPTION]).skip_frame(core).keep(keep), &mut links, &mut driver);
     if std::env::var_os("IBX_SCENARIO_DUMP").is_some() {
         dump("20261007/session_start", &o);
     }
