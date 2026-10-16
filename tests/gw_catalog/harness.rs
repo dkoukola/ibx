@@ -67,7 +67,7 @@ impl Engine {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.control.send(ControlCommand::RegisterInstrument {
             con_id: contract.con_id, symbol: contract.symbol.clone(), sec_type: contract.sec_type.clone(),
-            exchange: contract.exchange.clone(), reply_tx: Some(reply_tx),
+            exchange: contract.exchange.clone(), reply_tx: Some(reply_tx.into()),
         }).unwrap();
         let id = reply_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
         self.control.send(ControlCommand::SetInstrumentCurrency {

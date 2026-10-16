@@ -324,7 +324,7 @@ fn a_full_instrument_table_refuses_and_goes_on() {
     let ControlCommand::Subscribe { con_id, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier, mode_9887, snapshot, .. } = subscribe(265598) else { unreachable!() };
     control.send(ControlCommand::Subscribe {
         con_id, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier, mode_9887, snapshot,
-        reply_tx: Some(reply_tx),
+        reply_tx: Some(reply_tx.into()),
     }).unwrap();
     engine.step_for_test();
     let reply = reply_rx.recv_timeout(Duration::from_secs(1)).expect("a reply");

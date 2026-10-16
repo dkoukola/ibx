@@ -252,7 +252,7 @@ impl HotLoop {
         symbol: String,
         sec_type: &str,
         exchange: &str,
-        reply_tx: &Option<crossbeam_channel::Sender<Result<InstrumentId, String>>>,
+        reply_tx: &Option<crate::types::RegistrationReply>,
     ) -> Option<InstrumentId> {
         self.register_slot_or_reject(Some(con_id), symbol, sec_type, exchange, reply_tx)
     }
@@ -265,19 +265,27 @@ impl HotLoop {
         symbol: String,
         sec_type: &str,
         exchange: &str,
-        reply_tx: &Option<crossbeam_channel::Sender<Result<InstrumentId, String>>>,
+        reply_tx: &Option<crate::types::RegistrationReply>,
     ) -> Option<InstrumentId> {
         let con_id_log = con_id.unwrap_or(0);
+        let existed = con_id.and_then(|id| self.context.market.instrument_by_con_id(id)).is_some();
         let registered = match con_id {
             Some(con_id) => self.context.market.try_register(con_id),
             None => self.context.market.try_register_unresolved(),
         };
         match registered {
             Some(id) => {
+                // Shared quote storage is available before the caller gets
+                // the ID. Private routing follows on this same engine thread.
+                self.shared.market.set_instrument_count(self.context.market.count());
+                if reply_tx.as_ref().is_some_and(|tx| tx.send(Ok(id)).is_err()) {
+                    // A timeout owns this abandoned request. Do not subscribe,
+                    // perform lookups, or alter an existing observer's slot.
+                    if !existed { self.context.market.unregister(id); }
+                    return None;
+                }
                 self.context.market.set_symbol(id, symbol);
                 self.context.market.set_routing(id, sec_type, exchange);
-                self.shared.market.set_instrument_count(self.context.market.count());
-                if let Some(tx) = reply_tx { let _ = tx.send(Ok(id)); }
                 Some(id)
             }
             None => {
@@ -4313,7 +4321,7 @@ mod tests {
         let by_symbol = |symbol: &str, sec_type: &str, reply: crossbeam_channel::Sender<Result<InstrumentId, String>>| {
             ControlCommand::SubscribeBySymbol {
                 symbol: symbol.into(), sec_type: sec_type.into(), exchange: "SMART".into(), currency: "USD".into(),
-                filters: Default::default(), mode_9887: 0, snapshot: false, reply_tx: Some(reply),
+                filters: Default::default(), mode_9887: 0, snapshot: false, reply_tx: Some(reply.into()),
             }
         };
         let (r1, a1) = crossbeam_channel::bounded(1);
@@ -4943,6 +4951,56 @@ mod tag_cleaner_tests {
 }
 
 #[cfg(test)]
+mod registration_timeout_tests {
+    use super::*;
+    use crate::types::RegistrationReply;
+
+    fn subscription(reply: RegistrationReply) -> ControlCommand {
+        ControlCommand::Subscribe {
+            con_id: 265598, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "STK".into(),
+            last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
+            mode_9887: 0, snapshot: true, reply_tx: Some(reply),
+        }
+    }
+
+    #[test]
+    fn registration_timeout_before_engine_admission_cannot_start_a_subscription() {
+        let (mut engine, _shared, mut farm_side, tx) = super::news_tests::engine();
+        let (reply, receiver) = RegistrationReply::channel();
+        tx.send(subscription(reply)).unwrap();
+        assert!(receiver.recv_timeout(std::time::Duration::ZERO).is_err());
+        engine.poll_once();
+        assert!(engine.context.market.instrument_by_con_id(265598).is_none());
+        assert!(super::news_tests::sent(&mut farm_side).is_empty());
+        // The failed allocation is reusable, including symbol-only requests.
+        for _ in 0..crate::types::MAX_INSTRUMENTS + 1 {
+            let (reply, receiver) = RegistrationReply::channel();
+            assert!(receiver.recv_timeout(std::time::Duration::ZERO).is_err());
+            assert!(engine.register_slot_or_reject(None, "AAPL".into(), "OPT", "SMART", &Some(reply)).is_none());
+        }
+        assert_eq!(engine.context.market.try_register(265598), Some(0));
+    }
+
+    #[test]
+    fn registration_timeout_preserves_an_existing_subscriber_and_its_routing() {
+        let (mut engine, _shared, mut farm_side, tx) = super::news_tests::engine();
+        let (reply, receiver) = RegistrationReply::channel();
+        tx.send(subscription(reply)).unwrap();
+        engine.poll_once();
+        let id = receiver.recv_timeout(std::time::Duration::ZERO).unwrap().unwrap();
+        assert!(engine.farm.has_md_subscription(id));
+        assert!(!super::news_tests::sent(&mut farm_side).is_empty());
+        let (reply, receiver) = RegistrationReply::channel();
+        assert!(receiver.recv_timeout(std::time::Duration::ZERO).is_err());
+        assert!(engine.register_slot_or_reject(Some(265598), "WRONG".into(), "OPT", "CBOE", &Some(reply)).is_none());
+        assert_eq!(engine.context.market.symbol(id), "AAPL");
+        assert_eq!(engine.context.market.exchange(id), "SMART");
+        assert!(engine.farm.has_md_subscription(id));
+        assert!(super::news_tests::sent(&mut farm_side).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod news_tests {
     use super::*;
     use std::sync::Arc;
@@ -5120,7 +5178,7 @@ mod news_tests {
             let (reply, answer) = crossbeam_channel::bounded(1);
             tx.send(ControlCommand::SubscribeBySymbol {
                 symbol: symbol.into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(),
-                filters: Default::default(), mode_9887: 0, snapshot: false, reply_tx: Some(reply),
+                filters: Default::default(), mode_9887: 0, snapshot: false, reply_tx: Some(reply.into()),
             }).unwrap();
             engine.poll_once();
             let id = answer.recv().unwrap().unwrap();
@@ -5250,7 +5308,7 @@ mod sharing_tests {
         let (reply, answer) = crossbeam_channel::bounded(1);
         tx.send(ControlCommand::SubscribeBySymbol {
             symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(),
-            filters: Default::default(), mode_9887: 0, snapshot: false, reply_tx: Some(reply),
+            filters: Default::default(), mode_9887: 0, snapshot: false, reply_tx: Some(reply.into()),
         }).unwrap();
         engine.poll_once();
         let second = answer.recv().unwrap().unwrap();

@@ -264,11 +264,9 @@ fn req_ids_calls_wrapper() {
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
-fn req_mkt_data_sends_register_and_subscribe() {
+fn req_mkt_data_sends_one_atomic_registration_and_subscribe() {
     let (client, rx, _shared) = test_client();
     let _ = client.req_mkt_data(1, &spy(), "", false, false);
-    let cmd1 = rx.try_recv().unwrap();
-    assert!(matches!(cmd1, ControlCommand::RegisterInstrument { con_id: 756733, .. }));
     let cmd2 = rx.try_recv().unwrap();
     match cmd2 {
         ControlCommand::Subscribe { con_id, symbol, .. } => {
@@ -277,6 +275,7 @@ fn req_mkt_data_sends_register_and_subscribe() {
         }
         _ => panic!("expected Subscribe, got {:?}", cmd2),
     }
+    assert!(rx.is_empty(), "no unowned preliminary registration");
 }
 
 // ibx#278: a contract with no conId is no identity: each symbol-only
@@ -305,7 +304,6 @@ fn symbol_only_requests_are_looked_up_not_keyed_on_con_id_0() {
 fn req_mkt_data_defaults_to_realtime_mode() {
     let (client, rx, _shared) = test_client();
     let _ = client.req_mkt_data(1, &spy(), "", false, false);
-    let _register = rx.try_recv().unwrap();
     match rx.try_recv().unwrap() {
         ControlCommand::Subscribe { mode_9887, .. } => assert_eq!(mode_9887, 0),
         other => panic!("expected Subscribe, got {:?}", other),
@@ -317,7 +315,6 @@ fn req_mkt_data_ex_propagates_mode_9887() {
     for mode in [1_i32, 2, 3] {
         let (client, rx, _shared) = test_client();
         let _ = client.req_mkt_data_ex(1, &spy(), "", false, false, mode);
-        let _register = rx.try_recv().unwrap();
         match rx.try_recv().unwrap() {
             ControlCommand::Subscribe { mode_9887, con_id, .. } => {
                 assert_eq!(mode_9887, mode);

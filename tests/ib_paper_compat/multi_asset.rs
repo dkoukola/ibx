@@ -19,7 +19,7 @@ fn register_as_client(
 ) -> crossbeam_channel::Receiver<Result<InstrumentId, String>> {
     let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
     control_tx.send(ControlCommand::RegisterInstrument {
-        con_id, symbol: symbol.into(), sec_type: sec_type.into(), exchange: exchange.into(), reply_tx: Some(reply_tx),
+        con_id, symbol: symbol.into(), sec_type: sec_type.into(), exchange: exchange.into(), reply_tx: Some(reply_tx.into()),
     }).unwrap();
     control_tx.send(ControlCommand::SetInstrumentCurrency { con_id, currency: currency.into() }).unwrap();
     reply_rx

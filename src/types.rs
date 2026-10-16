@@ -2029,6 +2029,10 @@ pub struct ContractLookup {
     pub filters: SecDefFilters,
 }
 
+mod registration;
+pub use registration::RegistrationReply;
+pub use registration::RegistrationReceiver;
+
 /// Commands sent from the control plane to the hot loop via SPSC channel.
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
@@ -2068,7 +2072,7 @@ pub enum ControlCommand {
         con_id: i64, symbol: String, exchange: String, sec_type: String,
         last_trade_date: String, strike: f64, right: String, multiplier: String,
         mode_9887: i32, snapshot: bool,
-        reply_tx: Option<crossbeam_channel::Sender<Result<InstrumentId, String>>>,
+        reply_tx: Option<RegistrationReply>,
     },
     /// Subscribe to market data for a contract given without a conId
     /// (ibx#278): the engine looks the contract up first, as the
@@ -2079,7 +2083,7 @@ pub enum ControlCommand {
         symbol: String, sec_type: String, exchange: String, currency: String,
         filters: SecDefFilters,
         mode_9887: i32, snapshot: bool,
-        reply_tx: Option<crossbeam_channel::Sender<Result<InstrumentId, String>>>,
+        reply_tx: Option<RegistrationReply>,
     },
     /// Unsubscribe from market data for an instrument.
     Unsubscribe { instrument: InstrumentId },
@@ -2096,7 +2100,7 @@ pub enum ControlCommand {
         req_id: ReqId,
         con_id: i64, symbol: String, exchange: String, sec_type: String,
         tbt_type: TbtType, number_of_ticks: i32, ignore_size: bool,
-        reply_tx: Option<crossbeam_channel::Sender<Result<InstrumentId, String>>>,
+        reply_tx: Option<RegistrationReply>,
     },
     /// End the tick-by-tick request `req_id`: its stream is cancelled once
     /// no request is left on it.
@@ -2144,11 +2148,11 @@ pub enum ControlCommand {
     /// Submit an order from external caller (bridge mode).
     Order(OrderRequest),
     /// Register an instrument from external caller (bridge mode).
-    RegisterInstrument { con_id: i64, symbol: String, sec_type: String, exchange: String, reply_tx: Option<crossbeam_channel::Sender<Result<InstrumentId, String>>> },
+    RegisterInstrument { con_id: i64, symbol: String, sec_type: String, exchange: String, reply_tx: Option<RegistrationReply> },
     /// A slot of its own for the contract of an order given without a
     /// conId: the engine looks the contract up before the order goes out,
     /// as the reference does for each API order (ibx#486).
-    RegisterOrderContract { symbol: String, sec_type: String, exchange: String, currency: String, reply_tx: Option<crossbeam_channel::Sender<Result<InstrumentId, String>>> },
+    RegisterOrderContract { symbol: String, sec_type: String, exchange: String, currency: String, reply_tx: Option<RegistrationReply> },
     /// Request historical bar data via historical data connection.
     FetchHistorical {
         req_id: ReqId,
@@ -2256,7 +2260,7 @@ pub enum ControlCommand {
     /// the farm, answered into the instrument's record.
     SubscribeSnapshot {
         con_id: i64, symbol: String, exchange: String, sec_type: String,
-        reply_tx: Option<crossbeam_channel::Sender<Result<InstrumentId, String>>>,
+        reply_tx: Option<RegistrationReply>,
     },
     /// End of a regulatory snapshot: its request is forgotten, nothing is
     /// sent to the farm.

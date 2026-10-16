@@ -1788,7 +1788,7 @@ impl ClientCore {
     /// Wait for the hot loop to process a registration command and return the
     /// assigned ID. The engine replies Err when the instrument table is full
     /// (ibx#233) — previously that condition killed the hot loop.
-    fn recv_registration(reply_rx: crossbeam_channel::Receiver<Result<InstrumentId, String>>) -> Result<InstrumentId, String> {
+    fn recv_registration(reply_rx: crate::types::RegistrationReceiver) -> Result<InstrumentId, String> {
         reply_rx.recv_timeout(Self::REGISTRATION_TIMEOUT)
             .map_err(|_| "Registration timed out".to_string())?
     }
@@ -1810,7 +1810,7 @@ impl ClientCore {
         if !what_if && let Some(t) = self.open_orders.lock().unwrap().get(&order_id) {
             return Ok(t.instrument);
         }
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let (reply_tx, reply_rx) = crate::types::RegistrationReply::channel();
         control_tx.send(ControlCommand::RegisterOrderContract {
             symbol: symbol.to_string(), sec_type: sec_type.to_string(), exchange: exchange.to_string(),
             currency: currency.to_string(), reply_tx: Some(reply_tx),
@@ -1858,7 +1858,7 @@ impl ClientCore {
         }
 
         // Register new — only allocates an InstrumentId slot, does not subscribe to market data.
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let (reply_tx, reply_rx) = crate::types::RegistrationReply::channel();
         control_tx.send(ControlCommand::RegisterInstrument {
             con_id, symbol: symbol.to_string(),
             sec_type: sec_type.to_string(), exchange: exchange.to_string(),
@@ -1963,7 +1963,7 @@ impl ClientCore {
         // contract it finds is subscribed already, the request joins that
         // subscription (`take_md_rejects`).
         if con_id == 0 {
-            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+            let (reply_tx, reply_rx) = crate::types::RegistrationReply::channel();
             control_tx.send(ControlCommand::SubscribeBySymbol {
                 symbol: symbol.to_string(),
                 sec_type: sec_type.to_string(),
@@ -2020,12 +2020,7 @@ impl ClientCore {
             return Ok(None);
         }
 
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        control_tx.send(ControlCommand::RegisterInstrument {
-            con_id, symbol: symbol.to_string(),
-            sec_type: sec_type.to_string(), exchange: exchange.to_string(),
-            reply_tx: None,
-        }).map_err(|e| format!("Engine stopped: {}", e))?;
+        let (reply_tx, reply_rx) = crate::types::RegistrationReply::channel();
         control_tx.send(ControlCommand::Subscribe {
             con_id,
             symbol: symbol.to_string(),
@@ -2199,10 +2194,7 @@ impl ClientCore {
                 format!("Regulatory snapshot for {} is already being fetched in ticker id={}", symbol, other));
             return Ok(());
         }
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        control_tx.send(ControlCommand::RegisterInstrument {
-            con_id, symbol: symbol.to_string(), sec_type: sec_type.to_string(), exchange: exchange.to_string(), reply_tx: None,
-        }).map_err(|e| format!("Engine stopped: {}", e))?;
+        let (reply_tx, reply_rx) = crate::types::RegistrationReply::channel();
         control_tx.send(ControlCommand::SubscribeSnapshot {
             con_id, symbol: symbol.to_string(), exchange: exchange.to_string(), sec_type: sec_type.to_string(),
             reply_tx: Some(reply_tx),
@@ -2347,7 +2339,7 @@ impl ClientCore {
             }).and_then(|_| control_tx.send(ControlCommand::Subscribe {
                 con_id, symbol, exchange: "SMART".into(), sec_type: "STK".into(),
                 last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
-                mode_9887: 0, snapshot: false, reply_tx: Some(reply_tx),
+                mode_9887: 0, snapshot: false, reply_tx: Some(reply_tx.into()),
             }));
             if registered.is_ok() {
                 q.pending.insert(con_id, reply_rx);
@@ -2759,7 +2751,7 @@ impl ClientCore {
         number_of_ticks: i32,
         ignore_size: bool,
     ) -> Result<InstrumentId, String> {
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let (reply_tx, reply_rx) = crate::types::RegistrationReply::channel();
         control_tx.send(ControlCommand::SubscribeTbt {
             req_id,
             con_id,

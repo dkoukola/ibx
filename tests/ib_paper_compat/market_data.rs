@@ -303,7 +303,7 @@ pub(super) fn phase_news_ticks(conns: Conns) -> Conns {
         .send(ControlCommand::Subscribe {
             con_id: 265598, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "STK".into(),
             last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
-            mode_9887: 0, snapshot: false, reply_tx: Some(reply_tx),
+            mode_9887: 0, snapshot: false, reply_tx: Some(reply_tx.into()),
         })
         .unwrap();
     let instrument = reply_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
