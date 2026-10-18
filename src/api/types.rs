@@ -912,6 +912,10 @@ pub struct ContractDetails {
     pub sec_id_list: Vec<TagValue>,
     pub real_expiration_date: String,
     pub last_trade_time: String,
+    /// Native tag 6659: 1 American, 2 European; 0 or other values are unknown.
+    pub exercise_style: u8,
+    /// Native tag 6660. Does not establish an adjusted option's deliverables.
+    pub settlement_method: Option<crate::control::contracts::SettlementMethod>,
     pub stock_type: String,
     pub min_size: f64,
     pub size_increment: f64,
@@ -988,6 +992,8 @@ impl Default for ContractDetails {
             sec_id_list: Vec::new(),
             real_expiration_date: String::new(),
             last_trade_time: String::new(),
+            exercise_style: 0,
+            settlement_method: None,
             stock_type: String::new(),
             min_size: f64::MAX,
             size_increment: f64::MAX,
@@ -1142,6 +1148,8 @@ impl ContractDetails {
             sec_id_list,
             real_expiration_date: def.real_expiration_date.clone(),
             last_trade_time: if bond && !def.bond_api { String::new() } else { expiry_time },
+            exercise_style: def.exercise_style,
+            settlement_method: def.settlement_method,
             stock_type: def.stock_type.clone(),
             min_size,
             size_increment,

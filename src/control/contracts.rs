@@ -127,6 +127,31 @@ pub enum OptionRight {
     Put,
 }
 
+/// Native security-definition settlement method (tag 6660). This describes
+/// the payout method, not the contents of an adjusted contract's deliverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettlementMethod {
+    PhysicalDelivery,
+    CashBalance,
+    Binary,
+    PhysicalTruncation,
+    UnknownPayoutMode,
+}
+
+impl SettlementMethod {
+    fn from_fix(value: &str) -> Option<Self> {
+        // jsecdef.SettlementMethod, selected by the native secdef parser.
+        match value {
+            "D" => Some(Self::PhysicalDelivery),
+            "C" => Some(Self::CashBalance),
+            "B" => Some(Self::Binary),
+            "T" => Some(Self::PhysicalTruncation),
+            "U" => Some(Self::UnknownPayoutMode),
+            _ => None,
+        }
+    }
+}
+
 /// Full contract definition.
 #[derive(Debug, Clone)]
 pub struct ContractDefinition {
@@ -170,6 +195,8 @@ pub struct ContractDefinition {
     pub under_con_id: i64,
     /// Exercise style of an option: 1 American, 2 European, 0 unknown.
     pub exercise_style: u8,
+    /// Native payout method; absent or unrecognized values remain unknown.
+    pub settlement_method: Option<SettlementMethod>,
     /// Last trading time of a derivative, `HHMM`, empty when absent.
     pub last_trade_time: String,
     /// API security type of the underlying, empty when absent.
@@ -295,6 +322,7 @@ impl Default for ContractDefinition {
             join_key: String::new(),
             under_con_id: 0,
             exercise_style: 0,
+            settlement_method: None,
             last_trade_time: String::new(),
             under_sec_type: String::new(),
             wire_sec_type: String::new(),
@@ -717,6 +745,7 @@ fn apply_secdef_fields<'a>(def: &mut ContractDefinition, keys: &mut RecordKeys<'
             6855 => def.under_symbol = v.to_string(),
             6178 => def.agg_group = v.trim().parse().ok(),
             6659 => def.exercise_style = v.parse().unwrap_or(0),
+            6660 => def.settlement_method = SettlementMethod::from_fix(v),
             6850 => def.last_trade_time = v.to_string(),
             310 => def.under_sec_type = if v == "CS" { "STK".to_string() } else { v.to_string() },
             6858 => def.ev_rule = v.to_string(),
@@ -1660,6 +1689,66 @@ pub(crate) mod tests {
         assert_eq!(tags[&TAG_SECURITY_TYPE], "CS");
         assert_eq!(tags[&TAG_EXCHANGE], "BEST"); // SMART→BEST
         assert_eq!(tags[&TAG_CURRENCY], "USD");
+    }
+
+    #[test]
+    fn native_settlement_metadata_survives_captured_definitions_and_public_rows() {
+        use base64::Engine as _;
+        use crate::api::types::ContractDetails;
+
+        // Unmodified native 35=d replies, not the client API protobuf rows:
+        // AAPL option i=56 and five MNQ futures i=61, captured 07/10/2026.
+        let capture = include_str!("../../tests/fixtures/gw1040/scenarios/20261007/b4_generic_rest2.jsonl");
+        for (index, symbol, style, method, count) in [
+            (56, "AAPL", 1, SettlementMethod::PhysicalDelivery, 1),
+            (61, "MNQ", 0, SettlementMethod::CashBalance, 5),
+        ] {
+            let frame = capture.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|row| row["i"] == index).unwrap();
+            assert_eq!(frame["leg"], "fix_in");
+            assert_eq!(frame["msg_type"], "d");
+            let wire = base64::engine::general_purpose::STANDARD.decode(frame["raw_b64"].as_str().unwrap()).unwrap();
+            let rows = parse_secdef_records(&wire).unwrap();
+            assert_eq!(rows.len(), count);
+            for def in rows {
+                assert_eq!(def.symbol, symbol);
+                assert_eq!(def.exercise_style, style);
+                assert_eq!(def.settlement_method, Some(method));
+                let details = ContractDetails::from_definition(&def);
+                assert_eq!(details.exercise_style, style);
+                assert_eq!(details.settlement_method, Some(method));
+            }
+        }
+    }
+
+    #[test]
+    fn native_settlement_metadata_retains_unusual_methods_without_defaulting() {
+        use crate::api::types::ContractDetails;
+
+        for (code, expected) in [
+            ("D", Some(SettlementMethod::PhysicalDelivery)),
+            ("C", Some(SettlementMethod::CashBalance)),
+            ("B", Some(SettlementMethod::Binary)),
+            ("T", Some(SettlementMethod::PhysicalTruncation)),
+            ("U", Some(SettlementMethod::UnknownPayoutMode)),
+            ("", None), ("?", None), ("DC", None),
+        ] {
+            let wire = pipe_msg(&format!("35=d|55=TEST|167=OPT|6008=9|146=0|6344=1|6008=9|6659=2|6660={code}"));
+            let def = super::parse_secdef_response(&wire).unwrap();
+            assert_eq!(def.settlement_method, expected);
+            let details = ContractDetails::from_definition(&def);
+            assert_eq!(details.exercise_style, 2);
+            assert_eq!(details.settlement_method, expected);
+        }
+        for (fields, style) in [("", 0), ("|6659=0", 0), ("|6659=9", 9), ("|6659=bad", 0)] {
+            let wire = pipe_msg(&format!("35=d|55=TEST|167=OPT|6008=9|146=0|6344=1|6008=9{fields}"));
+            let details = ContractDetails::from_definition(&super::parse_secdef_response(&wire).unwrap());
+            assert_eq!(details.exercise_style, style);
+            assert_eq!(details.settlement_method, None);
+        }
+        let defaults = ContractDetails::default();
+        assert_eq!(defaults.exercise_style, 0);
+        assert_eq!(defaults.settlement_method, None);
     }
 
     #[test]
