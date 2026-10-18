@@ -1432,6 +1432,9 @@ impl HotLoop {
             .collect();
         for cmd in cmds {
             match cmd {
+                ControlCommand::CancelWhatIf { order_id } => {
+                    order_builder::cancel_what_if(&mut self.context, order_id);
+                }
                 ControlCommand::RequestExecutionsRange { connection, req_id, start, end, filter } => {
                     if let Err(reply) = self.ccp.execution_ranges.queue(connection, req_id, start, end, filter) {
                         self.shared.orders.push_execution_range_reply(reply);

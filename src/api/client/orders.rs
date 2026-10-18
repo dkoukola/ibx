@@ -141,14 +141,31 @@ impl EClient {
         } else {
             ClientCore::build_order_request(&sent, oid, instrument)?
         };
-        self.send(cmd)?;
-        self.core.cache_contract(contract.con_id, contract.clone());
         if order.what_if {
+            // A callback thread can consume the reply as soon as the engine
+            // receives this command. Publish its identity before enqueueing.
+            self.core.cache_contract(contract.con_id, contract.clone());
             self.core.track_what_if(oid, contract.clone(), order.clone());
+            if let Err(error) = self.send(cmd) {
+                self.core.untrack_latest_what_if(oid);
+                return Err(error);
+            }
         } else {
+            self.send(cmd)?;
+            self.core.cache_contract(contract.con_id, contract.clone());
             self.core.track_order(oid, contract.clone(), order.clone(), instrument);
         }
         Ok(())
+    }
+
+    /// Abandon all outstanding previews under this API id locally. This is
+    /// not `cancel_order`: it sends no cancellation to the broker and leaves
+    /// any working order sharing the id untouched. Use a unique id per preview
+    /// when independent cancellation is needed. Already queued replies can
+    /// still be delivered; callers must retain their request ownership check.
+    pub fn cancel_what_if(&self, order_id: i64) -> Result<(), String> {
+        self.core.what_if_orders.lock().unwrap().remove(&order_id);
+        self.send(ControlCommand::CancelWhatIf { order_id })
     }
 
     /// Cancel an order. Matches `cancelOrder` in C++.

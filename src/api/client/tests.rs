@@ -1690,6 +1690,114 @@ fn place_order_what_if() {
     assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitWhatIf { .. })));
 }
 
+#[test]
+fn what_if_tracking_precedes_the_send_and_negative_ids_are_preserved() {
+    let (mut client, _old_rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    client.core.currency_sent.lock().unwrap().insert(756733, "USD".into());
+    let (tx, rx) = crossbeam_channel::bounded(0);
+    client.control_tx = tx;
+    let client = Arc::new(client);
+    let worker = client.clone();
+    let task = std::thread::spawn(move || worker.place_order(-72, &spy(), &Order {
+        action: "SELL".into(), total_quantity: 1.0, order_type: "LMT".into(),
+        lmt_price: 150.0, what_if: true, ..Default::default()
+    }));
+    let mut select = crossbeam_channel::Select::new();
+    select.recv(&rx);
+    select.ready_timeout(std::time::Duration::from_secs(2)).unwrap();
+    // The sender cannot return from send until we receive its command.
+    assert!(client.core.peek_what_if(-72).is_some());
+    assert!(matches!(rx.recv().unwrap(), ControlCommand::Order(OrderRequest::SubmitWhatIf { request }) if request.order_id() == -72));
+    task.join().unwrap().unwrap();
+    assert_eq!(client.next_order_id(), 1, "research must not advance positive execution ids");
+    drop(rx); // EClient::drop sends Shutdown; do not block the rendezvous.
+}
+
+#[test]
+fn what_if_send_failure_rolls_back_only_latest_tracking() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    client.core.track_what_if(-7, spy(), Order { lmt_price: 111.0, what_if: true, ..Default::default() });
+    drop(rx);
+    assert!(client.place_order(-7, &spy(), &Order {
+        action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(),
+        lmt_price: 222.0, what_if: true, ..Default::default()
+    }).is_err());
+    assert_eq!(client.core.take_what_if(-7).unwrap().1.lmt_price, 111.0);
+    assert!(client.core.peek_what_if(-7).is_none());
+}
+
+#[test]
+fn what_if_local_cancel_and_terminal_rejection_release_tracking_only() {
+    let (client, rx, shared) = test_client();
+    client.core.track_what_if(-7, spy(), Order { what_if: true, ..Default::default() });
+    client.core.track_what_if(-8, spy(), Order { what_if: true, ..Default::default() });
+    client.cancel_what_if(-7).unwrap();
+    assert!(matches!(rx.recv().unwrap(), ControlCommand::CancelWhatIf { order_id: -7 }));
+    assert!(client.core.peek_what_if(-7).is_none());
+    assert!(client.core.peek_what_if(-8).is_some());
+    let mut wrapper = RecordingWrapper::default();
+    shared.orders.push_order_error(-8, 201, "a different real order".into());
+    client.process_msgs(&mut wrapper);
+    assert!(client.core.peek_what_if(-8).is_some(), "only the engine knows this was a preview rejection");
+    shared.orders.reject_what_if(-8, "not permitted");
+    client.process_msgs(&mut wrapper);
+    assert!(client.core.peek_what_if(-8).is_none());
+    assert!(!wrapper.events.iter().any(|e| e.starts_with("open_order:")));
+}
+
+#[test]
+fn what_if_native_callback_retains_finality_refusal_and_legacy_callbacks() {
+    #[derive(Default)]
+    struct PreviewWrapper { native: Vec<(bool, String)>, opens: usize, errors: usize }
+    impl Wrapper for PreviewWrapper {
+        fn what_if(&mut self, reply: &WhatIfResponse) {
+            self.native.push((reply.final_reply, reply.state.reject_reason.clone()));
+        }
+        fn open_order(&mut self, _: i64, _: &Contract, _: &Order, _: &crate::api::types::OrderState) { self.opens += 1; }
+        fn error(&mut self, _: i64, _: i64, _: &str, _: &str) { self.errors += 1; }
+    }
+    let (client, _rx, shared) = test_client();
+    client.core.track_what_if(-7, spy(), Order { what_if: true, ..Default::default() });
+    let mut warning = what_if_reply(-7, [0.0; 3], [0.0; 3], 0.0);
+    warning.final_reply = false;
+    warning.state.warning_text = "warning".into();
+    shared.orders.push_what_if(warning);
+    let mut wrapper = PreviewWrapper::default();
+    client.process_msgs(&mut wrapper);
+    assert!(client.core.peek_what_if(-7).is_some());
+    let mut reply = what_if_reply(-7, [0.0; 3], [0.0; 3], 0.0);
+    reply.state.reject_reason = "not permitted".into();
+    shared.orders.push_what_if(reply);
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.native, [(false, String::new()), (true, "not permitted".into())]);
+    assert_eq!((wrapper.opens, wrapper.errors), (2, 1));
+    assert!(client.core.peek_what_if(-7).is_none());
+}
+
+#[test]
+fn what_if_mixed_terminal_events_preserve_same_id_fifo_metadata() {
+    #[derive(Default)]
+    struct Prices(Vec<f64>);
+    impl Wrapper for Prices {
+        fn open_order(&mut self, _: i64, _: &Contract, order: &Order, _: &crate::api::types::OrderState) {
+            self.0.push(order.lmt_price);
+        }
+    }
+    let (client, _rx, shared) = test_client();
+    for price in [111.0, 222.0, 333.0] {
+        client.core.track_what_if(-7, spy(), Order { what_if: true, lmt_price: price, ..Default::default() });
+    }
+    shared.orders.push_what_if(what_if_reply(-7, [0.0; 3], [0.0; 3], 0.0));
+    shared.orders.reject_what_if(-7, "middle preview rejected");
+    shared.orders.push_what_if(what_if_reply(-7, [0.0; 3], [0.0; 3], 0.0));
+    let mut wrapper = Prices::default();
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.0, [111.0, 333.0]);
+    assert!(client.core.peek_what_if(-7).is_none());
+}
+
 // ibx#462, captured 02/10/2026 (b1_462_whatif): a what-if sent with the id
 // of a live order the server has not answered yet is refused with 103 and
 // nothing is sent; the live order goes on.

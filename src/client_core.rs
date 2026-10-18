@@ -5481,6 +5481,16 @@ impl ClientCore {
         first
     }
 
+    /// Roll back the latest preview if its enqueue failed, preserving older
+    /// previews a compatible caller may have placed under the same id.
+    pub fn untrack_latest_what_if(&self, order_id: OrderId) {
+        let mut previews = self.what_if_orders.lock().unwrap();
+        if let Some(queue) = previews.get_mut(&order_id) {
+            queue.pop_back();
+            if queue.is_empty() { previews.remove(&order_id); }
+        }
+    }
+
     /// The contract and order of the oldest what-if preview of `order_id`
     /// in flight, kept: the reply was not the last one (ibx#462).
     pub fn peek_what_if(&self, order_id: OrderId) -> Option<(ApiContract, ApiOrder)> {

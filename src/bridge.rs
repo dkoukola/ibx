@@ -658,6 +658,12 @@ impl MarketDataState {
     }
 }
 
+/// Preview replies and terminal refusals in arrival order.
+pub(crate) enum WhatIfCallback {
+    Reply(Box<WhatIfResponse>),
+    Rejected(OrderId),
+}
+
 /// Fills, order status updates, cancel rejects, what-if responses, and order cache.
 pub struct OrderState {
     /// Fills with what the report says about each execution.
@@ -676,7 +682,7 @@ pub struct OrderState {
     /// the reject 201 and the cancel 202 (ibx#486).
     order_notices: Mutex<Vec<(i64, i64, String)>>,
     error_tap: ErrorTap,
-    what_if_responses: Mutex<Vec<WhatIfResponse>>,
+    what_if_responses: Mutex<Vec<WhatIfCallback>>,
     completed_orders: Mutex<Vec<(CompletedOrder, Option<Arc<RichOrderInfo>>)>>,
     completed_history_replies: Mutex<Vec<CompletedHistoryReply>>,
     execution_range_replies: Mutex<Vec<ExecutionHistoryReply>>,
@@ -892,7 +898,19 @@ impl OrderState {
     }
 
     pub fn drain_what_if_responses(&self) -> Vec<WhatIfResponse> {
+        self.drain_what_if_callbacks().into_iter().filter_map(|event| match event {
+            WhatIfCallback::Reply(reply) => Some(*reply),
+            WhatIfCallback::Rejected(_) => None,
+        }).collect()
+    }
+
+    pub(crate) fn drain_what_if_callbacks(&self) -> Vec<WhatIfCallback> {
         self.what_if_responses.lock().unwrap().drain(..).collect()
+    }
+
+    pub(crate) fn reject_what_if(&self, order_id: OrderId, reason: &str) {
+        self.what_if_responses.lock().unwrap().push(WhatIfCallback::Rejected(order_id));
+        self.push_order_error(order_id, 201, format!("Order rejected - reason:{}", reason));
     }
 
     pub fn drain_completed_orders(&self) -> Vec<CompletedOrder> {
@@ -1031,7 +1049,7 @@ impl OrderState {
     }
 
     #[doc(hidden)] pub fn push_what_if(&self, response: WhatIfResponse) {
-        self.what_if_responses.lock().unwrap().push(response);
+        self.what_if_responses.lock().unwrap().push(WhatIfCallback::Reply(Box::new(response)));
     }
 
     #[doc(hidden)] pub fn push_completed_order(&self, order: CompletedOrder) {

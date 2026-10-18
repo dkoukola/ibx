@@ -109,6 +109,17 @@ impl OrderPreparation {
     }
 }
 
+/// Drop only the preview's local work, including metadata-parked requests.
+/// Its native ClOrdID is distinct from every working order's ClOrdID.
+pub(crate) fn cancel_what_if(context: &mut Context, order_id: OrderId) {
+    let keep = |request: &OrderRequest| {
+        !matches!(request, OrderRequest::SubmitWhatIf { .. } if request.order_id() == order_id)
+    };
+    context.pending_orders.retain(keep);
+    context.rth_parked.retain(keep);
+    context.what_ifs.retain(|_, (id, _)| *id != order_id);
+}
+
 pub(crate) fn drain_and_send_orders(
     ccp_conn: &mut Option<Connection>,
     context: &mut Context,
@@ -5380,6 +5391,38 @@ mod tests {
         }) });
         assert_eq!(tag(&tags, 59), Some("1"));
         assert_eq!(tag(&tags, 6091), Some("1"));
+    }
+
+    #[test]
+    fn what_if_negative_api_id_still_has_a_native_positive_clord() {
+        let tags = wire_tags(OrderRequest::SubmitWhatIf { request: Box::new(OrderRequest::SubmitLimit {
+            order_id: -72, instrument: 0, side: Side::Sell, qty: 1, price: 237 * crate::types::PRICE_SCALE,
+        }) });
+        assert_eq!(tag(&tags, 6091), Some("1"));
+        // The existing encoder omits negative API keys from 6121. Response
+        // ownership uses the distinct positive native ClOrdID, not that tag.
+        assert_eq!(tag(&tags, 6121), None);
+        assert_eq!(tag(&tags, 11), Some(format!("{FIRST}.0").as_str()));
+    }
+
+    #[test]
+    fn what_if_abandonment_drops_queued_parked_and_sent_previews_only() {
+        let mut context = Context::new();
+        let ordinary = OrderRequest::SubmitLimit { order_id: 7, instrument: 0, side: Side::Buy, qty: 1, price: 100 };
+        let preview = OrderRequest::SubmitWhatIf { request: Box::new(ordinary.clone()) };
+        context.pending_orders.push(preview.clone());
+        context.pending_orders.push(ordinary.clone());
+        context.rth_parked.push(preview);
+        context.rth_parked.push(ordinary);
+        context.what_ifs.insert("100.0".into(), (7, 0));
+        context.what_ifs.insert("101.0".into(), (8, 0));
+        context.insert_order(crate::types::Order::new(7, 0, Side::Buy, 1, 100, b'2', b'0', 0));
+        cancel_what_if(&mut context, 7);
+        assert_eq!(context.pending_orders.drain().count(), 1);
+        assert!(matches!(context.rth_parked.as_slice(), [OrderRequest::SubmitLimit { order_id: 7, .. }]));
+        assert_eq!(context.what_ifs.len(), 1);
+        assert!(context.what_ifs.contains_key("101.0"));
+        assert!(context.order(7).is_some());
     }
 
     /// The what-if request the API mapping builds for `order`.

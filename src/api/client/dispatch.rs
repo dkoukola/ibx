@@ -234,13 +234,24 @@ impl EClient {
         // What-if → open_order(contract, order, OrderState) only, as the
         // reference answers a preview; a refused one then gets error 201
         // (ibx#462).
-        for wi in self.shared.orders.drain_what_if_responses() {
+        for event in self.shared.orders.drain_what_if_callbacks() {
+            let wi = match event {
+                crate::bridge::WhatIfCallback::Reply(reply) => reply,
+                crate::bridge::WhatIfCallback::Rejected(order_id) => {
+                    // Keep terminal events in response arrival order for
+                    // callers reusing an API id for several previews. A real
+                    // order's 201 does not produce this preview-only event.
+                    self.core.take_what_if(order_id);
+                    continue;
+                }
+            };
             let state = ClientCore::what_if_order_state(&wi.state);
             let tracked = if wi.final_reply {
                 self.core.take_what_if(wi.order_id)
             } else {
                 self.core.peek_what_if(wi.order_id)
             };
+            wrapper.what_if(&wi);
             let (mut contract, mut order) = tracked.unwrap_or_else(|| (Contract::default(), ApiOrder::default()));
             // A preview placed without a conId shows the contract looked
             // up (ibx#486).

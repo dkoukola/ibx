@@ -1659,6 +1659,10 @@ impl OrderBuffer {
         self.buf.drain(..)
     }
 
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&OrderRequest) -> bool) {
+        self.buf.retain(keep);
+    }
+
     /// Put requests back ahead of the queued ones, in their order.
     pub fn prepend(&mut self, reqs: Vec<OrderRequest>) {
         self.buf.splice(0..0, reqs);
@@ -2036,6 +2040,9 @@ pub use registration::RegistrationReceiver;
 /// Commands sent from the control plane to the hot loop via SPSC channel.
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
+    /// Abandon only local previews with this API id. Never sends an order
+    /// cancellation and never touches a working order with the same id.
+    CancelWhatIf { order_id: OrderId },
     /// Fresh executions over an explicit UTC interval, isolated from live accounting.
     RequestExecutionsRange {
         connection: String,

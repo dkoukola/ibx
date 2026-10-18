@@ -1245,7 +1245,7 @@ impl CcpState {
         if reject && tag(20) != Some("3") {
             context.what_ifs.remove(clord.as_str());
             let reason = parsed.get(&58).map(|s| s.as_str()).unwrap_or("");
-            shared.orders.push_order_error(order_id, 201, format!("Order rejected - reason:{}", reason));
+            shared.orders.reject_what_if(order_id, reason);
             return;
         }
         const MARGIN_TAGS: [u32; 6] = [6826, 6827, 6828, 6092, 6093, 6094];
@@ -4457,6 +4457,22 @@ mod tests {
 
     /// The ClOrdID the preview of order 42 was sent under (ibx#462).
     const WHAT_IF_CLORD: &str = "2147483648.0";
+
+    #[test]
+    fn what_if_negative_id_routes_locally_and_late_reply_after_cancel_is_ignored() {
+        let (mut ccp, mut context, shared) = what_if_test_state();
+        context.what_ifs.insert(WHAT_IF_CLORD.into(), (-72, 0));
+        let frame = what_if_frame(&ZERO_CLOSE_FIELDS);
+        ccp.handle_exec_report(&frame, &mut context, &shared, &None, "");
+        assert_eq!(shared.orders.drain_what_if_responses()[0].order_id, -72);
+        context.what_ifs.insert(WHAT_IF_CLORD.into(), (-73, 0));
+        super::super::order_builder::cancel_what_if(&mut context, -73);
+        ccp.handle_exec_report(&frame, &mut context, &shared, &None, "");
+        assert!(shared.orders.drain_what_if_responses().is_empty());
+        assert!(shared.orders.drain_order_updates().is_empty());
+        assert!(shared.orders.drain_order_errors().is_empty());
+        assert!(context.order(42).is_some());
+    }
 
     /// A preview of order 42 in flight, and a working order 42 the preview
     /// must not touch (ibx#462).

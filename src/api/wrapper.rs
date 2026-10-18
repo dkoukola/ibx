@@ -38,6 +38,10 @@ pub trait Wrapper {
     ) {}
 
     fn open_order(&mut self, order_id: i64, contract: &Contract, order: &Order, order_state: &OrderState) {}
+    /// Native preview details, including authoritative finality and refusal.
+    /// The compatible `open_order` / `error` callbacks still follow this.
+    /// Like other callbacks, a reply already queued may arrive after cancel.
+    fn what_if(&mut self, response: &crate::types::WhatIfResponse) {}
     fn open_order_end(&mut self) {}
     fn exec_details(&mut self, req_id: i64, contract: &Contract, execution: &Execution) {}
     fn exec_details_end(&mut self, req_id: i64) {}
