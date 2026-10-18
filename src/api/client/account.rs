@@ -53,6 +53,8 @@ impl EClient {
                 exchange: ac.exchange, primary_exchange: ac.primary_exchange,
                 currency: ac.currency, local_symbol: ac.local_symbol,
                 trading_class: ac.trading_class, multiplier: ac.multiplier,
+                last_trade_date_or_contract_month: ac.last_trade_date_or_contract_month,
+                last_trade_date: ac.last_trade_date, strike: ac.strike, right: ac.right,
                 ..Default::default()
             };
             wrapper.position(&self.account_id, &c, pi.position_fixed as f64 / QTY_SCALE_F, pi.avg_cost as f64 / PRICE_SCALE_F);
@@ -266,6 +268,8 @@ impl EClient {
                     exchange: ac.exchange, primary_exchange: ac.primary_exchange,
                     currency: ac.currency, local_symbol: ac.local_symbol,
                     trading_class: ac.trading_class, multiplier: ac.multiplier,
+                    last_trade_date_or_contract_month: ac.last_trade_date_or_contract_month,
+                    last_trade_date: ac.last_trade_date, strike: ac.strike, right: ac.right,
                     ..Default::default()
                 };
                 wrapper.position_multi(req_id, &account, &model_code, &c,

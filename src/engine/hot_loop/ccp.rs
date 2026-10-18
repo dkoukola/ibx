@@ -3119,6 +3119,7 @@ impl CcpState {
         if def.con_id == 0 {
             return;
         }
+        let identity = api::ContractDetails::from_definition(def).contract;
         shared.reference.cache_contract(def.con_id, api::Contract {
             con_id: def.con_id,
             symbol: def.symbol.clone(),
@@ -3128,6 +3129,11 @@ impl CcpState {
             local_symbol: def.local_symbol.clone(),
             primary_exchange: def.primary_exchange.clone(),
             trading_class: def.trading_class.clone(),
+            last_trade_date_or_contract_month: identity.last_trade_date_or_contract_month,
+            last_trade_date: identity.last_trade_date,
+            strike: identity.strike,
+            right: identity.right,
+            multiplier: identity.multiplier,
             ..Default::default()
         });
         // The suffix of the primary exchange, which the 399 text names
@@ -4215,6 +4221,31 @@ pub(crate) fn handle_position_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn option_identity_is_retained_by_the_native_definition_cache() {
+        use base64::Engine as _;
+        let capture = include_str!("../../../tests/fixtures/gw1040/scenarios/20261007/b4_generic_rest2.jsonl");
+        let frame = capture.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|row| row["i"] == 56).unwrap();
+        let wire = base64::engine::general_purpose::STANDARD.decode(frame["raw_b64"].as_str().unwrap()).unwrap();
+        let def = crate::control::contracts::parse_secdef_response(&wire).unwrap();
+        let expected = api::ContractDetails::from_definition(&def).contract;
+        let shared = SharedState::new();
+        shared.reference.cache_contract(def.con_id, api::Contract { con_id: def.con_id, ..Default::default() });
+        CcpState::new().cache_definition(&def, &shared);
+        let cached = shared.reference.get_contract(def.con_id).unwrap();
+        assert_eq!(cached, expected);
+        assert_eq!(cached.last_trade_date_or_contract_month, "20261014");
+        assert_eq!(cached.strike, 332.5);
+        assert_eq!(cached.right, "C");
+        assert_eq!(cached.multiplier, "100");
+        for strike in [0.0, f64::MAX] {
+            shared.reference.cache_contract(def.con_id, api::Contract { con_id: def.con_id, strike, ..Default::default() });
+            assert_eq!(shared.reference.get_contract(def.con_id).unwrap(), expected,
+                "a later thin portfolio/order descriptor must not erase exact option terms");
+        }
+    }
 
     #[test]
     fn broker_perm_id_keeps_versions_and_never_invents_missing_identity() {

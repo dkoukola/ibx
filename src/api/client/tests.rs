@@ -2574,6 +2574,38 @@ fn process_msgs_symbol_samples_carry_the_row_fields() {
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
+fn option_identity_reaches_position_multi_and_portfolio_callbacks() {
+    #[derive(Default)]
+    struct Contracts { positions: Vec<Contract>, multi: Vec<Contract>, portfolio: Vec<Contract> }
+    impl Wrapper for Contracts {
+        fn position(&mut self, _: &str, c: &Contract, _: f64, _: f64) { self.positions.push(c.clone()); }
+        fn position_multi(&mut self, _: i64, _: &str, _: &str, c: &Contract, _: f64, _: f64) { self.multi.push(c.clone()); }
+        fn update_portfolio(&mut self, c: &Contract, _: f64, _: f64, _: f64, _: f64, _: f64, _: f64, _: &str) { self.portfolio.push(c.clone()); }
+    }
+    let (client, _rx, shared) = test_client();
+    let contract = Contract {
+        con_id: 9, symbol: "AAPL".into(), sec_type: "OPT".into(), currency: "USD".into(),
+        last_trade_date_or_contract_month: "20261014".into(), last_trade_date: "20261014".into(),
+        strike: 332.5, right: "C".into(), multiplier: "100".into(), ..Default::default()
+    };
+    shared.reference.cache_contract(9, Contract { con_id: 9, ..Default::default() });
+    shared.reference.cache_contract(9, contract.clone());
+    shared.portfolio.set_position_info(PositionInfo {
+        con_id: 9, position_fixed: QTY_SCALE, avg_cost: 200 * PRICE_SCALE, ..Default::default()
+    });
+    shared.portfolio.set_account_download_complete();
+    seed_account_rows(&shared, true);
+    let mut wrapper = Contracts::default();
+    client.req_positions(&mut wrapper);
+    client.core.subscribe_positions_multi(5, "", "");
+    client.req_account_updates(true, "");
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.positions, [contract.clone()]);
+    assert_eq!(wrapper.multi, [contract.clone()]);
+    assert_eq!(wrapper.portfolio, [contract]);
+}
+
+#[test]
 fn req_positions_delivers_via_wrapper() {
     let (client, _rx, shared) = test_client();
     shared.portfolio.set_account_download_complete();

@@ -2675,9 +2675,18 @@ impl ClientCore {
         match (local, shared_ref) {
             (Some(mut l), Some(s)) => {
                 // Enrich local with shared reference fields (secdef has richer data)
+                if l.symbol.is_empty() { l.symbol = s.symbol; }
+                if l.sec_type.is_empty() { l.sec_type = s.sec_type; }
+                if l.exchange.is_empty() { l.exchange = s.exchange; }
+                if l.currency.is_empty() { l.currency = s.currency; }
                 if l.local_symbol.is_empty() { l.local_symbol = s.local_symbol; }
                 if l.trading_class.is_empty() { l.trading_class = s.trading_class; }
                 if l.primary_exchange.is_empty() { l.primary_exchange = s.primary_exchange; }
+                if l.last_trade_date_or_contract_month.is_empty() { l.last_trade_date_or_contract_month = s.last_trade_date_or_contract_month; }
+                if l.last_trade_date.is_empty() { l.last_trade_date = s.last_trade_date; }
+                if l.strike == 0.0 || l.strike == f64::MAX { l.strike = s.strike; }
+                if l.right.is_empty() { l.right = s.right; }
+                if l.multiplier.is_empty() { l.multiplier = s.multiplier; }
                 Some(l)
             }
             (Some(l), None) => Some(l),
@@ -6031,6 +6040,48 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contract_identity_enriches_con_id_only_local_cache_without_overwriting_local_fields() {
+        let core = ClientCore::new();
+        let shared = SharedState::new();
+        let exact = ApiContract {
+            con_id: 9, symbol: "AAPL".into(), sec_type: "STK".into(),
+            exchange: "SMART".into(), currency: "USD".into(), ..Default::default()
+        };
+        shared.reference.cache_contract(9, exact.clone());
+        core.cache_contract(9, ApiContract { con_id: 9, ..Default::default() });
+        assert_eq!(core.get_contract(9, &shared).unwrap(), exact);
+        let local = ApiContract {
+            con_id: 9, symbol: "LOCAL".into(), sec_type: "OPT".into(),
+            exchange: "CBOE".into(), currency: "EUR".into(), ..Default::default()
+        };
+        core.cache_contract(9, local.clone());
+        assert_eq!(core.get_contract(9, &shared).unwrap(), local);
+    }
+
+    #[test]
+    fn option_identity_enriches_missing_cache_fields_without_overwriting_local_terms() {
+        let core = ClientCore::new();
+        let shared = SharedState::new();
+        let exact = ApiContract {
+            con_id: 9, sec_type: "OPT".into(), last_trade_date_or_contract_month: "20261014".into(),
+            last_trade_date: "20261014".into(), strike: 332.5, right: "C".into(), multiplier: "100".into(),
+            ..Default::default()
+        };
+        shared.reference.cache_contract(9, exact.clone());
+        for strike in [0.0, f64::MAX] {
+            core.cache_contract(9, ApiContract { con_id: 9, sec_type: "OPT".into(), strike, ..Default::default() });
+            assert_eq!(core.get_contract(9, &shared).unwrap(), exact);
+        }
+        let local = ApiContract {
+            last_trade_date_or_contract_month: "20261120".into(), last_trade_date: "20261120".into(),
+            strike: 350.0, right: "P".into(), multiplier: "10".into(), ..exact
+        };
+        core.cache_contract(9, local.clone());
+        assert_eq!(core.get_contract(9, &shared).unwrap(), local);
+        assert!(core.get_contract(10, &shared).is_none());
+    }
 
     // ibx#486: whyHeld as jclient.pe.iK(): only PreSubmitted; "child" while
     // the parent is not done with a fill; "trigger" for the stop types.

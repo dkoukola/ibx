@@ -1487,6 +1487,11 @@ impl ReferenceState {
             if !contract.local_symbol.is_empty() { existing.local_symbol = contract.local_symbol; }
             if !contract.primary_exchange.is_empty() { existing.primary_exchange = contract.primary_exchange; }
             if !contract.trading_class.is_empty() { existing.trading_class = contract.trading_class; }
+            if !contract.last_trade_date_or_contract_month.is_empty() { existing.last_trade_date_or_contract_month = contract.last_trade_date_or_contract_month; }
+            if !contract.last_trade_date.is_empty() { existing.last_trade_date = contract.last_trade_date; }
+            if contract.strike != 0.0 && contract.strike != f64::MAX { existing.strike = contract.strike; }
+            if !contract.right.is_empty() { existing.right = contract.right; }
+            if !contract.multiplier.is_empty() { existing.multiplier = contract.multiplier; }
         } else {
             cache.insert(con_id, contract);
         }

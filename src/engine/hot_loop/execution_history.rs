@@ -151,7 +151,7 @@ impl ExecutionRequests {
         // only to rows admitted to this explicit query's existing interval.
         let possible_resend = fields.get(&97).map(String::as_str) == Some("Y");
         let mut consumed = historical;
-        match project_execution(fields, account, active.request.req_id) {
+        match project_execution(fields, account, active.request.req_id, shared) {
             Ok(row) => {
                 let time = fill_exec_of(fields, &row.execution.exec_id)
                     .time_secs
@@ -234,6 +234,7 @@ fn project_execution(
     fields: &HashMap<u32, String>,
     account: &str,
     req_id: i64,
+    shared: &SharedState,
 ) -> Result<StoredExecution, String> {
     let id = fields
         .get(&17)
@@ -263,7 +264,8 @@ fn project_execution(
             account_id: account,
             fallback_order: None,
             fallback_con_id: 0,
-            cached_contract: None,
+            cached_contract: fields.get(&6008).and_then(|id| id.parse().ok())
+                .and_then(|con_id| shared.reference.get_contract(con_id)),
             combo: None,
             trail_limit: None,
             combo_leg_prices: Vec::new(),
@@ -448,6 +450,44 @@ mod tests {
         .into_iter()
         .map(|(tag, value)| (tag, value.into()))
         .collect()
+    }
+
+    #[test]
+    fn option_identity_in_execution_history_comes_only_from_its_exact_cached_contract() {
+        let contract = crate::api::types::Contract {
+            con_id: 9, symbol: "AAPL".into(), sec_type: "OPT".into(), currency: "USD".into(),
+            last_trade_date_or_contract_month: "20261014".into(), last_trade_date: "20261014".into(),
+            strike: 332.5, right: "C".into(), multiplier: "100".into(), ..Default::default()
+        };
+        for cached in [false, true] {
+            let shared = SharedState::new();
+            shared.reference.cache_contract(10, crate::api::types::Contract { con_id: 10, ..contract.clone() });
+            if cached {
+                shared.reference.cache_contract(9, crate::api::types::Contract { con_id: 9, ..Default::default() });
+                shared.reference.cache_contract(9, contract.clone());
+            }
+            let mut fields = row("option.01", true);
+            fields.insert(6008, "9".into());
+            fields.insert(167, "OPT".into());
+            fields.insert(15, "EUR".into());
+            // No new claim about option fields in 35=8: identity was already
+            // decoded from a separate definition for this exact conId.
+            let mut requests = active();
+            assert!(requests.report(&fields, &shared, "DU123456"));
+            let result = requests.active.as_ref().unwrap().rows.values().next().unwrap();
+            let expected = if cached {
+                crate::api::types::Contract { currency: "EUR".into(), ..contract.clone() }
+            } else {
+                crate::api::types::Contract {
+                    con_id: 9, symbol: "AAPL".into(), sec_type: "OPT".into(), currency: "EUR".into(),
+                    ..Default::default()
+                }
+            };
+            assert_eq!(result.contract, expected);
+            assert_eq!(result.execution.shares, 0.5, "identity retention does not rescale quantity");
+            assert_eq!(result.execution.price, 100.0, "identity retention does not rescale price");
+            assert!(shared.portfolio.position_infos().is_empty(), "history remains read-only");
+        }
     }
 
     #[test]
