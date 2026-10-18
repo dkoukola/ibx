@@ -3417,23 +3417,42 @@ impl ClientCore {
     /// `req_executions`); its commission report is not given to this
     /// client (`jextend.ba.a(dq, aQ)`).
     pub fn push_silent_execution(&self, contract: ApiContract, execution: ApiExecution, time_secs: Option<i64>) {
-        let (base, _) = crate::engine::hot_loop::ccp::split_exec_revision(&execution.exec_id);
-        if !base.is_empty() {
-            self.silent_executions.lock().unwrap().insert(base.to_string());
-        }
-        let _ = self.push_execution(-1, contract, execution, time_secs);
+        let _ = self.store_execution(-1, contract, execution, time_secs, true);
     }
 
     pub fn push_execution(&self, req_id: i64, contract: ApiContract, execution: ApiExecution, time_secs: Option<i64>) -> Option<ApiCommissionAndFeesReport> {
-        let (base, _) = crate::engine::hot_loop::ccp::split_exec_revision(&execution.exec_id);
+        self.store_execution(req_id, contract, execution, time_secs, false)
+    }
+
+    fn store_execution(&self, req_id: i64, contract: ApiContract, execution: ApiExecution, time_secs: Option<i64>, silent: bool) -> Option<ApiCommissionAndFeesReport> {
+        let (base, revision) = crate::engine::hot_loop::ccp::split_exec_revision(&execution.exec_id);
+        let mut silent_executions = self.silent_executions.lock().unwrap();
+        let mut executions = self.executions.lock().unwrap();
+        let previous = (!execution.exec_id.is_empty()).then(|| executions.iter().position(|row| {
+            crate::engine::hot_loop::ccp::split_exec_revision(&row.execution.exec_id).0 == base
+        })).flatten();
+        if previous.is_some_and(|index| {
+            crate::engine::hot_loop::ccp::split_exec_revision(&executions[index].execution.exec_id).1 >= revision
+        }) {
+            return None;
+        }
+        if !base.is_empty() {
+            if silent { silent_executions.insert(base.to_owned()); }
+            else { silent_executions.remove(base); }
+        }
         let commission_and_fees = if execution.exec_id.is_empty() {
             None
         } else {
             self.pending_commissions.lock().unwrap().remove(base)
         };
-        self.executions.lock().unwrap().push(StoredExecution {
-            req_id, contract, execution, time_secs, commission_and_fees: commission_and_fees.clone(),
-        });
+        let retained_fee = previous.and_then(|index| executions[index].commission_and_fees.clone())
+            .filter(|fee| crate::engine::hot_loop::ccp::split_exec_revision(&fee.exec_id).1 >= revision);
+        let row = StoredExecution {
+            req_id, contract, execution, time_secs,
+            commission_and_fees: commission_and_fees.clone().or(retained_fee),
+        };
+        if let Some(index) = previous { executions[index] = row; }
+        else { executions.push(row); }
         commission_and_fees
     }
 
@@ -4118,6 +4137,7 @@ impl ClientCore {
         let mut live_priced = 0usize;
         let mut daily_known = true;
         let mut unrealized_known = true;
+        let mut realized_known = true;
 
         for con_id in con_ids {
             let seed = seeds.get(&con_id);
@@ -4129,8 +4149,12 @@ impl ClientCore {
             let qty_midnight = seed.map(|s| s.qty_midnight_fixed).unwrap_or(0) as f64 / QTY_SCALE_F;
 
             // The seed's realized P&L, plus this session's fills (ibx#478).
-            total_realized += seed.map(|s| s.realized_pnl).unwrap_or(0.0)
-                + realized_since.get(&con_id).copied().unwrap_or(0.0);
+            let realized = realized_since.get(&con_id).copied().unwrap_or(0.0);
+            if realized == f64::MAX {
+                realized_known = false;
+            } else {
+                total_realized += seed.map(|s| s.realized_pnl).unwrap_or(0.0) + realized;
+            }
 
             let units = shared.portfolio.valuation(con_id, &shared.reference);
             let money_traded = money_traded_today(seed, money_since.get(&con_id).copied(), qty_now, avg_cost, units);
@@ -4197,6 +4221,7 @@ impl ClientCore {
                 total_realized = realized;
                 daily_known = true;
                 unrealized_known = true;
+                realized_known = true;
             }
         }
         // A value that cannot be computed is unset, as the reference (ibx#478).
@@ -4205,6 +4230,9 @@ impl ClientCore {
         }
         if !unrealized_known {
             total_unrealized = f64::MAX;
+        }
+        if !realized_known {
+            total_realized = f64::MAX;
         }
 
         let scaled = |v: f64| if v == f64::MAX { i64::MAX } else { (v * PRICE_SCALE_F) as i64 };
@@ -4295,6 +4323,7 @@ impl ClientCore {
             let realized_fills = realized_since.get(&con_id).copied();
             let realized = match (seed.map(|s| s.realized_pnl), realized_fills) {
                 (None, None) => f64::MAX,
+                (_, Some(f64::MAX)) => f64::MAX,
                 (seed_value, fills) => seed_value.unwrap_or(0.0) + fills.unwrap_or(0.0),
             };
             let value = mv_now.unwrap_or(f64::MAX);

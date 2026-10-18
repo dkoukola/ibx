@@ -61,6 +61,12 @@ pub struct FillExec {
     /// The print is new accounting, but its order snapshot failed the native
     /// revision/time guard. Dispatch executions without stale order callbacks.
     pub stale_order_state: bool,
+    /// Full replacement of an earlier execution, including when its order
+    /// has already left the active book. Never a synthetic delta execution.
+    pub correction: bool,
+    /// Contract of this queued print. A later correction may change the
+    /// order cache's conId before callbacks are drained.
+    pub contract: Option<Box<api::Contract>>,
     /// Server execution id (tag 17).
     pub exec_id: String,
     /// Execution time, Unix seconds: tag 6699, else 60, else 52.
@@ -1999,7 +2005,7 @@ pub struct PortfolioState {
     /// Signed quantity × quoted price since the last seed, by conId.
     /// Cash is derived only once exact product units are available; retaining
     /// the quoted total lets a late secdef resolve an initially unknown factor.
-    quoted_fills_since_seed: Mutex<HashMap<i64, f64>>,
+    quoted_fills_since_seed: Mutex<HashMap<i64, Option<f64>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2279,13 +2285,31 @@ impl PortfolioState {
 
     /// Add realized P&L of a fill for `con_id` (ibx#478).
     #[doc(hidden)] pub fn add_realized_since_seed(&self, con_id: i64, amount: f64) {
-        *self.realized_since_seed.lock().unwrap().entry(con_id).or_insert(0.0) += amount;
+        let mut totals = self.realized_since_seed.lock().unwrap();
+        let total = totals.entry(con_id).or_insert(0.0);
+        if *total != f64::MAX { *total += amount; }
     }
 
     /// Add signed quantity × quoted fill price: sell positive, buy negative.
     /// This is not cash until the product's quote multiplier is known.
     #[doc(hidden)] pub fn add_quoted_fill_since_seed(&self, con_id: i64, value: f64) {
-        *self.quoted_fills_since_seed.lock().unwrap().entry(con_id).or_insert(0.0) += value;
+        if let Some(total) = self.quoted_fills_since_seed.lock().unwrap().entry(con_id).or_insert(Some(0.0)) {
+            *total += value;
+        }
+    }
+
+    /// A revision whose prior print is outside the bounded session window
+    /// cannot supply a cash/realized delta. Retain that contract's unknown
+    /// result until a fresh native seed replaces it; later fills are not a
+    /// substitute for the missing baseline. Other contracts remain unchanged.
+    pub(crate) fn invalidate_execution_accounting(&self, con_id: i64) {
+        self.quoted_fills_since_seed.lock().unwrap().insert(con_id, None);
+        self.invalidate_realized_accounting(con_id);
+        self.invalidate_position_snapshot();
+    }
+
+    pub(crate) fn invalidate_realized_accounting(&self, con_id: i64) {
+        self.realized_since_seed.lock().unwrap().insert(con_id, f64::MAX);
     }
 
     /// Signed cash of fills since the last seed, by exact conId. `None` means
@@ -2295,8 +2319,8 @@ impl PortfolioState {
     pub fn money_since_seed(&self, reference: &ReferenceState) -> HashMap<i64, Option<f64>> {
         let totals = self.quoted_fills_since_seed.lock().unwrap().clone();
         totals.into_iter().map(|(con_id, value)| {
-            let cash = self.valuation(con_id, reference)
-                .map(|units| value * units.multiplier())
+            let cash = value.zip(self.valuation(con_id, reference))
+                .map(|(value, units)| value * units.multiplier())
                 .filter(|cash| cash.is_finite());
             (con_id, cash)
         }).collect()

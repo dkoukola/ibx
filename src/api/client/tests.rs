@@ -4893,6 +4893,104 @@ fn req_executions_without_a_commission_report_sends_the_execution_only() {
     assert_eq!(w.events, ["exec_details:1:BOT:100", "exec_details_end:1"]);
 }
 
+#[test]
+fn execution_revision_after_order_retirement_delivers_full_print_and_latest_replay() {
+    #[derive(Default)]
+    struct Revisions(Vec<(i64, String, f64, f64)>);
+    impl Wrapper for Revisions {
+        fn exec_details(&mut self, req_id: i64, _: &Contract, execution: &crate::api::types::Execution) {
+            self.0.push((req_id, execution.exec_id.clone(), execution.shares, execution.price));
+        }
+    }
+    let (client, _rx, shared) = test_client();
+    shared.orders.push_fill_with_exec(aapl_fill(7), crate::bridge::FillExec {
+        exec_id: "retired.01".into(), ..Default::default()
+    });
+    let mut callbacks = Revisions::default();
+    client.process_msgs(&mut callbacks);
+    for (exec_id, shares) in [("retired.02", 50.0), ("retired.03", 0.0)] {
+        shared.orders.push_untracked_execution(Contract::default(), crate::api::types::Execution {
+            exec_id: exec_id.into(), order_id: 7, side: "BOT".into(), shares, price: 160.0, ..Default::default()
+        }, crate::bridge::FillExec {
+            exec_id: exec_id.into(), correction: true, ..Default::default()
+        });
+        client.process_msgs(&mut callbacks);
+    }
+    assert_eq!(callbacks.0.len(), 3);
+    assert_eq!((callbacks.0[1].2, callbacks.0[1].3), (50.0, 160.0), "not -50 shares or a price delta");
+    assert_eq!(callbacks.0[2], (-1, "retired.03".into(), 0.0, 160.0));
+    let mut replay = Revisions::default();
+    client.req_executions(8, &Default::default(), &mut replay);
+    client.process_msgs(&mut replay);
+    assert_eq!(replay.0, [(8, "retired.03".into(), 0.0, 160.0)]);
+
+    // Replayed or another client's correction stays silent, as before.
+    for (exec_id, other_client, replayed) in [("other.02", true, false), ("outage.02", false, true)] {
+        shared.orders.push_untracked_execution(Contract::default(), crate::api::types::Execution {
+            exec_id: exec_id.into(), shares: 2.0, price: 3.0, ..Default::default()
+        }, crate::bridge::FillExec {
+            exec_id: exec_id.into(), correction: true, other_client, replayed, ..Default::default()
+        });
+    }
+    client.process_msgs(&mut callbacks);
+    assert_eq!(callbacks.0.len(), 3);
+}
+
+#[test]
+fn execution_revision_storage_rejects_older_rows_and_preserves_already_corrected_fee() {
+    let core = ClientCore::new();
+    let contract = Contract::default();
+    let execution = |id: &str, shares| crate::api::types::Execution {
+        exec_id: id.into(), shares, price: 10.0, ..Default::default()
+    };
+    core.push_execution(-1, contract.clone(), execution("revision.01", 2.0), None);
+    let fee = crate::api::types::CommissionAndFeesReport { exec_id: "revision.02".into(), commission_and_fees: 1.0, ..Default::default() };
+    assert!(core.apply_commission(&fee));
+    assert!(core.push_execution(-1, contract.clone(), execution("revision.02", 1.0), None).is_none());
+    core.push_execution(-1, contract.clone(), execution("revision.01", 2.0), None);
+    core.push_execution(-1, contract, execution("revision.02", 1.0), None);
+    let rows = core.matching_executions(&Default::default());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].execution.shares, 1.0);
+    assert_eq!(rows[0].commission_and_fees.as_ref().unwrap().exec_id, "revision.02");
+}
+
+#[test]
+fn execution_revision_live_authority_replaces_replay_silence() {
+    let core = ClientCore::new();
+    let execution = |id: &str| crate::api::types::Execution { exec_id: id.into(), shares: 1.0, price: 2.0, ..Default::default() };
+    core.push_silent_execution(Contract::default(), execution("silent.01"), None);
+    assert!(!core.apply_commission(&crate::api::types::CommissionAndFeesReport { exec_id: "silent.01".into(), ..Default::default() }));
+    core.push_execution(-1, Contract::default(), execution("silent.02"), None);
+    core.push_silent_execution(Contract::default(), execution("silent.01"), None);
+    assert!(core.apply_commission(&crate::api::types::CommissionAndFeesReport { exec_id: "silent.02".into(), ..Default::default() }));
+}
+
+#[test]
+fn execution_revision_dispatch_uses_each_queued_contract() {
+    #[derive(Default)]
+    struct Contracts(Vec<(String, i64)>);
+    impl Wrapper for Contracts {
+        fn exec_details(&mut self, _: i64, contract: &Contract, execution: &crate::api::types::Execution) {
+            self.0.push((execution.exec_id.clone(), contract.con_id));
+        }
+    }
+    let (client, _rx, shared) = test_client();
+    for (exec_id, con_id) in [("changed.01", 1), ("changed.02", 2)] {
+        shared.orders.push_fill_with_exec(aapl_fill(7), crate::bridge::FillExec {
+            exec_id: exec_id.into(), correction: con_id == 2,
+            contract: Some(Box::new(Contract { con_id, ..Default::default() })),
+            ..Default::default()
+        });
+    }
+    let mut callbacks = Contracts::default();
+    client.process_msgs(&mut callbacks);
+    assert_eq!(callbacks.0, [("changed.01".into(), 1), ("changed.02".into(), 2)]);
+    let rows = client.core.matching_executions(&Default::default());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].contract.con_id, 2);
+}
+
 // ibx#265: as the reference, every execution first, then the commission
 // reports, then the end; no lock is held while the callbacks run, so a
 // callback can use the client.
@@ -5015,6 +5113,8 @@ fn execution_history_loss_after_capture_prevents_the_first_reply_callback() {
 /// pm0925-fill-BUY, time 20260925-08:49:54 UTC, routed to ARCA.
 fn captured_fill_exec() -> crate::bridge::FillExec {
     crate::bridge::FillExec {
+        correction: false,
+        contract: None,
         stale_order_state: false,
         exec_id: "0000e0d5.6ab5f36f.01.01".into(),
         time_secs: Some(1790326194),

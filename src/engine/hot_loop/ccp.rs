@@ -157,6 +157,16 @@ pub(crate) fn split_exec_revision(exec_id: &str) -> (&str, u64) {
     }
 }
 
+pub(super) fn is_execution_print(parsed: &std::collections::HashMap<u32, String>) -> bool {
+    parsed.get(&20).map(String::as_str) != Some("3")
+        && matches!(parsed.get(&150).map(String::as_str), Some("F" | "1" | "2"))
+        && parsed.get(&32).and_then(|value| parse_qty(value)).is_some_and(|quantity| {
+            quantity > 0 || (quantity == 0
+                && matches!(parsed.get(&20).map(String::as_str), Some("1" | "2"))
+                && parsed.get(&19).is_some_and(|reference| !reference.is_empty()))
+        })
+}
+
 /// The report of a combo's leg (ibx#470): 6013 gives the leg index (-1
 /// for the combo itself) and the leg count, 442 = 2 on a leg's report.
 fn is_leg_report(parsed: &std::collections::HashMap<u32, String>) -> bool {
@@ -179,6 +189,8 @@ pub(super) fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec
     let tag = |t: u32| parsed.get(&t).filter(|s| !s.is_empty());
     crate::bridge::FillExec {
         stale_order_state: false,
+        correction: false,
+        contract: None,
         exec_id: exec_id.to_string(),
         time_secs: tag(6699).or_else(|| tag(60)).or_else(|| tag(52))
             .and_then(|s| fix_utc_to_unix_secs(s)),
@@ -303,6 +315,33 @@ pub(crate) enum ReplayKind {
     Reconnect,
 }
 
+/// Latest full print of one execution family, not another fill ledger. The
+/// existing bounded commission window owns this record across link recovery
+/// and P&L seed refreshes: a revision replaces the economics already counted.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExecutionAccounting {
+    con_id: i64,
+    realized: Option<f64>,
+    moves_position: bool,
+    print: Option<ExecutionPrint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExecutionPrint {
+    revision: u64,
+    quantity: Qty,
+    quoted_value: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FillDelta {
+    quantity: Qty,
+    filled: Qty,
+    quoted_value: f64,
+    correction: bool,
+    moves_position: bool,
+}
+
 pub(crate) struct CcpState {
     /// The group of each account summary subscription, which its cancel
     /// restates (ibx#486).
@@ -322,7 +361,7 @@ pub(crate) struct CcpState {
     /// conId of this session's fills and the realized P&L counted for each,
     /// by execution id without its revision (ibx#478). Bounded like the
     /// commission window.
-    pub(crate) exec_realized: std::collections::HashMap<String, (i64, f64)>,
+    pub(crate) exec_realized: std::collections::HashMap<String, ExecutionAccounting>,
     /// Order messages already reported as 399, by order and text (ibx#465).
     pub(crate) order_messages_sent: HashSet<(OrderId, String)>,
     /// The per-leg prices (6879) of the report being read, in leg order
@@ -806,6 +845,13 @@ impl CcpState {
         true
     }
 
+    fn execution_already_counted(&self, exec_id: &str) -> bool {
+        let (base, revision) = split_exec_revision(exec_id);
+        self.seen_exec_ids.contains(exec_id)
+            || self.exec_realized.get(base).and_then(|entry| entry.print)
+                .is_some_and(|print| revision <= print.revision)
+    }
+
     /// Remember the conId of a fill of this session, for the realized P&L
     /// its commission frame carries (ibx#478).
     pub(crate) fn record_exec_con_id(&mut self, exec_id: &str, con_id: i64) {
@@ -813,7 +859,10 @@ impl CcpState {
             return;
         }
         let (base, _) = split_exec_revision(exec_id);
-        if self.exec_realized.insert(base.to_string(), (con_id, 0.0)).is_none() {
+        if !self.exec_realized.contains_key(base) {
+            self.exec_realized.insert(base.to_string(), ExecutionAccounting {
+                con_id, realized: Some(0.0), moves_position: true, print: None,
+            });
             self.exec_realized_order.push_back(base.to_string());
             while self.exec_realized_order.len() > EXEC_ID_WINDOW {
                 if let Some(old) = self.exec_realized_order.pop_front() {
@@ -821,6 +870,64 @@ impl CcpState {
                 }
             }
         }
+    }
+
+    /// Book a new full print or the difference from the latest revision. The
+    /// native execution ID revision names a replacement; tag 32 and tag 31
+    /// remain the full corrected print for callbacks, never synthetic deltas.
+    fn record_fill_economics(&mut self, parsed: &std::collections::HashMap<u32, String>, shared: &SharedState, exec_id: &str, con_id: i64, quantity: Qty, price: f64) -> Option<FillDelta> {
+        let quoted_value = -(quantity as f64 / QTY_SCALE as f64) * price;
+        let moves_position = parsed.get(&167).map(String::as_str) != Some("BAG")
+            && !shared.reference.get_contract(con_id).is_some_and(|contract| contract.sec_type == "BAG");
+        let mut delta = FillDelta { quantity, filled: quantity.abs(), quoted_value, correction: false, moves_position };
+        if exec_id.is_empty() {
+            if !moves_position {
+                delta.quantity = 0;
+                delta.quoted_value = 0.0;
+            }
+            return Some(delta);
+        }
+        let (base, revision) = split_exec_revision(exec_id);
+        self.record_exec_con_id(exec_id, con_id);
+        let entry = self.exec_realized.get_mut(base).unwrap();
+        entry.moves_position &= moves_position;
+        delta.moves_position = entry.moves_position;
+        if let Some(previous) = entry.print {
+            if revision <= previous.revision {
+                return None;
+            }
+            // Native dc.a(eO) logs a changed conId but retains the revised
+            // report. Preserve it without guessing how two authoritative
+            // position baselines already incorporate that transformation.
+            if entry.con_id != con_id {
+                log::warn!("Execution {} changed conId from {} to {}; awaiting authoritative accounting", exec_id, entry.con_id, con_id);
+                shared.portfolio.invalidate_execution_accounting(entry.con_id);
+                shared.portfolio.invalidate_execution_accounting(con_id);
+                entry.con_id = con_id;
+                entry.realized = None;
+                entry.moves_position = moves_position;
+                delta = FillDelta { quantity: 0, filled: 0, quoted_value: 0.0, correction: true, moves_position };
+            } else {
+                delta.quantity -= previous.quantity;
+                delta.filled -= previous.quantity.abs();
+                delta.quoted_value -= previous.quoted_value;
+                delta.correction = true;
+            }
+        } else if revision > 1 || matches!(parsed.get(&20).map(String::as_str), Some("1" | "2")) {
+            // A correction can be the first row after restart or after this
+            // bounded window evicted its prior print. It is still a complete
+            // execution observation, but not a new fill with a known delta.
+            log::warn!("Execution {} has no prior print in the session window; awaiting authoritative position/P&L refresh", exec_id);
+            delta = FillDelta { quantity: 0, filled: 0, quoted_value: 0.0, correction: true, moves_position: entry.moves_position };
+            entry.realized = None;
+            if entry.moves_position { shared.portfolio.invalidate_execution_accounting(con_id); }
+        }
+        entry.print = Some(ExecutionPrint { revision, quantity, quoted_value });
+        if !entry.moves_position {
+            delta.quantity = 0;
+            delta.quoted_value = 0.0;
+        }
+        Some(delta)
     }
 
     /// Record a commission report for `exec_id`. Returns `false` for a
@@ -890,12 +997,28 @@ impl CcpState {
         // a higher revision replaces the amount counted before.
         if report.realized_pnl != f64::MAX {
             let (base, _) = split_exec_revision(exec_id);
-            if let Some((con_id, counted)) = self.exec_realized.get_mut(base) {
-                let delta = report.realized_pnl - *counted;
-                *counted = report.realized_pnl;
-                shared.portfolio.add_realized_since_seed(*con_id, delta);
+            if let Some(entry) = self.exec_realized.get_mut(base) {
+                if let Some(counted) = entry.realized {
+                    shared.portfolio.add_realized_since_seed(entry.con_id, report.realized_pnl - counted);
+                } else {
+                    // A seed may have arrived since the unknown-prior fill;
+                    // it does not identify this family's prior fee amount.
+                    shared.portfolio.invalidate_realized_accounting(entry.con_id);
+                }
+                entry.realized = Some(report.realized_pnl);
             } else {
                 log::debug!("Commission report for {}: no fill of this session, realized P&L not counted", exec_id);
+            }
+        } else {
+            let (base, _) = split_exec_revision(exec_id);
+            if let Some(entry) = self.exec_realized.get_mut(base)
+                && entry.realized != Some(0.0)
+            {
+                // A revised full fee no longer supplies its prior known
+                // realized amount. Public zero/unset decoding stays unchanged;
+                // do not retain the superseded amount as current accounting.
+                entry.realized = None;
+                shared.portfolio.invalidate_realized_accounting(entry.con_id);
             }
         }
         shared.orders.push_commission_report(report);
@@ -1425,9 +1548,17 @@ impl CcpState {
             |info| ((info.order.filled_quantity * QTY_SCALE as f64).round() as Qty, info.last_exec.avg_price)));
         // A stale print still belongs to execution accounting. A snapshot never
         // does, even if it includes the last print's ID, quantity and price.
-        let real_print = !is_status_report
-            && matches!(parsed.get(&150).map(String::as_str), Some("F" | "1" | "2"))
-            && parsed.get(&32).and_then(|value| parse_qty(value)).is_some_and(|qty| qty > 0);
+        let real_print = is_execution_print(parsed);
+        // An older execution revision cannot roll the order's corrected
+        // cumulative totals back either. Same-ID status repeats still run the
+        // normal order clock below, as they may close a recovered order.
+        if real_print && parsed.get(&17).is_some_and(|id| {
+            let (base, revision) = split_exec_revision(id);
+            self.exec_realized.get(base).and_then(|entry| entry.print)
+                .is_some_and(|print| revision < print.revision)
+        }) {
+            return;
+        }
         if !state_admitted && !real_print {
             if collect_history {
                 // Rejection by the live order clock must not erase requested
@@ -1624,9 +1755,7 @@ impl CcpState {
         // gives no execDetails and no orderStatus; once filled, the order is
         // unknown to the client (a cancel gets 10147). Captured 30/09/2026
         // (ib-agent#192 C4). A combo keeps its own path.
-        if !is_status_report && self.fill_up_pending.is_some()
-            && matches!(parsed.get(&150).map(String::as_str), Some("F" | "1" | "2"))
-            && parsed.get(&32).and_then(|s| parse_qty(s)).is_some_and(|q| q > 0)
+        if real_print && self.fill_up_pending.is_some()
             && context.order(clord_id).is_some()
             && !context.combos.orders.contains_key(&clord_id)
         {
@@ -1868,17 +1997,14 @@ impl CcpState {
         let mut update_out: Option<crate::types::OrderUpdate> = None;
         let mut had_fill = false;
         let mut untracked_out: Option<(api::Execution, crate::bridge::FillExec)> = None;
-        if !is_status_report && matches!(exec_type, "F" | "1" | "2") && last_shares > 0 {
+        if real_print {
             let tracked = context.order(clord_id).copied();
             // A duplicate execution is not booked again, but the report still
             // runs the order state below: status, order cache, and the end
             // of a terminal order (ibx#330). The id of an untracked fill is
             // recorded only once the fill is stored, so a fill that could not
             // be booked stays replayable (ibx#314).
-            let duplicate = !exec_id.is_empty() && match tracked {
-                Some(_) => !self.record_exec_id(exec_id),
-                None => self.seen_exec_ids.contains(exec_id),
-            };
+            let duplicate = !exec_id.is_empty() && self.execution_already_counted(exec_id);
             if !duplicate && !exec_id.is_empty() {
                 // Last execution of the session, for the fill-up after a reconnect (ibx#399).
                 let time = parsed.get(&60).or_else(|| parsed.get(&52)).cloned().unwrap_or_default();
@@ -1887,7 +2013,22 @@ impl CcpState {
             if duplicate {
                 log::warn!("Duplicate ExecID={}: fill not booked again", exec_id);
             } else if let Some(order) = tracked {
-                context.update_order_filled_fixed(clord_id, last_shares);
+                let signed_quantity = match order.side {
+                    Side::Buy => last_shares,
+                    Side::Sell | Side::ShortSell => -last_shares,
+                };
+                let con_id = parsed.get(&6008).and_then(|id| id.parse().ok()).filter(|id| *id != 0)
+                    .or_else(|| context.market.con_id(order.instrument)).unwrap_or(0);
+                let Some(delta) = self.record_fill_economics(parsed, shared, exec_id, con_id, signed_quantity, last_px) else { return };
+                if !exec_id.is_empty() { self.record_exec_id(exec_id); }
+                // Native oT.fillOccurredImpl replaces cumulative filled with
+                // tag 14, including a reduction on a bust/correction. A stale
+                // order image must not move that newer cumulative snapshot.
+                if state_admitted {
+                    let filled_delta = parsed.get(&14).and_then(|s| parse_qty(s))
+                        .map_or(delta.filled, |cumulative| cumulative - order.filled_fixed);
+                    context.update_order_filled_fixed(clord_id, filled_delta);
+                }
                 // Order totals ride on every fill report next to the print
                 // (ib-agent#192 C3): the callback's filled and average price
                 // are these, not the print (ibx#315).
@@ -1905,32 +2046,37 @@ impl CcpState {
                     commission: (commission * PRICE_SCALE as f64) as i64,
                     timestamp_ns: context.now_ns(),
                 };
-                let delta = match order.side {
-                    Side::Buy => last_shares,
-                    Side::Sell | Side::ShortSell => -last_shares,
-                };
                 let mut exec = fill_exec_of(parsed, exec_id);
                 exec.stale_order_state = !state_admitted;
+                exec.correction = delta.correction;
                 // The fill of a combo moves no position: its legs' fills do
                 // (ibx#470). Its execution shows the combo contract without
                 // its legs (captured 30/09/2026).
                 if let Some(view) = &combo_view {
+                    if let Some(entry) = self.exec_realized.get_mut(split_exec_revision(exec_id).0) {
+                        entry.moves_position = false;
+                    }
                     let contract = api::Contract {
                         combo_legs: Vec::new(), combo_legs_descrip: String::new(), ..view.contract.clone()
                     };
                     exec.combo = Some(Box::new(crate::bridge::ComboExec { contract, leg: None }));
-                    if let Some(con_id) = context.market.con_id(order.instrument) {
-                        self.record_exec_con_id(&exec.exec_id, con_id);
-                    }
                 }
                 if combo_view.is_none() {
-                    context.update_position_fixed(order.instrument, delta);
-                    // notify_fill inlined
-                    shared.portfolio.set_position_fixed(fill.instrument, context.position_fixed(fill.instrument));
-                    if let Some(con_id) = context.market.con_id(order.instrument) {
-                        self.record_exec_con_id(&exec.exec_id, con_id);
-                        book_fill_value(parsed, shared, con_id, delta, last_px, None);
+                    let mut contract = report_contract(parsed, shared);
+                    if contract.con_id == 0 {
+                        contract = shared.reference.get_contract(con_id).unwrap_or_default();
+                        contract.con_id = con_id;
                     }
+                    exec.contract = Some(Box::new(contract));
+                    // The report can correct the contract itself. Keep the
+                    // order's routing identity, but account by exact reported
+                    // conId rather than the old order's instrument slot.
+                    if let Some(instrument) = context.market.try_register(con_id) {
+                        shared.market.set_instrument_count(context.market.count());
+                        context.update_position_fixed(instrument, delta.quantity);
+                        shared.portfolio.set_position_fixed(instrument, context.position_fixed(instrument));
+                    }
+                    book_fill_value(parsed, shared, con_id, delta, last_px, None);
                 }
                 fill_out = Some((fill, exec));
                 had_fill = true;
@@ -2062,11 +2208,17 @@ impl CcpState {
                 shared.orders.push_untracked_execution(info.contract.clone(), execution, exec);
             }
             shared.orders.push_order_info(clord_id, info);
-        } else if let (Some(previous), Some((execution, exec))) = (&previous, untracked_out.take()) {
-            shared.orders.push_untracked_execution(previous.contract.clone(), execution, exec);
+        } else if let (Some(_), Some((execution, exec))) = (&previous, untracked_out.take()) {
+            // Execution revisions do not follow the order-state clock. A
+            // stale order report can still correct the execution's contract.
+            shared.orders.push_untracked_execution(report_contract(parsed, shared), execution, exec);
         }
 
         if let Some((fill, mut exec)) = fill_out {
+            // Event::Fill has no execution ID/revision and cannot express a
+            // replacement. The API path below retains the full correction;
+            // never present it as another additive fill to event consumers.
+            let correction = exec.correction;
             if delivered {
                 shared.orders.push_fill_with_exec(fill, exec);
             } else {
@@ -2077,7 +2229,7 @@ impl CcpState {
                     account_id, shared.orders.api_order_id(clord_id));
                 shared.orders.push_untracked_execution(report_contract(parsed, shared), execution, exec);
             }
-            emit(event_tx, Event::Fill(fill));
+            if !correction { emit(event_tx, Event::Fill(fill)); }
         }
         if let Some(update) = update_out {
             if delivered {
@@ -2124,8 +2276,8 @@ impl CcpState {
     ) {
         let exec_id = parsed.get(&17).map(|s| s.as_str()).unwrap_or("");
         let last_shares: Qty = parsed.get(&32).and_then(|s| parse_qty(s)).unwrap_or(0);
-        if last_shares <= 0 { return; }
-        if !exec_id.is_empty() && !self.record_exec_id(exec_id) {
+        if last_shares <= 0 && !is_execution_print(parsed) { return; }
+        if !exec_id.is_empty() && self.execution_already_counted(exec_id) {
             log::warn!("Duplicate ExecID={}: leg fill not booked again", exec_id);
             return;
         }
@@ -2137,20 +2289,22 @@ impl CcpState {
         let buy = parsed.get(&54).map(|s| s.as_str()) == Some("1");
         let price = parsed.get(&31).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
         let shares = last_shares as f64 / QTY_SCALE as f64;
-        let delta = if buy { last_shares } else { -last_shares };
+        let quantity = if buy { last_shares } else { -last_shares };
+        let Some(delta) = self.record_fill_economics(parsed, shared, exec_id, con_id, quantity, price) else { return };
+        if !exec_id.is_empty() { self.record_exec_id(exec_id); }
         let leg = combo.combo.legs.iter().find(|l| l.con_id == con_id);
         if con_id != 0 {
             if let Some(instrument) = context.market.try_register(con_id) {
                 shared.market.set_instrument_count(context.market.count());
-                context.update_position_fixed(instrument, delta);
+                context.update_position_fixed(instrument, delta.quantity);
                 shared.portfolio.set_position_fixed(instrument, context.position_fixed(instrument));
             }
-            self.record_exec_con_id(exec_id, con_id);
             // Leg.multiplier may be the builder's default 1; use only its
             // sourced product type, never that value as option cash evidence.
             book_fill_value(parsed, shared, con_id, delta, price, leg.map(|leg| leg.sec_type.as_str()));
         }
         let mut exec = fill_exec_of(parsed, exec_id);
+        exec.correction = delta.correction;
         let sec_type = match parsed.get(&167).map(|s| s.as_str()) {
             Some("CS") | Some("COMMON") | None => "STK".to_string(),
             Some(other) => other.to_string(),
@@ -2210,7 +2364,7 @@ impl CcpState {
         let exec_id = parsed.get(&17).map(|s| s.as_str()).unwrap_or("");
         let last_px = parsed.get(&31).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
         let last_shares: Qty = parsed.get(&32).and_then(|s| parse_qty(s)).unwrap_or(0);
-        if !exec_id.is_empty() && self.seen_exec_ids.contains(exec_id) {
+        if !exec_id.is_empty() && self.execution_already_counted(exec_id) {
             log::warn!("Duplicate ExecID={}: fill not booked again", exec_id);
         } else {
             if !exec_id.is_empty() {
@@ -2267,24 +2421,24 @@ impl CcpState {
             log::warn!("Fill {} of untracked order {}: no contract or side, not booked", exec_id, clord_id);
             return None;
         };
-        let delta = match side {
+        let quantity = match side {
             Side::Buy => last_shares,
             Side::Sell | Side::ShortSell => -last_shares,
         };
+        let delta = self.record_fill_economics(parsed, shared, exec_id, con_id, quantity, last_px)?;
         match context.market.try_register(con_id) {
             Some(instrument) => {
                 shared.market.set_instrument_count(context.market.count());
                 if let Some(sym) = parsed.get(&55) {
                     context.set_symbol(instrument, sym.clone());
                 }
-                context.update_position_fixed(instrument, delta);
+                context.update_position_fixed(instrument, delta.quantity);
                 shared.portfolio.set_position_fixed(instrument, context.position_fixed(instrument));
             }
             None => log::error!("Fill {} of untracked order {}: instrument table full ({} contracts), engine position of con_id {} not moved",
                 exec_id, clord_id, crate::types::MAX_INSTRUMENTS, con_id),
         }
         let shares = last_shares as f64 / QTY_SCALE as f64;
-        self.record_exec_con_id(exec_id, con_id);
         book_fill_value(parsed, shared, con_id, delta, last_px, None);
 
         // The placing client's order id when the report carries it.
@@ -2295,6 +2449,7 @@ impl CcpState {
         // The execution's reports go to its client, else to client 0
         // (`jextend.ba.a(dq, aQ)`).
         let mut exec = fill_exec_of(parsed, exec_id);
+        exec.correction = delta.correction;
         let me = context.api_client_id;
         exec.other_client = me != 0 && exec.client_id != me;
         Some((execution, exec))
@@ -3509,10 +3664,11 @@ fn book_fill_value(
     parsed: &std::collections::HashMap<u32, String>,
     shared: &SharedState,
     con_id: i64,
-    delta: Qty,
+    delta: FillDelta,
     price: f64,
     fallback_sec_type: Option<&str>,
 ) {
+    if !delta.moves_position { return; }
     let mut contract = shared.reference.get_contract(con_id).unwrap_or_default();
     contract.con_id = con_id;
     for (field, tag) in [
@@ -3533,13 +3689,12 @@ fn book_fill_value(
             _ => sec_type.to_string(),
         };
     }
-    let quoted_value = -(delta as f64 / QTY_SCALE as f64) * price;
-    shared.portfolio.add_quoted_fill_since_seed(con_id, quoted_value);
+    shared.portfolio.add_quoted_fill_since_seed(con_id, delta.quoted_value);
     let stock = crate::bridge::PositionValuation::is_stock_type(&contract.sec_type)
         || (contract.sec_type.is_empty()
             && shared.portfolio.valuation(con_id, &shared.reference) == Some(crate::bridge::PositionValuation::Stock));
     let stock_price = stock.then_some((price * PRICE_SCALE as f64) as Price);
-    shared.portfolio.apply_fill_to_position(&contract, delta, stock_price);
+    shared.portfolio.apply_fill_to_position(&contract, delta.quantity, stock_price);
 }
 
 /// The contract of an execution report: the cached one when its conId is
@@ -4385,7 +4540,8 @@ mod tests {
                 ..Default::default()
             };
             shared.reference.cache_contract(42, contract.clone());
-            book_fill_value(&std::collections::HashMap::from([(167, native_type.into())]), &shared, 42, QTY_SCALE, 2.5, None);
+            let delta = CcpState::new().record_fill_economics(&Default::default(), &shared, "fill.01", 42, QTY_SCALE, 2.5).unwrap();
+            book_fill_value(&std::collections::HashMap::from([(167, native_type.into())]), &shared, 42, delta, 2.5, None);
             assert_eq!(shared.reference.get_contract(42), Some(contract));
             assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(-2.5));
             assert_eq!(shared.portfolio.position_info(42).unwrap().avg_cost, 5 * PRICE_SCALE / 2);
@@ -4431,6 +4587,28 @@ mod tests {
             con_id: 42, sec_type: "OPT".into(), multiplier: "100".into(), ..Default::default()
         });
         assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(-250.0));
+        let mut revision = fill.clone();
+        revision.insert(17, "option-leg.02".into());
+        revision.insert(20, "2".into());
+        revision.insert(19, "option-leg.01".into());
+        revision.insert(31, "3".into());
+        ccp.handle_combo_leg_report(&revision, &mut context, &shared, 90, &combo);
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(-300.0));
+        assert_eq!(shared.portfolio.position_info(42).unwrap().position_fixed, QTY_SCALE);
+        revision.insert(17, "option-leg.03".into());
+        revision.insert(20, "1".into());
+        revision.insert(19, "option-leg.02".into());
+        revision.insert(150, "2".into());
+        revision.insert(32, "0".into());
+        ccp.handle_combo_leg_report(&revision, &mut context, &shared, 90, &combo);
+        ccp.handle_combo_leg_report(&fill, &mut context, &shared, 90, &combo);
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(0.0));
+        assert_eq!(shared.portfolio.position_info(42).unwrap().position_fixed, 0);
+        let callbacks = shared.orders.drain_fills_with_exec();
+        assert_eq!(callbacks.len(), 3);
+        let revised = callbacks[1].1.combo.as_ref().unwrap().leg.as_ref().unwrap();
+        assert_eq!((revised.shares, revised.price), (1.0, 3.0));
+        assert_eq!(callbacks[2].1.combo.as_ref().unwrap().leg.as_ref().unwrap().shares, 0.0);
     }
 
     #[test]
@@ -4955,6 +5133,361 @@ mod tests {
             m.insert(*tag, val.to_string());
         }
         m
+    }
+
+    #[test]
+    fn execution_revisions_replace_economics_in_tracked_untracked_and_outage_paths() {
+        for path in ["tracked", "terminal", "untracked", "outage"] {
+            for (side, wire_side, sign) in [(Side::Buy, "1", 1), (Side::Sell, "2", -1)] {
+                for (sec_type, factor) in [("STK", 1.0), ("OPT", 100.0)] {
+                    let (mut ccp, mut context, shared) = ord_status_test_state();
+                    let instrument = context.market.instrument_by_con_id(756733).unwrap();
+                    context.forget_order(42);
+                    if matches!(path, "tracked" | "terminal") {
+                        context.insert_order(crate::types::Order::new(42, instrument, side, 5, 2 * PRICE_SCALE, b'2', b'0', 0));
+                    }
+                    shared.reference.cache_contract(756733, api::Contract {
+                        con_id: 756733, sec_type: sec_type.into(), multiplier: factor.to_string(), ..Default::default()
+                    });
+                    let status = if path == "tracked" { "1" } else { "2" };
+                    let first = exec_report_frame(&[
+                        (20, "0"), (39, status), (150, "F"), (17, "replacement.01"),
+                        (6008, "756733"), (54, wire_side), (31, "2"), (32, "2"), (14, "2"), (151, "3"),
+                    ]);
+                    let revised = exec_report_frame(&[
+                        (20, "2"), (19, "replacement.01"), (39, status), (150, "F"), (17, "replacement.02"),
+                        (6008, "756733"), (54, wire_side), (31, "3"), (32, "1"), (14, "1"), (151, "4"),
+                    ]);
+                    for row in [&first, &revised, &first, &revised] {
+                        if path == "outage" {
+                            ccp.handle_outage_fill(row, &mut context, &shared, 42, "DU1");
+                        } else {
+                            ccp.handle_exec_report(row, &mut context, &shared, &None, "DU1");
+                        }
+                    }
+                    assert_eq!(context.position_fixed(instrument), sign * QTY_SCALE, "{path}/{sec_type}");
+                    assert_eq!(shared.portfolio.position_info(756733).unwrap().position_fixed, sign * QTY_SCALE);
+                    assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&756733], Some(-3.0 * factor * sign as f64));
+                    if path == "tracked" {
+                        assert_eq!(context.order(42).unwrap().filled_fixed, QTY_SCALE);
+                        assert_eq!(shared.orders.get_order_info(42).unwrap().order.filled_quantity, 1.0);
+                    }
+                    let fills = shared.orders.drain_fills_with_exec();
+                    let untracked = shared.orders.drain_untracked_executions();
+                    assert_eq!(fills.len() + untracked.len(), 2, "only the two full revisions survive");
+                    if let Some((fill, metadata)) = fills.last().filter(|_| path == "tracked") {
+                        assert_eq!((fill.qty_fixed, fill.price), (QTY_SCALE, 3 * PRICE_SCALE));
+                        assert!(metadata.correction);
+                    } else if let Some((_, execution, metadata)) = untracked.last() {
+                        assert_eq!((execution.shares, execution.price), (1.0, 3.0));
+                        assert!(metadata.correction);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn execution_bust_replaces_print_with_zero_without_reopening_terminal_order() {
+        for path in ["tracked", "terminal", "untracked", "outage"] {
+            let (mut ccp, mut context, shared) = ord_status_test_state();
+            if matches!(path, "untracked" | "outage") { context.forget_order(42); }
+            let status = if path == "tracked" { "1" } else { "2" };
+            let first = exec_report_frame(&[
+                (20, "0"), (39, status), (150, "F"), (17, "bust.01"),
+                (6008, "756733"), (54, "1"), (31, "2"), (32, "1"), (14, "1"), (151, "1"),
+            ]);
+            let bust = exec_report_frame(&[
+                (20, "1"), (19, "bust.01"), (39, status), (150, "2"), (17, "bust.02"),
+                (6008, "756733"), (54, "1"), (31, "2"), (32, "0"), (14, "0"), (151, "1"),
+            ]);
+            for row in [&first, &bust, &first, &bust] {
+                if path == "outage" { ccp.handle_outage_fill(row, &mut context, &shared, 42, "DU1"); }
+                else { ccp.handle_exec_report(row, &mut context, &shared, &None, "DU1"); }
+            }
+            assert_eq!(context.position_fixed(0), 0, "{path}");
+            assert_eq!(shared.portfolio.position_info(756733).unwrap().position_fixed, 0);
+            assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&756733], Some(0.0));
+            if path == "tracked" { assert_eq!(context.order(42).unwrap().filled_fixed, 0); }
+            else { assert!(context.order(42).is_none()); }
+        }
+    }
+
+    #[test]
+    fn execution_revision_keeps_commission_delta_across_position_and_seed_refresh() {
+        for seed_refresh in [false, true] {
+            let (mut ccp, mut context, shared) = ord_status_test_state();
+            let first = exec_report_frame(&[
+                (20, "0"), (39, "1"), (150, "F"), (17, "refresh.01"),
+                (6008, "756733"), (54, "1"), (31, "2"), (32, "2"), (14, "2"), (151, "1"),
+            ]);
+            ccp.handle_exec_report(&first, &mut context, &shared, &None, "DU1");
+            ccp.handle_commission_report(&commission_frame(&[(17, "refresh.01"), (6099, "5")]), &shared);
+            handle_position_update(&exec_report_frame(&[(6008, "756733"), (6064, "2"), (6101, "2.25")]), &mut context, &shared, &None);
+            if seed_refresh {
+                shared.portfolio.set_midnight_seeds(vec![crate::types::MidnightSeed {
+                    con_id: 756733, qty_midnight_fixed: 0, money_traded: -4.0, realized_pnl: 5.0,
+                }]);
+            }
+            let revised = exec_report_frame(&[
+                (20, "2"), (19, "refresh.01"), (39, "1"), (150, "F"), (17, "refresh.02"),
+                (6008, "756733"), (54, "1"), (31, "3"), (32, "1"), (14, "1"), (151, "2"),
+            ]);
+            ccp.handle_exec_report(&revised, &mut context, &shared, &None, "DU1");
+            ccp.handle_commission_report(&commission_frame(&[(17, "refresh.02"), (6099, "6")]), &shared);
+            assert_eq!(context.position_fixed(0), QTY_SCALE);
+            assert_eq!(shared.portfolio.position_info(756733).unwrap().avg_cost, 225 * PRICE_SCALE / 100, "raw broker basis unchanged");
+            assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&756733], Some(if seed_refresh { 1.0 } else { -3.0 }));
+            assert_eq!(shared.portfolio.realized_since_seed()[&756733], if seed_refresh { 1.0 } else { 6.0 });
+        }
+    }
+
+    #[test]
+    fn execution_revision_without_prior_keeps_only_affected_cash_unknown_until_seed() {
+        for evicted in [false, true] {
+            let (mut ccp, mut context, shared) = ord_status_test_state();
+            context.forget_order(42);
+            if evicted {
+                ccp.record_fill_economics(&Default::default(), &shared, "missing.01", 756733, QTY_SCALE, 2.0).unwrap();
+                for index in 0..EXEC_ID_WINDOW {
+                    ccp.record_exec_con_id(&format!("other-{index}.01"), 123);
+                }
+                assert!(!ccp.exec_realized.contains_key("missing"));
+                assert_eq!(ccp.exec_realized.len(), EXEC_ID_WINDOW);
+            }
+            handle_position_update(&exec_report_frame(&[(6008, "756733"), (6064, "5"), (6101, "10"), (6065, "12")]), &mut context, &shared, &None);
+            shared.portfolio.set_account_download_complete();
+            shared.reference.cache_contract(123, api::Contract { con_id: 123, sec_type: "STK".into(), ..Default::default() });
+            shared.portfolio.add_quoted_fill_since_seed(123, -7.0);
+            shared.portfolio.add_realized_since_seed(123, 1.0);
+            let revised = exec_report_frame(&[
+                (20, "2"), (19, "missing.01"), (39, "2"), (150, "F"), (17, "missing.02"),
+                (6008, "756733"), (54, "1"), (31, "3"), (32, "2"), (14, "2"), (151, "0"),
+            ]);
+            ccp.handle_exec_report(&revised, &mut context, &shared, &None, "DU1");
+            ccp.handle_commission_report(&commission_frame(&[(17, "missing.02"), (6099, "4")]), &shared);
+            assert_eq!(context.position_fixed(0), 5 * QTY_SCALE, "replacement is not an additional buy");
+            assert!(!shared.portfolio.account_download_complete());
+            let cash = shared.portfolio.money_since_seed(&shared.reference);
+            assert_eq!(cash[&756733], None);
+            assert_eq!(cash[&123], Some(-7.0));
+            assert_eq!(shared.portfolio.realized_since_seed()[&123], 1.0);
+            let observations = shared.orders.drain_untracked_executions();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].1.shares, 2.0);
+            assert!(observations[0].2.correction);
+
+            let core = crate::client_core::ClientCore::new();
+            core.subscribe_pnl(1);
+            core.subscribe_pnl_single(2, 756733);
+            let account = core.poll_pnl(&shared).pop().unwrap();
+            assert_eq!((account.daily_pnl, account.realized_pnl), (f64::MAX, f64::MAX));
+            let position = core.poll_pnl_single(&shared).pop().unwrap();
+            assert_eq!((position.daily_pnl, position.realized_pnl), (f64::MAX, f64::MAX));
+
+            shared.portfolio.add_quoted_fill_since_seed(756733, 9.0);
+            shared.portfolio.add_realized_since_seed(756733, 9.0);
+            handle_position_update(&exec_report_frame(&[(6008, "756733"), (6064, "5"), (6101, "11")]), &mut context, &shared, &None);
+            assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&756733], None, "a position image is not a cash seed");
+            assert_eq!(shared.portfolio.realized_since_seed()[&756733], f64::MAX);
+            shared.portfolio.set_midnight_seeds(vec![crate::types::MidnightSeed {
+                con_id: 756733, qty_midnight_fixed: 0, money_traded: -6.0, realized_pnl: 4.0,
+            }]);
+            assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty());
+            let mut next = revised.clone();
+            next.insert(17, "missing.03".into());
+            next.insert(19, "missing.02".into());
+            next.insert(32, "3".into());
+            next.insert(14, "3".into());
+            ccp.handle_exec_report(&next, &mut context, &shared, &None, "DU1");
+            ccp.handle_commission_report(&commission_frame(&[(17, "missing.03"), (6099, "5")]), &shared);
+            assert_eq!(context.position_fixed(0), 6 * QTY_SCALE);
+            assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&756733], Some(-3.0));
+            assert_eq!(shared.portfolio.realized_since_seed()[&756733], 1.0);
+        }
+    }
+
+    #[test]
+    fn execution_revision_of_terminal_combo_parent_never_books_parent_economics() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        shared.reference.cache_contract(756733, api::Contract {
+            con_id: 756733, sec_type: "BAG".into(), ..Default::default()
+        });
+        let mut row = exec_report_frame(&[
+            (20, "0"), (39, "2"), (150, "F"), (17, "parent.01"),
+            (6008, "756733"), (167, "BAG"), (54, "1"), (31, "2"), (32, "1"), (14, "1"), (151, "0"),
+        ]);
+        ccp.handle_exec_report(&row, &mut context, &shared, &None, "DU1");
+        assert!(context.order(42).is_none());
+        assert!(!ccp.exec_realized["parent"].moves_position);
+        row.remove(&167);
+        row.insert(17, "parent.02".into());
+        row.insert(19, "parent.01".into());
+        row.insert(20, "2".into());
+        row.insert(31, "3".into());
+        ccp.handle_exec_report(&row, &mut context, &shared, &None, "DU1");
+        row.insert(17, "parent.03".into());
+        row.insert(19, "parent.02".into());
+        row.insert(20, "1".into());
+        row.insert(32, "0".into());
+        row.insert(14, "0".into());
+        ccp.handle_exec_report(&row, &mut context, &shared, &None, "DU1");
+        assert_eq!(context.position_fixed(0), 0);
+        assert!(shared.portfolio.position_infos().is_empty());
+        assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty());
+        assert_eq!(shared.orders.drain_fills_with_exec().len(), 1);
+        let corrections = shared.orders.drain_untracked_executions();
+        assert_eq!(corrections.len(), 2);
+        assert_eq!((corrections[0].1.shares, corrections[0].1.price), (1.0, 3.0));
+        assert_eq!(corrections[1].1.shares, 0.0);
+    }
+
+    #[test]
+    fn execution_revision_unknown_commission_after_seed_does_not_invent_realized_delta() {
+        for first_realized in ["5", "0"] {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        context.forget_order(42);
+        let revision = exec_report_frame(&[
+            (20, "2"), (19, "late-fee.01"), (39, "2"), (150, "F"), (17, "late-fee.02"),
+            (6008, "756733"), (54, "1"), (31, "3"), (32, "1"), (14, "1"), (151, "0"),
+        ]);
+        ccp.handle_exec_report(&revision, &mut context, &shared, &None, "DU1");
+        let seed = crate::types::MidnightSeed { con_id: 756733, qty_midnight_fixed: 0, money_traded: -3.0, realized_pnl: 4.0 };
+        shared.portfolio.set_midnight_seeds(vec![seed]);
+        shared.portfolio.set_account_download_complete();
+        ccp.handle_commission_report(&commission_frame(&[(17, "late-fee.02"), (6099, first_realized)]), &shared);
+        assert_eq!(shared.portfolio.realized_since_seed()[&756733], f64::MAX);
+        assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty(), "fee uncertainty does not erase known cash");
+        assert!(shared.portfolio.account_download_complete(), "nor invalidate position readiness");
+        ccp.handle_commission_report(&commission_frame(&[(17, "late-fee.03"), (6099, "6")]), &shared);
+        assert_eq!(shared.portfolio.realized_since_seed()[&756733], f64::MAX);
+        shared.portfolio.set_midnight_seeds(vec![crate::types::MidnightSeed { realized_pnl: 6.0, ..seed }]);
+        assert!(shared.portfolio.realized_since_seed().is_empty());
+        ccp.handle_commission_report(&commission_frame(&[(17, "late-fee.04"), (6099, "7")]), &shared);
+        assert_eq!(shared.portfolio.realized_since_seed()[&756733], 1.0);
+        }
+    }
+
+    #[test]
+    fn execution_bust_unset_commission_withdraws_prior_realized_without_guessing_zero() {
+        for missing in [false, true] {
+            let (mut ccp, mut context, shared) = ord_status_test_state();
+            let mut row = exec_report_frame(&[
+                (20, "0"), (39, "2"), (150, "F"), (17, "fee-bust.01"),
+                (6008, "756733"), (54, "1"), (31, "2"), (32, "1"), (14, "1"), (151, "0"),
+            ]);
+            ccp.handle_exec_report(&row, &mut context, &shared, &None, "DU1");
+            ccp.handle_commission_report(&commission_frame(&[(17, "fee-bust.01"), (6099, "5")]), &shared);
+            shared.portfolio.set_account_download_complete();
+            row.insert(17, "fee-bust.02".into());
+            row.insert(19, "fee-bust.01".into());
+            row.insert(20, "1".into());
+            row.insert(32, "0".into());
+            row.insert(14, "0".into());
+            ccp.handle_exec_report(&row, &mut context, &shared, &None, "DU1");
+            let mut fee = commission_frame(&[(17, "fee-bust.02"), (6099, "0")]);
+            if missing { fee.remove(&6099); }
+            ccp.handle_commission_report(&fee, &shared);
+            assert_eq!(shared.orders.drain_commission_reports().last().unwrap().realized_pnl, f64::MAX);
+            assert_eq!(shared.portfolio.realized_since_seed()[&756733], f64::MAX);
+            assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&756733], Some(0.0));
+            assert!(shared.portfolio.account_download_complete());
+            shared.portfolio.set_midnight_seeds(vec![crate::types::MidnightSeed {
+                con_id: 756733, qty_midnight_fixed: 0, money_traded: 0.0, realized_pnl: 0.0,
+            }]);
+            assert!(shared.portfolio.realized_since_seed().is_empty());
+        }
+    }
+
+    #[test]
+    fn execution_revision_changed_contract_preserves_observation_without_guessed_transfer() {
+        for tracked in [false, true] {
+            let (mut ccp, mut context, shared) = ord_status_test_state();
+            if !tracked { context.forget_order(42); }
+            let status = if tracked { "1" } else { "2" };
+            let (events, receiver) = crossbeam_channel::unbounded();
+            let events = Some(events);
+            let mut row = exec_report_frame(&[
+                (20, "0"), (39, status), (150, "F"), (17, "identity.01"),
+                (6008, "756733"), (54, "1"), (31, "2"), (32, "1"), (14, "1"), (151, "2"),
+            ]);
+            ccp.handle_exec_report(&row, &mut context, &shared, &events, "DU1");
+            let new_instrument = context.register_instrument(123);
+            shared.reference.cache_contract(123, api::Contract { con_id: 123, sec_type: "STK".into(), ..Default::default() });
+            handle_position_update(&exec_report_frame(&[(6008, "123"), (6064, "7"), (6101, "5")]), &mut context, &shared, &None);
+            shared.portfolio.set_account_download_complete();
+            row.insert(17, "identity.02".into());
+            row.insert(19, "different-reference-is-not-the-family-key.01".into());
+            row.insert(20, "2".into());
+            row.insert(6008, "123".into());
+            row.insert(31, "3".into());
+            ccp.handle_exec_report(&row, &mut context, &shared, &events, "DU1");
+            assert_eq!(context.position_fixed(0), QTY_SCALE);
+            assert_eq!(context.position_fixed(new_instrument), 7 * QTY_SCALE);
+            let cash = shared.portfolio.money_since_seed(&shared.reference);
+            assert_eq!((cash[&756733], cash[&123]), (None, None));
+            assert!(!shared.portfolio.account_download_complete());
+            assert_eq!(ccp.exec_realized["identity"].con_id, 123);
+            row.insert(17, "identity.03".into());
+            row.insert(32, "2".into());
+            row.insert(14, "2".into());
+            ccp.handle_exec_report(&row, &mut context, &shared, &events, "DU1");
+            assert_eq!(context.position_fixed(0), QTY_SCALE, "later new-contract delta cannot move old slot");
+            assert_eq!(context.position_fixed(new_instrument), 8 * QTY_SCALE);
+            assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&123], None);
+            let fills = shared.orders.drain_fills_with_exec();
+            if tracked {
+                assert_eq!(fills.len(), 3);
+                assert_eq!(fills[0].1.contract.as_ref().unwrap().con_id, 756733);
+                assert_eq!(fills[1].1.contract.as_ref().unwrap().con_id, 123);
+            } else {
+                let observations = shared.orders.drain_untracked_executions();
+                assert_eq!(observations.len(), 3);
+                assert_eq!(observations[1].0.con_id, 123);
+                assert_eq!(observations[1].1.shares, 1.0);
+            }
+            let additive_fills = receiver.try_iter().filter(|event| matches!(event, Event::Fill(_))).count();
+            assert_eq!(additive_fills, usize::from(tracked), "corrections are not additive Event::Fill observations");
+        }
+    }
+
+    #[test]
+    fn execution_revision_stale_order_clock_preserves_corrected_contract_only() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        context.forget_order(42);
+        let first = exec_report_frame(&[
+            (11, "42.2"), (60, "20261018 12:00:02"),
+            (20, "0"), (39, "2"), (150, "F"), (17, "stale-identity.01"),
+            (6008, "756733"), (55, "OLD"), (54, "1"), (31, "2"), (32, "1"), (14, "1"), (151, "0"),
+        ]);
+        ccp.handle_exec_report(&first, &mut context, &shared, &None, "DU1");
+        shared.reference.cache_contract(123, api::Contract {
+            con_id: 123, symbol: "NEW".into(), sec_type: "STK".into(), ..Default::default()
+        });
+        let revised = exec_report_frame(&[
+            (11, "42.1"), (60, "20261018 12:00:01"),
+            (20, "2"), (19, "stale-identity.01"), (39, "2"), (150, "F"), (17, "stale-identity.02"),
+            (6008, "123"), (55, "NEW"), (54, "1"), (31, "3"), (32, "1"), (14, "1"), (151, "0"),
+        ]);
+        ccp.handle_exec_report(&revised, &mut context, &shared, &None, "DU1");
+        let observations = shared.orders.drain_untracked_executions();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[1].0.con_id, 123);
+        assert_eq!(observations[1].0.symbol, "NEW");
+        assert_eq!(observations[1].1.exec_id, "stale-identity.02");
+        assert_eq!((observations[1].1.shares, observations[1].1.price), (1.0, 3.0));
+        assert!(observations[1].2.correction);
+        let order = shared.orders.get_order_info(42).unwrap();
+        assert_eq!(order.contract.con_id, 756733, "stale order identity is not admitted");
+        assert_eq!(order.contract.symbol, "OLD");
+        assert_eq!(order.report_revision, Some(2));
+        assert_eq!(order.report_time.as_deref(), Some("20261018 12:00:02"));
+        assert_eq!(shared.reference.get_contract(756733).unwrap().symbol, "OLD");
+        let new_instrument = context.market.instrument_by_con_id(123).unwrap();
+        assert_eq!(context.position_fixed(0), QTY_SCALE);
+        assert_eq!(context.position_fixed(new_instrument), 0, "unknown cross-contract delta is not guessed");
+        let cash = shared.portfolio.money_since_seed(&shared.reference);
+        assert_eq!((cash[&756733], cash[&123]), (None, None));
     }
 
     #[test]

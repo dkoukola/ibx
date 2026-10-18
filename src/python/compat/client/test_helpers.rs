@@ -148,6 +148,32 @@ impl EClient {
         Ok(())
     }
 
+    /// Queue a full revision, including after its order left the active book.
+    #[doc(hidden)]
+    #[pyo3(signature = (con_id, exec_id, qty, price, tracked=false, replayed=false))]
+    fn _test_push_execution_revision(&self, con_id: i64, exec_id: String, qty: f64, price: f64, tracked: bool, replayed: bool) -> PyResult<()> {
+        let shared = self.shared_state()?;
+        let contract = crate::api::types::Contract { con_id, sec_type: "STK".into(), ..Default::default() };
+        let metadata = crate::bridge::FillExec {
+            exec_id: exec_id.clone(), correction: true, replayed,
+            contract: Some(Box::new(contract.clone())), ..Default::default()
+        };
+        if tracked {
+            shared.orders.push_fill_with_exec(Fill {
+                instrument: 0, order_id: 7, side: Side::Buy,
+                price: (price * PRICE_SCALE as f64) as Price,
+                qty_fixed: (qty * QTY_SCALE as f64) as Qty,
+                remaining_fixed: 0, cum_qty_fixed: (qty * QTY_SCALE as f64) as Qty,
+                avg_price: (price * PRICE_SCALE as f64) as Price, commission: 0, timestamp_ns: 0,
+            }, metadata);
+        } else {
+            shared.orders.push_untracked_execution(contract, crate::api::types::Execution {
+                exec_id, order_id: 7, side: "BOT".into(), shares: qty, price, ..Default::default()
+            }, metadata);
+        }
+        Ok(())
+    }
+
     /// Run the second-factor code provider built from `callable` the way the
     /// login runs it: on its own thread, with the interpreter lock released
     /// by the caller (ibx#208).

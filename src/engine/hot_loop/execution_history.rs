@@ -284,7 +284,7 @@ fn project_execution(
     if perm_id <= 0
         || projected.contract.con_id <= 0
         || !execution.shares.is_finite()
-        || execution.shares <= 0.0
+        || (execution.shares <= 0.0 && !super::ccp::is_execution_print(fields))
         || !execution.price.is_finite()
         || execution.price <= 0.0
     {
@@ -676,6 +676,31 @@ mod tests {
         assert!(shared.portfolio.position_infos().is_empty());
         assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty());
         assert!(shared.orders.drain_untracked_executions().is_empty());
+    }
+
+    #[test]
+    fn execution_range_keeps_zero_bust_as_latest_revision_without_live_accounting() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        ccp.execution_ranges = active();
+        let first = row("busted.01", true);
+        let mut bust = row("busted.02", true);
+        bust.insert(20, "1".into());
+        bust.insert(19, "busted.01".into());
+        bust.insert(32, "0".into());
+        bust.insert(14, "0".into());
+        for row in [&first, &bust, &first] {
+            deliver(&mut ccp, &mut context, &shared, row);
+        }
+        end(&mut ccp, &mut context, &shared);
+        let rows = shared.orders.drain_execution_range_replies().pop().unwrap().result.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].execution.exec_id, "busted.02");
+        assert_eq!(rows[0].execution.shares, 0.0);
+        assert!(ccp.exec_realized.is_empty());
+        assert!(shared.portfolio.position_infos().is_empty());
+        assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty());
     }
 
     #[test]

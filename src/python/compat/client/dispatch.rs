@@ -370,6 +370,7 @@ impl EClient {
             api_exec.order_id = shown;
             // A combo's report shows the combo or the leg (ibx#470).
             let mut api_contract = api_contract;
+            if let Some(contract) = &fill_exec.contract { api_contract = (**contract).clone(); }
             crate::client_core::ClientCore::apply_combo_exec(&fill_exec, &mut api_contract, &mut api_exec);
 
             // Build Python contract for callback
@@ -450,6 +451,12 @@ impl EClient {
             if fill_exec.other_client || fill_exec.replayed {
                 self.core.push_silent_execution(contract, exec, fill_exec.time_secs);
                 continue;
+            }
+            if fill_exec.correction {
+                self.send_execution_rows(py, -1, &[crate::client_core::StoredExecution {
+                    req_id: -1, contract: contract.clone(), execution: exec.clone(),
+                    time_secs: fill_exec.time_secs, commission_and_fees: None,
+                }])?;
             }
             if let Some(cr) = self.core.push_execution(-1, contract, exec, fill_exec.time_secs) {
                 self.send_commission_report(py, &cr)?;

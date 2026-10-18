@@ -116,6 +116,7 @@ impl EClient {
             exec.order_id = shown;
             // A combo's report shows the combo or the leg (ibx#470).
             let mut c = c;
+            if let Some(contract) = &fill_exec.contract { c = (**contract).clone(); }
             ClientCore::apply_combo_exec(&fill_exec, &mut c, &mut exec);
             // The execution first, then openOrder and orderStatus, as the
             // reference (captured 30/09/2026 on a stock and a combo fill).
@@ -170,6 +171,9 @@ impl EClient {
             if fill_exec.other_client || fill_exec.replayed {
                 self.core.push_silent_execution(contract, exec, fill_exec.time_secs);
                 continue;
+            }
+            if fill_exec.correction {
+                wrapper.exec_details(-1, &contract, &exec);
             }
             if let Some(report) = self.core.push_execution(-1, contract, exec, fill_exec.time_secs) {
                 wrapper.commission_and_fees_report(&report);
