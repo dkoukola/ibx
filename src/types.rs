@@ -1232,6 +1232,9 @@ pub enum OrderRequest {
     /// working order; the answer is an `Event::WhatIf`.
     SubmitWhatIf {
         request: Box<OrderRequest>,
+        /// Exact option terms of this preview, not shared mutable instrument
+        /// state. Ordinary stock/combo previews leave this absent.
+        option_terms: Option<crate::engine::market_state::OptionTerms>,
     },
     /// Fractional shares limit order. Qty is fixed-point (QTY_SCALE = 10^4).
     /// E.g., 0.5 shares = 5000. Tag 38 sent as decimal string.
@@ -1333,7 +1336,7 @@ impl OrderRequest {
             | Self::SubmitEx { order_id, .. } => *order_id,
             Self::SubmitBracket { parent_id, .. } => *parent_id,
             Self::SubmitProtectedBracket { entry, .. } => entry.order_id,
-            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.order_id(),
+            Self::SubmitWhatIf { request, .. } | Self::Guarded { request, .. } => request.order_id(),
         }
     }
 
@@ -1345,7 +1348,7 @@ impl OrderRequest {
                 std::iter::once(entry.order_id).chain(std::iter::once(stop_loss.order_id))
                     .chain(take_profit.iter().map(|leg| leg.order_id)).collect(),
             Self::SubmitBracket { parent_id, tp_id, sl_id, .. } => vec![*parent_id, *tp_id, *sl_id],
-            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.new_order_ids(),
+            Self::SubmitWhatIf { request, .. } | Self::Guarded { request, .. } => request.new_order_ids(),
             _ if self.new_order_qty().is_some() => vec![self.order_id()],
             _ => Vec::new(),
         }
@@ -1356,7 +1359,7 @@ impl OrderRequest {
     pub fn new_order_qty(&self) -> Option<Qty> {
         match self {
             Self::Cancel { .. } | Self::CancelAll { .. } | Self::GlobalCancel | Self::Modify { .. } => None,
-            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.new_order_qty(),
+            Self::SubmitWhatIf { request, .. } | Self::Guarded { request, .. } => request.new_order_qty(),
             Self::SubmitLimitFractional { qty, .. } => Some(*qty),
             Self::SubmitProtectedBracket { qty, .. } => Some(*qty as Qty * QTY_SCALE),
             Self::SubmitLimit { qty, .. }
@@ -1445,7 +1448,7 @@ impl OrderRequest {
             | Self::SubmitEx { instrument, .. }
             | Self::SubmitBracket { instrument, .. }
             | Self::SubmitProtectedBracket { instrument, .. } => Some(*instrument),
-            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.instrument(),
+            Self::SubmitWhatIf { request, .. } | Self::Guarded { request, .. } => request.instrument(),
         }
     }
 
@@ -1494,7 +1497,7 @@ impl OrderRequest {
             | Self::SubmitAdjustableStop { instrument, .. }
             | Self::SubmitEx { instrument, .. }
             | Self::SubmitBracket { instrument, .. } => Some(instrument),
-            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => request.new_order_instrument_mut(),
+            Self::SubmitWhatIf { request, .. } | Self::Guarded { request, .. } => request.new_order_instrument_mut(),
         }
     }
 
@@ -1507,7 +1510,7 @@ impl OrderRequest {
     /// the one every combo order takes (ibx#470).
     pub fn ex_instrument_mut(&mut self) -> Option<&mut InstrumentId> {
         match self {
-            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => {
+            Self::SubmitWhatIf { request, .. } | Self::Guarded { request, .. } => {
                 request.ex_instrument_mut()
             }
             Self::SubmitTrailingStopPctEx { instrument, .. }
@@ -1525,7 +1528,7 @@ impl OrderRequest {
         match self {
             Self::SubmitProtectedBracket { side, entry, .. } => Some((*side, Some(&entry.attrs))),
             Self::Cancel { .. } | Self::CancelAll { .. } | Self::GlobalCancel | Self::Modify { .. } => None,
-            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => {
+            Self::SubmitWhatIf { request, .. } | Self::Guarded { request, .. } => {
                 request.new_order_side()
             }
             Self::SubmitTrailingStopPctEx { side, attrs, .. }
@@ -1582,7 +1585,7 @@ impl OrderRequest {
             | Self::SubmitMtl { .. } | Self::SubmitMktPrt { .. }
             | Self::SubmitMtlAuc { .. }
             | Self::SubmitTrailingStopPct { .. } | Self::SubmitTrailingStopPctEx { .. } => return None,
-            Self::SubmitWhatIf { request } | Self::Guarded { request, .. } => {
+            Self::SubmitWhatIf { request, .. } | Self::Guarded { request, .. } => {
                 return request.off_grid_order(tick, signed);
             }
             Self::Modify { order_id, kind, .. } | Self::SubmitEx { order_id, kind, .. } => (*order_id, kind.grid_prices()),
@@ -2765,7 +2768,7 @@ mod tests {
             .off_grid_order(TICK_CENT, false), None);
         assert_eq!(ex(OrderKind::TrailingStop { trail_amt: 1, trail_stop_price: 0 }).off_grid_order(TICK_CENT, false), Some(4));
         // A what-if is checked as its order; a bracket answers for its leg.
-        let what_if = OrderRequest::SubmitWhatIf { request: Box::new(stop_limit(15_012_345_678, 0)) };
+        let what_if = OrderRequest::SubmitWhatIf { request: Box::new(stop_limit(15_012_345_678, 0)), option_terms: None };
         assert_eq!(what_if.off_grid_order(TICK_CENT, false), Some(3));
         let bracket = OrderRequest::SubmitBracket {
             parent_id: 10, tp_id: 11, sl_id: 12, instrument: 0, side: Side::Buy, qty: 1,

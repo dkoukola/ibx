@@ -63,7 +63,7 @@ impl EClient {
         let order = &*ClientCore::with_canonical_order_type(order);
         // Validate order params and contract before registering instrument (fail fast).
         ClientCore::validate_order(order)?;
-        ClientCore::validate_order_contract(&contract.sec_type)?;
+        let option_terms = ClientCore::option_preview_terms(contract, order.what_if, &self.shared.reference)?;
 
         // The id as given: the reference refuses 0 with 10149 below.
         let oid = order_id;
@@ -126,7 +126,7 @@ impl EClient {
                 return Ok(());
             }
         }
-        let cmd = if let Some(working) = working {
+        let mut cmd = if let Some(working) = working {
             match ClientCore::build_modify_request(&sent, oid, &working)? {
                 ModifyPlan::Send(cmd) => cmd,
                 ModifyPlan::Refused { code, message } => {
@@ -142,6 +142,9 @@ impl EClient {
             ClientCore::build_order_request(&sent, oid, instrument)?
         };
         if order.what_if {
+            if let ControlCommand::Order(OrderRequest::SubmitWhatIf { option_terms: terms, .. }) = &mut cmd {
+                *terms = option_terms;
+            }
             // A callback thread can consume the reply as soon as the engine
             // receives this command. Publish its identity before enqueueing.
             self.core.cache_contract(contract.con_id, contract.clone());

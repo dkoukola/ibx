@@ -17,7 +17,7 @@ use crate::api::types::{
     Order as ApiOrder, OrderState as ApiOrderState,
     PRICE_SCALE_F, QTY_SCALE_F,
 };
-use crate::bridge::SharedState;
+use crate::bridge::{PositionValuation, SharedState};
 use crate::types::*;
 
 /// The longest wait for the order replay of the logon before a next
@@ -169,12 +169,24 @@ fn auto_execution_from_farm(sec_type: &str, exchange: &str) -> bool {
 /// session's fills after it (a fill moved the daily P&L by the whole trade
 /// value: +770 for 1 SPY bought, seen on paper 25/09/2026). With no seed row:
 /// the cash of this session's fills when there are some, else the opening
-/// trade's cash synthesized from the average cost (-qty * avgCost).
-fn money_traded_today(seed: Option<&MidnightSeed>, since_seed: Option<f64>, qty_now: f64, avg_cost: Price) -> f64 {
+/// trade's cash synthesized from the average cost for confirmed stocks only.
+/// Raw option avgCost units are not inferred from the quote multiplier.
+fn money_traded_today(
+    seed: Option<&MidnightSeed>,
+    since_seed: Option<Option<f64>>,
+    qty_now: f64,
+    avg_cost: Price,
+    units: Option<PositionValuation>,
+) -> Option<f64> {
     match (seed, since_seed) {
-        (Some(s), since) => s.money_traded + since.unwrap_or(0.0),
+        (_, Some(None)) => None,
+        (Some(s), since) => Some(s.money_traded + since.flatten().unwrap_or(0.0)),
         (None, Some(since)) => since,
-        (None, None) => -(qty_now * avg_cost as f64 / PRICE_SCALE_F),
+        (None, None) if qty_now == 0.0 => Some(0.0),
+        (None, None) if units == Some(PositionValuation::Stock) && avg_cost != 0 => {
+            Some(-(qty_now * avg_cost as f64 / PRICE_SCALE_F))
+        }
+        (None, None) => None,
     }
 }
 
@@ -2314,7 +2326,7 @@ impl ClientCore {
 
         let infos: HashMap<i64, PositionInfo> = shared.portfolio.position_infos()
             .into_iter().map(|p| (p.con_id, p)).collect();
-        let is_stock = |con_id: i64| infos.get(&con_id).is_none_or(|p| p.sec_type.is_empty() || p.sec_type == "STK");
+        let is_stock = |con_id: i64| shared.portfolio.valuation(con_id, &shared.reference) == Some(PositionValuation::Stock);
         let mut wanted: HashSet<i64> = HashSet::new();
         if n_pnl > 0 {
             wanted.extend(infos.values().filter(|p| p.position_fixed != 0).map(|p| p.con_id));
@@ -4070,15 +4082,15 @@ impl ClientCore {
 
     /// Poll PnL and return update if values changed.
     /// Computes daily P&L client-side from midnight seeds + live quotes.
-    /// Formula: dailyPnL = Σ(qtyNow × priceNow - qtyMidnight × prevClose - moneyTraded)
-    /// For positions opened intraday (no seed), synthesizes
-    /// moneyTraded = qtyNow × avgCost so the formula collapses to unrealized P&L.
+    /// Formula: dailyPnL = Σ((qtyNow × priceNow - qtyMidnight × prevClose)
+    /// × quoteMultiplier + signedCashTraded). Only a confirmed stock can
+    /// synthesize missing opening cash from raw broker average cost.
     pub fn poll_pnl(&self, shared: &SharedState) -> Vec<PnlUpdate> {
         if self.pnl_reqs.lock().unwrap().is_empty() {
             return Vec::new();
         }
         let realized_since = shared.portfolio.realized_since_seed();
-        let money_since = shared.portfolio.money_since_seed();
+        let money_since = shared.portfolio.money_since_seed(&shared.reference);
 
         let seeds: HashMap<i64, MidnightSeed> = shared.portfolio.midnight_seeds()
             .into_iter().map(|s| (s.con_id, s)).collect();
@@ -4110,7 +4122,8 @@ impl ClientCore {
         for con_id in con_ids {
             let seed = seeds.get(&con_id);
             let pi = shared.portfolio.position_info(con_id);
-            // Positions are fixed-point; the P&L works in shares.
+            // Positions are fixed-point shares or contracts; quoted values
+            // require the product's established multiplier.
             let qty_now = pi.as_ref().map(|p| p.position_fixed).unwrap_or(0) as f64 / QTY_SCALE_F;
             let avg_cost = pi.as_ref().map(|p| p.avg_cost).unwrap_or(0);
             let qty_midnight = seed.map(|s| s.qty_midnight_fixed).unwrap_or(0) as f64 / QTY_SCALE_F;
@@ -4119,10 +4132,15 @@ impl ClientCore {
             total_realized += seed.map(|s| s.realized_pnl).unwrap_or(0.0)
                 + realized_since.get(&con_id).copied().unwrap_or(0.0);
 
-            let money_traded = money_traded_today(seed, money_since.get(&con_id).copied(), qty_now, avg_cost);
+            let units = shared.portfolio.valuation(con_id, &shared.reference);
+            let money_traded = money_traded_today(seed, money_since.get(&con_id).copied(), qty_now, avg_cost, units);
             // A position flat at midnight and now: its daily P&L is its cash.
             if qty_now == 0.0 && qty_midnight == 0.0 {
-                total_daily += money_traded;
+                if let Some(cash) = money_traded {
+                    total_daily += cash;
+                } else {
+                    daily_known = false;
+                }
                 continue;
             }
 
@@ -4144,14 +4162,18 @@ impl ClientCore {
             // A position held at midnight needs the previous close.
             if qty_midnight != 0.0 && prev_close == 0 {
                 daily_known = false;
-            } else {
-                let mv_now = qty_now * price_now as f64 / PRICE_SCALE_F;
-                let mv_midnight = qty_midnight * prev_close as f64 / PRICE_SCALE_F;
+            } else if let (Some(mv_now), Some(mv_midnight), Some(money_traded)) = (
+                units.and_then(|units| units.value(qty_now, price_now)),
+                units.and_then(|units| units.value(qty_midnight, prev_close)),
+                money_traded,
+            ) {
                 total_daily += mv_now - mv_midnight + money_traded;
+            } else {
+                daily_known = false;
             }
 
             if qty_now != 0.0 {
-                if avg_cost != 0 {
+                if avg_cost != 0 && units == Some(PositionValuation::Stock) {
                     total_unrealized += qty_now * (price_now - avg_cost) as f64 / PRICE_SCALE_F;
                 } else {
                     unrealized_known = false;
@@ -4207,8 +4229,8 @@ impl ClientCore {
 
     /// Poll per-position PnL and return updates whose values changed.
     /// Routes the quote lookup by con_id (not first-non-zero across all subscriptions),
-    /// computes daily/realized from the matching midnight seed, and synthesizes
-    /// money_traded = qty_now × avg_cost for intraday-opened positions.
+    /// computes daily/realized from the matching midnight seed. Opening cash
+    /// may be synthesized from raw average cost only for confirmed stocks.
     pub fn poll_pnl_single(&self, shared: &SharedState) -> Vec<PnlSingleUpdate> {
         let reqs: Vec<(i64, i64)> = self.pnl_single_reqs.lock().unwrap()
             .iter().map(|(&r, &c)| (r, c)).collect();
@@ -4219,14 +4241,14 @@ impl ClientCore {
         let seeds: HashMap<i64, MidnightSeed> = shared.portfolio.midnight_seeds()
             .into_iter().map(|s| (s.con_id, s)).collect();
         let realized_since = shared.portfolio.realized_since_seed();
-        let money_since = shared.portfolio.money_since_seed();
+        let money_since = shared.portfolio.money_since_seed(&shared.reference);
         let con_id_map = self.con_id_to_instrument.lock().unwrap();
         let mut last_cache = self.last_pnl_single.lock().unwrap();
         let mut results = Vec::new();
 
         for (req_id, con_id) in reqs {
             let Some(pi) = shared.portfolio.position_info(con_id) else { continue; };
-            // Positions are fixed-point; the P&L works in shares.
+            // Positions are fixed-point shares or contracts.
             let qty_fx = pi.position_fixed;
             let qty_now = qty_fx as f64 / QTY_SCALE_F;
             let avg_cost = pi.avg_cost;
@@ -4248,21 +4270,26 @@ impl ClientCore {
             let qty_midnight = seed.map(|s| s.qty_midnight_fixed).unwrap_or(0) as f64 / QTY_SCALE_F;
             let prev_close = q.map(|q| q.close).unwrap_or(0);
 
-            let money_traded = money_traded_today(seed, money_since.get(&con_id).copied(), qty_now, avg_cost);
+            let units = shared.portfolio.valuation(con_id, &shared.reference);
+            let money_traded = money_traded_today(seed, money_since.get(&con_id).copied(), qty_now, avg_cost, units);
 
-            let mv_now = qty_now * price_now as f64 / PRICE_SCALE_F;
-            let mv_midnight = qty_midnight * prev_close as f64 / PRICE_SCALE_F;
+            let mv_now = units.and_then(|units| units.value(qty_now, price_now));
+            let mv_midnight = units.and_then(|units| units.value(qty_midnight, prev_close));
             // A position held at midnight needs the previous close, which
             // comes with a quote only: without one, the daily P&L is unset.
-            let daily = if qty_midnight != 0.0 && prev_close == 0 {
+            let daily = if qty_now == 0.0 && qty_midnight == 0.0 {
+                money_traded.unwrap_or(f64::MAX)
+            } else if qty_midnight != 0.0 && prev_close == 0 {
                 f64::MAX
-            } else {
+            } else if let (Some(mv_now), Some(mv_midnight), Some(money_traded)) = (mv_now, mv_midnight, money_traded) {
                 mv_now - mv_midnight + money_traded
+            } else {
+                f64::MAX
             };
             // A value that cannot be computed is unset (f64::MAX), as the
             // reference (ibx#478): no average cost, or no realized P&L on
             // this position today (captured 25/09/2026).
-            let unrealized = if avg_cost != 0 {
+            let unrealized = if avg_cost != 0 && units == Some(PositionValuation::Stock) {
                 qty_now * (price_now - avg_cost) as f64 / PRICE_SCALE_F
             } else { f64::MAX };
             let realized_fills = realized_since.get(&con_id).copied();
@@ -4270,7 +4297,7 @@ impl ClientCore {
                 (None, None) => f64::MAX,
                 (seed_value, fills) => seed_value.unwrap_or(0.0) + fills.unwrap_or(0.0),
             };
-            let value = mv_now;
+            let value = mv_now.unwrap_or(f64::MAX);
 
             let scaled = |v: f64| if v == f64::MAX { i64::MAX } else { (v * PRICE_SCALE_F) as i64 };
             let snapshot: [i64; 5] = [
@@ -4939,6 +4966,45 @@ impl ClientCore {
              See https://github.com/deepentropy/ibx/issues/202",
             sec_type
         ))
+    }
+
+    /// Simulation-only support for an exact, fully specified option. Keep
+    /// ordinary option submissions behind the existing execution guard.
+    pub fn option_preview_terms(
+        contract: &ApiContract,
+        what_if: bool,
+        reference: &crate::bridge::ReferenceState,
+    ) -> Result<Option<crate::engine::market_state::OptionTerms>, String> {
+        if !what_if || !contract.sec_type.eq_ignore_ascii_case("OPT") {
+            Self::validate_order_contract(&contract.sec_type)?;
+            return Ok(None);
+        }
+        let maturity = &contract.last_trade_date_or_contract_month;
+        let multiplier = contract.multiplier.parse::<f64>().ok();
+        let call = match contract.right.to_ascii_uppercase().as_str() {
+            "C" | "CALL" => Some(true),
+            "P" | "PUT" => Some(false),
+            _ => None,
+        };
+        let representable = |value: f64| value.is_finite() && value > 0.0
+            && value < i64::MAX as f64 / crate::types::PRICE_SCALE as f64;
+        if contract.con_id <= 0 || contract.symbol.is_empty() || contract.currency.is_empty()
+            || contract.exchange.is_empty()
+            || !matches!(maturity.len(), 6 | 8) || !maturity.bytes().all(|b| b.is_ascii_digit())
+            || !representable(contract.strike) || !multiplier.is_some_and(representable)
+            || call.is_none()
+        {
+            return Err("Option what-if requires an exact positive conId, symbol, currency, exchange, maturity, right, strike and multiplier".into());
+        }
+        let (identity, terms) = reference.option_order_terms(contract.con_id)
+            .ok_or_else(|| "Option what-if requires resolved native contract details before previewing".to_string())?;
+        if terms.call != call.unwrap() || terms.strike != contract.strike || Some(terms.multiplier) != multiplier
+            || contract.symbol != identity.symbol || contract.currency != identity.currency
+            || (maturity != &identity.last_trade_date_or_contract_month && maturity != &terms.maturity)
+        {
+            return Err("Option what-if contract conflicts with resolved native option terms".into());
+        }
+        Ok(Some(terms))
     }
 
     /// The combo of a BAG order, read and checked as the reference reads a
@@ -5813,7 +5879,7 @@ impl ClientCore {
             let real = ApiOrder { what_if: false, ..order.clone() };
             return match Self::build_order_request_with(&real, order_id, instrument, combo)? {
                 ControlCommand::Order(request) => Ok(ControlCommand::Order(
-                    OrderRequest::SubmitWhatIf { request: Box::new(request) })),
+                    OrderRequest::SubmitWhatIf { request: Box::new(request), option_terms: None })),
                 other => Ok(other),
             };
         }
@@ -6357,6 +6423,83 @@ mod tests {
         assert!(core.poll_pnl(&shared).is_empty());
     }
 
+    fn seed_option_pnl_position(core: &ClientCore, shared: &SharedState, quantity: i64, multiplier: &str) {
+        seed_pnl_position(core, shared, 42, 0, quantity, 250.0, 3.0, 2.0);
+        let mut position = shared.portfolio.position_info(42).unwrap();
+        position.sec_type = "OPT".into();
+        position.multiplier = multiplier.into();
+        shared.portfolio.set_position_info(position);
+        core.subscribe_pnl(1);
+        core.subscribe_pnl_single(2, 42);
+    }
+
+    #[test]
+    fn option_pnl_values_premiums_without_reinterpreting_broker_basis() {
+        for quantity in [2, -2] {
+            let core = ClientCore::new();
+            let shared = SharedState::new();
+            seed_option_pnl_position(&core, &shared, quantity, "100");
+            shared.portfolio.set_position_marks(42, 3 * PRICE_SCALE, 777 * PRICE_SCALE, 17 * PRICE_SCALE, 8 * PRICE_SCALE);
+            shared.portfolio.add_quoted_fill_since_seed(42, -(quantity as f64) * 2.5);
+            let total = core.poll_pnl(&shared).pop().unwrap();
+            let position = core.poll_pnl_single(&shared).pop().unwrap();
+            assert_eq!(total.daily_pnl, quantity as f64 * 50.0);
+            assert_eq!(position.daily_pnl, total.daily_pnl);
+            assert_eq!(position.value, quantity as f64 * 300.0);
+            assert_eq!(total.unrealized_pnl, f64::MAX);
+            assert_eq!(position.unrealized_pnl, f64::MAX);
+            let raw = shared.portfolio.position_info(42).unwrap();
+            assert_eq!(raw.avg_cost, 250 * PRICE_SCALE);
+            assert_eq!(raw.market_value, 777 * PRICE_SCALE);
+            assert_eq!(raw.unrealized_pnl, 17 * PRICE_SCALE);
+        }
+    }
+
+    #[test]
+    fn option_pnl_recovers_when_exact_multiplier_arrives_after_fills() {
+        let core = ClientCore::new();
+        let shared = SharedState::new();
+        seed_option_pnl_position(&core, &shared, 1, "");
+        shared.portfolio.add_quoted_fill_since_seed(42, -2.5);
+        let total = core.poll_pnl(&shared).pop().unwrap();
+        let position = core.poll_pnl_single(&shared).pop().unwrap();
+        assert_eq!(total.daily_pnl, f64::MAX);
+        assert_eq!((position.daily_pnl, position.value), (f64::MAX, f64::MAX));
+        let generation = shared.portfolio.position_generation();
+        shared.reference.cache_contract(42, ApiContract {
+            con_id: 42,
+            sec_type: "OPT".into(),
+            multiplier: "100".into(),
+            ..Default::default()
+        });
+        assert_eq!(shared.portfolio.position_generation(), generation);
+        assert_eq!(core.poll_pnl(&shared).pop().unwrap().daily_pnl, 50.0);
+        let position = core.poll_pnl_single(&shared).pop().unwrap();
+        assert_eq!((position.daily_pnl, position.value), (50.0, 300.0));
+        assert_eq!(position.unrealized_pnl, f64::MAX);
+    }
+
+    #[test]
+    fn option_pnl_never_scales_native_seed_cash_or_synthesizes_option_basis() {
+        let core = ClientCore::new();
+        let shared = SharedState::new();
+        seed_option_pnl_position(&core, &shared, 2, "100");
+        assert_eq!(core.poll_pnl(&shared).pop().unwrap().daily_pnl, f64::MAX);
+        assert_eq!(core.poll_pnl_single(&shared).pop().unwrap().daily_pnl, f64::MAX);
+        shared.portfolio.add_quoted_fill_since_seed(42, -999.0);
+        shared.portfolio.set_midnight_seeds(vec![MidnightSeed {
+            con_id: 42,
+            qty_midnight_fixed: 2 * QTY_SCALE,
+            money_traded: 50.0,
+            realized_pnl: 7.0,
+        }]);
+        assert_eq!(core.poll_pnl(&shared).pop().unwrap().daily_pnl, 250.0);
+        let position = core.poll_pnl_single(&shared).pop().unwrap();
+        assert_eq!(position.daily_pnl, 250.0);
+        assert_eq!(position.realized_pnl, 7.0);
+        assert_eq!(position.value, 600.0);
+    }
+
     #[test]
     fn poll_pnl_intraday_opened_position_fires_callback() {
         // #166: flat-at-midnight account opens an intraday position.
@@ -6448,6 +6591,7 @@ mod tests {
         core.subscribe_pnl(21);
         shared.portfolio.set_position_info(PositionInfo {
             con_id: 756733, position_fixed: 31 * crate::types::QTY_SCALE,
+            sec_type: "STK".into(),
             avg_cost: (764.59 * PRICE_SCALE_F) as i64, ..Default::default()
         });
         shared.portfolio.set_position_marks(756733, (770.0 * PRICE_SCALE_F) as i64, 0, 0, 0);
@@ -6489,6 +6633,7 @@ mod tests {
         let shared = SharedState::new();
         shared.portfolio.set_position_info(PositionInfo {
             con_id: 756733, position_fixed: 31 * crate::types::QTY_SCALE,
+            sec_type: "STK".into(),
             avg_cost: (764.59 * PRICE_SCALE_F) as i64, ..Default::default()
         });
         shared.portfolio.set_position_marks(756733, (770.0 * PRICE_SCALE_F) as i64, 0, 0, 0);
@@ -6644,7 +6789,7 @@ mod tests {
         assert!((before - 310.0).abs() < 1e-6, "31 × (770 - 760): {before}");
 
         seed_pnl_position(&core, &shared, 756733, 0, 32, 764.78, 770.00, 760.00);
-        shared.portfolio.add_money_since_seed(756733, -770.0);
+        shared.portfolio.add_quoted_fill_since_seed(756733, -770.0);
         let after = core.poll_pnl_single(&shared).pop().unwrap().daily_pnl;
         assert!((after - 310.0).abs() < 1e-6, "bought at the last price: no change, got {after}");
     }
@@ -6656,8 +6801,8 @@ mod tests {
         let core = ClientCore::new();
         let shared = SharedState::new();
         seed_pnl_position(&core, &shared, 1, 0, 0, 0.0, 103.0, 0.0);
-        shared.portfolio.add_money_since_seed(1, -100.0);
-        shared.portfolio.add_money_since_seed(1, 103.0);
+        shared.portfolio.add_quoted_fill_since_seed(1, -100.0);
+        shared.portfolio.add_quoted_fill_since_seed(1, 103.0);
         core.subscribe_pnl_single(4, 1);
         let u = core.poll_pnl_single(&shared).pop().unwrap();
         assert!((u.daily_pnl - 3.0).abs() < 1e-6, "daily={}", u.daily_pnl);

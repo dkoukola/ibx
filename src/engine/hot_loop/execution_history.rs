@@ -597,7 +597,7 @@ mod tests {
             assert_eq!(context.position_fixed(instrument), QTY_SCALE);
             assert!(shared.orders.drain_fills_with_exec().is_empty());
             assert!(shared.orders.drain_untracked_executions().is_empty());
-            assert!(shared.portfolio.money_since_seed().is_empty());
+            assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty());
             assert!(shared.portfolio.realized_since_seed().is_empty());
             assert!(ccp.last_exec.is_none());
         }
@@ -621,7 +621,7 @@ mod tests {
             deliver(&mut ccp, &mut context, &shared, &live);
             assert_eq!(context.position_fixed(instrument), QTY_SCALE / 2);
             assert_eq!(shared.portfolio.position_info(265598).unwrap().position_fixed, QTY_SCALE / 2);
-            assert_eq!(shared.portfolio.money_since_seed().get(&265598), Some(&-50.0));
+            assert_eq!(shared.portfolio.money_since_seed(&shared.reference).get(&265598), Some(&Some(-50.0)));
             assert_eq!(shared.orders.drain_fills_with_exec().len(), 1);
             assert!(shared.orders.drain_untracked_executions().is_empty());
             end(&mut ccp, &mut context, &shared);
@@ -674,7 +674,7 @@ mod tests {
         assert_eq!(rows[0].execution.exec_id, "partial.02");
         assert_eq!(rows[0].execution.shares, 0.75);
         assert!(shared.portfolio.position_infos().is_empty());
-        assert!(shared.portfolio.money_since_seed().is_empty());
+        assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty());
         assert!(shared.orders.drain_untracked_executions().is_empty());
     }
 

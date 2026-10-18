@@ -1929,19 +1929,7 @@ impl CcpState {
                     shared.portfolio.set_position_fixed(fill.instrument, context.position_fixed(fill.instrument));
                     if let Some(con_id) = context.market.con_id(order.instrument) {
                         self.record_exec_con_id(&exec.exec_id, con_id);
-                        // The daily P&L counts the cash of this session's fills
-                        // (sell positive, buy negative). Stock orders only, so
-                        // no multiplier.
-                        let shares = last_shares as f64 / QTY_SCALE as f64;
-                        let cash = match order.side {
-                            Side::Buy => -shares * last_px,
-                            Side::Sell | Side::ShortSell => shares * last_px,
-                        };
-                        shared.portfolio.add_money_since_seed(con_id, cash);
-                        // The position moves with the fill, as the reference's
-                        // position store does; the server's average cost follows
-                        // with its position feed.
-                        shared.portfolio.apply_fill_to_position(con_id, delta, fill.price);
+                        book_fill_value(parsed, shared, con_id, delta, last_px, None);
                     }
                 }
                 fill_out = Some((fill, exec));
@@ -2150,6 +2138,7 @@ impl CcpState {
         let price = parsed.get(&31).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
         let shares = last_shares as f64 / QTY_SCALE as f64;
         let delta = if buy { last_shares } else { -last_shares };
+        let leg = combo.combo.legs.iter().find(|l| l.con_id == con_id);
         if con_id != 0 {
             if let Some(instrument) = context.market.try_register(con_id) {
                 shared.market.set_instrument_count(context.market.count());
@@ -2157,10 +2146,10 @@ impl CcpState {
                 shared.portfolio.set_position_fixed(instrument, context.position_fixed(instrument));
             }
             self.record_exec_con_id(exec_id, con_id);
-            shared.portfolio.add_money_since_seed(con_id, if buy { -shares * price } else { shares * price });
-            shared.portfolio.apply_fill_to_position(con_id, delta, (price * PRICE_SCALE as f64) as i64);
+            // Leg.multiplier may be the builder's default 1; use only its
+            // sourced product type, never that value as option cash evidence.
+            book_fill_value(parsed, shared, con_id, delta, price, leg.map(|leg| leg.sec_type.as_str()));
         }
-        let leg = combo.combo.legs.iter().find(|l| l.con_id == con_id);
         let mut exec = fill_exec_of(parsed, exec_id);
         let sec_type = match parsed.get(&167).map(|s| s.as_str()) {
             Some("CS") | Some("COMMON") | None => "STK".to_string(),
@@ -2296,12 +2285,7 @@ impl CcpState {
         }
         let shares = last_shares as f64 / QTY_SCALE as f64;
         self.record_exec_con_id(exec_id, con_id);
-        let cash = match side {
-            Side::Buy => -shares * last_px,
-            Side::Sell | Side::ShortSell => shares * last_px,
-        };
-        shared.portfolio.add_money_since_seed(con_id, cash);
-        shared.portfolio.apply_fill_to_position(con_id, delta, (last_px * PRICE_SCALE as f64) as i64);
+        book_fill_value(parsed, shared, con_id, delta, last_px, None);
 
         // The placing client's order id when the report carries it.
         let order_id = parsed.get(&6121).and_then(|s| s.parse().ok()).unwrap_or(clord_id);
@@ -2788,6 +2772,15 @@ impl CcpState {
         if let Some(rid) = response_req_id.as_deref() {
             // Asked to build a combo (ibx#470): not a user reply.
             if let Some(progress) = context.combos.secdef_reply(rid, msg, &chrono_free_timestamp()) {
+                // Retain the exact leg metadata already returned for setup.
+                // Combo::Leg defaults a missing multiplier to 1; that is not
+                // evidence of an option's cash/value multiplier.
+                let records = contracts::parse_secdef_records(msg).unwrap_or_default();
+                for (index, def) in records.iter().enumerate() {
+                    if !records[..index].iter().any(|prior| prior.con_id == def.con_id) {
+                        self.cache_definition(def, shared);
+                    }
+                }
                 super::order_builder::combo_progress(context, ccp_conn, hb, progress);
                 return;
             }
@@ -3120,6 +3113,7 @@ impl CcpState {
             return;
         }
         let identity = api::ContractDetails::from_definition(def).contract;
+        shared.reference.cache_option_order_terms(def);
         shared.reference.cache_contract(def.con_id, api::Contract {
             con_id: def.con_id,
             symbol: def.symbol.clone(),
@@ -3506,6 +3500,46 @@ impl CcpState {
         }
         fields
     }
+}
+
+/// Retain quote-valued economics, not guessed cash. A native report's product
+/// type may precede its secdef; the exact multiplier can arrive later. No
+/// derivative fields are inferred from execution-report tags.
+fn book_fill_value(
+    parsed: &std::collections::HashMap<u32, String>,
+    shared: &SharedState,
+    con_id: i64,
+    delta: Qty,
+    price: f64,
+    fallback_sec_type: Option<&str>,
+) {
+    let mut contract = shared.reference.get_contract(con_id).unwrap_or_default();
+    contract.con_id = con_id;
+    for (field, tag) in [
+        (&mut contract.symbol, 55),
+        (&mut contract.currency, 15),
+        (&mut contract.exchange, 207),
+        (&mut contract.local_symbol, 6035),
+    ] {
+        if field.is_empty() {
+            *field = parsed.get(&tag).cloned().unwrap_or_default();
+        }
+    }
+    if let Some(sec_type) = parsed.get(&167).map(String::as_str).filter(|value| !value.is_empty())
+        .or_else(|| contract.sec_type.is_empty().then_some(fallback_sec_type).flatten())
+    {
+        contract.sec_type = match sec_type {
+            "CS" | "COMMON" => "STK".into(),
+            _ => sec_type.to_string(),
+        };
+    }
+    let quoted_value = -(delta as f64 / QTY_SCALE as f64) * price;
+    shared.portfolio.add_quoted_fill_since_seed(con_id, quoted_value);
+    let stock = crate::bridge::PositionValuation::is_stock_type(&contract.sec_type)
+        || (contract.sec_type.is_empty()
+            && shared.portfolio.valuation(con_id, &shared.reference) == Some(crate::bridge::PositionValuation::Stock));
+    let stock_price = stock.then_some((price * PRICE_SCALE as f64) as Price);
+    shared.portfolio.apply_fill_to_position(&contract, delta, stock_price);
 }
 
 /// The contract of an execution report: the cached one when its conId is
@@ -4007,7 +4041,7 @@ impl CcpState {
         }
     }
 
-    /// Issue an internal secdef request for `con_id` if the reference cache is cold and we
+    /// Issue an internal secdef request for `con_id` if its identity/value units are cold and we
     /// haven't already auto-fetched it this session. The reply path populates the cache via
     /// the existing 35=d handler; we don't track the response.
     fn auto_fetch_secdef_if_cold(
@@ -4019,7 +4053,12 @@ impl CcpState {
     ) {
         if con_id == 0 { return; }
         if self.auto_fetched_conids.contains(&con_id) { return; }
-        if shared.reference.get_contract(con_id).is_some() { return; }
+        if let Some(contract) = shared.reference.get_contract(con_id) {
+            let incomplete = contract.sec_type.is_empty()
+                || (contract.sec_type.eq_ignore_ascii_case("OPT")
+                    && shared.portfolio.valuation(con_id, &shared.reference).is_none());
+            if !incomplete { return; }
+        }
         let req_id = self.next_internal_secdef_id;
         self.next_internal_secdef_id = self.next_internal_secdef_id.wrapping_add(1);
         self.auto_fetched_conids.insert(con_id);
@@ -4223,6 +4262,178 @@ mod tests {
     use super::*;
 
     #[test]
+    fn thin_option_identity_does_not_suppress_existing_once_only_secdef_fetch() {
+        for (sec_type, multiplier, expected) in [
+            ("OPT", "", 1), ("OPT", "0", 1), ("", "100", 1),
+            ("OPT", "100", 0), ("STK", "", 0), ("FUT", "", 0),
+        ] {
+            let mut ccp = CcpState::new();
+            let shared = SharedState::new();
+            shared.reference.cache_contract(42, api::Contract {
+                con_id: 42, sec_type: sec_type.into(), multiplier: multiplier.into(),
+                ..Default::default()
+            });
+            let (client, mut server) = socket_pair();
+            let mut connection = Some(Connection::new_mem(client));
+            let mut heartbeat = HeartbeatState::new();
+            ccp.auto_fetch_secdef_if_cold(42, &mut connection, &shared, &mut heartbeat);
+            ccp.auto_fetch_secdef_if_cold(42, &mut connection, &shared, &mut heartbeat);
+            let sent = ccp_messages_sent(&mut server);
+            assert_eq!(sent.len(), expected, "{sec_type} / {multiplier}");
+            assert!(sent.iter().all(|frame| frame.contains("35=c|") && frame.contains("6008=42|")));
+            shared.reference.cache_contract(42, api::Contract {
+                con_id: 42, sec_type: "OPT".into(), multiplier: "100".into(),
+                ..Default::default()
+            });
+            ccp.auto_fetch_secdef_if_cold(42, &mut connection, &shared, &mut heartbeat);
+            assert!(ccp_messages_sent(&mut server).is_empty());
+        }
+    }
+
+    #[test]
+    fn outage_stock_fill_keeps_reference_cold_for_position_feed_enrichment() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let fill = exec_report_frame(&[
+            (17, "stock-cold.01"), (6008, "42"), (167, "CS"), (55, "AAPL"),
+            (15, "USD"), (54, "1"), (31, "2.5"), (32, "1"), (151, "0"),
+        ]);
+        ccp.handle_outage_fill(&fill, &mut context, &shared, 42, "DU1");
+        assert!(shared.reference.get_contract(42).is_none());
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(-2.5));
+        let provisional = shared.portfolio.position_info(42).unwrap();
+        assert_eq!(provisional.sec_type, "STK");
+        assert_eq!(provisional.avg_cost, 5 * PRICE_SCALE / 2);
+        let callbacks = shared.orders.drain_untracked_executions();
+        assert_eq!(callbacks[0].0.symbol, "AAPL");
+        let (client, mut server) = socket_pair();
+        let mut connection = Some(Connection::new_mem(client));
+        let mut heartbeat = HeartbeatState::new();
+        for _ in 0..2 {
+            ccp.handle_position_feed(LightweightPositions {
+                account: "DU1", model: "", snapshot: false, count: Some(1),
+                rows: vec![PositionInfo { con_id: 42, position_fixed: QTY_SCALE, ..Default::default() }],
+            }, &mut connection, &mut context, &shared, &None, &mut heartbeat);
+        }
+        let sent = ccp_messages_sent(&mut server);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("35=c|") && sent[0].contains("6008=42|"));
+    }
+
+    #[test]
+    fn option_fills_recover_cash_from_captured_definition_without_rebooking() {
+        use base64::Engine as _;
+        let capture = include_str!("../../../tests/fixtures/gw1040/scenarios/20261007/b4_generic_rest2.jsonl");
+        let frame = capture.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|row| row["i"] == 56).unwrap();
+        let wire = base64::engine::general_purpose::STANDARD.decode(frame["raw_b64"].as_str().unwrap()).unwrap();
+        let definition = crate::control::contracts::parse_secdef_response(&wire).unwrap();
+        for path in ["tracked", "untracked", "outage"] {
+            for (side, wire_side, direction) in [(Side::Buy, "1", 1), (Side::Sell, "2", -1)] {
+                let mut ccp = CcpState::new();
+                let mut context = Context::new();
+                let shared = SharedState::new();
+                let instrument = context.register_instrument(definition.con_id);
+                if path == "tracked" {
+                    context.insert_order(crate::types::Order::new(42, instrument, side, 1, 3 * PRICE_SCALE, b'2', b'0', 0));
+                }
+                // Synthetic fill numbers paired with a captured native secdef;
+                // this is not a claim that an option execution was captured.
+                let fill = exec_report_frame(&[
+                    (20, "0"), (39, "2"), (150, "F"), (17, "option-cash.01"),
+                    (6008, "929914886"), (167, "OPT"), (55, "AAPL"),
+                    (54, wire_side), (31, "2.5"), (32, "1"), (14, "1"), (151, "0"),
+                ]);
+                for _ in 0..2 {
+                    if path == "outage" {
+                        ccp.handle_outage_fill(&fill, &mut context, &shared, 42, "DU1");
+                    } else {
+                        ccp.handle_exec_report(&fill, &mut context, &shared, &None, "DU1");
+                    }
+                }
+                let before = shared.portfolio.position_info(definition.con_id).unwrap();
+                assert_eq!(before.position_fixed, direction * QTY_SCALE, "{path}");
+                assert_eq!(before.avg_cost, 0, "no option quote-price basis inference");
+                assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&definition.con_id], None);
+                ccp.cache_definition(&definition, &shared);
+                assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&definition.con_id], Some(-250.0 * direction as f64));
+                assert_eq!(shared.portfolio.position_info(definition.con_id).unwrap().position_fixed, before.position_fixed);
+                assert_eq!(shared.portfolio.position_info(definition.con_id).unwrap().avg_cost, 0);
+                shared.portfolio.set_position_info(PositionInfo {
+                    con_id: definition.con_id,
+                    position_fixed: before.position_fixed,
+                    avg_cost: 251 * PRICE_SCALE,
+                    ..Default::default()
+                });
+                assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&definition.con_id], Some(-250.0 * direction as f64));
+                assert_eq!(shared.portfolio.position_info(definition.con_id).unwrap().avg_cost, 251 * PRICE_SCALE);
+            }
+        }
+    }
+
+    #[test]
+    fn stock_fill_value_normalizes_native_type_without_losing_cached_identity() {
+        for native_type in ["CS", "COMMON"] {
+            let shared = SharedState::new();
+            let contract = api::Contract {
+                con_id: 42,
+                symbol: "AAPL".into(),
+                sec_type: "STK".into(),
+                currency: "USD".into(),
+                primary_exchange: "NASDAQ".into(),
+                ..Default::default()
+            };
+            shared.reference.cache_contract(42, contract.clone());
+            book_fill_value(&std::collections::HashMap::from([(167, native_type.into())]), &shared, 42, QTY_SCALE, 2.5, None);
+            assert_eq!(shared.reference.get_contract(42), Some(contract));
+            assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(-2.5));
+            assert_eq!(shared.portfolio.position_info(42).unwrap().avg_cost, 5 * PRICE_SCALE / 2);
+        }
+    }
+
+    #[test]
+    fn option_combo_leg_cash_does_not_use_the_combo_builders_default_multiplier() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let combo = crate::engine::combo::ComboOrder {
+            combo: crate::engine::combo::Combo {
+                bag_con_id: 9000,
+                exchange: "SMART".into(),
+                routed: "BEST".into(),
+                currency: "USD".into(),
+                trading_class: "COMB".into(),
+                legs: vec![crate::engine::combo::Leg {
+                    con_id: 42, ratio: 1, buy: true, exchange: "SMART".into(),
+                    symbol: "AAPL".into(), sec_type: "OPT".into(),
+                    currency: "USD".into(), multiplier: 1.0,
+                }],
+                multiplier: 1.0,
+            },
+            spec: Default::default(),
+            leg_prices: Vec::new(),
+            price: None,
+            cum_qty: QTY_SCALE,
+            leaves_qty: 0,
+            avg_price: 5 * PRICE_SCALE / 2,
+            last_price: 5 * PRICE_SCALE / 2,
+        };
+        let fill = exec_report_frame(&[
+            (17, "option-leg.01"), (6008, "42"), (54, "1"), (31, "2.5"), (32, "1"),
+        ]);
+        ccp.handle_combo_leg_report(&fill, &mut context, &shared, 90, &combo);
+        ccp.handle_combo_leg_report(&fill, &mut context, &shared, 90, &combo);
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], None);
+        assert_eq!(shared.portfolio.position_info(42).unwrap().position_fixed, QTY_SCALE);
+        assert_eq!(shared.portfolio.position_info(42).unwrap().avg_cost, 0);
+        shared.reference.cache_contract(42, api::Contract {
+            con_id: 42, sec_type: "OPT".into(), multiplier: "100".into(), ..Default::default()
+        });
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(-250.0));
+    }
+
+    #[test]
     fn option_identity_is_retained_by_the_native_definition_cache() {
         use base64::Engine as _;
         let capture = include_str!("../../../tests/fixtures/gw1040/scenarios/20261007/b4_generic_rest2.jsonl");
@@ -4240,6 +4451,10 @@ mod tests {
         assert_eq!(cached.strike, 332.5);
         assert_eq!(cached.right, "C");
         assert_eq!(cached.multiplier, "100");
+        let (option_identity, terms) = shared.reference.option_order_terms(def.con_id).unwrap();
+        assert_eq!(option_identity.last_trade_date_or_contract_month, "20261014");
+        assert_eq!(terms.maturity, "202610", "native 200 must not become API expiry 541");
+        assert_eq!((terms.call, terms.strike, terms.multiplier), (true, 332.5, 100.0));
         for strike in [0.0, f64::MAX] {
             shared.reference.cache_contract(def.con_id, api::Contract { con_id: def.con_id, strike, ..Default::default() });
             assert_eq!(shared.reference.get_contract(def.con_id).unwrap(), expected,
@@ -4724,7 +4939,13 @@ mod tests {
         context.insert_order(crate::types::Order::new(
             42, instrument, Side::Buy, 1, 100 * PRICE_SCALE, b'2', b'0', 0,
         )); // starts at PendingSubmit
-        (CcpState::new(), context, SharedState::new())
+        let shared = SharedState::new();
+        shared.reference.cache_contract(756733, api::Contract {
+            con_id: 756733,
+            sec_type: "STK".into(),
+            ..Default::default()
+        });
+        (CcpState::new(), context, shared)
     }
 
     fn exec_report_frame(pairs: &[(u32, &str)]) -> std::collections::HashMap<u32, String> {
@@ -7387,7 +7608,7 @@ mod tests {
         let status = if leaves == 0 { "2" } else { "1" };
         [
             (11u32, "90.0".to_string()), (17, exec_id.into()), (150, status.into()), (39, status.into()),
-            (55, "TEST".into()), (54, "1".into()), (38, "300".into()), (40, "2".into()), (44, "15".into()),
+            (55, "TEST".into()), (167, "STK".into()), (54, "1".into()), (38, "300".into()), (40, "2".into()), (44, "15".into()),
             (32, last_qty.to_string()), (31, last_px.into()), (14, cum_qty.to_string()),
             (6, avg_px.into()), (151, leaves.to_string()), (6008, "1005".into()),
         ].into_iter().collect()
@@ -7437,7 +7658,7 @@ mod tests {
                     assert_eq!(shared.portfolio.position_fixed(instrument), 0);
                     assert!(shared.portfolio.position_infos().is_empty());
                     assert_eq!(shared.portfolio.position_generation(), 0);
-                    assert!(shared.portfolio.money_since_seed().is_empty());
+                    assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty());
                     assert!(shared.portfolio.realized_since_seed().is_empty());
                     assert!(shared.orders.drain_fills_with_exec().is_empty());
                     assert!(shared.orders.drain_untracked_executions().is_empty());
@@ -7494,7 +7715,7 @@ mod tests {
                         shared.portfolio.position_info(1005).unwrap().position_fixed,
                         100 * QTY_SCALE
                     );
-                    assert_eq!(shared.portfolio.money_since_seed()[&1005], -1000.0);
+                    assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&1005], Some(-1000.0));
                     assert!(ccp.seen_exec_ids.contains("snapshot.01"));
                     assert_eq!(
                         ccp.last_exec,
@@ -7551,7 +7772,7 @@ mod tests {
         assert_eq!(shared.portfolio.position_fixed(instrument), 0);
         assert!(shared.portfolio.position_infos().is_empty());
         assert_eq!(shared.portfolio.position_generation(), 0);
-        assert!(shared.portfolio.money_since_seed().is_empty());
+        assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty());
         assert!(shared.portfolio.realized_since_seed().is_empty());
         assert!(shared.orders.drain_fills_with_exec().is_empty());
         assert!(shared.orders.drain_untracked_executions().is_empty());
@@ -7570,7 +7791,7 @@ mod tests {
         assert!(fills[0].1.combo.as_ref().unwrap().leg.is_some());
         assert_eq!(context.position_fixed(instrument), 100 * QTY_SCALE);
         assert_eq!(shared.portfolio.position_fixed(instrument), 100 * QTY_SCALE);
-        assert_eq!(shared.portfolio.money_since_seed()[&1005], -1000.0);
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&1005], Some(-1000.0));
         assert!(ccp.seen_exec_ids.contains("leg.01"));
     }
 
@@ -8195,7 +8416,7 @@ mod tests {
             (31, "770.56"), (32, "1"), (14, "1"), (151, "0"), (6, "770.56")]);
         ccp.handle_exec_report(&fill, &mut context, &shared, &None, "");
         // The fill's cash, for the daily P&L: a buy of 1 at 770.56.
-        let cash = shared.portfolio.money_since_seed().get(&756733).copied().unwrap();
+        let cash = shared.portfolio.money_since_seed(&shared.reference).get(&756733).copied().flatten().unwrap();
         assert!((cash + 770.56).abs() < 1e-9, "cash={cash}");
         // The position moves with the fill; a new position takes the fill
         // price as average cost.

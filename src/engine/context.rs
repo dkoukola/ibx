@@ -197,6 +197,7 @@ pub struct Context {
     pub(crate) what_ifs: HashMap<String, (OrderId, InstrumentId)>,
     /// Set while a what-if is encoded: the ClOrdID it goes out under.
     pub(crate) what_if_send: Option<String>,
+    pub(crate) what_if_option_terms: Option<crate::engine::market_state::OptionTerms>,
     /// The contract lookups of orders given without a conId: request
     /// number and the order's slot (ibx#486).
     pub(crate) order_lookups: Vec<(u32, InstrumentId)>,
@@ -317,6 +318,7 @@ impl Context {
             next_rth_lookup: 0,
             what_ifs: HashMap::new(),
             what_if_send: None,
+            what_if_option_terms: None,
             order_lookups: Vec::new(),
             bypass_redirect_warning: crate::config::bypass_redirect_order_warning(),
             next_order_lookup: 0,
@@ -1132,6 +1134,7 @@ impl Context {
         self.next_order_id += 1;
         self.pending_orders.push(OrderRequest::SubmitWhatIf {
             request: Box::new(OrderRequest::SubmitLimit { order_id: id, instrument, side, qty, price }),
+            option_terms: None,
         });
         id
     }
@@ -2190,7 +2193,7 @@ mod tests {
         let orders: Vec<_> = ctx.drain_pending_orders().collect();
         assert_eq!(orders.len(), 1);
         match &orders[0] {
-            OrderRequest::SubmitWhatIf { request } => {
+            OrderRequest::SubmitWhatIf { request, .. } => {
                 let OrderRequest::SubmitLimit { order_id, instrument, side, qty, price } = request.as_ref() else {
                     panic!("expected a limit order under the preview");
                 };

@@ -172,13 +172,17 @@ pub(crate) fn drain_and_send_orders(
         // its own encoder (ibx#462); it is unwrapped here and wrapped again
         // if it has to wait.
         let what_if = matches!(order_req, OrderRequest::SubmitWhatIf { .. });
-        if let OrderRequest::SubmitWhatIf { request } = order_req {
+        let option_terms = if let OrderRequest::SubmitWhatIf { request, option_terms } = order_req {
             order_req = *request;
-        }
+            option_terms
+        } else {
+            None
+        };
         let rewrap = |req: OrderRequest| {
             let request = if what_if {
                 OrderRequest::SubmitWhatIf {
                     request: Box::new(req),
+                    option_terms: option_terms.clone(),
                 }
             } else {
                 req
@@ -453,6 +457,7 @@ pub(crate) fn drain_and_send_orders(
             let instrument = order_req.instrument().unwrap_or(0);
             context.what_ifs.insert(clord.clone(), (oid, instrument));
             context.what_if_send = Some(clord);
+            context.what_if_option_terms = option_terms;
         }
         // A new order goes out under a server id of the reference's order
         // id generator; its API order id is its key, sent in 6121.
@@ -1738,6 +1743,7 @@ pub(crate) fn drain_and_send_orders(
         }
         if let Some((order, version, peak)) = held {
             let clord = context.what_if_send.take().unwrap_or_default();
+            context.what_if_option_terms = None;
             match order {
                 Some(o) => context.insert_order(o),
                 None => context.remove_order(oid),
@@ -2286,7 +2292,8 @@ fn send_new_order(
     let stock = fields.iter().any(|&(t, v)| t == 167 && v == "STK");
     // An option's terms after its symbol, and its multiplier
     // (`jclient.pe.c(StringBuffer)@1195-1235`, `@1485`).
-    let option = context.market.option_terms(instrument).map(|t| (
+    let option = context.what_if_option_terms.as_ref()
+        .or_else(|| context.market.option_terms(instrument)).map(|t| (
         t.maturity.clone(),
         if t.call { "1" } else { "0" },
         super::format_price((t.strike * crate::types::PRICE_SCALE as f64).round() as crate::types::Price).to_string(),
@@ -3035,7 +3042,7 @@ fn price_mgmt_flag(
 /// The orders of a request, a bracket's three included.
 fn request_order_ids(req: &OrderRequest) -> Vec<crate::types::OrderId> {
     match req {
-        OrderRequest::SubmitWhatIf { request } | OrderRequest::Guarded { request, .. } => {
+        OrderRequest::SubmitWhatIf { request, .. } | OrderRequest::Guarded { request, .. } => {
             request_order_ids(request)
         }
         OrderRequest::SubmitBracket {
@@ -5388,7 +5395,7 @@ mod tests {
         let tags = wire_tags(OrderRequest::SubmitWhatIf { request: Box::new(OrderRequest::SubmitLimitEx {
             order_id: 11, instrument: 0, side: Side::Buy, qty: 1, price: 237 * crate::types::PRICE_SCALE,
             tif: b'1', attrs: crate::types::OrderAttrs::default(),
-        }) });
+        }), option_terms: None });
         assert_eq!(tag(&tags, 59), Some("1"));
         assert_eq!(tag(&tags, 6091), Some("1"));
     }
@@ -5397,7 +5404,7 @@ mod tests {
     fn what_if_negative_api_id_still_has_a_native_positive_clord() {
         let tags = wire_tags(OrderRequest::SubmitWhatIf { request: Box::new(OrderRequest::SubmitLimit {
             order_id: -72, instrument: 0, side: Side::Sell, qty: 1, price: 237 * crate::types::PRICE_SCALE,
-        }) });
+        }), option_terms: None });
         assert_eq!(tag(&tags, 6091), Some("1"));
         // The existing encoder omits negative API keys from 6121. Response
         // ownership uses the distinct positive native ClOrdID, not that tag.
@@ -5409,7 +5416,7 @@ mod tests {
     fn what_if_abandonment_drops_queued_parked_and_sent_previews_only() {
         let mut context = Context::new();
         let ordinary = OrderRequest::SubmitLimit { order_id: 7, instrument: 0, side: Side::Buy, qty: 1, price: 100 };
-        let preview = OrderRequest::SubmitWhatIf { request: Box::new(ordinary.clone()) };
+        let preview = OrderRequest::SubmitWhatIf { request: Box::new(ordinary.clone()), option_terms: None };
         context.pending_orders.push(preview.clone());
         context.pending_orders.push(ordinary.clone());
         context.rth_parked.push(preview);
@@ -5439,7 +5446,7 @@ mod tests {
         let lmt = crate::api::types::Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(),
             lmt_price: 237.82, tif: "GTC".into(), ..Default::default() };
         let req = what_if_of(lmt, 100);
-        assert!(matches!(&req, OrderRequest::SubmitWhatIf { request } if matches!(**request, OrderRequest::SubmitLimitEx { .. })));
+        assert!(matches!(&req, OrderRequest::SubmitWhatIf { request, .. } if matches!(**request, OrderRequest::SubmitLimitEx { .. })));
         let ours = wire_tags(req);
         let want = captured(reference, &[35, 40, 59, 6091, 100, 6210, 6008]);
         assert_eq!(ours_as(&ours, &want), want);
@@ -6860,7 +6867,7 @@ mod tests {
             short_limit(1, Default::default()),
             OrderRequest::SubmitMarket { order_id: 1, instrument: 0, side: Side::ShortSell, qty: 1 },
             short_limit(1, short_attrs("IB", 1, "", -1)),
-            OrderRequest::SubmitWhatIf { request: Box::new(short_limit(1, Default::default())) },
+            OrderRequest::SubmitWhatIf { request: Box::new(short_limit(1, Default::default())), option_terms: None },
         ] {
             let (frames, errors) = short_sale_run(false, false, "DU1", req);
             assert!(frames.is_empty(), "nothing sent: {frames:?}");
@@ -8056,5 +8063,51 @@ mod tests {
             .filter(|(t, _)| matches!(t, 55 | 200 | 201 | 202 | 167 | 231 | 54 | 100 | 6008)).collect();
         assert_eq!(order, [(55, "SPY"), (200, "202610"), (201, "1"), (202, "768"), (167, "OPT"), (231, "100.00"),
             (54, "1"), (100, "BEST"), (6008, "265598")]);
+    }
+
+    #[test]
+    fn option_what_if_terms_are_request_bound_across_parking_and_never_mutate_the_instrument() {
+        use crate::engine::market_state::OptionTerms;
+        let mut context = Context::new();
+        context.market.register(265598);
+        context.market.set_symbol(0, "SPY".into());
+        context.market.set_routing(0, "OPT", "SMART");
+        let shared = Arc::new(SharedState::new());
+        let (client, mut server) = crate::protocol::connection::mem_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        for (id, call, strike) in [(-10, true, 500.0), (-11, false, 510.0), (-12, true, 520.0)] {
+            context.pending_orders.push(OrderRequest::SubmitWhatIf {
+                request: Box::new(OrderRequest::SubmitLimitGtc {
+                    order_id: id, instrument: 0, side: Side::Buy, qty: 1, price: P,
+                    outside_rth: true,
+                }),
+                option_terms: Some(OptionTerms { maturity: "202611".into(), call, strike, multiplier: 100.0 }),
+            });
+        }
+        let first = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        assert!(!first.iter().any(|frame| tag(frame, 35) == Some("D")));
+        assert_eq!(context.rth_parked.len(), 3, "all wait for native contract metadata");
+        cancel_what_if(&mut context, -12);
+        assert_eq!(context.rth_parked.len(), 2, "cancel removes only the owned preview and its terms");
+        context.rth_types.insert((265598, "BEST".into()), crate::engine::outside_rth::RthTypes {
+            rth: true, sec_type: "OPT".into(), ..Default::default()
+        });
+        let parked = std::mem::take(&mut context.rth_parked);
+        for request in parked { context.pending_orders.push(request); }
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        let orders: Vec<_> = frames.iter().filter(|frame| tag(frame, 35) == Some("D")).collect();
+        assert_eq!(orders.len(), 2, "{frames:?}");
+        for (frame, right, strike) in [(orders[0], "1", "500"), (orders[1], "0", "510")] {
+            assert_eq!(tag(frame, 6091), Some("1"));
+            assert_eq!(tag(frame, 167), Some("OPT"));
+            assert_eq!(tag(frame, 6008), Some("265598"));
+            assert_eq!(tag(frame, 200), Some("202611"));
+            assert_eq!(tag(frame, 201), Some(right));
+            assert_eq!(tag(frame, 202), Some(strike));
+            assert_eq!(tag(frame, 231), Some("100.00"));
+        }
+        assert!(context.market.option_terms(0).is_none());
+        assert!(context.what_if_option_terms.is_none() && context.what_if_send.is_none());
+        assert!(context.order(-10).is_none() && context.order(-11).is_none());
     }
 }

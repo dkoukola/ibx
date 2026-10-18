@@ -1691,6 +1691,60 @@ fn place_order_what_if() {
 }
 
 #[test]
+fn option_what_if_keeps_exact_terms_and_does_not_allow_real_option_orders() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let contract = Contract {
+        con_id: 756733, symbol: "SPY".into(), sec_type: "OPT".into(),
+        exchange: "SMART".into(), currency: "USD".into(),
+        last_trade_date_or_contract_month: "20261120".into(), right: "C".into(),
+        strike: 500.0, multiplier: "100".into(), ..Default::default()
+    };
+    let preview = Order { action: "BUY".into(), total_quantity: 1.0,
+        order_type: "LMT".into(), lmt_price: 5.0, what_if: true, ..Default::default() };
+    assert!(client.place_order(-73, &contract, &preview).is_err(), "the API expiry is not the native maturity");
+    shared.reference.cache_option_order_terms(&ContractDefinition {
+        con_id: contract.con_id, symbol: "SPY".into(), currency: "USD".into(),
+        sec_type: SecurityType::Option, contract_month: "202611".into(), last_trade_date: "20261120".into(),
+        right: Some(crate::control::contracts::OptionRight::Call), strike: 500.0,
+        multiplier: 100.0, multiplier_text: "100".into(), ..Default::default()
+    });
+    client.place_order(-73, &contract, &preview).unwrap();
+    let commands: Vec<_> = rx.try_iter().collect();
+    let terms = commands.iter().find_map(|command| match command {
+        ControlCommand::Order(OrderRequest::SubmitWhatIf { request, option_terms }) => {
+            assert_eq!(request.order_id(), -73);
+            option_terms.as_ref()
+        },
+        _ => None,
+    }).expect("public API preserves the option terms on the preview command");
+    assert_eq!((terms.maturity.as_str(), terms.call, terms.strike, terms.multiplier),
+        ("202611", true, 500.0, 100.0));
+    assert_eq!(client.core.peek_what_if(-73).unwrap().0.con_id, contract.con_id);
+    assert!(client.core.tracked_order(-73).is_none());
+    assert!(client.place_order(73, &contract, &Order { what_if: false, ..preview.clone() }).is_err());
+    for invalid in [
+        Contract { con_id: 0, ..contract.clone() },
+        Contract { right: String::new(), ..contract.clone() },
+        Contract { multiplier: String::new(), ..contract.clone() },
+        Contract { last_trade_date_or_contract_month: String::new(), ..contract.clone() },
+        Contract { strike: f64::NAN, ..contract.clone() },
+        Contract { strike: 501.0, ..contract.clone() },
+        Contract { right: "P".into(), ..contract.clone() },
+        Contract { multiplier: "10".into(), ..contract.clone() },
+        Contract { symbol: "WRONG".into(), ..contract.clone() },
+        Contract { currency: "EUR".into(), ..contract.clone() },
+        Contract { last_trade_date_or_contract_month: "20261220".into(), ..contract.clone() },
+        Contract { last_trade_date_or_contract_month: "20261121".into(), ..contract.clone() },
+        Contract { sec_type: "FUT".into(), ..contract.clone() },
+    ] {
+        assert!(client.place_order(-74, &invalid, &preview).is_err());
+    }
+    assert!(rx.try_recv().is_err(), "refusals must not enqueue or register orders");
+    assert!(client.core.peek_what_if(-74).is_none());
+}
+
+#[test]
 fn what_if_tracking_precedes_the_send_and_negative_ids_are_preserved() {
     let (mut client, _old_rx, shared) = test_client();
     shared.market.set_instrument_count(1);
@@ -1708,7 +1762,7 @@ fn what_if_tracking_precedes_the_send_and_negative_ids_are_preserved() {
     select.ready_timeout(std::time::Duration::from_secs(2)).unwrap();
     // The sender cannot return from send until we receive its command.
     assert!(client.core.peek_what_if(-72).is_some());
-    assert!(matches!(rx.recv().unwrap(), ControlCommand::Order(OrderRequest::SubmitWhatIf { request }) if request.order_id() == -72));
+    assert!(matches!(rx.recv().unwrap(), ControlCommand::Order(OrderRequest::SubmitWhatIf { request, .. }) if request.order_id() == -72));
     task.join().unwrap().unwrap();
     assert_eq!(client.next_order_id(), 1, "research must not advance positive execution ids");
     drop(rx); // EClient::drop sends Shutdown; do not block the rendezvous.
@@ -1944,7 +1998,7 @@ fn algo_what_if_is_a_preview() {
         };
         client.place_order(74, &spy(), &order).unwrap();
         let cmd = rx.try_recv().unwrap();
-        assert!(matches!(&cmd, ControlCommand::Order(OrderRequest::SubmitWhatIf { request })
+        assert!(matches!(&cmd, ControlCommand::Order(OrderRequest::SubmitWhatIf { request, .. })
             if matches!(&**request, OrderRequest::SubmitLimitEx { attrs, .. } if attrs.algo.is_some())), "{algo}: {cmd:?}");
         assert!(client.core.tracked_order(74).is_none(), "{algo}: not an open order");
     }

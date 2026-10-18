@@ -295,7 +295,7 @@ fn cases() -> Vec<Case> {
         case("SubmitLimitAuc", vec![SubmitLimitAuc { order_id: 137, instrument: i, side: s, qty: q, price: 100 * P }],
             vec![d("LMT", &["lmt_price"])]),
         case("SubmitMtlAuc", vec![SubmitMtlAuc { order_id: 138, instrument: i, side: s, qty: q }], vec![d("MTL", &[])]),
-        case("SubmitWhatIf", vec![SubmitWhatIf { request: Box::new(SubmitLimit {
+        case("SubmitWhatIf", vec![SubmitWhatIf { option_terms: None, request: Box::new(SubmitLimit {
             order_id: 139, instrument: i, side: s, qty: q, price: 100 * P }) }],
             vec![d("LMT", &["lmt_price", "what_if"])]),
         case("SubmitLimitFractional", vec![SubmitLimitFractional {

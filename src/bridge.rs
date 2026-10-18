@@ -1105,6 +1105,9 @@ pub struct ReferenceState {
     depth_exchanges_pending: Mutex<bool>,
     /// Contract cache from CCP exec reports (con_id -> api::Contract).
     contract_cache: Mutex<HashMap<i64, api::Contract>>,
+    /// Exact native order terms, including tag 200 (not the API last-trade
+    /// date, which may instead come from 541 or the trading schedule).
+    option_order_terms: Mutex<HashMap<i64, (api::Contract, crate::engine::market_state::OptionTerms)>>,
     /// Market names from contract details, by conId.
     market_names: Mutex<HashMap<i64, String>>,
     /// Zone of the trading hours from contract details, by conId (ibx#335).
@@ -1215,6 +1218,7 @@ impl ReferenceState {
             depth_exchanges_cache: Mutex::new(Vec::new()),
             depth_exchanges_pending: Mutex::new(false),
             contract_cache: Mutex::new(HashMap::new()),
+            option_order_terms: Mutex::new(HashMap::new()),
             market_names: Mutex::new(HashMap::new()),
             time_zone_ids: Mutex::new(HashMap::new()),
             exchange_maps: Mutex::new(Vec::new()),
@@ -1343,6 +1347,25 @@ impl ReferenceState {
         self.contract_cache.lock().unwrap().get(&con_id).cloned()
     }
 
+    pub(crate) fn option_order_terms(&self, con_id: i64) -> Option<(api::Contract, crate::engine::market_state::OptionTerms)> {
+        self.option_order_terms.lock().unwrap().get(&con_id).cloned()
+    }
+
+    pub(crate) fn cache_option_order_terms(&self, def: &ContractDefinition) {
+        use crate::control::contracts::OptionRight;
+        let multiplier = def.multiplier_text.parse::<f64>().ok();
+        if def.con_id > 0 && def.api_sec_type() == "OPT" && !def.contract_month.is_empty()
+            && let Some(right) = def.right
+            && def.strike.is_finite() && def.strike > 0.0
+            && let Some(multiplier) = multiplier.filter(|m| m.is_finite() && *m > 0.0)
+        {
+            self.option_order_terms.lock().unwrap().insert(def.con_id, (api::ContractDetails::from_definition(def).contract, crate::engine::market_state::OptionTerms {
+                maturity: def.contract_month.clone(), call: right == OptionRight::Call,
+                strike: def.strike, multiplier,
+            }));
+        }
+    }
+
     /// Market name of a contract from its contract details (for example
     /// NMS for AAPL), when they were received.
     pub fn market_name(&self, con_id: i64) -> Option<String> {
@@ -1388,6 +1411,9 @@ impl ReferenceState {
     }
 
     #[doc(hidden)] pub fn push_contract_details(&self, req_id: ReqId, def: ContractDefinition) {
+        // Final rows can include a schedule-derived API last-trade date.
+        // Keep that identity together with its unchanged native order month.
+        self.cache_option_order_terms(&def);
         self.contract_details.lock().unwrap().push((req_id, def));
     }
 
@@ -1970,9 +1996,34 @@ pub struct PortfolioState {
     /// Realized P&L of this session's fills since the last seed, by conId,
     /// from the commission frames (ibx#478). A new seed includes them.
     realized_since_seed: Mutex<HashMap<i64, f64>>,
-    /// Signed cash of this session's fills since the last seed, by conId
-    /// (sell positive, buy negative, like the seed's money traded).
-    money_since_seed: Mutex<HashMap<i64, f64>>,
+    /// Signed quantity × quoted price since the last seed, by conId.
+    /// Cash is derived only once exact product units are available; retaining
+    /// the quoted total lets a late secdef resolve an initially unknown factor.
+    quoted_fills_since_seed: Mutex<HashMap<i64, f64>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PositionValuation {
+    Stock,
+    Option(f64),
+}
+
+impl PositionValuation {
+    pub(crate) fn is_stock_type(sec_type: &str) -> bool {
+        ["STK", "CS", "COMMON"].iter().any(|t| sec_type.eq_ignore_ascii_case(t))
+    }
+
+    pub(crate) fn multiplier(self) -> f64 {
+        match self {
+            Self::Stock => 1.0,
+            Self::Option(factor) => factor,
+        }
+    }
+
+    pub(crate) fn value(self, quantity: f64, price: Price) -> Option<f64> {
+        let value = quantity * price as f64 / PRICE_SCALE as f64 * self.multiplier();
+        value.is_finite().then_some(value)
+    }
 }
 
 impl PortfolioState {
@@ -1988,7 +2039,7 @@ impl PortfolioState {
             positions: std::array::from_fn(|_| AtomicU64::new(0)),
             midnight_seeds: Mutex::new(HashMap::new()),
             realized_since_seed: Mutex::new(HashMap::new()),
-            money_since_seed: Mutex::new(HashMap::new()),
+            quoted_fills_since_seed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2148,17 +2199,25 @@ impl PortfolioState {
     /// Move a position by a fill of this session (`delta` fixed-point,
     /// signed). The reference's position store moves with the execution, so
     /// the position row and the P&L see the fill at once; the server's
-    /// average cost comes with the next position feed. A position opened by
-    /// the fill takes the fill price as average cost, as the reference's
-    /// first row did (captured 25/09/2026: avgCost 336.25, then 336.260003).
-    #[doc(hidden)] pub fn apply_fill_to_position(&self, con_id: i64, delta: Qty, price: Price) {
+    /// average cost comes with the next position feed. Only a confirmed stock
+    /// may seed its average cost from the quoted fill price (captured
+    /// 25/09/2026: avgCost 336.25, then 336.260003). Other products' raw broker
+    /// average-cost units are not inferred from their quote multiplier.
+    #[doc(hidden)] pub fn apply_fill_to_position(&self, contract: &api::Contract, delta: Qty, stock_price: Option<Price>) {
         if delta == 0 {
             return;
         }
+        let con_id = contract.con_id;
         let mut map = self.position_infos.lock().unwrap();
         let entry = map.entry(con_id).or_insert_with(|| PositionInfo { con_id, ..Default::default() });
+        // A fill's basic identity belongs to the provisional portfolio row;
+        // it must not turn a cold reference cache into a complete secdef.
+        if !contract.symbol.is_empty() { entry.symbol = contract.symbol.clone(); }
+        if !contract.sec_type.is_empty() { entry.sec_type = contract.sec_type.clone(); }
+        if !contract.currency.is_empty() { entry.currency = contract.currency.clone(); }
+        if !contract.multiplier.is_empty() { entry.multiplier = contract.multiplier.clone(); }
         if entry.position_fixed == 0 {
-            entry.avg_cost = price;
+            entry.avg_cost = stock_price.unwrap_or(0);
         }
         entry.position_fixed += delta;
         self.position_generation.fetch_add(1, Ordering::AcqRel);
@@ -2210,7 +2269,7 @@ impl PortfolioState {
     #[doc(hidden)] pub fn set_midnight_seeds(&self, seeds: Vec<MidnightSeed>) {
         // The seed's realized P&L includes the fills so far (ibx#478).
         self.realized_since_seed.lock().unwrap().clear();
-        self.money_since_seed.lock().unwrap().clear();
+        self.quoted_fills_since_seed.lock().unwrap().clear();
         let mut map = self.midnight_seeds.lock().unwrap();
         map.clear();
         for s in seeds {
@@ -2223,15 +2282,44 @@ impl PortfolioState {
         *self.realized_since_seed.lock().unwrap().entry(con_id).or_insert(0.0) += amount;
     }
 
-    /// Add the signed cash of a fill for `con_id`: sell positive, buy
-    /// negative.
-    #[doc(hidden)] pub fn add_money_since_seed(&self, con_id: i64, cash: f64) {
-        *self.money_since_seed.lock().unwrap().entry(con_id).or_insert(0.0) += cash;
+    /// Add signed quantity × quoted fill price: sell positive, buy negative.
+    /// This is not cash until the product's quote multiplier is known.
+    #[doc(hidden)] pub fn add_quoted_fill_since_seed(&self, con_id: i64, value: f64) {
+        *self.quoted_fills_since_seed.lock().unwrap().entry(con_id).or_insert(0.0) += value;
     }
 
-    /// Signed cash of fills since the last seed, by conId.
-    pub fn money_since_seed(&self) -> HashMap<i64, f64> {
-        self.money_since_seed.lock().unwrap().clone()
+    /// Signed cash of fills since the last seed, by exact conId. `None` means
+    /// product units are not known, not zero cash. Native seed cash is already
+    /// currency-valued and is never multiplied. A later contract definition
+    /// can resolve the same retained fill total without booking it again.
+    pub fn money_since_seed(&self, reference: &ReferenceState) -> HashMap<i64, Option<f64>> {
+        let totals = self.quoted_fills_since_seed.lock().unwrap().clone();
+        totals.into_iter().map(|(con_id, value)| {
+            let cash = self.valuation(con_id, reference)
+                .map(|units| value * units.multiplier())
+                .filter(|cash| cash.is_finite());
+            (con_id, cash)
+        }).collect()
+    }
+
+    /// Only stocks and premium-quoted options have established cash/value
+    /// semantics here. In particular, a futures multiplier alone does not
+    /// establish premium cash flow. Unknown metadata never defaults to stock.
+    pub(crate) fn valuation(&self, con_id: i64, reference: &ReferenceState) -> Option<PositionValuation> {
+        let contract = reference.get_contract(con_id);
+        let position = self.position_info(con_id);
+        let sec_type = contract.as_ref().map(|c| c.sec_type.as_str()).filter(|s| !s.is_empty())
+            .or_else(|| position.as_ref().map(|p| p.sec_type.as_str())).unwrap_or("");
+        if PositionValuation::is_stock_type(sec_type) {
+            return Some(PositionValuation::Stock);
+        }
+        if !sec_type.eq_ignore_ascii_case("OPT") {
+            return None;
+        }
+        let text = contract.as_ref().map(|c| c.multiplier.as_str()).filter(|s| !s.is_empty())
+            .or_else(|| position.as_ref().map(|p| p.multiplier.as_str()))?;
+        let factor = text.parse::<f64>().ok().filter(|factor| factor.is_finite() && *factor > 0.0 && *factor != f64::MAX)?;
+        Some(PositionValuation::Option(factor))
     }
 
     /// Realized P&L of fills since the last seed, by conId (ibx#478).
@@ -2376,6 +2464,86 @@ impl SharedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_fill_cash_recovers_from_late_exact_metadata_and_resets_at_seed() {
+        let shared = SharedState::new();
+        shared.portfolio.add_quoted_fill_since_seed(42, -2.5);
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], None);
+        shared.reference.cache_contract(42, api::Contract {
+            con_id: 42,
+            sec_type: "OPT".into(),
+            ..Default::default()
+        });
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], None);
+        shared.reference.cache_contract(42, api::Contract {
+            con_id: 42,
+            multiplier: "100".into(),
+            ..Default::default()
+        });
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(-250.0));
+        shared.portfolio.add_quoted_fill_since_seed(42, 3.0);
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(50.0));
+        shared.portfolio.set_midnight_seeds(vec![MidnightSeed {
+            con_id: 42,
+            money_traded: 50.0,
+            ..Default::default()
+        }]);
+        assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty());
+        assert_eq!(shared.portfolio.midnight_seeds()[0].money_traded, 50.0);
+    }
+
+    #[test]
+    fn quoted_fill_cash_requires_established_product_units() {
+        for (sec_type, multiplier, expected) in [
+            ("STK", "", Some(-2.0)),
+            ("CS", "100", Some(-2.0)),
+            ("COMMON", "", Some(-2.0)),
+            ("OPT", "10", Some(-20.0)),
+            ("OPT", "100.0", Some(-200.0)),
+            ("OPT", "", None),
+            ("OPT", "0", None),
+            ("OPT", "-1", None),
+            ("OPT", "NaN", None),
+            ("OPT", "inf", None),
+            ("OPT", "1.7976931348623157e308", None),
+            ("OPT", "1e308", None),
+            ("", "100", None),
+            ("FUT", "100", None),
+            ("FOP", "100", None),
+            ("BAG", "100", None),
+        ] {
+            let shared = SharedState::new();
+            shared.reference.cache_contract(42, api::Contract {
+                con_id: 42,
+                sec_type: sec_type.into(),
+                multiplier: multiplier.into(),
+                ..Default::default()
+            });
+            shared.portfolio.add_quoted_fill_since_seed(42, -2.0);
+            assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], expected, "{sec_type} / {multiplier}");
+        }
+    }
+
+    #[test]
+    fn quoted_fill_cash_can_use_native_portfolio_multiplier_without_mutating_basis() {
+        let shared = SharedState::new();
+        shared.portfolio.set_position_info(PositionInfo {
+            con_id: 42,
+            position_fixed: QTY_SCALE,
+            sec_type: "OPT".into(),
+            multiplier: "100".into(),
+            avg_cost: 250 * PRICE_SCALE,
+            ..Default::default()
+        });
+        shared.portfolio.set_position_marks(42, 3 * PRICE_SCALE, 300 * PRICE_SCALE, 49 * PRICE_SCALE, 7 * PRICE_SCALE);
+        shared.portfolio.add_quoted_fill_since_seed(42, -2.5);
+        assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(-250.0));
+        let position = shared.portfolio.position_info(42).unwrap();
+        assert_eq!(position.avg_cost, 250 * PRICE_SCALE);
+        assert_eq!(position.unrealized_pnl, 49 * PRICE_SCALE);
+        assert_eq!(position.market_value, 300 * PRICE_SCALE);
+    }
 
     /// Every error queue gives its entries to an attached event channel,
     /// with the id and the code the queue holds, and nothing before a
