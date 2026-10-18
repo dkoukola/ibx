@@ -197,6 +197,10 @@ pub struct ContractDefinition {
     pub exercise_style: u8,
     /// Native payout method; absent or unrecognized values remain unknown.
     pub settlement_method: Option<SettlementMethod>,
+    /// Native basket composition (6799), retained verbatim on this contract.
+    /// An option may reference a separate BASKET underlying carrying it.
+    /// Absence does not certify standard-share delivery.
+    pub basket_composition: Option<String>,
     /// Last trading time of a derivative, `HHMM`, empty when absent.
     pub last_trade_time: String,
     /// API security type of the underlying, empty when absent.
@@ -323,6 +327,7 @@ impl Default for ContractDefinition {
             under_con_id: 0,
             exercise_style: 0,
             settlement_method: None,
+            basket_composition: None,
             last_trade_time: String::new(),
             under_sec_type: String::new(),
             wire_sec_type: String::new(),
@@ -746,6 +751,7 @@ fn apply_secdef_fields<'a>(def: &mut ContractDefinition, keys: &mut RecordKeys<'
             6178 => def.agg_group = v.trim().parse().ok(),
             6659 => def.exercise_style = v.parse().unwrap_or(0),
             6660 => def.settlement_method = SettlementMethod::from_fix(v),
+            6799 => def.basket_composition = Some(v.to_string()),
             6850 => def.last_trade_time = v.to_string(),
             310 => def.under_sec_type = if v == "CS" { "STK".to_string() } else { v.to_string() },
             6858 => def.ev_rule = v.to_string(),

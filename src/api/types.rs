@@ -916,6 +916,9 @@ pub struct ContractDetails {
     pub exercise_style: u8,
     /// Native tag 6660. Does not establish an adjusted option's deliverables.
     pub settlement_method: Option<crate::control::contracts::SettlementMethod>,
+    /// IBX extension: raw native 6799 composition of this contract.
+    /// No underlying lookup is performed. None is not proof of standard delivery.
+    pub basket_composition: Option<String>,
     pub stock_type: String,
     pub min_size: f64,
     pub size_increment: f64,
@@ -994,6 +997,7 @@ impl Default for ContractDetails {
             last_trade_time: String::new(),
             exercise_style: 0,
             settlement_method: None,
+            basket_composition: None,
             stock_type: String::new(),
             min_size: f64::MAX,
             size_increment: f64::MAX,
@@ -1150,6 +1154,7 @@ impl ContractDetails {
             last_trade_time: if bond && !def.bond_api { String::new() } else { expiry_time },
             exercise_style: def.exercise_style,
             settlement_method: def.settlement_method,
+            basket_composition: def.basket_composition.clone(),
             stock_type: def.stock_type.clone(),
             min_size,
             size_increment,
