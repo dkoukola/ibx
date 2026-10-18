@@ -1748,6 +1748,28 @@ fn what_if_local_cancel_and_terminal_rejection_release_tracking_only() {
 }
 
 #[test]
+fn what_if_queued_reply_remains_a_preview_after_local_cancellation() {
+    #[derive(Default)]
+    struct PreviewFlags { native: usize, opens: Vec<(i64, bool)> }
+    impl Wrapper for PreviewFlags {
+        fn what_if(&mut self, _: &WhatIfResponse) { self.native += 1; }
+        fn open_order(&mut self, id: i64, _: &Contract, order: &Order, _: &crate::api::types::OrderState) {
+            self.opens.push((id, order.what_if));
+        }
+    }
+    let (client, rx, shared) = test_client();
+    client.core.track_what_if(-7, spy(), Order { what_if: true, ..Default::default() });
+    shared.orders.push_what_if(what_if_reply(-7, [0.0; 3], [0.0; 3], 0.0));
+    client.cancel_what_if(-7).unwrap();
+    assert!(matches!(rx.recv().unwrap(), ControlCommand::CancelWhatIf { order_id: -7 }));
+    assert!(client.core.peek_what_if(-7).is_none());
+    let mut wrapper = PreviewFlags::default();
+    client.process_msgs(&mut wrapper);
+    assert_eq!(wrapper.native, 1);
+    assert_eq!(wrapper.opens, [(-7, true)]);
+}
+
+#[test]
 fn what_if_native_callback_retains_finality_refusal_and_legacy_callbacks() {
     #[derive(Default)]
     struct PreviewWrapper { native: Vec<(bool, String)>, opens: usize, errors: usize }

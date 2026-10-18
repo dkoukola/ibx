@@ -253,6 +253,9 @@ impl EClient {
             };
             wrapper.what_if(&wi);
             let (mut contract, mut order) = tracked.unwrap_or_else(|| (Contract::default(), ApiOrder::default()));
+            // This queue is authoritative even if local cancellation removed
+            // the original metadata before an already queued reply is read.
+            order.what_if = true;
             // A preview placed without a conId shows the contract looked
             // up (ibx#486).
             if contract.con_id == 0 && wi.state.con_id != 0 && !contract.sec_type.eq_ignore_ascii_case("BAG") {
