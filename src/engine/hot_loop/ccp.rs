@@ -205,9 +205,63 @@ fn option_lifecycle_observation(
 /// The report of a combo's leg (ibx#470): 6013 gives the leg index (-1
 /// for the combo itself) and the leg count, 442 = 2 on a leg's report.
 fn is_leg_report(parsed: &std::collections::HashMap<u32, String>) -> bool {
-    match parsed.get(&6013).and_then(|v| v.split(':').next()).and_then(|i| i.parse::<i32>().ok()) {
-        Some(index) => index >= 0,
-        None => parsed.get(&442).map(|s| s.as_str()) == Some("2"),
+    matches!(
+        execution_component(parsed),
+        api::ExecutionComponent::ComboLeg { .. }
+    )
+}
+
+/// Decode only native, self-contained combo execution identity. The captured
+/// combo parent reports `6013=-1:N`; each leg reports `6013=I:N` and tag 6400
+/// equal to the parent's tag 17. Partial or malformed evidence remains
+/// explicitly unsupported rather than becoming an ordinary execution.
+pub(super) fn execution_component(
+    parsed: &std::collections::HashMap<u32, String>,
+) -> api::ExecutionComponent {
+    let parent_execution_id = parsed.get(&6400).cloned();
+    let raw_descriptor = parsed.get(&6013).cloned();
+    let unsupported = || api::ExecutionComponent::UnsupportedCombo {
+        raw_descriptor: raw_descriptor.clone(),
+        parent_execution_id: parent_execution_id.clone(),
+    };
+    let Some(raw) = raw_descriptor.as_deref().filter(|value| !value.is_empty()) else {
+        return if matches!(parsed.get(&442).map(String::as_str), Some("2" | "3"))
+            || parent_execution_id.is_some()
+            || raw_descriptor.is_some()
+        {
+            unsupported()
+        } else {
+            api::ExecutionComponent::Ordinary
+        };
+    };
+    let mut fields = raw.split(':');
+    let index = fields.next().and_then(|value| value.parse::<i32>().ok());
+    let leg_count = fields.next().and_then(|value| value.parse::<u32>().ok());
+    if fields.next().is_some() || leg_count == Some(0) {
+        return unsupported();
+    }
+    match (index, leg_count) {
+        (Some(-1), Some(leg_count))
+            if parsed.get(&442).map(String::as_str) == Some("3")
+                && parent_execution_id.is_none() =>
+        {
+            api::ExecutionComponent::ComboParent { leg_count }
+        }
+        (Some(index), Some(leg_count))
+            if index >= 0
+                && (index as u32) < leg_count
+                && parsed.get(&442).map(String::as_str) == Some("2")
+                && parent_execution_id
+                    .as_ref()
+                    .is_some_and(|value| !value.is_empty()) =>
+        {
+            api::ExecutionComponent::ComboLeg {
+                index: index as u32,
+                leg_count,
+                parent_execution_id: parent_execution_id.unwrap(),
+            }
+        }
+        _ => unsupported(),
     }
 }
 
@@ -240,6 +294,7 @@ pub(super) fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec
         last_liquidity: tag(851).and_then(|s| s.parse().ok()).unwrap_or(0),
         order_ref_present: parsed.contains_key(&6010),
         combo: None,
+        component: execution_component(parsed),
         other_client: false,
         replayed: parsed.get(&97).is_some_and(|v| v == "Y"),
     }
@@ -2105,7 +2160,14 @@ impl CcpState {
                 // (ibx#470). Its execution shows the combo contract without
                 // its legs (captured 30/09/2026).
                 if let Some(view) = &combo_view {
-                    if let Some(entry) = self.exec_realized.get_mut(split_exec_revision(exec_id).0) {
+                    if matches!(exec.component, api::ExecutionComponent::Ordinary) {
+                        exec.component = api::ExecutionComponent::UnsupportedCombo {
+                            raw_descriptor: None,
+                            parent_execution_id: None,
+                        };
+                    }
+                    if let Some(entry) = self.exec_realized.get_mut(split_exec_revision(exec_id).0)
+                    {
                         entry.moves_position = false;
                     }
                     let contract = api::Contract {
@@ -4467,6 +4529,64 @@ pub(crate) fn handle_position_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combo_execution_component_requires_complete_native_identity() {
+        use api::ExecutionComponent::{ComboLeg, ComboParent, Ordinary, UnsupportedCombo};
+
+        let fields = |values: &[(u32, &str)]| {
+            values
+                .iter()
+                .map(|(tag, value)| (*tag, (*value).to_string()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        assert_eq!(execution_component(&fields(&[])), Ordinary);
+        assert_eq!(
+            execution_component(&fields(&[(442, "3"), (6013, "-1:2")])),
+            ComboParent { leg_count: 2 }
+        );
+        let leg = execution_component(&fields(&[(442, "2"), (6013, "1:2"), (6400, "parent.01")]));
+        assert_eq!(
+            leg,
+            ComboLeg {
+                index: 1,
+                leg_count: 2,
+                parent_execution_id: "parent.01".into(),
+            }
+        );
+        assert_eq!(leg.role(), "leg");
+        assert_eq!(leg.leg_index(), Some(1));
+        assert_eq!(leg.leg_count(), Some(2));
+        assert_eq!(leg.parent_execution_id(), Some("parent.01"));
+        assert!(is_leg_report(&fields(&[
+            (442, "2"),
+            (6013, "1:2"),
+            (6400, "parent.01"),
+        ])));
+        assert!(!is_leg_report(&fields(&[
+            (442, "3"),
+            (6013, "1:2"),
+            (6400, "parent.01"),
+        ])));
+
+        for values in [
+            vec![(442, "2")],
+            vec![(442, "3")],
+            vec![(6013, "")],
+            vec![(6013, "-1:2")],
+            vec![(442, "2"), (6013, "-1:2")],
+            vec![(6013, "0:2")],
+            vec![(442, "3"), (6013, "0:2"), (6400, "parent.01")],
+            vec![(6013, "2:2"), (6400, "parent.01")],
+            vec![(6013, "-1:2"), (6400, "unexpected")],
+            vec![(6013, "0:not-a-count"), (6400, "parent.01")],
+        ] {
+            assert!(matches!(
+                execution_component(&fields(&values)),
+                UnsupportedCombo { .. }
+            ));
+        }
+    }
 
     #[test]
     fn thin_option_identity_does_not_suppress_existing_once_only_secdef_fetch() {
@@ -8534,7 +8654,9 @@ mod tests {
         );
         let mut frame = fill_frame("leg.01", 100, "10", 100, "10", 200);
         frame.insert(20, "3".into());
+        frame.insert(442, "2".into());
         frame.insert(6013, "0:1".into());
+        frame.insert(6400, "parent.01".into());
 
         ccp.handle_exec_report(&frame, &mut context, &shared, &None, "DU123");
 

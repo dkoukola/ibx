@@ -3101,6 +3101,16 @@ pub struct Execution {
     pub pending_price_revision: bool,
     #[pyo3(get, set)]
     pub submitter: String,
+    #[pyo3(get, set)]
+    pub combo_role: String,
+    #[pyo3(get, set)]
+    pub combo_leg_index: Option<u32>,
+    #[pyo3(get, set)]
+    pub combo_leg_count: Option<u32>,
+    #[pyo3(get, set)]
+    pub combo_parent_execution_id: Option<String>,
+    #[pyo3(get, set)]
+    pub combo_raw_descriptor: Option<String>,
 }
 
 impl Default for Execution {
@@ -3126,6 +3136,43 @@ impl Default for Execution {
             last_liquidity: 0,
             pending_price_revision: false,
             submitter: String::new(),
+            combo_role: "ordinary".into(),
+            combo_leg_index: None,
+            combo_leg_count: None,
+            combo_parent_execution_id: None,
+            combo_raw_descriptor: None,
+        }
+    }
+}
+
+impl Execution {
+    pub(crate) fn from_api(execution: &crate::api::types::Execution) -> Self {
+        Self {
+            exec_id: execution.exec_id.clone(),
+            time: execution.time.clone(),
+            acct_number: execution.acct_number.clone(),
+            exchange: execution.exchange.clone(),
+            side: execution.side.clone(),
+            shares: execution.shares,
+            price: execution.price,
+            perm_id: execution.perm_id,
+            client_id: execution.client_id,
+            order_id: execution.order_id,
+            liquidation: execution.liquidation,
+            cum_qty: execution.cum_qty,
+            avg_price: execution.avg_price,
+            order_ref: execution.order_ref.clone(),
+            ev_rule: execution.ev_rule.clone(),
+            ev_multiplier: execution.ev_multiplier,
+            model_code: execution.model_code.clone(),
+            last_liquidity: execution.last_liquidity,
+            pending_price_revision: execution.pending_price_revision,
+            submitter: String::new(),
+            combo_role: execution.component.role().into(),
+            combo_leg_index: execution.component.leg_index(),
+            combo_leg_count: execution.component.leg_count(),
+            combo_parent_execution_id: execution.component.parent_execution_id().map(str::to_owned),
+            combo_raw_descriptor: execution.component.raw_descriptor().map(str::to_owned),
         }
     }
 }

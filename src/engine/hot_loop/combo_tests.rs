@@ -343,6 +343,73 @@ fn combo_fill_session_is_the_captured_one() {
     assert_eq!(s.engine.shared.portfolio.position_fixed(s.engine.context.market.instrument_by_con_id(SPY).unwrap()), 0);
 }
 
+#[test]
+fn guarded_combo_authorizes_only_at_first_order_write_and_refusal_is_byte_zero() {
+    let frames = fixture("20260930/i105_combo_fill.jsonl");
+    let mut s = Session::new();
+    s.engine
+        .shared
+        .orders
+        .begin_execution_history("guarded-combo");
+    let authorizations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let called = authorizations.clone();
+    let receipt = s
+        .client
+        .place_combo_order_guarded(
+            42,
+            &spy_qqq("QQQ,SPY"),
+            &combo_lmt("BUY", 23.84),
+            "guarded-combo".into(),
+            move || {
+                called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(receipt.outcome(), None);
+    s.run();
+    s.read(Duration::from_millis(200));
+    assert!(!s.queued.is_empty(), "combo setup must precede its order");
+    assert!(s.queued.iter().all(|frame| tag(frame, 35) != Some("D")));
+    assert_eq!(authorizations.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(receipt.outcome(), None);
+
+    s.play(&frames, is("c", "SecDefReqMsgReqByConid"), order_msg("D"));
+    assert_eq!(authorizations.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        receipt.wait_timeout(Duration::from_secs(1)),
+        Some(crate::protocol::order_write::OrderWriteOutcome::Written)
+    );
+    let order = s.next_sent();
+    assert_eq!(
+        (tag(&order, 35), tag(&order, 6121)),
+        (Some("D"), Some("42"))
+    );
+
+    let refused = authorizations.clone();
+    let receipt = s
+        .client
+        .place_combo_order_guarded(
+            43,
+            &spy_qqq("QQQ,SPY"),
+            &combo_lmt("BUY", 23.84),
+            "guarded-combo".into(),
+            move || {
+                refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("test refusal".into())
+            },
+        )
+        .unwrap();
+    s.run();
+    assert_eq!(authorizations.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        receipt.wait_timeout(Duration::from_secs(1)),
+        Some(crate::protocol::order_write::OrderWriteOutcome::NotSent)
+    );
+    assert!(s.engine.context.order(43).is_none());
+    s.assert_nothing_sent();
+}
+
 // ibx#470 (captured 26/09/2026, market closed, i105_combo_stock_smart of
 // both runs): with the BAG symbol SPY,QQQ the set-up runs and the order
 // is refused with 478, no 35=D; a second order on the same legs is

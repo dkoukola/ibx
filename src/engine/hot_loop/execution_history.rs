@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::api::types::{CommissionAndFeesReport, ExecutionFilter};
+use crate::api::types::{CommissionAndFeesReport, ExecutionComponent, ExecutionFilter};
 use crate::bridge::{Event, ExecutionHistoryReply, SharedState};
 use crate::client_core::{ClientCore, StoredExecution, format_exec_time};
 use crate::config::chrono_free_timestamp;
@@ -300,12 +300,36 @@ fn project_execution(
     execution.client_id = metadata.client_id;
     execution.model_code = metadata.model_code;
     execution.order_ref = metadata.order_ref;
+    execution.component = metadata.component;
+    let reported_price = fields
+        .get(&31)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite());
+    let combo_price_is_valid = match &execution.component {
+        ExecutionComponent::Ordinary => reported_price.is_some_and(|price| price > 0.0),
+        ExecutionComponent::ComboParent { .. } if projected.contract.sec_type == "BAG" => {
+            reported_price.is_some()
+        }
+        ExecutionComponent::ComboLeg { .. } if projected.contract.sec_type != "BAG" => {
+            reported_price.is_some_and(|price| price >= 0.0)
+        }
+        ExecutionComponent::ComboParent { .. }
+        | ExecutionComponent::ComboLeg { .. }
+        | ExecutionComponent::UnsupportedCombo { .. } => {
+            return Err("Execution history contains unsupported combo component metadata".into());
+        }
+    };
+    if matches!(execution.component, ExecutionComponent::Ordinary)
+        && (projected.contract.sec_type == "BAG" || !projected.contract.combo_legs.is_empty())
+    {
+        return Err("Execution history contains unsupported combo component metadata".into());
+    }
     if perm_id <= 0
         || projected.contract.con_id <= 0
         || !execution.shares.is_finite()
         || (execution.shares <= 0.0 && !super::ccp::is_execution_print(fields))
         || !execution.price.is_finite()
-        || execution.price <= 0.0
+        || !combo_price_is_valid
     {
         return Err("Incomplete execution history identity, quantity or price".into());
     }
@@ -574,6 +598,162 @@ mod tests {
         let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
         assert!(requests.report(&end, &shared, "DU123456"));
         assert!(shared.orders.drain_execution_range_replies().is_empty());
+    }
+
+    #[test]
+    fn execution_range_preserves_complete_combo_parent_and_leg_identity() {
+        let shared = SharedState::new();
+        let mut requests = active();
+        let mut parent = row("package-parent.01", true);
+        parent.insert(6008, "28812380".into());
+        parent.insert(167, "BAG".into());
+        parent.insert(442, "3".into());
+        parent.insert(6013, "-1:2".into());
+        parent.insert(31, "-0.05".into());
+        let mut leg = row("package-leg.01", true);
+        leg.insert(6008, "756733".into());
+        leg.insert(167, "OPT".into());
+        leg.insert(442, "2".into());
+        leg.insert(6013, "0:2".into());
+        leg.insert(6400, "package-parent.01".into());
+        leg.insert(31, "0".into());
+        assert!(requests.report(&parent, &shared, "DU123456"));
+        assert!(requests.report(&leg, &shared, "DU123456"));
+        let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
+        assert!(requests.report(&end, &shared, "DU123456"));
+        let rows = shared
+            .orders
+            .drain_execution_range_replies()
+            .pop()
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let parent = rows
+            .iter()
+            .find(|row| row.execution.exec_id == "package-parent.01")
+            .unwrap();
+        assert_eq!(
+            parent.execution.component,
+            ExecutionComponent::ComboParent { leg_count: 2 }
+        );
+        assert_eq!(parent.execution.price, -0.05);
+        let leg = rows
+            .iter()
+            .find(|row| row.execution.exec_id == "package-leg.01")
+            .unwrap();
+        assert_eq!(
+            leg.execution.component,
+            ExecutionComponent::ComboLeg {
+                index: 0,
+                leg_count: 2,
+                parent_execution_id: "package-parent.01".into(),
+            }
+        );
+        assert_eq!(leg.execution.price, 0.0);
+        assert!(shared.portfolio.position_infos().is_empty());
+        assert!(
+            shared
+                .portfolio
+                .money_since_seed(&shared.reference)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn execution_range_fails_instead_of_partially_returning_ambiguous_combo_rows() {
+        let mut cases = Vec::new();
+
+        let mut missing_parent_descriptor = row("ambiguous-parent.01", true);
+        missing_parent_descriptor.insert(167, "BAG".into());
+        missing_parent_descriptor.insert(442, "3".into());
+        cases.push(missing_parent_descriptor);
+
+        let mut parent_without_role = row("untyped-parent.01", true);
+        parent_without_role.insert(167, "BAG".into());
+        parent_without_role.insert(6013, "-1:2".into());
+        cases.push(parent_without_role);
+
+        let mut parent_with_leg_link = row("linked-parent.01", true);
+        parent_with_leg_link.insert(167, "BAG".into());
+        parent_with_leg_link.insert(442, "3".into());
+        parent_with_leg_link.insert(6013, "-1:2".into());
+        parent_with_leg_link.insert(6400, "unexpected".into());
+        cases.push(parent_with_leg_link);
+
+        let mut leg_without_parent = row("orphan-leg.01", true);
+        leg_without_parent.insert(167, "OPT".into());
+        leg_without_parent.insert(442, "2".into());
+        leg_without_parent.insert(6013, "0:2".into());
+        cases.push(leg_without_parent);
+
+        let mut mismatched_leg_role = row("mismatched-leg.01", true);
+        mismatched_leg_role.insert(167, "OPT".into());
+        mismatched_leg_role.insert(442, "3".into());
+        mismatched_leg_role.insert(6013, "0:2".into());
+        mismatched_leg_role.insert(6400, "parent.01".into());
+        cases.push(mismatched_leg_role);
+
+        let mut bag_claiming_leg = row("bag-leg.01", true);
+        bag_claiming_leg.insert(167, "BAG".into());
+        bag_claiming_leg.insert(442, "2".into());
+        bag_claiming_leg.insert(6013, "0:2".into());
+        bag_claiming_leg.insert(6400, "parent.01".into());
+        cases.push(bag_claiming_leg);
+
+        let mut stock_claiming_parent = row("stock-parent.01", true);
+        stock_claiming_parent.insert(442, "3".into());
+        stock_claiming_parent.insert(6013, "-1:2".into());
+        cases.push(stock_claiming_parent);
+
+        let mut ordinary_bag = row("ordinary-bag.01", true);
+        ordinary_bag.insert(167, "BAG".into());
+        cases.push(ordinary_bag);
+
+        for ambiguous in cases {
+            let shared = SharedState::new();
+            let mut requests = active();
+            assert!(requests.report(&row("valid-first.01", true), &shared, "DU123456"));
+            assert!(requests.report(&ambiguous, &shared, "DU123456"));
+            let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
+            assert!(requests.report(&end, &shared, "DU123456"));
+            assert_eq!(
+                shared
+                    .orders
+                    .drain_execution_range_replies()
+                    .pop()
+                    .unwrap()
+                    .result
+                    .unwrap_err(),
+                "Execution history contains unsupported combo component metadata"
+            );
+        }
+
+        for price in [None, Some("not-a-price")] {
+            let shared = SharedState::new();
+            let mut requests = active();
+            let mut missing_price = row("missing-price.01", true);
+            missing_price.insert(167, "BAG".into());
+            missing_price.insert(442, "3".into());
+            missing_price.insert(6013, "-1:2".into());
+            missing_price.remove(&31);
+            if let Some(price) = price {
+                missing_price.insert(31, price.into());
+            }
+            assert!(requests.report(&missing_price, &shared, "DU123456"));
+            let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
+            assert!(requests.report(&end, &shared, "DU123456"));
+            assert_eq!(
+                shared
+                    .orders
+                    .drain_execution_range_replies()
+                    .pop()
+                    .unwrap()
+                    .result
+                    .unwrap_err(),
+                "Incomplete execution history identity, quantity or price"
+            );
+        }
     }
 
     fn deliver(

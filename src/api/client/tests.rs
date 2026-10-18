@@ -2034,6 +2034,71 @@ fn place_order_non_stk_contract_rejected() {
 }
 
 #[test]
+fn guarded_combo_rejects_non_combo_and_what_if_before_authorization_or_queueing() {
+    let (client, rx, _) = test_client();
+    let authorizations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let order = Order {
+        action: "BUY".into(),
+        total_quantity: 1.0,
+        order_type: "LMT".into(),
+        lmt_price: 1.0,
+        ..Default::default()
+    };
+    let called = authorizations.clone();
+    assert!(
+        client
+            .place_combo_order_guarded(1, &spy(), &order, "fixture".into(), move || {
+                called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err()
+    );
+    let called = authorizations.clone();
+    let bag = Contract {
+        symbol: "SPY".into(),
+        sec_type: "BAG".into(),
+        exchange: "SMART".into(),
+        currency: "USD".into(),
+        combo_legs: vec![
+            crate::api::types::ComboLeg {
+                con_id: 1,
+                ratio: 1,
+                action: "BUY".into(),
+                exchange: "SMART".into(),
+                ..Default::default()
+            },
+            crate::api::types::ComboLeg {
+                con_id: 2,
+                ratio: 1,
+                action: "SELL".into(),
+                exchange: "SMART".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    assert!(
+        client
+            .place_combo_order_guarded(
+                2,
+                &bag,
+                &Order {
+                    what_if: true,
+                    ..order
+                },
+                "fixture".into(),
+                move || {
+                    called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .is_err()
+    );
+    assert_eq!(authorizations.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn place_order_explicit_stk_contract_accepted() {
     // An explicit sec_type="STK" must still be accepted.
     let (client, rx, shared) = test_client();
@@ -5259,6 +5324,7 @@ fn captured_fill_exec() -> crate::bridge::FillExec {
         last_liquidity: 0,
         order_ref_present: true,
         combo: None,
+        component: Default::default(),
         other_client: false,
         replayed: false,
     }
@@ -5270,6 +5336,35 @@ impl Wrapper for ExecRecorder {
     fn exec_details(&mut self, req_id: i64, _c: &Contract, e: &crate::api::types::Execution) {
         self.execs.push((req_id, e.clone()));
     }
+}
+
+#[test]
+fn combo_execution_component_survives_live_callback_and_replay() {
+    let (client, _rx, shared) = test_client();
+    let component = crate::api::types::ExecutionComponent::ComboLeg {
+        index: 1,
+        leg_count: 2,
+        parent_execution_id: "parent.01".into(),
+    };
+    shared.orders.push_fill_with_exec(
+        aapl_fill(7),
+        crate::bridge::FillExec {
+            exec_id: "leg.01".into(),
+            component: component.clone(),
+            ..Default::default()
+        },
+    );
+    let mut callbacks = ExecRecorder::default();
+    client.process_msgs(&mut callbacks);
+    assert_eq!(callbacks.execs.len(), 1);
+    assert_eq!(callbacks.execs[0].0, -1);
+    assert_eq!(callbacks.execs[0].1.component, component);
+
+    client.req_executions(9, &Default::default(), &mut callbacks);
+    client.process_msgs(&mut callbacks);
+    assert_eq!(callbacks.execs.len(), 2);
+    assert_eq!(callbacks.execs[1].0, 9);
+    assert_eq!(callbacks.execs[1].1.component, component);
 }
 
 #[test]

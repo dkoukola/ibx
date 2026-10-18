@@ -55,6 +55,104 @@ impl EClient {
         Ok(receipt)
     }
 
+    /// Validate and queue one new native combo order under owned first-write
+    /// authorization. Contract discovery and combo setup may use the wire
+    /// first; `authorize` runs only at the actual first 35=D socket write.
+    ///
+    /// This is deliberately narrower than [`Self::place_order`]: the contract
+    /// must be a BAG, the order must be a new non-WhatIf order, and no local
+    /// API order is optimistically cached before authorization. The engine's
+    /// ordinary reports establish the broker-visible order after a write.
+    pub fn place_combo_order_guarded(
+        &self,
+        order_id: i64,
+        contract: &Contract,
+        order: &Order,
+        expected_connection: String,
+        authorize: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> Result<crate::protocol::order_write::OrderWriteReceipt, String> {
+        if !ClientCore::ids_fit("place_combo_order_guarded", &[order_id, contract.con_id]) {
+            return Err("combo order id and conId must fit the native 32-bit fields".into());
+        }
+        if !contract.sec_type.eq_ignore_ascii_case("BAG") {
+            return Err("place_combo_order_guarded requires a BAG contract".into());
+        }
+        if order.what_if {
+            return Err("place_combo_order_guarded does not accept WhatIf orders".into());
+        }
+        if self.core.is_order_tracked(order_id)
+            || self.shared.orders.get_order_info(order_id).is_some()
+        {
+            return Err("place_combo_order_guarded requires a new order id".into());
+        }
+
+        let order = &*ClientCore::with_canonical_order_type(order);
+        ClientCore::validate_order(order)?;
+        let contract_zone = self.shared.reference.time_zone_id(contract.con_id);
+        let account_pending =
+            ClientCore::order_account_pending(order, &self.shared.reference, &self.account_id);
+        let mut algo_warnings = Vec::new();
+        let refusal =
+            ClientCore::refusal_before_sending_for(order, &contract.exchange, account_pending)
+                .or_else(|| {
+                    ClientCore::algo_definition_refusal(
+                        order,
+                        &contract.exchange,
+                        &self.shared.reference,
+                        &mut algo_warnings,
+                    )
+                })
+                .or_else(|| {
+                    ClientCore::account_config_refusal(
+                        order,
+                        self.shared.reference.account_features().as_deref(),
+                        &self.account_id,
+                    )
+                })
+                .or_else(|| ClientCore::good_till_date_refusal(order, contract_zone.as_deref()))
+                .or_else(|| {
+                    ClientCore::condition_time_zone_refusal(order, contract_zone.as_deref())
+                })
+                .or_else(|| ClientCore::price_refusal(order))
+                .or_else(|| ClientCore::order_id_refusal(order_id))
+                .or_else(|| {
+                    self.core
+                        .refusal_for_order_id(order_id, order, &self.shared)
+                });
+        if let Some((code, message)) = refusal {
+            return Err(format!("{code}: {message}"));
+        }
+
+        let combo =
+            ClientCore::combo_order(contract, order, &self.shared.reference, &self.account_id)
+                .map_err(|(code, message)| format!("{code}: {message}"))?
+                .ok_or_else(|| "place_combo_order_guarded requires a BAG contract".to_string())?;
+        let sent = ClientCore::with_condition_times(order);
+        let con_id = if combo.smart_con_id > 0 {
+            combo.smart_con_id
+        } else {
+            contract.con_id
+        };
+        let instrument = self.core.order_instrument(
+            &self.control_tx,
+            order_id,
+            false,
+            con_id,
+            &contract.symbol,
+            &contract.exchange,
+            &contract.sec_type,
+            &contract.currency,
+        )?;
+        self.core
+            .note_currency(&self.control_tx, con_id, &contract.currency);
+        let request =
+            match ClientCore::build_combo_order_request(&sent, order_id, instrument, combo)? {
+                ControlCommand::Order(request) => request,
+                _ => return Err("combo order did not produce a native order command".into()),
+            };
+        self.send_order_guarded(request, expected_connection, authorize)
+    }
+
     /// Place an order. Matches `placeOrder` in C++.
     pub fn place_order(&self, order_id: i64, contract: &Contract, order: &Order) -> Result<(), String> {
         if !ClientCore::ids_fit("place_order", &[order_id, contract.con_id]) { return Ok(()); }

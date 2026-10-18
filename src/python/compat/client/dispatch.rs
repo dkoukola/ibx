@@ -6,17 +6,19 @@ use std::sync::atomic::Ordering;
 use pyo3::prelude::*;
 
 use crate::bridge::{Event, SharedState};
-use crate::client_core::{order_status_str, MdOut, MdTick};
+use crate::client_core::{MdOut, MdTick, order_status_str};
 use crate::types::*;
 
-use crate::api::types::{
-    Contract as ApiContract, Execution as ApiExecution,
-    CommissionAndFeesReport as ApiCommissionAndFeesReport,
-};
-use super::{send_cmd, EClient};
-use super::super::contract::{Contract, ContractDescription, ContractDetails, BarData, CommissionAndFeesReport, DepthMktDataDescriptionPy, Execution, Order, OrderState};
-use super::super::tick_types::*;
 use super::super::super::types::{PRICE_SCALE_F, QTY_SCALE_F};
+use super::super::contract::{
+    BarData, CommissionAndFeesReport, Contract, ContractDescription, ContractDetails,
+    DepthMktDataDescriptionPy, Execution, Order, OrderState,
+};
+use super::super::tick_types::*;
+use super::{EClient, send_cmd};
+use crate::api::types::{
+    CommissionAndFeesReport as ApiCommissionAndFeesReport, Execution as ApiExecution,
+};
 
 /// Call a Python wrapper method. An `Exception` it raises is logged and
 /// dropped, so one failing callback does not stop the dispatch loop. Any
@@ -428,26 +430,7 @@ impl EClient {
             let exec_contract = Contract::from_api(py, &api_contract)?;
 
             let c_py = Py::new(py, exec_contract)?.into_any();
-            let exec_obj = Execution {
-                exec_id: api_exec.exec_id.clone(),
-                time: api_exec.time.clone(),
-                acct_number: api_exec.acct_number.clone(),
-                exchange: api_exec.exchange.clone(),
-                side: api_exec.side.clone(),
-                shares: api_exec.shares,
-                price: api_exec.price,
-                perm_id,
-                client_id: api_exec.client_id,
-                order_id: shown,
-                liquidation: 0,
-                cum_qty: api_exec.cum_qty,
-                avg_price: api_exec.avg_price,
-                order_ref: api_exec.order_ref.clone(),
-                model_code: api_exec.model_code.clone(),
-                last_liquidity: api_exec.last_liquidity,
-                pending_price_revision: false,
-                ..Default::default()
-            };
+            let exec_obj = Execution::from_api(&api_exec);
 
             // Store for req_executions replay via shared core; a commission
             // report that came first is sent after exec_details.

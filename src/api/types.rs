@@ -756,6 +756,77 @@ impl Default for OrderState {
 
 // ── Execution ──
 
+/// The native role of one execution in a combination order.
+///
+/// Ordinary executions carry no combination metadata. A combo parent reports
+/// package-level order progress but is not an execution of any component
+/// position; combo legs carry their exact zero-based index, total leg count,
+/// and the server's parent execution id (native tag 6400). Unsupported combo
+/// metadata is never silently presented as an ordinary execution.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ExecutionComponent {
+    #[default]
+    Ordinary,
+    ComboParent {
+        leg_count: u32,
+    },
+    ComboLeg {
+        index: u32,
+        leg_count: u32,
+        parent_execution_id: String,
+    },
+    UnsupportedCombo {
+        raw_descriptor: Option<String>,
+        parent_execution_id: Option<String>,
+    },
+}
+
+impl ExecutionComponent {
+    pub fn role(&self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::ComboParent { .. } => "parent",
+            Self::ComboLeg { .. } => "leg",
+            Self::UnsupportedCombo { .. } => "unsupported",
+        }
+    }
+
+    pub fn leg_index(&self) -> Option<u32> {
+        match self {
+            Self::ComboLeg { index, .. } => Some(*index),
+            _ => None,
+        }
+    }
+
+    pub fn leg_count(&self) -> Option<u32> {
+        match self {
+            Self::ComboParent { leg_count } | Self::ComboLeg { leg_count, .. } => Some(*leg_count),
+            _ => None,
+        }
+    }
+
+    pub fn parent_execution_id(&self) -> Option<&str> {
+        match self {
+            Self::ComboLeg {
+                parent_execution_id,
+                ..
+            } => Some(parent_execution_id),
+            Self::UnsupportedCombo {
+                parent_execution_id,
+                ..
+            } => parent_execution_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn raw_descriptor(&self) -> Option<&str> {
+        match self {
+            Self::UnsupportedCombo { raw_descriptor, .. } => raw_descriptor.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 /// ibapi-compatible Execution (used in execDetails callback).
 #[derive(Clone, Debug, Default)]
 pub struct Execution {
@@ -779,6 +850,9 @@ pub struct Execution {
     pub ev_rule: String,
     pub ev_multiplier: f64,
     pub pending_price_revision: bool,
+    /// Native combo parent/leg identity. Defaults to ordinary for API-created
+    /// values and historical rows that carry no combo evidence.
+    pub component: ExecutionComponent,
 }
 
 // ── ExecutionFilter ──

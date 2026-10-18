@@ -3495,6 +3495,7 @@ impl ClientCore {
         {
             ex.order_ref = tracked.order.order_ref.clone();
         }
+        ex.component = fe.component.clone();
     }
 
     /// Attach a commission report to its stored execution (a higher revision

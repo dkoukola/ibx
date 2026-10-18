@@ -150,13 +150,56 @@ impl EClient {
 
     /// Queue a full revision, including after its order left the active book.
     #[doc(hidden)]
-    #[pyo3(signature = (con_id, exec_id, qty, price, tracked=false, replayed=false))]
-    fn _test_push_execution_revision(&self, con_id: i64, exec_id: String, qty: f64, price: f64, tracked: bool, replayed: bool) -> PyResult<()> {
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (con_id, exec_id, qty, price, tracked=false, replayed=false, combo_role="ordinary", combo_leg_index=None, combo_leg_count=None, combo_parent_execution_id=None, combo_raw_descriptor=None))]
+    fn _test_push_execution_revision(
+        &self,
+        con_id: i64,
+        exec_id: String,
+        qty: f64,
+        price: f64,
+        tracked: bool,
+        replayed: bool,
+        combo_role: &str,
+        combo_leg_index: Option<u32>,
+        combo_leg_count: Option<u32>,
+        combo_parent_execution_id: Option<String>,
+        combo_raw_descriptor: Option<String>,
+    ) -> PyResult<()> {
         let shared = self.shared_state()?;
-        let contract = crate::api::types::Contract { con_id, sec_type: "STK".into(), ..Default::default() };
+        let contract = crate::api::types::Contract {
+            con_id,
+            sec_type: "STK".into(),
+            ..Default::default()
+        };
+        let component = match combo_role {
+            "ordinary" => crate::api::types::ExecutionComponent::Ordinary,
+            "parent" => crate::api::types::ExecutionComponent::ComboParent {
+                leg_count: combo_leg_count
+                    .ok_or_else(|| PyRuntimeError::new_err("parent requires combo_leg_count"))?,
+            },
+            "leg" => crate::api::types::ExecutionComponent::ComboLeg {
+                index: combo_leg_index
+                    .ok_or_else(|| PyRuntimeError::new_err("leg requires combo_leg_index"))?,
+                leg_count: combo_leg_count
+                    .ok_or_else(|| PyRuntimeError::new_err("leg requires combo_leg_count"))?,
+                parent_execution_id: combo_parent_execution_id.clone().ok_or_else(|| {
+                    PyRuntimeError::new_err("leg requires combo_parent_execution_id")
+                })?,
+            },
+            "unsupported" => crate::api::types::ExecutionComponent::UnsupportedCombo {
+                raw_descriptor: combo_raw_descriptor,
+                parent_execution_id: combo_parent_execution_id,
+            },
+            _ => return Err(PyRuntimeError::new_err("unknown combo_role")),
+        };
         let metadata = crate::bridge::FillExec {
-            exec_id: exec_id.clone(), correction: true, replayed,
-            contract: Some(Box::new(contract.clone())), ..Default::default()
+            exec_id: exec_id.clone(),
+            correction: true,
+            replayed,
+            component,
+            contract: Some(Box::new(contract.clone())),
+            ..Default::default()
         };
         if tracked {
             shared.orders.push_fill_with_exec(Fill {

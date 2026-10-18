@@ -4,14 +4,12 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::sync::atomic::Ordering;
 
-use crate::api::types::{
-    Contract as ApiContract, Order as ApiOrder, ExecutionFilter,
-};
-use crate::client_core::{ClientCore, ModifyPlan};
+use super::super::contract::{Contract, Execution, Order};
+use super::{EClient, send_cmd};
+use crate::api::types::{Contract as ApiContract, ExecutionFilter};
 use crate::bridge::SharedState;
+use crate::client_core::{ClientCore, ModifyPlan};
 use crate::types::*;
-use super::{send_cmd, EClient};
-use super::super::contract::{Contract, Order, Execution};
 
 #[pymethods]
 impl EClient {
@@ -373,28 +371,7 @@ impl EClient {
         for se in rows {
             let c_py = Py::new(py, Contract::from_api(py, &se.contract)?)?.into_any();
 
-            let exec_obj = Execution {
-                exec_id: se.execution.exec_id.clone(),
-                time: se.execution.time.clone(),
-                acct_number: se.execution.acct_number.clone(),
-                exchange: se.execution.exchange.clone(),
-                side: se.execution.side.clone(),
-                shares: se.execution.shares,
-                price: se.execution.price,
-                perm_id: se.execution.perm_id,
-                client_id: se.execution.client_id,
-                order_id: se.execution.order_id,
-                liquidation: se.execution.liquidation,
-                cum_qty: se.execution.cum_qty,
-                avg_price: se.execution.avg_price,
-                order_ref: se.execution.order_ref.clone(),
-                ev_rule: se.execution.ev_rule.clone(),
-                ev_multiplier: se.execution.ev_multiplier,
-                model_code: se.execution.model_code.clone(),
-                last_liquidity: se.execution.last_liquidity,
-                pending_price_revision: se.execution.pending_price_revision,
-                submitter: String::new(),
-            };
+            let exec_obj = Execution::from_api(&se.execution);
             let exec_py = Py::new(py, exec_obj)?.into_any();
 
             self.wrapper.call_method(

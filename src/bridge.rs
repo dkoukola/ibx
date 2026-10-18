@@ -86,6 +86,8 @@ pub struct FillExec {
     /// A report of a combo order (ibx#470): the contract its execution
     /// shows, and for a leg report the leg's own execution values.
     pub combo: Option<Box<ComboExec>>,
+    /// Exact native combo role carried to live callbacks and execution replay.
+    pub component: api::ExecutionComponent,
     /// An execution of an order of another API client: kept for
     /// `req_executions`, with no live callback and no commission report
     /// (`jextend.ba.a(dq, aQ)`: the reports go to the order's client).
