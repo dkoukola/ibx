@@ -1,19 +1,26 @@
-//! Deliberately destructive paper-only evidence capture for one long equity option.
+//! Deliberately destructive paper-only evidence capture for one long equity-option call.
 //!
 //! This is not part of the normal SDK test suite. Both entry points are ignored and
 //! require exact semantic opt-ins, an exact expected paper account, an explicitly
 //! selected option/underlying pair, bounded operator-supplied limit prices, and a
-//! private durable JSONL receipt. The ordinary entry point buys at most one contract,
+//! private durable JSONL receipt. The ordinary entry point buys at most one call contract,
 //! physically reconnects, reconciles fresh broker history and positions, and closes
 //! only the exposure established by its own order references. The recovery entry
-//! point never creates an entry; it reloads the receipt, cancels receipt-owned working
-//! orders, freshly reconciles, and closes only a corroborated receipt-owned exposure.
+//! point never creates an entry; it reloads either prior standard-share call or put
+//! receipts, cancels receipt-owned working orders, freshly reconciles, and closes only
+//! a corroborated receipt-owned exposure.
 //!
 //! Credentials are read from a private JSON file with exactly this shape:
 //! `{"username":"...","password":"..."}`. They are never written to the receipt or
 //! printed. Native wire capture is disabled during authentication and admits only the
 //! reviewed incoming execution, commission, position, portfolio, account, and account
 //! completion message classes after the authenticated account matches exactly.
+//! A successful run additionally proves that every owned fill has a positive price at
+//! or better than its owned limit, that the SDK derives premium cash with the
+//! qualified 100 multiplier, and that every callback fee corresponds to a native
+//! commission amount and currency actually present on the wire. Broker average cost
+//! remains an opaque raw value, and derived fill cash is not called settled account
+//! cash.
 //!
 //! Required environment for the entry test:
 //! - `IB_OPTION_ACCOUNTING_OPT_IN=SEND_ONE_BOUNDED_PAPER_OPTION_AND_CLOSE_IT`
@@ -68,6 +75,7 @@ const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(60);
 const ORDER_TIMEOUT: Duration = Duration::from_secs(120);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
+const OPTION_PREMIUM_MULTIPLIER: f64 = 100.0;
 
 type Check<T> = Result<T, String>;
 
@@ -316,6 +324,15 @@ struct NativeExecution {
     correction_status: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NativeCommission {
+    session: u64,
+    sequence: u64,
+    execution_id: String,
+    amount: Option<String>,
+    currency: Option<String>,
+}
+
 #[derive(Default)]
 struct NativeTracker {
     sequence: u64,
@@ -324,6 +341,7 @@ struct NativeTracker {
     position_completions: Vec<(u64, u64, String)>,
     portfolio_rows: Vec<NativePortfolioRow>,
     option_execution_frames: Vec<NativeExecution>,
+    commissions: Vec<NativeCommission>,
 }
 
 struct WireCapture {
@@ -395,6 +413,24 @@ impl WireCapture {
             tracker.portfolio_rows.len(),
             tracker.option_execution_frames.len(),
         )
+    }
+
+    fn commission_marker(&self) -> (u64, u64, usize) {
+        let tracker = self.tracker.lock().unwrap();
+        (
+            self.session.load(Ordering::Acquire),
+            tracker.sequence,
+            tracker.commissions.len(),
+        )
+    }
+
+    fn commissions_since(&self, marker: (u64, u64, usize)) -> Vec<NativeCommission> {
+        let (session, sequence, index) = marker;
+        self.tracker.lock().unwrap().commissions[index..]
+            .iter()
+            .filter(|row| row.session == session && row.sequence > sequence)
+            .cloned()
+            .collect()
     }
 
     fn has_connection_image(
@@ -524,6 +560,15 @@ impl WireCapture {
                         correction_status,
                     });
                 }
+            }
+            "U" if field(fields, 6040) == Some("60") => {
+                tracker.commissions.push(NativeCommission {
+                    session,
+                    sequence,
+                    execution_id: field(fields, 17).unwrap_or_default().to_string(),
+                    amount: field(fields, 6378).map(str::to_string),
+                    currency: field(fields, 6381).map(str::to_string),
+                });
             }
             "U" if field(fields, 6040) == Some("75") => {
                 let expected_account = self.expected_account.lock().unwrap().clone();
@@ -1672,12 +1717,26 @@ fn contains_token(list: &str, expected: &str) -> bool {
         .any(|value| value.eq_ignore_ascii_case(expected))
 }
 
+#[derive(Clone, Copy)]
+enum QualificationPurpose {
+    NewLongCallEntry,
+    ExistingLongRecovery,
+}
+
+fn right_is_supported(right: &str, purpose: QualificationPurpose) -> bool {
+    matches!(
+        (right.to_ascii_uppercase().as_str(), purpose),
+        ("C" | "CALL", _) | ("P" | "PUT", QualificationPurpose::ExistingLongRecovery)
+    )
+}
+
 fn qualify_and_register(
     session: &Session,
     probe: &mut Probe,
     plan: &Plan,
     receipt: &Receipt,
     minimum_days_to_expiry: i64,
+    purpose: QualificationPurpose,
 ) -> Check<(Contract, InstrumentId)> {
     wire_capture().set_stage("qualification");
     let option_query = Contract {
@@ -1720,11 +1779,8 @@ fn qualify_and_register(
         && contract.currency.eq_ignore_ascii_case("USD")
         && contract.strike.is_finite()
         && contract.strike > 0.0
-        && matches!(
-            contract.right.to_ascii_uppercase().as_str(),
-            "C" | "CALL" | "P" | "PUT"
-        )
-        && multiplier == Some(100.0)
+        && right_is_supported(&contract.right, purpose)
+        && multiplier == Some(OPTION_PREMIUM_MULTIPLIER)
         && option.under_con_id as i64 == plan.underlying_con_id
         && option.under_symbol.eq_ignore_ascii_case(&plan.symbol)
         && option.under_sec_type.eq_ignore_ascii_case("STK")
@@ -1761,6 +1817,10 @@ fn qualify_and_register(
             "minimum_days_to_expiry": minimum_days_to_expiry,
             "native_multiplier": contract.multiplier,
             "settlement": "PhysicalDelivery",
+            "supported_shape": match purpose {
+                QualificationPurpose::NewLongCallEntry => "one new long standard-share call",
+                QualificationPurpose::ExistingLongRecovery => "one existing receipt-owned long standard-share call or put",
+            },
             "delivery_limitation": "positive native branch: physical settlement, multiplier 100, and direct STK with a nonempty native exchange and no basket markers; these fields still do not establish authoritative deliverable transformation units",
         }),
     );
@@ -1967,6 +2027,8 @@ fn submit_owned_limit(
 #[derive(Debug)]
 struct FillEvidence {
     execution_ids: BTreeSet<String>,
+    quoted_value: f64,
+    derived_premium_cash: f64,
 }
 
 fn execution_family(exec_id: &str) -> (&str, u64) {
@@ -1978,12 +2040,36 @@ fn execution_family(exec_id: &str) -> (&str, u64) {
     }
 }
 
+fn fill_price_at_or_better(side: &str, price: f64, limit: i64) -> bool {
+    if !price.is_finite() || price <= 0.0 {
+        return false;
+    }
+    let limit = limit as f64 / PRICE_SCALE as f64;
+    match side.to_ascii_uppercase().as_str() {
+        "BOT" | "BUY" => price <= limit,
+        "SLD" | "SELL" => price >= limit,
+        _ => false,
+    }
+}
+
+fn derived_premium_cash(side: &str, quoted_value: f64) -> Check<f64> {
+    if !quoted_value.is_finite() || quoted_value <= 0.0 {
+        return Err("owned execution quoted value must be positive and finite".into());
+    }
+    match side.to_ascii_uppercase().as_str() {
+        "BOT" | "BUY" => Ok(-quoted_value * OPTION_PREMIUM_MULTIPLIER),
+        "SLD" | "SELL" => Ok(quoted_value * OPTION_PREMIUM_MULTIPLIER),
+        _ => Err("owned execution has an unsupported side".into()),
+    }
+}
+
 fn owned_fill(
     rows: &[SeenExecution],
     start: usize,
     order_id: i64,
     order_ref: &str,
     side: &str,
+    limit: i64,
     plan: &Plan,
 ) -> Check<Option<FillEvidence>> {
     let mut executions = BTreeMap::<String, &Execution>::new();
@@ -2018,9 +2104,15 @@ fn owned_fill(
                 "execution replacement/correction is unsupported by this accounting probe".into(),
             );
         }
+        if !fill_price_at_or_better(side, row.execution.price, limit) {
+            return Err(
+                "owned execution price was not positive and at or better than its limit".into(),
+            );
+        }
         executions.insert(row.execution.exec_id.clone(), &row.execution);
     }
     let mut total = 0i64;
+    let mut quoted_value = 0.0;
     for execution in executions.values() {
         let fixed = api_quantity_fixed(execution.shares)?;
         if fixed <= 0 {
@@ -2029,6 +2121,10 @@ fn owned_fill(
         total = total
             .checked_add(fixed)
             .ok_or_else(|| "owned execution quantity overflow".to_string())?;
+        quoted_value += execution.shares * execution.price;
+        if !quoted_value.is_finite() {
+            return Err("owned execution quoted value is not finite".into());
+        }
     }
     if total == 0 {
         return Ok(None);
@@ -2036,20 +2132,35 @@ fn owned_fill(
     if total != QTY_SCALE {
         return Err("owned order did not fill exactly one native whole unit".into());
     }
+    let derived_cash = derived_premium_cash(side, quoted_value)?;
     Ok(Some(FillEvidence {
         execution_ids: executions.into_keys().collect(),
+        quoted_value,
+        derived_premium_cash: derived_cash,
     }))
+}
+
+struct OwnedFillExpectation<'a> {
+    order_id: i64,
+    order_ref: &'a str,
+    side: &'a str,
+    limit: i64,
+    execution_start: usize,
 }
 
 fn wait_owned_fill(
     session: &Session,
     probe: &mut Probe,
     plan: &Plan,
-    order_id: i64,
-    order_ref: &str,
-    side: &str,
-    execution_start: usize,
+    expectation: OwnedFillExpectation<'_>,
 ) -> Check<FillEvidence> {
+    let OwnedFillExpectation {
+        order_id,
+        order_ref,
+        side,
+        limit,
+        execution_start,
+    } = expectation;
     let deadline = Instant::now() + ORDER_TIMEOUT;
     loop {
         pump(session, probe)?;
@@ -2059,6 +2170,7 @@ fn wait_owned_fill(
             order_id,
             order_ref,
             side,
+            limit,
             plan,
         )? && probe
             .observed
@@ -2120,11 +2232,33 @@ fn cancel_owned_best_effort(session: &Session, receipt: &Receipt, order_id: i64,
     }
 }
 
+fn sdk_derived_fill_cash(session: &Session, con_id: i64) -> Check<f64> {
+    match session
+        .shared
+        .portfolio
+        .money_since_seed(&session.shared.reference)
+        .get(&con_id)
+        .copied()
+    {
+        None => Ok(0.0),
+        Some(Some(value)) if value.is_finite() => Ok(value),
+        Some(Some(_)) => Err("SDK derived fill cash is not finite".into()),
+        Some(None) => Err("SDK cannot establish option premium cash units".into()),
+    }
+}
+
+fn cash_values_correspond(actual: f64, expected: f64) -> bool {
+    actual.is_finite()
+        && expected.is_finite()
+        && (actual - expected).abs() <= 1e-8_f64.max(expected.abs() * 1e-12)
+}
+
 struct PostFillExpectation<'a> {
     marker: (u64, u64, usize, usize, usize),
     callback_position_start: usize,
     fill: &'a FillEvidence,
     order_ref: &'a str,
+    derived_cash_before: Check<f64>,
     expected_whole_quantity: i64,
     stage: &'a str,
 }
@@ -2141,9 +2275,11 @@ fn wait_post_fill_evidence(
         callback_position_start,
         fill,
         order_ref,
+        derived_cash_before,
         expected_whole_quantity,
         stage,
     } = expectation;
+    let derived_cash_before = derived_cash_before?;
     let expected_fixed = expected_whole_quantity * QTY_SCALE;
     let deadline = Instant::now() + CALLBACK_TIMEOUT;
     loop {
@@ -2171,6 +2307,14 @@ fn wait_post_fill_evidence(
             order_ref,
         );
         if raw_ready && callback == Some(expected_fixed) && sdk.position_fixed == expected_fixed {
+            let derived_cash_after = sdk_derived_fill_cash(session, plan.option_con_id)?;
+            let derived_cash_delta = derived_cash_after - derived_cash_before;
+            if !cash_values_correspond(derived_cash_delta, fill.derived_premium_cash) {
+                return Err(format!(
+                    "SDK derived fill cash delta {derived_cash_delta} did not equal reported premium cash {}",
+                    fill.derived_premium_cash
+                ));
+            }
             let raw = wire_capture()
                 .post_fill_portfolio_row(marker, expected_whole_quantity as f64)
                 .ok_or_else(|| "raw portfolio row disappeared".to_string())?;
@@ -2179,8 +2323,15 @@ fn wait_post_fill_evidence(
                 stage,
                 json!({
                     "execution_ids": fill.execution_ids,
+                    "reported_fill_quote_value": fill.quoted_value.to_string(),
+                    "qualified_premium_multiplier": OPTION_PREMIUM_MULTIPLIER.to_string(),
+                    "expected_sdk_derived_fill_cash_delta": fill.derived_premium_cash.to_string(),
+                    "sdk_derived_fill_cash_before": derived_cash_before.to_string(),
+                    "sdk_derived_fill_cash_after": derived_cash_after.to_string(),
+                    "sdk_derived_fill_cash_delta": derived_cash_delta.to_string(),
                     "sdk_position_fixed_qty_scale": sdk.position_fixed.to_string(),
                     "sdk_average_cost_raw_price_scale": sdk.avg_cost.to_string(),
+                    "sdk_average_cost_interpretation": "opaque raw broker value; no option unit normalization claimed",
                     "raw_portfolio": {
                         "native_session": raw.session,
                         "native_sequence": raw.sequence,
@@ -2194,6 +2345,7 @@ fn wait_post_fill_evidence(
                         "realized_pnl": raw.realized_pnl,
                     },
                     "account_row_caveat": "a later account row proves report timing only, not settled cash impact",
+                    "derived_cash_caveat": "SDK fill quantity times reported premium quote times qualified multiplier; not settled account cash",
                 }),
             );
             receipt.check()?;
@@ -2434,6 +2586,81 @@ struct HistoryState {
     net_fixed: i64,
     execution_ids: BTreeSet<String>,
     fees_complete: bool,
+    fee_error: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+struct VerifiedCommission {
+    execution_id: String,
+    amount: f64,
+    currency: String,
+}
+
+fn verify_commission_correspondence(
+    execution_ids: &BTreeSet<String>,
+    callbacks: &[CommissionAndFeesReport],
+    native: &[NativeCommission],
+) -> Check<Vec<VerifiedCommission>> {
+    let mut verified = Vec::new();
+    for execution_id in execution_ids {
+        let callback_rows = callbacks
+            .iter()
+            .filter(|row| row.exec_id == *execution_id)
+            .collect::<Vec<_>>();
+        let Some(first_callback) = callback_rows.first() else {
+            return Err(format!(
+                "owned execution {execution_id} has no commission callback"
+            ));
+        };
+        if !first_callback.commission_and_fees.is_finite()
+            || first_callback.commission_and_fees == f64::MAX
+            || first_callback.currency.is_empty()
+        {
+            return Err(format!(
+                "owned execution {execution_id} has an incomplete commission callback"
+            ));
+        }
+        if callback_rows.iter().skip(1).any(|row| {
+            row.commission_and_fees.to_bits() != first_callback.commission_and_fees.to_bits()
+                || row.currency != first_callback.currency
+        }) {
+            return Err(format!(
+                "owned execution {execution_id} has conflicting commission callbacks"
+            ));
+        }
+
+        let native_rows = native
+            .iter()
+            .filter(|row| row.execution_id == *execution_id)
+            .collect::<Vec<_>>();
+        if native_rows.is_empty() {
+            return Err(format!(
+                "owned execution {execution_id} has no native commission frame"
+            ));
+        }
+        let raw_corresponds = native_rows.iter().any(|row| {
+            let amount = row
+                .amount
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok());
+            amount.is_some_and(|amount| {
+                amount.is_finite()
+                    && amount != f64::MAX
+                    && amount.to_bits() == first_callback.commission_and_fees.to_bits()
+            }) && row.currency.as_deref() == Some(first_callback.currency.as_str())
+        });
+        if !raw_corresponds {
+            return Err(format!(
+                "owned execution {execution_id} has no explicit native amount/currency matching its callback"
+            ));
+        }
+        verified.push(VerifiedCommission {
+            execution_id: execution_id.clone(),
+            amount: first_callback.commission_and_fees,
+            currency: first_callback.currency.clone(),
+        });
+    }
+    Ok(verified)
 }
 
 fn query_owned_history(
@@ -2452,6 +2679,7 @@ fn query_owned_history(
     let req_id = next_request_id();
     let execution_start = probe.observed.executions.len();
     let commission_start = probe.observed.commissions.len();
+    let native_commission_marker = wire_capture().commission_marker();
     let error_start = probe.observed.errors.len();
     let filter = ExecutionFilter {
         acct_code: plan.expected_account.clone(),
@@ -2505,14 +2733,13 @@ fn query_owned_history(
         execution_ids,
     } = projection;
     let commissions = &probe.observed.commissions[commission_start..];
-    let fees_complete = execution_ids.iter().all(|execution_id| {
-        commissions.iter().any(|report| {
-            report.exec_id == *execution_id
-                && report.commission_and_fees.is_finite()
-                && report.commission_and_fees != f64::MAX
-                && !report.currency.is_empty()
-        })
-    });
+    let native_commissions = wire_capture().commissions_since(native_commission_marker);
+    let (verified_commissions, fee_error) =
+        match verify_commission_correspondence(&execution_ids, commissions, &native_commissions) {
+            Ok(rows) => (rows, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+    let fees_complete = fee_error.is_none();
     receipt.append(
         "history_reconciliation",
         stage,
@@ -2530,6 +2757,13 @@ fn query_owned_history(
             "sell_fixed_qty_scale": sells.to_string(),
             "net_fixed_qty_scale": net_fixed.to_string(),
             "fees_complete": fees_complete,
+            "fee_error": fee_error.as_deref(),
+            "fee_evidence": "each callback amount and currency exactly matches a native 6040=60 frame carrying tag 6378 and tag 6381",
+            "verified_native_commissions": verified_commissions.iter().map(|row| json!({
+                "exec_id": row.execution_id,
+                "commission_and_fees": row.amount.to_string(),
+                "currency": row.currency,
+            })).collect::<Vec<_>>(),
             "commissions": commissions.iter().filter(|report| execution_ids.contains(&report.exec_id)).map(|report| json!({
                 "exec_id": report.exec_id,
                 "commission_and_fees": report.commission_and_fees.to_string(),
@@ -2543,6 +2777,7 @@ fn query_owned_history(
         net_fixed,
         execution_ids,
         fees_complete,
+        fee_error,
     })
 }
 
@@ -2608,8 +2843,16 @@ fn reconcile_and_close(
             return Ok((None, required_final_execution_ids));
         }
 
-        let (_, instrument) = qualify_and_register(&session, &mut probe, plan, &receipt, 0)?;
+        let (_, instrument) = qualify_and_register(
+            &session,
+            &mut probe,
+            plan,
+            &receipt,
+            0,
+            QualificationPurpose::ExistingLongRecovery,
+        )?;
         wire_capture().set_stage("recovery_close");
+        let derived_cash_before = sdk_derived_fill_cash(&session, plan.option_con_id);
         let marker = wire_capture().marker();
         let execution_start = probe.observed.executions.len();
         let callback_position_start = probe.observed.positions.len();
@@ -2634,10 +2877,13 @@ fn reconcile_and_close(
             &session,
             &mut probe,
             plan,
-            order_id,
-            &order_ref,
-            "SLD",
-            execution_start,
+            OwnedFillExpectation {
+                order_id,
+                order_ref: &order_ref,
+                side: "SLD",
+                limit: close_limit,
+                execution_start,
+            },
         ) {
             Ok(fill) => fill,
             Err(error) => {
@@ -2656,6 +2902,7 @@ fn reconcile_and_close(
                 callback_position_start,
                 fill: &fill,
                 order_ref: &order_ref,
+                derived_cash_before,
                 expected_whole_quantity: 0,
                 stage: "recovery_close",
             },
@@ -2687,9 +2934,13 @@ fn reconcile_and_close(
             return Err("underlying position changed during the option probe; lifecycle accounting is unsupported".into());
         }
         if !history.fees_complete {
-            return Err(
-                "final owned execution history did not include fees for every execution".into(),
-            );
+            return Err(format!(
+                "final owned execution history did not prove native fees for every execution: {}",
+                history
+                    .fee_error
+                    .as_deref()
+                    .unwrap_or("unknown fee evidence gap")
+            ));
         }
         if let Some(gap) = close_evidence_gap.as_deref() {
             return Err(format!(
@@ -2733,14 +2984,20 @@ fn entry_acceptance_run() -> Check<()> {
         session.shutdown();
         return Err(error);
     }
-    let (contract, instrument) =
-        match qualify_and_register(&session, &mut probe, &plan, &receipt, 7) {
-            Ok(value) => value,
-            Err(error) => {
-                session.shutdown();
-                return Err(error);
-            }
-        };
+    let (contract, instrument) = match qualify_and_register(
+        &session,
+        &mut probe,
+        &plan,
+        &receipt,
+        7,
+        QualificationPurpose::NewLongCallEntry,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            session.shutdown();
+            return Err(error);
+        }
+    };
     if let Err(error) = capture_quote(&session, &mut probe, &contract, &receipt)
         .and_then(|()| ensure_no_selected_working(&session, &mut probe, &plan))
     {
@@ -2749,6 +3006,13 @@ fn entry_acceptance_run() -> Check<()> {
     }
 
     wire_capture().set_stage("entry");
+    let derived_cash_before = match sdk_derived_fill_cash(&session, plan.option_con_id) {
+        Ok(value) => value,
+        Err(error) => {
+            session.shutdown();
+            return Err(error);
+        }
+    };
     let marker = wire_capture().marker();
     let execution_start = probe.observed.executions.len();
     let callback_position_start = probe.observed.positions.len();
@@ -2772,10 +3036,13 @@ fn entry_acceptance_run() -> Check<()> {
                 &session,
                 &mut probe,
                 &plan,
-                order_id,
-                &entry_ref,
-                "BOT",
-                execution_start,
+                OwnedFillExpectation {
+                    order_id,
+                    order_ref: &entry_ref,
+                    side: "BOT",
+                    limit: entry_limit,
+                    execution_start,
+                },
             )
             .and_then(|fill| {
                 wait_post_fill_evidence(
@@ -2788,6 +3055,7 @@ fn entry_acceptance_run() -> Check<()> {
                         callback_position_start,
                         fill: &fill,
                         order_ref: &entry_ref,
+                        derived_cash_before: Ok(derived_cash_before),
                         expected_whole_quantity: 1,
                         stage: "entry",
                     },
@@ -2887,6 +3155,147 @@ fn operator_limits_are_exact_and_bounded() {
     assert!(parse_price("0.00999999").is_err());
     assert!(parse_price("1.00000001").is_err());
     assert!(parse_price("-0.1").is_err());
+}
+
+#[test]
+fn new_entry_is_call_only_while_existing_long_put_recovery_remains_available() {
+    assert!(right_is_supported(
+        "C",
+        QualificationPurpose::NewLongCallEntry
+    ));
+    assert!(right_is_supported(
+        "call",
+        QualificationPurpose::NewLongCallEntry
+    ));
+    assert!(!right_is_supported(
+        "P",
+        QualificationPurpose::NewLongCallEntry
+    ));
+    assert!(!right_is_supported(
+        "PUT",
+        QualificationPurpose::NewLongCallEntry
+    ));
+    assert!(!right_is_supported(
+        "",
+        QualificationPurpose::NewLongCallEntry
+    ));
+
+    assert!(right_is_supported(
+        "C",
+        QualificationPurpose::ExistingLongRecovery
+    ));
+    assert!(right_is_supported(
+        "put",
+        QualificationPurpose::ExistingLongRecovery
+    ));
+}
+
+#[test]
+fn owned_fill_prices_and_premium_cash_use_the_qualified_multiplier() {
+    let buy_limit = PRICE_SCALE / 2;
+    assert!(fill_price_at_or_better("BOT", 0.49, buy_limit));
+    assert!(fill_price_at_or_better("BUY", 0.5, buy_limit));
+    assert!(!fill_price_at_or_better("BOT", 0.51, buy_limit));
+    assert!(!fill_price_at_or_better("BOT", 0.0, buy_limit));
+    assert!(!fill_price_at_or_better("BOT", f64::NAN, buy_limit));
+    assert!(fill_price_at_or_better("SLD", 0.51, buy_limit));
+    assert!(fill_price_at_or_better("SELL", 0.5, buy_limit));
+    assert!(!fill_price_at_or_better("SLD", 0.49, buy_limit));
+
+    assert_eq!(derived_premium_cash("BOT", 0.5), Ok(-50.0));
+    assert_eq!(derived_premium_cash("SLD", 0.5), Ok(50.0));
+    assert!(derived_premium_cash("BOT", 0.0).is_err());
+    assert!(cash_values_correspond(-50.0, -50.0));
+    assert!(!cash_values_correspond(-0.5, -50.0));
+}
+
+fn commission(exec_id: &str, amount: f64, currency: &str) -> CommissionAndFeesReport {
+    CommissionAndFeesReport {
+        exec_id: exec_id.into(),
+        commission_and_fees: amount,
+        currency: currency.into(),
+        realized_pnl: f64::MAX,
+        yield_amount: f64::MAX,
+        yield_redemption_date: String::new(),
+    }
+}
+
+#[test]
+fn fee_completeness_requires_raw_amount_currency_and_callback_correspondence() {
+    let capture = WireCapture::new();
+    capture.session.store(7, Ordering::Release);
+    let marker = capture.commission_marker();
+    capture.note(&[
+        (35, "U".into()),
+        (6040, "60".into()),
+        (17, "fill.01".into()),
+        (6378, "1.25".into()),
+        (6381, "USD".into()),
+    ]);
+    let native = capture.commissions_since(marker);
+    assert_eq!(native.len(), 1);
+    assert_eq!(native[0].amount.as_deref(), Some("1.25"));
+    assert_eq!(native[0].currency.as_deref(), Some("USD"));
+    assert_eq!(
+        verify_commission_correspondence(
+            &BTreeSet::from(["fill.01".to_string()]),
+            &[commission("fill.01", 1.25, "USD")],
+            &native,
+        ),
+        Ok(vec![VerifiedCommission {
+            execution_id: "fill.01".into(),
+            amount: 1.25,
+            currency: "USD".into(),
+        }])
+    );
+
+    let explicit_zero = [NativeCommission {
+        session: 7,
+        sequence: 2,
+        execution_id: "zero.01".into(),
+        amount: Some("0".into()),
+        currency: Some("USD".into()),
+    }];
+    assert!(
+        verify_commission_correspondence(
+            &BTreeSet::from(["zero.01".to_string()]),
+            &[commission("zero.01", 0.0, "USD")],
+            &explicit_zero,
+        )
+        .is_ok()
+    );
+
+    let synthetic_zero = [NativeCommission {
+        session: 7,
+        sequence: 2,
+        execution_id: "fill.01".into(),
+        amount: None,
+        currency: Some("USD".into()),
+    }];
+    assert!(
+        verify_commission_correspondence(
+            &BTreeSet::from(["fill.01".to_string()]),
+            &[commission("fill.01", 0.0, "USD")],
+            &synthetic_zero,
+        )
+        .is_err()
+    );
+    assert!(
+        verify_commission_correspondence(
+            &BTreeSet::from(["fill.01".to_string()]),
+            &[commission("fill.01", 1.25, "EUR")],
+            &native,
+        )
+        .is_err()
+    );
+    assert!(
+        verify_commission_correspondence(
+            &BTreeSet::from(["fill.01".to_string()]),
+            &[commission("fill.01", 1.5, "USD")],
+            &native,
+        )
+        .is_err()
+    );
 }
 
 #[test]
