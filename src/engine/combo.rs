@@ -169,7 +169,21 @@ impl Combo {
             let sign = if leg.buy { 1.0 } else { -1.0 };
             sum += sign * leg.ratio as f64 * leg.multiplier * (*price as f64 / PRICE_SCALE as f64);
         }
-        let multiplier = if self.multiplier > 0.0 { self.multiplier } else { 1.0 };
+        // `jcomb.aZ.a(double, jmarketrules.n, double...)` selects the
+        // server's combo multiplier for SMART and the greatest leg
+        // multiplier for a directed combo. Directed combos skip the
+        // 6040=36 request, so using `self.multiplier` there would turn a
+        // 0.05 option spread into 5.00.
+        let multiplier = if is_smart(&self.exchange) {
+            self.multiplier
+        } else {
+            self.legs
+                .iter()
+                .map(|leg| leg.multiplier)
+                .reduce(f64::max)
+                .unwrap_or(1.0)
+        };
+        let multiplier = if multiplier > 0.0 { multiplier } else { 1.0 };
         Some(((sum / multiplier) * PRICE_SCALE as f64).round() as Price)
     }
 }
@@ -769,6 +783,131 @@ mod tests {
         assert_eq!(combo.symbol(), "QQQ,SPY");
         assert_eq!(combo.legs_descrip(), "756733|1,320227571|-1");
         assert_eq!(text(&combo.order_block()), "6079=2|6080=756733|6081=1|6082=1|6080=320227571|6081=1|6082=0|6175=0|6134=9");
+    }
+
+    #[test]
+    fn directed_option_combo_uses_the_greatest_leg_multiplier() {
+        let px = |v: f64| (v * PRICE_SCALE as f64).round() as Price;
+        let spec = ComboSpec {
+            exchange: "CBOE".into(),
+            currency: "USD".into(),
+            symbol: "SOUN".into(),
+            smart_con_id: 0,
+            legs: vec![
+                ComboLegSpec {
+                    con_id: 5,
+                    ratio: 1,
+                    buy: true,
+                    exchange: "CBOE".into(),
+                },
+                ComboLegSpec {
+                    con_id: 6,
+                    ratio: 1,
+                    buy: false,
+                    exchange: "CBOE".into(),
+                },
+            ],
+            leg_prices: vec![px(0.06), px(0.01)],
+            routing_attrs: Vec::new(),
+            non_guaranteed: false,
+        };
+        let setup = Setup {
+            key: ComboKey::of(&spec),
+            spec: spec.clone(),
+            step: Step::Confirm,
+            req_id: String::new(),
+            bag: Some(Bag {
+                con_id: 7,
+                ics_con_id: 0,
+                trading_class: "COMB".into(),
+                types: RthTypes::default(),
+            }),
+            legs: vec![
+                Leg {
+                    con_id: 5,
+                    ratio: 1,
+                    buy: true,
+                    exchange: "CBOE".into(),
+                    symbol: "SOUN".into(),
+                    sec_type: "OPT".into(),
+                    currency: "USD".into(),
+                    multiplier: 100.0,
+                },
+                Leg {
+                    con_id: 6,
+                    ratio: 1,
+                    buy: false,
+                    exchange: "CBOE".into(),
+                    symbol: "SOUN".into(),
+                    sec_type: "OPT".into(),
+                    currency: "USD".into(),
+                    multiplier: 50.0,
+                },
+            ],
+            // Directed combos never make the server multiplier request.
+            multiplier: 1.0,
+            waiting: Vec::new(),
+        };
+
+        let combo = setup_combo(&setup);
+        assert_eq!(
+            combo.multiplier, 1.0,
+            "directed setup sends no 6040=36 request"
+        );
+        assert_eq!(
+            combo.price_of_legs(&combo.leg_prices(&spec)),
+            Some(px(0.055))
+        );
+
+        let mut standard = combo.clone();
+        standard.legs[1].multiplier = 100.0;
+        assert_eq!(
+            standard.price_of_legs(&standard.leg_prices(&spec)),
+            Some(px(0.05))
+        );
+
+        let mut mixed = combo.clone();
+        mixed.legs[0].sec_type = "FOP".into();
+        mixed.legs[0].multiplier = 50.0;
+        mixed.legs[1].sec_type = "FUT".into();
+        mixed.legs[1].multiplier = 10.0;
+        assert_eq!(
+            mixed.price_of_legs(&mixed.leg_prices(&spec)),
+            Some(px(0.058))
+        );
+        let block = mixed.order_block();
+        assert_eq!(
+            block.first().map(|(tag, value)| (*tag, value.as_str())),
+            Some((231, "1")),
+            "the directed price denominator must not replace the wire multiplier"
+        );
+
+        let mut book = ComboBook::default();
+        book.built.insert(ComboKey::of(&spec), combo.clone());
+        assert!(matches!(book.ready(1, &spec, "T"), Ready::Built(c)
+            if c.price_of_legs(&c.leg_prices(&spec)) == Some(px(0.055))));
+
+        let mut smart_spec = spec.clone();
+        smart_spec.exchange = "SMART".into();
+        smart_spec.smart_con_id = 8;
+        let smart = setup_combo(&Setup {
+            key: ComboKey::of(&smart_spec),
+            spec: smart_spec,
+            step: Step::Confirm,
+            req_id: String::new(),
+            bag: None,
+            legs: combo.legs,
+            multiplier: 25.0,
+            waiting: Vec::new(),
+        });
+        assert_eq!(
+            smart.multiplier, 25.0,
+            "SMART retains the authoritative 6040=36 reply"
+        );
+        assert_eq!(
+            smart.price_of_legs(&smart.leg_prices(&spec)),
+            Some(px(0.22))
+        );
     }
 
     // ibx#470, the set-up of the first combo order of a session (captured
