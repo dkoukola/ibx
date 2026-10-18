@@ -57,6 +57,28 @@ fn reply(shared: &SharedState, connection: String, result: Result<Vec<RichOrderI
 }
 
 impl HistoryRequests {
+    /// Mark an active completed-order query incomplete when a row it would
+    /// otherwise collect is instead quarantined as an option lifecycle
+    /// report. Explicit foreign-account rows are unrelated; absent or empty
+    /// account identity cannot support a successful omission.
+    pub(super) fn reject_option_lifecycle(&mut self, fields: &HashMap<u32, String>, account: &str) {
+        let Some(active) = self.active.as_mut().filter(|active| !active.timed_out) else {
+            return;
+        };
+        if fields.get(&6556).is_some_and(|id| !id.starts_with("PT."))
+            || fields.get(&20).map(String::as_str) != Some("3")
+            || fields.get(&11).map(String::as_str) == Some("*")
+            || fields
+                .get(&1)
+                .is_some_and(|reported| !reported.is_empty() && reported != account)
+        {
+            return;
+        }
+        active.rows.error.get_or_insert_with(|| {
+            "Completed-order history contains unsupported option lifecycle report".into()
+        });
+    }
+
     pub(super) fn queue(&mut self, connection: String, api_only: bool, start: String, end: String) {
         self.waiting.push_back(Request {
             connection,
@@ -94,6 +116,30 @@ impl HistoryRequests {
                 }
             }
         }
+    }
+
+    /// A quarantined lifecycle status is still the wire reply to an earlier
+    /// per-order status request. Retire that bookkeeping without projecting
+    /// the report into ordinary order state. An explicitly foreign account
+    /// cannot acknowledge this account's pending request; absent identity is
+    /// attributable because the native H reply is not request-tagged.
+    pub(super) fn option_lifecycle_status_reply(
+        &mut self,
+        fields: &HashMap<u32, String>,
+        account: &str,
+    ) {
+        if fields
+            .get(&1)
+            .is_some_and(|reported| !reported.is_empty() && reported != account)
+        {
+            return;
+        }
+        self.status_reply(fields);
+    }
+
+    #[cfg(test)]
+    pub(super) fn status_reply_pending(&self) -> bool {
+        !self.status_pending.is_empty()
     }
 
     pub(super) fn disconnected(&mut self, shared: &SharedState) {
@@ -668,6 +714,45 @@ mod tests {
         assert!(shared.orders.drain_fills().is_empty());
         assert!(shared.orders.drain_order_updates().is_empty());
         assert!(shared.orders.drain_open_orders().is_empty());
+    }
+
+    #[test]
+    fn option_lifecycle_fails_only_an_eligible_own_or_unattributed_completed_query() {
+        for (reported_account, status, expect_failure) in [
+            (None, "3", true),
+            (Some(""), "3", true),
+            (Some("DU123456"), "3", true),
+            (Some("OTHER"), "3", false),
+            (Some("DU123456"), "0", false),
+        ] {
+            let shared = SharedState::new();
+            let mut state = active();
+            let mut lifecycle = working_row(1, "20260102-12:00:00");
+            lifecycle.insert(20, status.into());
+            lifecycle.insert(6809, "101".into());
+            lifecycle.remove(&1);
+            if let Some(reported_account) = reported_account {
+                lifecycle.insert(1, reported_account.into());
+            }
+            state.reject_option_lifecycle(&lifecycle, "DU123456");
+            assert_eq!(
+                state.report(&capture()[2], &shared, "DU123456"),
+                HistoryReport::End
+            );
+            let reply = shared
+                .orders
+                .drain_completed_history_replies()
+                .pop()
+                .unwrap();
+            match (reply.result, expect_failure) {
+                (Err(message), true) => assert_eq!(
+                    message,
+                    "Completed-order history contains unsupported option lifecycle report"
+                ),
+                (Ok(rows), false) => assert!(rows.is_empty()),
+                (result, expected) => panic!("unexpected result {result:?}, failure={expected}"),
+            }
+        }
     }
 
     #[test]

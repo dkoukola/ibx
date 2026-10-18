@@ -333,7 +333,9 @@ impl EClient {
     }
 
     pub(super) fn answer_completed_orders(&self, wrapper: &mut impl Wrapper) {
-        for reply in self.shared.orders.drain_completed_history_replies() {
+        let replies = self.shared.orders.drain_completed_history_replies();
+        self.dispatch_option_lifecycles(wrapper);
+        for reply in replies {
             let current = || self.is_connected()
                 && self.shared.orders.execution_history_matches(&reply.connection);
             let rows = match reply.result {
@@ -410,7 +412,9 @@ impl EClient {
     }
 
     pub(super) fn answer_execution_ranges(&self, wrapper: &mut impl Wrapper) {
-        for reply in self.shared.orders.drain_execution_range_replies() {
+        let replies = self.shared.orders.drain_execution_range_replies();
+        self.dispatch_option_lifecycles(wrapper);
+        for reply in replies {
             let current = || self.is_connected() && self.shared.orders.execution_history_matches(&reply.connection);
             let rows = match reply.result {
                 Ok(rows) => rows,

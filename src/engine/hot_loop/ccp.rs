@@ -9,8 +9,9 @@ use crate::protocol::connection::{Connection, Frame};
 use crate::protocol::fix;
 use crate::protocol::fixcomp;
 use crate::types::{
-    CompletedOrder, Fill, MidnightSeed, NewsBulletin, OrderId, ReqId,
-    PositionInfo, Price, Qty, Side, PRICE_SCALE, QTY_SCALE,
+    CompletedOrder, Fill, MidnightSeed, NewsBulletin, OptionLifecycleClassification,
+    OptionLifecycleObservation, OrderId, PRICE_SCALE, PositionInfo, Price, QTY_SCALE, Qty, ReqId,
+    Side,
 };
 use crossbeam_channel::Sender;
 
@@ -165,6 +166,40 @@ pub(super) fn is_execution_print(parsed: &std::collections::HashMap<u32, String>
                 && matches!(parsed.get(&20).map(String::as_str), Some("1" | "2"))
                 && parsed.get(&19).is_some_and(|reference| !reference.is_empty()))
         })
+}
+
+/// Decode a non-default passive option lifecycle observation. Missing tag
+/// 6809 and its canonical ordinary value `-1` stay on the ordinary execution
+/// path. Every other present value is quarantined, including unknown and
+/// malformed values.
+fn option_lifecycle_observation(
+    parsed: &std::collections::HashMap<u32, String>,
+) -> Option<OptionLifecycleObservation> {
+    let raw_value = parsed.get(&6809)?.clone();
+    if raw_value == "-1" {
+        return None;
+    }
+    let classification = match raw_value.parse::<i64>() {
+        Ok(1) => OptionLifecycleClassification::Exercise,
+        Ok(2) => OptionLifecycleClassification::Lapse,
+        Ok(3) => OptionLifecycleClassification::DoNothing,
+        Ok(100) => OptionLifecycleClassification::Assigned,
+        Ok(101) => OptionLifecycleClassification::AutoExercise,
+        Ok(102) => OptionLifecycleClassification::Expired,
+        Ok(103) => OptionLifecycleClassification::Netting,
+        Ok(200) => OptionLifecycleClassification::ExDividendExercise,
+        _ => OptionLifecycleClassification::Unknown,
+    };
+    let nonempty = |tag| parsed.get(&tag).filter(|value| !value.is_empty()).cloned();
+    Some(OptionLifecycleObservation {
+        raw_value,
+        classification,
+        account: nonempty(1),
+        contract_id: parsed.get(&6008).and_then(|value| value.parse().ok()),
+        execution_id: nonempty(17),
+        order_id: nonempty(11),
+        api_order_id: parsed.get(&6121).and_then(|value| value.parse().ok()),
+    })
 }
 
 /// The report of a combo's leg (ibx#470): 6013 gives the leg index (-1
@@ -1455,6 +1490,23 @@ impl CcpState {
         let what_if_flag = parsed.get(&6091).and_then(|v| v.parse::<i64>().ok()).is_some_and(|v| v > 0);
         if what_if_clord || what_if_flag {
             Self::handle_what_if(parsed, context, shared, event_tx);
+            return;
+        }
+        // Exercise/lapse/assignment-style reports are not ordinary fills or
+        // order states. Surface their exact classification before any history,
+        // identity, order, position, or cash projection can consume them.
+        if let Some(observation) = option_lifecycle_observation(parsed) {
+            shared
+                .orders
+                .push_option_lifecycle_observation(observation.clone());
+            emit(event_tx, Event::OptionLifecycle(observation));
+            self.execution_ranges
+                .reject_option_lifecycle(parsed, account_id);
+            self.completed_history
+                .reject_option_lifecycle(parsed, account_id);
+            self.completed_history
+                .option_lifecycle_status_reply(parsed, account_id);
+            shared.notify();
             return;
         }
         // Dated 8080 reports and in-range possible resends answering an
@@ -8145,6 +8197,191 @@ mod tests {
             (32, last_qty.to_string()), (31, last_px.into()), (14, cum_qty.to_string()),
             (6, avg_px.into()), (151, leaves.to_string()), (6008, "1005".into()),
         ].into_iter().collect()
+    }
+
+    #[test]
+    fn option_lifecycle_classification_preserves_raw_value_and_observed_identity() {
+        let mut fields = std::collections::HashMap::from([
+            (1, "DU123".to_string()),
+            (11, "C42.7".to_string()),
+            (17, "execution.01".to_string()),
+            (6008, "882133170".to_string()),
+            (6121, "42".to_string()),
+        ]);
+        assert!(option_lifecycle_observation(&fields).is_none());
+        fields.insert(6809, "-1".into());
+        assert!(option_lifecycle_observation(&fields).is_none());
+
+        for (raw, expected) in [
+            ("1", OptionLifecycleClassification::Exercise),
+            ("2", OptionLifecycleClassification::Lapse),
+            ("3", OptionLifecycleClassification::DoNothing),
+            ("100", OptionLifecycleClassification::Assigned),
+            ("101", OptionLifecycleClassification::AutoExercise),
+            ("102", OptionLifecycleClassification::Expired),
+            ("103", OptionLifecycleClassification::Netting),
+            ("200", OptionLifecycleClassification::ExDividendExercise),
+            ("-2", OptionLifecycleClassification::Unknown),
+            ("malformed", OptionLifecycleClassification::Unknown),
+            ("999", OptionLifecycleClassification::Unknown),
+        ] {
+            fields.insert(6809, raw.into());
+            let observation = option_lifecycle_observation(&fields).unwrap();
+            assert_eq!(observation.raw_value, raw);
+            assert_eq!(observation.classification, expected);
+            assert_eq!(observation.account.as_deref(), Some("DU123"));
+            assert_eq!(observation.contract_id, Some(882_133_170));
+            assert_eq!(observation.execution_id.as_deref(), Some("execution.01"));
+            assert_eq!(observation.order_id.as_deref(), Some("C42.7"));
+            assert_eq!(observation.api_order_id, Some(42));
+        }
+
+        fields.insert(6809, String::new());
+        fields.insert(1, String::new());
+        fields.insert(6008, "not-an-id".into());
+        fields.insert(17, String::new());
+        fields.insert(11, String::new());
+        fields.insert(6121, "not-an-id".into());
+        let unknown = option_lifecycle_observation(&fields).unwrap();
+        assert_eq!(
+            unknown.classification,
+            OptionLifecycleClassification::Unknown
+        );
+        assert_eq!(unknown.account, None);
+        assert_eq!(unknown.contract_id, None);
+        assert_eq!(unknown.execution_id, None);
+        assert_eq!(unknown.order_id, None);
+        assert_eq!(unknown.api_order_id, None);
+    }
+
+    #[test]
+    fn tracked_and_untracked_option_lifecycle_reports_are_passive_observations() {
+        for tracked in [true, false] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            let mut report = if tracked {
+                let instrument = context.market.try_register(1005).unwrap();
+                context.insert_order(crate::types::Order::new(
+                    90,
+                    instrument,
+                    Side::Buy,
+                    300,
+                    15 * PRICE_SCALE,
+                    b'2',
+                    b'0',
+                    0,
+                ));
+                let mut report = fill_frame("lifecycle.01", 300, "10", 300, "10", 0);
+                report.insert(1, "DU123".into());
+                report.insert(6121, "90".into());
+                report
+            } else {
+                untracked_fill_frame("lifecycle.01")
+            };
+            report.insert(6809, if tracked { "1" } else { "100" }.into());
+            let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+            ccp.handle_exec_report(&report, &mut context, &shared, &Some(event_tx), "DU123");
+
+            let observations = shared.orders.drain_option_lifecycle_observations();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(
+                observations[0].execution_id.as_deref(),
+                Some("lifecycle.01")
+            );
+            assert!(matches!(
+                event_rx.try_recv(),
+                Ok(Event::OptionLifecycle(ref observation))
+                    if observation == &observations[0]
+            ));
+            assert!(shared.orders.drain_fills_with_exec().is_empty());
+            assert!(shared.orders.drain_untracked_executions().is_empty());
+            assert!(shared.orders.drain_order_updates().is_empty());
+            assert!(shared.orders.drain_completed_orders().is_empty());
+            assert!(shared.portfolio.position_infos().is_empty());
+            assert!(
+                shared
+                    .portfolio
+                    .money_since_seed(&shared.reference)
+                    .is_empty()
+            );
+            assert!(shared.portfolio.realized_since_seed().is_empty());
+            assert!(ccp.seen_exec_ids.is_empty());
+            assert!(ccp.last_exec.is_none());
+            if tracked {
+                assert!(context.order(90).is_some(), "lifecycle report does not finish the order");
+                assert_eq!(context.position_fixed(0), 0);
+            } else {
+                assert_eq!(context.market.count(), 0, "lifecycle report does not register a contract");
+            }
+        }
+    }
+
+    #[test]
+    fn option_lifecycle_status_retires_only_matching_account_wire_bookkeeping() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        ccp.completed_history.sent_status("90.0");
+
+        let mut foreign = fill_frame("lifecycle.foreign", 0, "10", 0, "10", 300);
+        foreign.insert(1, "OTHER".into());
+        foreign.insert(20, "3".into());
+        foreign.insert(6809, "102".into());
+        ccp.handle_exec_report(&foreign, &mut context, &shared, &None, "DU123");
+        assert!(ccp.completed_history.status_reply_pending());
+
+        let mut unattributed = foreign;
+        unattributed.remove(&1);
+        unattributed.insert(17, "lifecycle.own".into());
+        ccp.handle_exec_report(&unattributed, &mut context, &shared, &None, "DU123");
+        assert!(!ccp.completed_history.status_reply_pending());
+        assert!(shared.orders.drain_fills_with_exec().is_empty());
+        assert!(shared.orders.drain_untracked_executions().is_empty());
+        assert!(shared.orders.drain_order_updates().is_empty());
+        assert!(shared.portfolio.position_infos().is_empty());
+        assert!(
+            shared
+                .portfolio
+                .money_since_seed(&shared.reference)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn absent_and_canonical_none_option_lifecycle_values_remain_ordinary_fills() {
+        for raw in [None, Some("-1")] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            let instrument = context.market.try_register(1005).unwrap();
+            context.insert_order(crate::types::Order::new(
+                90,
+                instrument,
+                Side::Buy,
+                300,
+                15 * PRICE_SCALE,
+                b'2',
+                b'0',
+                0,
+            ));
+            let mut report = fill_frame("ordinary.01", 300, "10", 300, "10", 0);
+            if let Some(raw) = raw {
+                report.insert(6809, raw.into());
+            }
+
+            ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU123");
+
+            assert!(
+                shared
+                    .orders
+                    .drain_option_lifecycle_observations()
+                    .is_empty()
+            );
+            assert_eq!(shared.orders.drain_fills_with_exec().len(), 1);
+            assert_eq!(context.position_fixed(instrument), 300 * QTY_SCALE);
+        }
     }
 
     #[test]

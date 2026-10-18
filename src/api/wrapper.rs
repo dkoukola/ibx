@@ -46,6 +46,10 @@ pub trait Wrapper {
     fn exec_details(&mut self, req_id: i64, contract: &Contract, execution: &Execution) {}
     fn exec_details_end(&mut self, req_id: i64) {}
     fn commission_and_fees_report(&mut self, report: &CommissionAndFeesReport) {}
+    /// A non-default option lifecycle report that was quarantined from
+    /// ordinary fill/history/accounting processing. Missing tag 6809 and its
+    /// canonical ordinary value `-1` do not produce this callback.
+    fn option_lifecycle(&mut self, observation: &crate::types::OptionLifecycleObservation) {}
 
     // ── Account ──
 
@@ -308,6 +312,12 @@ pub mod tests {
         }
         fn commission_and_fees_report(&mut self, report: &CommissionAndFeesReport) {
             self.events.push(format!("commission:{}:{}:{}", report.exec_id, report.commission_and_fees, report.currency));
+        }
+        fn option_lifecycle(&mut self, observation: &crate::types::OptionLifecycleObservation) {
+            self.events.push(format!(
+                "option_lifecycle:{}:{:?}",
+                observation.raw_value, observation.classification
+            ));
         }
         fn historical_data(&mut self, req_id: i64, bar: &BarData) {
             self.events.push(format!("historical_data:{req_id}:{}", bar.date));

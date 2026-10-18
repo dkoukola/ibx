@@ -176,6 +176,9 @@ pub enum Event {
     TbtMidPoint(TbtMidPoint),
     /// What-if order response (margin/commission preview).
     WhatIf(WhatIfResponse),
+    /// A non-default option exercise/lapse/assignment-style report that was
+    /// quarantined from ordinary order, fill, position, and cash accounting.
+    OptionLifecycle(OptionLifecycleObservation),
     /// Real-time news headline.
     News(TickNews),
     /// Historical bar data.
@@ -679,6 +682,9 @@ pub struct OrderState {
     /// Executions of orders the engine does not track, for the execution
     /// store only: no live fill callback without a known order (ibx#314).
     untracked_executions: Mutex<Vec<(api::Contract, api::Execution, FillExec)>>,
+    /// Non-default or unknown option lifecycle reports. These are passive
+    /// observations and never share the ordinary fill queue.
+    option_lifecycle_observations: Mutex<Vec<OptionLifecycleObservation>>,
     order_updates: Mutex<Vec<OrderUpdate>>,
     cancel_rejects: Mutex<Vec<CancelReject>>,
     /// Errors raised before sending: (request or order id as the API gives
@@ -729,6 +735,7 @@ impl OrderState {
             fills: Mutex::new(Vec::with_capacity(64)),
             commission_reports: Mutex::new(Vec::with_capacity(64)),
             untracked_executions: Mutex::new(Vec::new()),
+            option_lifecycle_observations: Mutex::new(Vec::new()),
             order_updates: Mutex::new(Vec::with_capacity(64)),
             cancel_rejects: Mutex::new(Vec::with_capacity(16)),
             order_errors: Mutex::new(Vec::new()),
@@ -881,6 +888,15 @@ impl OrderState {
         self.untracked_executions.lock().unwrap().drain(..).collect()
     }
 
+    /// Drain passive non-default option lifecycle observations.
+    pub fn drain_option_lifecycle_observations(&self) -> Vec<OptionLifecycleObservation> {
+        self.option_lifecycle_observations
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect()
+    }
+
     pub fn drain_commission_reports(&self) -> Vec<api::CommissionAndFeesReport> {
         self.commission_reports.lock().unwrap().drain(..).collect()
     }
@@ -1026,6 +1042,14 @@ impl OrderState {
 
     #[doc(hidden)] pub fn push_untracked_execution(&self, contract: api::Contract, execution: api::Execution, exec: FillExec) {
         self.untracked_executions.lock().unwrap().push((contract, execution, exec));
+    }
+
+    #[doc(hidden)]
+    pub fn push_option_lifecycle_observation(&self, observation: OptionLifecycleObservation) {
+        self.option_lifecycle_observations
+            .lock()
+            .unwrap()
+            .push(observation);
     }
 
     #[doc(hidden)] pub fn push_commission_report(&self, report: api::CommissionAndFeesReport) {

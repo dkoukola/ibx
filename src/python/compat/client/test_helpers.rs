@@ -174,6 +174,33 @@ impl EClient {
         Ok(())
     }
 
+    /// Queue an unknown lifecycle observation to exercise Python callback
+    /// forwarding without projecting an ordinary fill (test-only).
+    #[doc(hidden)]
+    #[pyo3(signature = (raw_value, account=None, contract_id=None, execution_id=None, order_id=None, api_order_id=None))]
+    fn _test_push_unknown_option_lifecycle(
+        &self,
+        raw_value: String,
+        account: Option<String>,
+        contract_id: Option<i64>,
+        execution_id: Option<String>,
+        order_id: Option<String>,
+        api_order_id: Option<i64>,
+    ) -> PyResult<()> {
+        self.shared_state()?
+            .orders
+            .push_option_lifecycle_observation(OptionLifecycleObservation {
+                raw_value,
+                classification: OptionLifecycleClassification::Unknown,
+                account,
+                contract_id,
+                execution_id,
+                order_id,
+                api_order_id,
+            });
+        Ok(())
+    }
+
     /// Run the second-factor code provider built from `callable` the way the
     /// login runs it: on its own thread, with the interpreter lock released
     /// by the caller (ibx#208).

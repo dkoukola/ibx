@@ -63,6 +63,22 @@ impl EWrapper {
 
     fn commission_and_fees_report(&self, _commission_and_fees_report: Py<PyAny>) {}
 
+    /// Passive non-default option lifecycle report. The scalar identity
+    /// fields mirror Rust's `OptionLifecycleObservation`; no quantity, price,
+    /// cash, or resulting-contract semantics are implied.
+    #[allow(clippy::too_many_arguments)]
+    fn option_lifecycle(
+        &self,
+        _raw_value: &str,
+        _classification: &str,
+        _account: Option<String>,
+        _contract_id: Option<i64>,
+        _execution_id: Option<String>,
+        _order_id: Option<String>,
+        _api_order_id: Option<i64>,
+    ) {
+    }
+
     // ── Account ──
 
     fn update_account_value(&self, _key: &str, _value: &str, _currency: &str, _account_name: &str) {}

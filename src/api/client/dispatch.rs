@@ -16,10 +16,24 @@ impl EClient {
     /// Drain all SharedState queues and dispatch to the Wrapper.
     /// Call this in a loop — it is the Rust equivalent of C++ `EReader::processMsgs()`.
     pub fn process_msgs(&self, wrapper: &mut impl Wrapper) {
+        self.dispatch_option_lifecycles(wrapper);
         self.dispatch_orders(wrapper);
         self.dispatch_quotes(wrapper);
         self.dispatch_data(wrapper);
+        // Surface standalone observations that arrived while the other
+        // callback queues were being drained in this pass.
+        self.dispatch_option_lifecycles(wrapper);
         self.dispatch_connection(wrapper);
+    }
+
+    /// No shared-state lock is held across the callback. Callers that first
+    /// take a fill/history batch invoke this once more before publishing that
+    /// batch, so an earlier lifecycle observation cannot be overtaken by its
+    /// successful-looking ordinary callback/end marker.
+    pub(super) fn dispatch_option_lifecycles(&self, wrapper: &mut impl Wrapper) {
+        for observation in self.shared.orders.drain_option_lifecycle_observations() {
+            wrapper.option_lifecycle(&observation);
+        }
     }
 
     // ── Connection Dispatch ──
@@ -62,7 +76,9 @@ impl EClient {
         let executions = self.core.released_execution_requests(&self.shared);
         // Fills → order_status + exec_details. The commission report comes
         // later, from its own server frame (ibx#471).
-        for (fill, fill_exec) in self.shared.orders.drain_fills_with_exec() {
+        let fills = self.shared.orders.drain_fills_with_exec();
+        self.dispatch_option_lifecycles(wrapper);
+        for (fill, fill_exec) in fills {
             let price_f = fill.price as f64 / PRICE_SCALE_F;
             let status = if fill.remaining_fixed == 0 { "Filled" } else { self.core.partial_fill_status(fill.order_id) };
             let (perm_id, parent_id) = self.shared.orders.get_order_info(fill.order_id)
@@ -164,7 +180,9 @@ impl EClient {
 
         // Executions of orders this session does not track: stored for
         // req_executions, with no live callback (ibx#314).
-        for (contract, mut exec, fill_exec) in self.shared.orders.drain_untracked_executions() {
+        let untracked = self.shared.orders.drain_untracked_executions();
+        self.dispatch_option_lifecycles(wrapper);
+        for (contract, mut exec, fill_exec) in untracked {
             let order_id = exec.order_id;
             self.core.apply_fill_exec(&mut exec, &fill_exec, order_id);
             // An execution of another client's order: nothing for this one.
@@ -280,10 +298,12 @@ impl EClient {
             }
         }
 
+        self.dispatch_option_lifecycles(wrapper);
         for request in released {
             self.answer_open_orders(request, open_history.as_deref(), wrapper);
         }
         if let Some((history, requests)) = executions {
+            self.dispatch_option_lifecycles(wrapper);
             for (req_id, filter) in requests {
                 self.answer_executions(&history, req_id, &filter, wrapper);
             }

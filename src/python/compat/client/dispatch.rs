@@ -41,6 +41,41 @@ pub(crate) fn callback_raised(py: Python<'_>, method: &str, e: PyErr) -> PyResul
 }
 
 impl EClient {
+    fn dispatch_option_lifecycles(
+        &self,
+        py: Python<'_>,
+        shared: &Arc<SharedState>,
+    ) -> PyResult<()> {
+        for observation in shared.orders.drain_option_lifecycle_observations() {
+            let classification = match observation.classification {
+                OptionLifecycleClassification::Exercise => "Exercise",
+                OptionLifecycleClassification::Lapse => "Lapse",
+                OptionLifecycleClassification::DoNothing => "DoNothing",
+                OptionLifecycleClassification::Assigned => "Assigned",
+                OptionLifecycleClassification::AutoExercise => "AutoExercise",
+                OptionLifecycleClassification::Expired => "Expired",
+                OptionLifecycleClassification::Netting => "Netting",
+                OptionLifecycleClassification::ExDividendExercise => "ExDividendExercise",
+                OptionLifecycleClassification::Unknown => "Unknown",
+            };
+            call_wrapper!(
+                self.wrapper,
+                py,
+                "option_lifecycle",
+                (
+                    observation.raw_value.as_str(),
+                    classification,
+                    observation.account,
+                    observation.contract_id,
+                    observation.execution_id,
+                    observation.order_id,
+                    observation.api_order_id,
+                )
+            );
+        }
+        Ok(())
+    }
+
     /// The callbacks of market data requests beside their ticks (ibx#444).
     fn md_notices(&self, py: Python<'_>, notices: Vec<crate::client_core::MdNotice>) -> PyResult<()> {
         use crate::client_core::MdNotice;
@@ -199,10 +234,18 @@ impl EClient {
         Ok(())
     }
 
-    fn dispatch_completed_history(&self, py: Python<'_>, shared: &Arc<SharedState>) -> PyResult<()> {
-        for reply in shared.orders.drain_completed_history_replies() {
-            let current = || self.position_client_current(shared)
-                && shared.orders.execution_history_matches(&reply.connection);
+    fn dispatch_completed_history(
+        &self,
+        py: Python<'_>,
+        shared: &Arc<SharedState>,
+    ) -> PyResult<()> {
+        let replies = shared.orders.drain_completed_history_replies();
+        self.dispatch_option_lifecycles(py, shared)?;
+        for reply in replies {
+            let current = || {
+                self.position_client_current(shared)
+                    && shared.orders.execution_history_matches(&reply.connection)
+            };
             let rows = match reply.result {
                 Ok(rows) => rows,
                 Err(message) => {
@@ -211,11 +254,16 @@ impl EClient {
                 }
             };
             for row in rows {
-                if !current() { break; }
+                if !current() {
+                    break;
+                }
                 let order_id = row.order.order_id;
                 let view = crate::client_core::OrderView {
-                    contract: row.contract, order: row.order, state: row.order_state,
-                    last_fill_price: 0.0, client_id: 0,
+                    contract: row.contract,
+                    order: row.order,
+                    state: row.order_state,
+                    last_fill_price: 0.0,
+                    client_id: 0,
                 };
                 self.send_order_view(py, order_id, &view, true)?;
             }
@@ -298,6 +346,8 @@ impl EClient {
             self.connected.store(false, Ordering::Release);
         }
 
+        self.dispatch_option_lifecycles(py, shared)?;
+
         // Link lost / restored and farm status (ibx#399): errors with id -1.
         // The session stays open across a lost link.
         for (code, msg) in shared.drain_connection_notices() {
@@ -317,6 +367,7 @@ impl EClient {
         // Drain fills -> execDetails + orderStatus. The commission report
         // comes later, from its own server frame (ibx#471).
         let fills = shared.orders.drain_fills_with_exec();
+        self.dispatch_option_lifecycles(py, shared)?;
         for (fill, fill_exec) in fills {
             // As the reference: BOT / SLD (ibx#474).
             let side_str = match fill.side {
@@ -444,7 +495,9 @@ impl EClient {
 
         // Executions of orders this session does not track: stored for
         // req_executions, with no live callback (ibx#314).
-        for (contract, mut exec, fill_exec) in shared.orders.drain_untracked_executions() {
+        let untracked = shared.orders.drain_untracked_executions();
+        self.dispatch_option_lifecycles(py, shared)?;
+        for (contract, mut exec, fill_exec) in untracked {
             let order_id = exec.order_id;
             self.core.apply_fill_exec(&mut exec, &fill_exec, order_id);
             // An execution of another client's order: nothing for this one.
@@ -476,6 +529,7 @@ impl EClient {
         }
 
         if let Some((history_id, requests)) = execution_requests {
+            self.dispatch_option_lifecycles(py, shared)?;
             for (req_id, filter) in requests {
                 if let Err(e) = self.answer_executions(py, shared, &history_id, req_id, &filter) {
                     callback_raised(py, "exec_details", e)?;
@@ -521,30 +575,66 @@ impl EClient {
             self.wrapper.call_method0(py, "open_order_end")?;
         }
 
+        self.dispatch_option_lifecycles(py, shared)?;
         for request in released {
             if let Err(e) = self.answer_open_orders(py, shared, request, open_history.as_deref()) {
                 callback_raised(py, "open_order", e)?;
             }
         }
         self.dispatch_completed_history(py, shared)?;
-        for reply in shared.orders.drain_execution_range_replies() {
-            let current = || self.position_client_current(shared) && shared.orders.execution_history_matches(&reply.connection);
+        let replies = shared.orders.drain_execution_range_replies();
+        self.dispatch_option_lifecycles(py, shared)?;
+        for reply in replies {
+            let current = || {
+                self.position_client_current(shared)
+                    && shared.orders.execution_history_matches(&reply.connection)
+            };
             let rows = match reply.result {
                 Ok(rows) => rows,
-                Err(message) => { call_wrapper!(self.wrapper, py, "error", (reply.req_id, 10159, message.as_str(), "")); continue; }
+                Err(message) => {
+                    call_wrapper!(
+                        self.wrapper,
+                        py,
+                        "error",
+                        (reply.req_id, 10159, message.as_str(), "")
+                    );
+                    continue;
+                }
             };
             for row in &rows {
-                if !current() { break; }
+                if !current() {
+                    break;
+                }
                 self.send_execution_rows(py, reply.req_id, std::slice::from_ref(row))?;
             }
-            for commission in rows.iter().filter_map(|row| row.commission_and_fees.as_ref()) {
-                if !current() { break; }
+            for commission in rows
+                .iter()
+                .filter_map(|row| row.commission_and_fees.as_ref())
+            {
+                if !current() {
+                    break;
+                }
                 self.send_commission_report(py, commission)?;
             }
-            if current() { call_wrapper!(self.wrapper, py, "exec_details_end", (reply.req_id,)); }
-            else { call_wrapper!(self.wrapper, py, "error", (reply.req_id, 10159, "Execution history connection changed during delivery", "")); }
+            if current() {
+                call_wrapper!(self.wrapper, py, "exec_details_end", (reply.req_id,));
+            } else {
+                call_wrapper!(
+                    self.wrapper,
+                    py,
+                    "error",
+                    (
+                        reply.req_id,
+                        10159,
+                        "Execution history connection changed during delivery",
+                        ""
+                    )
+                );
+            }
         }
         shared.orders.retire_local_completed_orders(retired);
+
+        self.dispatch_option_lifecycles(py, shared)?;
 
         // Requests that joined a subscription, and subscriptions the
         // server rejected (ibx#444, ibx#447).
@@ -1124,6 +1214,7 @@ impl EClient {
             }
         }
 
+        self.dispatch_option_lifecycles(py, shared)?;
         Ok(())
     }
 }

@@ -3036,6 +3036,140 @@ fn account_reads_shared_state() {
 //  process_msgs — fills, order updates, cancel rejects (existing)
 // ═══════════════════════════════════════════════════════════════════
 
+fn lifecycle_observation() -> crate::types::OptionLifecycleObservation {
+    crate::types::OptionLifecycleObservation {
+        raw_value: "100".into(),
+        classification: crate::types::OptionLifecycleClassification::Assigned,
+        account: Some("DU123".into()),
+        contract_id: Some(882_133_170),
+        execution_id: Some("lifecycle.01".into()),
+        order_id: Some("42.0".into()),
+        api_order_id: Some(42),
+    }
+}
+
+#[test]
+fn option_lifecycle_callback_precedes_ordinary_fill_and_history_failure() {
+    let (client, _rx, shared) = test_client();
+    shared
+        .orders
+        .push_option_lifecycle_observation(lifecycle_observation());
+    shared.orders.push_fill(Fill {
+        cum_qty_fixed: QTY_SCALE,
+        avg_price: 150 * PRICE_SCALE,
+        instrument: 0,
+        order_id: 42,
+        side: Side::Buy,
+        price: 150 * PRICE_SCALE,
+        qty_fixed: QTY_SCALE,
+        remaining_fixed: 0,
+        commission: 0,
+        timestamp_ns: 123_456_789,
+    });
+    shared
+        .orders
+        .push_execution_range_reply(crate::bridge::ExecutionHistoryReply {
+            connection: "fixture".into(),
+            req_id: 7,
+            result: Err("Execution history contains unsupported option lifecycle report".into()),
+        });
+
+    let mut wrapper = RecordingWrapper::default();
+    client.process_msgs(&mut wrapper);
+
+    let lifecycle = wrapper
+        .events
+        .iter()
+        .position(|event| event == "option_lifecycle:100:Assigned")
+        .unwrap();
+    let fill = wrapper
+        .events
+        .iter()
+        .position(|event| event.starts_with("exec_details:-1:"))
+        .unwrap();
+    let history = wrapper
+        .events
+        .iter()
+        .position(|event| event.starts_with("error:7:10159:"))
+        .unwrap();
+    assert!(
+        lifecycle < fill && lifecycle < history,
+        "{:?}",
+        wrapper.events
+    );
+    assert!(
+        !wrapper
+            .events
+            .iter()
+            .any(|event| event == "exec_details_end:7")
+    );
+}
+
+#[test]
+fn lifecycle_arriving_during_dispatch_precedes_a_later_taken_history_reply() {
+    let (client, _rx, shared) = test_client();
+    shared.orders.push_fill(Fill {
+        cum_qty_fixed: QTY_SCALE,
+        avg_price: 150 * PRICE_SCALE,
+        instrument: 0,
+        order_id: 42,
+        side: Side::Buy,
+        price: 150 * PRICE_SCALE,
+        qty_fixed: QTY_SCALE,
+        remaining_fixed: 0,
+        commission: 0,
+        timestamp_ns: 123_456_789,
+    });
+    struct Inject {
+        shared: Arc<SharedState>,
+        events: Vec<String>,
+    }
+    impl Wrapper for Inject {
+        fn exec_details(&mut self, req_id: i64, _: &Contract, _: &crate::api::types::Execution) {
+            self.events.push(format!("exec:{req_id}"));
+            if req_id == -1 {
+                self.shared
+                    .orders
+                    .push_option_lifecycle_observation(lifecycle_observation());
+                self.shared.orders.push_completed_history_reply(
+                    crate::bridge::CompletedHistoryReply {
+                        connection: "fixture".into(),
+                        result: Ok(Vec::new()),
+                    },
+                );
+                self.shared.orders.push_execution_range_reply(
+                    crate::bridge::ExecutionHistoryReply {
+                        connection: "fixture".into(),
+                        req_id: 8,
+                        result: Ok(Vec::new()),
+                    },
+                );
+            }
+        }
+        fn option_lifecycle(&mut self, observation: &crate::types::OptionLifecycleObservation) {
+            self.events
+                .push(format!("lifecycle:{}", observation.raw_value));
+        }
+        fn exec_details_end(&mut self, req_id: i64) {
+            self.events.push(format!("end:{req_id}"));
+        }
+        fn completed_orders_end(&mut self) {
+            self.events.push("completed_end".into());
+        }
+    }
+    let mut wrapper = Inject {
+        shared: shared.clone(),
+        events: Vec::new(),
+    };
+
+    client.process_msgs(&mut wrapper);
+
+    assert_eq!(
+        wrapper.events,
+        ["exec:-1", "lifecycle:100", "completed_end", "end:8"]
+    );
+}
+
 #[test]
 fn process_msgs_dispatches_fill() {
     let (client, _rx, shared) = test_client();

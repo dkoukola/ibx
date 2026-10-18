@@ -74,6 +74,48 @@ pub enum OrderStatus {
     ApiCancelled,
 }
 
+/// Broker classification of an option lifecycle execution report (FIX tag
+/// 6809). These values describe why the report exists; they do not establish
+/// transformation quantities, cash, or a resulting contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionLifecycleClassification {
+    Exercise,
+    Lapse,
+    DoNothing,
+    Assigned,
+    AutoExercise,
+    Expired,
+    Netting,
+    ExDividendExercise,
+    /// A present value the installed Gateway does not classify, including
+    /// partial exercise (`-2`) and malformed or future values.
+    Unknown,
+}
+
+/// Passive observation of a non-default option lifecycle report.
+///
+/// This is emitted only when FIX tag 6809 is present and is not the canonical
+/// ordinary value `-1`. Identity fields are retained only when the report
+/// supplies them. There are deliberately no quantity, price, cash, or
+/// resulting-contract fields: the report is quarantined from ordinary fill
+/// accounting until those lifecycle semantics are established independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionLifecycleObservation {
+    /// Exact tag 6809 text as received.
+    pub raw_value: String,
+    pub classification: OptionLifecycleClassification,
+    /// FIX account (tag 1), when present and non-empty.
+    pub account: Option<String>,
+    /// Numeric broker contract id (tag 6008), when present and valid.
+    pub contract_id: Option<i64>,
+    /// Native execution id (tag 17), when present and non-empty.
+    pub execution_id: Option<String>,
+    /// Exact native ClOrdID (tag 11), when present and non-empty.
+    pub order_id: Option<String>,
+    /// API order id (tag 6121), when present and valid.
+    pub api_order_id: Option<i64>,
+}
+
 impl OrderStatus {
     /// Lifecycle progress rank for the monotonic status guard (ibx#212).
     /// A stale or reordered frame must not move an order's reported status

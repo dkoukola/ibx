@@ -56,6 +56,25 @@ fn reply(shared: &SharedState, request: &Request, result: Result<Vec<StoredExecu
 }
 
 impl ExecutionRequests {
+    /// Fail the one active native U72 request when it encounters a passive
+    /// option lifecycle report for its authenticated account. U72 rows carry
+    /// no row-level request id, so a concurrent own-account lifecycle report
+    /// cannot be omitted while still claiming a complete successful result.
+    pub(super) fn reject_option_lifecycle(&mut self, fields: &HashMap<u32, String>, account: &str) {
+        let Some(active) = self.active.as_mut().filter(|active| !active.timed_out) else {
+            return;
+        };
+        if fields
+            .get(&1)
+            .is_some_and(|reported| !reported.is_empty() && reported != account)
+        {
+            return;
+        }
+        active.failure.get_or_insert_with(|| {
+            "Execution history contains unsupported option lifecycle report".into()
+        });
+    }
+
     pub(super) fn queue(
         &mut self,
         connection: String,
@@ -512,6 +531,49 @@ mod tests {
             assert!(error.result.is_err());
             assert!(requests.waiting.is_empty());
         }
+    }
+
+    #[test]
+    fn option_lifecycle_fails_only_the_active_own_or_unattributed_u72_query() {
+        for (reported_account, expect_failure) in [
+            (None, true),
+            (Some(""), true),
+            (Some("DU123456"), true),
+            (Some("OTHER"), false),
+        ] {
+            let shared = SharedState::new();
+            let mut requests = active();
+            let mut lifecycle = HashMap::from([(6809, "100".into())]);
+            if let Some(reported_account) = reported_account {
+                lifecycle.insert(1, reported_account.into());
+            }
+            requests.reject_option_lifecycle(&lifecycle, "DU123456");
+            let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
+            assert!(requests.report(&end, &shared, "DU123456"));
+            let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+            match (reply.result, expect_failure) {
+                (Err(message), true) => assert_eq!(
+                    message,
+                    "Execution history contains unsupported option lifecycle report"
+                ),
+                (Ok(rows), false) => assert!(rows.is_empty()),
+                (result, expected) => panic!("unexpected result {result:?}, failure={expected}"),
+            }
+        }
+    }
+
+    #[test]
+    fn option_lifecycle_does_not_emit_a_second_reply_after_u72_timeout() {
+        let shared = SharedState::new();
+        let mut requests = active();
+        requests.active.as_mut().unwrap().timed_out = true;
+        requests.reject_option_lifecycle(
+            &HashMap::from([(6809, "2".into()), (1, "DU123456".into())]),
+            "DU123456",
+        );
+        let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
+        assert!(requests.report(&end, &shared, "DU123456"));
+        assert!(shared.orders.drain_execution_range_replies().is_empty());
     }
 
     fn deliver(
