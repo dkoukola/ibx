@@ -2201,6 +2201,15 @@ pub enum ControlCommand {
     Order(OrderRequest),
     /// Register an instrument from external caller (bridge mode).
     RegisterInstrument { con_id: i64, symbol: String, sec_type: String, exchange: String, reply_tx: Option<RegistrationReply> },
+    /// Atomically register an exact option contract with the native terms
+    /// its orders require. The engine verifies the contract against its
+    /// resolved native definition before allocating or changing a slot. The
+    /// reply retains [`RegistrationReply`]'s admission semantics; terms and
+    /// currency are installed before a later control command is processed.
+    RegisterOptionInstrument {
+        contract: Box<crate::api::types::Contract>,
+        reply_tx: Option<RegistrationReply>,
+    },
     /// A slot of its own for the contract of an order given without a
     /// conId: the engine looks the contract up before the order goes out,
     /// as the reference does for each API order (ibx#486).

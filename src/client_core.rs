@@ -30,6 +30,13 @@ const MDT_REALTIME: i32 = 1;
 /// The market data type of frozen data (ibx#447).
 const MDT_FROZEN: i32 = 2;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactOptionTermsError {
+    Incomplete,
+    Unresolved,
+    Conflict,
+}
+
 // ── Tick type constants matching ibapi ──
 
 pub const TICK_BID: i32 = 1;
@@ -4997,6 +5004,69 @@ impl ClientCore {
         ))
     }
 
+    /// Validate an exact option contract against the native definition whose
+    /// order terms were retained when the definition was resolved. This is
+    /// metadata validation only; it grants no order-submission authority.
+    fn resolved_option_terms(
+        contract: &ApiContract,
+        reference: &crate::bridge::ReferenceState,
+    ) -> Result<crate::engine::market_state::OptionTerms, ExactOptionTermsError> {
+        let maturity = &contract.last_trade_date_or_contract_month;
+        let multiplier = contract.multiplier.parse::<f64>().ok();
+        let call = match contract.right.to_ascii_uppercase().as_str() {
+            "C" | "CALL" => Some(true),
+            "P" | "PUT" => Some(false),
+            _ => None,
+        };
+        let representable = |value: f64| {
+            value.is_finite()
+                && value > 0.0
+                && value < i64::MAX as f64 / crate::types::PRICE_SCALE as f64
+        };
+        if !contract.sec_type.eq_ignore_ascii_case("OPT")
+            || contract.con_id <= 0
+            || contract.symbol.is_empty()
+            || contract.currency.is_empty()
+            || contract.exchange.is_empty()
+            || !matches!(maturity.len(), 6 | 8)
+            || !maturity.bytes().all(|b| b.is_ascii_digit())
+            || !representable(contract.strike)
+            || !multiplier.is_some_and(representable)
+            || call.is_none()
+        {
+            return Err(ExactOptionTermsError::Incomplete);
+        }
+        let (identity, terms) = reference
+            .option_order_terms(contract.con_id)
+            .ok_or(ExactOptionTermsError::Unresolved)?;
+        if terms.call != call.unwrap()
+            || terms.strike != contract.strike
+            || Some(terms.multiplier) != multiplier
+            || contract.symbol != identity.symbol
+            || contract.currency != identity.currency
+            || (maturity != &identity.last_trade_date_or_contract_month
+                && maturity != &terms.maturity)
+        {
+            return Err(ExactOptionTermsError::Conflict);
+        }
+        Ok(terms)
+    }
+
+    /// The authoritative terms for an exact option instrument registration.
+    /// The hot loop calls this before allocating or changing an instrument
+    /// slot, so a missing or conflicting definition cannot leave partial
+    /// registration state behind.
+    pub(crate) fn option_registration_terms(
+        contract: &ApiContract,
+        reference: &crate::bridge::ReferenceState,
+    ) -> Result<crate::engine::market_state::OptionTerms, String> {
+        Self::resolved_option_terms(contract, reference).map_err(|error| match error {
+            ExactOptionTermsError::Incomplete => "Option instrument registration requires an exact positive conId, symbol, currency, exchange, maturity, right, strike and multiplier",
+            ExactOptionTermsError::Unresolved => "Option instrument registration requires resolved native contract details",
+            ExactOptionTermsError::Conflict => "Option instrument registration conflicts with resolved native option terms",
+        }.to_string())
+    }
+
     /// Simulation-only support for an exact, fully specified option. Keep
     /// ordinary option submissions behind the existing execution guard.
     pub fn option_preview_terms(
@@ -5008,32 +5078,13 @@ impl ClientCore {
             Self::validate_order_contract(&contract.sec_type)?;
             return Ok(None);
         }
-        let maturity = &contract.last_trade_date_or_contract_month;
-        let multiplier = contract.multiplier.parse::<f64>().ok();
-        let call = match contract.right.to_ascii_uppercase().as_str() {
-            "C" | "CALL" => Some(true),
-            "P" | "PUT" => Some(false),
-            _ => None,
-        };
-        let representable = |value: f64| value.is_finite() && value > 0.0
-            && value < i64::MAX as f64 / crate::types::PRICE_SCALE as f64;
-        if contract.con_id <= 0 || contract.symbol.is_empty() || contract.currency.is_empty()
-            || contract.exchange.is_empty()
-            || !matches!(maturity.len(), 6 | 8) || !maturity.bytes().all(|b| b.is_ascii_digit())
-            || !representable(contract.strike) || !multiplier.is_some_and(representable)
-            || call.is_none()
-        {
-            return Err("Option what-if requires an exact positive conId, symbol, currency, exchange, maturity, right, strike and multiplier".into());
-        }
-        let (identity, terms) = reference.option_order_terms(contract.con_id)
-            .ok_or_else(|| "Option what-if requires resolved native contract details before previewing".to_string())?;
-        if terms.call != call.unwrap() || terms.strike != contract.strike || Some(terms.multiplier) != multiplier
-            || contract.symbol != identity.symbol || contract.currency != identity.currency
-            || (maturity != &identity.last_trade_date_or_contract_month && maturity != &terms.maturity)
-        {
-            return Err("Option what-if contract conflicts with resolved native option terms".into());
-        }
-        Ok(Some(terms))
+        Self::resolved_option_terms(contract, reference)
+            .map(Some)
+            .map_err(|error| match error {
+                ExactOptionTermsError::Incomplete => "Option what-if requires an exact positive conId, symbol, currency, exchange, maturity, right, strike and multiplier",
+                ExactOptionTermsError::Unresolved => "Option what-if requires resolved native contract details before previewing",
+                ExactOptionTermsError::Conflict => "Option what-if contract conflicts with resolved native option terms",
+            }.to_string())
     }
 
     /// The combo of a BAG order, read and checked as the reference reads a

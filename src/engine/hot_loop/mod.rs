@@ -1591,6 +1591,34 @@ impl HotLoop {
                 ControlCommand::RegisterInstrument { con_id, symbol, sec_type, exchange, reply_tx } => {
                     self.register_or_reject(con_id, symbol, &sec_type, &exchange, &reply_tx);
                 }
+                ControlCommand::RegisterOptionInstrument { contract, reply_tx } => {
+                    match crate::client_core::ClientCore::option_registration_terms(
+                        &contract,
+                        &self.shared.reference,
+                    ) {
+                        Ok(terms) => {
+                            if let Some(id) = self.register_or_reject(
+                                contract.con_id,
+                                contract.symbol.clone(),
+                                "OPT",
+                                &contract.exchange,
+                                &reply_tx,
+                            ) {
+                                // Registration admission is published by the
+                                // shared helper first. These private fields are
+                                // installed before this handler can process a
+                                // later order from the control FIFO.
+                                self.context.market.set_currency(id, &contract.currency);
+                                self.context.market.set_option_terms(id, terms);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(tx) = reply_tx {
+                                let _ = tx.send(Err(error));
+                            }
+                        }
+                    }
+                }
                 ControlCommand::RegisterOrderContract { symbol, sec_type, exchange, currency, reply_tx } => {
                     // Its conId comes from the lookup before the order
                     // goes out (ibx#486).
@@ -4956,6 +4984,11 @@ mod tag_cleaner_tests {
 #[cfg(test)]
 mod registration_timeout_tests {
     use super::*;
+    use std::time::Duration;
+
+    use crate::api::types::Contract as ApiContract;
+    use crate::control::contracts::{ContractDefinition, OptionRight, SecurityType};
+    use crate::engine::market_state::OptionTerms;
     use crate::types::RegistrationReply;
 
     fn subscription(reply: RegistrationReply) -> ControlCommand {
@@ -4964,6 +4997,68 @@ mod registration_timeout_tests {
             last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
             mode_9887: 0, snapshot: true, reply_tx: Some(reply),
         }
+    }
+
+    fn exact_option(shared: &SharedState, call: bool) -> ApiContract {
+        let con_id = if call { 920261546 } else { 920261547 };
+        shared
+            .reference
+            .cache_option_order_terms(&ContractDefinition {
+                con_id,
+                symbol: "SPY".into(),
+                sec_type: SecurityType::Option,
+                exchange: "SMART".into(),
+                currency: "USD".into(),
+                last_trade_date: "20261120".into(),
+                contract_month: "202611".into(),
+                strike: 500.0,
+                right: Some(if call {
+                    OptionRight::Call
+                } else {
+                    OptionRight::Put
+                }),
+                multiplier: 100.0,
+                multiplier_text: "100".into(),
+                ..Default::default()
+            });
+        ApiContract {
+            con_id,
+            symbol: "SPY".into(),
+            // The option-specific handler canonicalizes accepted casing on
+            // the native wire.
+            sec_type: if call { "opt" } else { "OpT" }.into(),
+            exchange: "SMART".into(),
+            currency: "USD".into(),
+            // API expiry and native tag 200 are intentionally distinct.
+            last_trade_date_or_contract_month: "20261120".into(),
+            strike: 500.0,
+            right: if call { "CALL" } else { "put" }.into(),
+            multiplier: "100".into(),
+            ..Default::default()
+        }
+    }
+
+    fn sent_order_tags(
+        engine: &mut HotLoop,
+        shared: &Arc<SharedState>,
+        request: crate::types::OrderRequest,
+    ) -> Vec<(u32, String)> {
+        engine.context.order_ids.start_at(1);
+        engine.context.pending_orders.push(request);
+        let (connection, mut peer) = crate::test_support::Peer::pair();
+        let mut connection = Some(connection);
+        order_builder::drain_and_send_orders(
+            &mut connection,
+            &mut engine.context,
+            "DU1",
+            &mut engine.hb,
+            false,
+            shared,
+        );
+        peer.messages()
+            .iter()
+            .flat_map(|message| crate::test_support::parse_fields(message))
+            .collect()
     }
 
     #[test]
@@ -5000,6 +5095,233 @@ mod registration_timeout_tests {
         assert_eq!(engine.context.market.exchange(id), "SMART");
         assert!(engine.farm.has_md_subscription(id));
         assert!(super::news_tests::sent(&mut farm_side).is_empty());
+    }
+
+    #[test]
+    fn option_registration_rejects_incomplete_unresolved_or_conflicting_terms_before_allocating() {
+        let (mut engine, shared, _farm_side, tx) = super::news_tests::engine();
+        let unresolved = ApiContract {
+            con_id: 920261546,
+            symbol: "SPY".into(),
+            sec_type: "OPT".into(),
+            exchange: "SMART".into(),
+            currency: "USD".into(),
+            last_trade_date_or_contract_month: "20261120".into(),
+            strike: 500.0,
+            right: "C".into(),
+            multiplier: "100".into(),
+            ..Default::default()
+        };
+        let mut incomplete = unresolved.clone();
+        incomplete.multiplier.clear();
+        let (reply, receiver) = RegistrationReply::channel();
+        tx.send(ControlCommand::RegisterOptionInstrument {
+            contract: Box::new(incomplete),
+            reply_tx: Some(reply),
+        })
+        .unwrap();
+        engine.poll_once();
+        assert_eq!(
+            receiver.recv_timeout(Duration::ZERO).unwrap().unwrap_err(),
+            "Option instrument registration requires an exact positive conId, symbol, currency, exchange, maturity, right, strike and multiplier"
+        );
+        assert!(
+            engine
+                .context
+                .market
+                .instrument_by_con_id(920261546)
+                .is_none()
+        );
+
+        let (reply, receiver) = RegistrationReply::channel();
+        tx.send(ControlCommand::RegisterOptionInstrument {
+            contract: Box::new(unresolved),
+            reply_tx: Some(reply),
+        })
+        .unwrap();
+        engine.poll_once();
+        assert_eq!(
+            receiver.recv_timeout(Duration::ZERO).unwrap().unwrap_err(),
+            "Option instrument registration requires resolved native contract details"
+        );
+        assert!(
+            engine
+                .context
+                .market
+                .instrument_by_con_id(920261546)
+                .is_none()
+        );
+
+        let mut conflict = exact_option(&shared, true);
+        conflict.strike = 501.0;
+        let (reply, receiver) = RegistrationReply::channel();
+        tx.send(ControlCommand::RegisterOptionInstrument {
+            contract: Box::new(conflict),
+            reply_tx: Some(reply),
+        })
+        .unwrap();
+        engine.poll_once();
+        assert_eq!(
+            receiver.recv_timeout(Duration::ZERO).unwrap().unwrap_err(),
+            "Option instrument registration conflicts with resolved native option terms"
+        );
+        assert!(
+            engine
+                .context
+                .market
+                .instrument_by_con_id(920261546)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn abandoned_option_registration_preserves_existing_private_metadata() {
+        let (mut engine, shared, _farm_side, tx) = super::news_tests::engine();
+        let contract = exact_option(&shared, true);
+        let id = engine.context.market.register(contract.con_id);
+        engine.context.market.set_symbol(id, "OLD".into());
+        engine.context.market.set_routing(id, "STK", "CBOE");
+        engine.context.market.set_currency(id, "EUR");
+        let old_terms = OptionTerms {
+            maturity: "202512".into(),
+            call: false,
+            strike: 400.0,
+            multiplier: 10.0,
+        };
+        engine
+            .context
+            .market
+            .set_option_terms(id, old_terms.clone());
+
+        let (reply, receiver) = RegistrationReply::channel();
+        assert!(receiver.recv_timeout(Duration::ZERO).is_err());
+        tx.send(ControlCommand::RegisterOptionInstrument {
+            contract: Box::new(contract),
+            reply_tx: Some(reply),
+        })
+        .unwrap();
+        engine.poll_once();
+
+        assert_eq!(engine.context.market.symbol(id), "OLD");
+        assert_eq!(
+            engine.context.market.order_routing(id),
+            ("STK".into(), "CBOE".into())
+        );
+        assert_eq!(engine.context.market.currency(id), "EUR");
+        assert_eq!(engine.context.market.option_terms(id), Some(&old_terms));
+    }
+
+    #[test]
+    fn atomic_option_registration_supplies_exact_native_order_wire_terms() {
+        use crate::types::{OrderRequest, Side};
+
+        let (mut engine, shared, _farm_side, tx) = super::news_tests::engine();
+        for (call, order_id, expected_right) in [(true, 9, "1"), (false, 10, "0")] {
+            let contract = exact_option(&shared, call);
+            let expected_con_id = contract.con_id.to_string();
+            // A quote subscription may already own the conId's slot without
+            // the private order terms. Complete that same slot atomically.
+            tx.send(ControlCommand::RegisterInstrument {
+                con_id: contract.con_id,
+                symbol: contract.symbol.clone(),
+                sec_type: contract.sec_type.clone(),
+                exchange: contract.exchange.clone(),
+                reply_tx: None,
+            })
+            .unwrap();
+            engine.poll_once();
+            let existing = engine
+                .context
+                .market
+                .instrument_by_con_id(contract.con_id)
+                .unwrap();
+            assert!(engine.context.market.option_terms(existing).is_none());
+            let (reply, receiver) = RegistrationReply::channel();
+            tx.send(ControlCommand::RegisterOptionInstrument {
+                contract: Box::new(contract),
+                reply_tx: Some(reply),
+            })
+            .unwrap();
+            engine.poll_once();
+            let instrument = receiver.recv_timeout(Duration::ZERO).unwrap().unwrap();
+            assert_eq!(instrument, existing);
+
+            let tags = sent_order_tags(
+                &mut engine,
+                &shared,
+                OrderRequest::SubmitLimitGtc {
+                    order_id,
+                    instrument,
+                    side: Side::Buy,
+                    qty: 1,
+                    price: 5 * crate::types::PRICE_SCALE,
+                    outside_rth: false,
+                },
+            );
+            let tag = |number| {
+                tags.iter()
+                    .find(|(candidate, _)| *candidate == number)
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(tag(55), Some("SPY"));
+            assert_eq!(tag(200), Some("202611"), "native tag 200, not API expiry");
+            assert_eq!(tag(201), Some(expected_right));
+            assert_eq!(tag(202), Some("500"));
+            assert_eq!(tag(167), Some("OPT"));
+            assert_eq!(tag(231), Some("100.00"));
+            assert_eq!(tag(15), Some("USD"));
+            assert_eq!(tag(100), Some("BEST"));
+            assert_eq!(tag(6008), Some(expected_con_id.as_str()));
+        }
+    }
+
+    #[test]
+    fn ordinary_registration_keeps_stock_wire_free_of_option_terms() {
+        use crate::types::{OrderRequest, Side};
+
+        let (mut engine, shared, _farm_side, tx) = super::news_tests::engine();
+        let (reply, receiver) = RegistrationReply::channel();
+        tx.send(ControlCommand::RegisterInstrument {
+            con_id: 265598,
+            symbol: "AAPL".into(),
+            sec_type: "STK".into(),
+            exchange: "SMART".into(),
+            reply_tx: Some(reply),
+        })
+        .unwrap();
+        tx.send(ControlCommand::SetInstrumentCurrency {
+            con_id: 265598,
+            currency: "USD".into(),
+        })
+        .unwrap();
+        engine.poll_once();
+        let instrument = receiver.recv_timeout(Duration::ZERO).unwrap().unwrap();
+
+        let tags = sent_order_tags(
+            &mut engine,
+            &shared,
+            OrderRequest::SubmitLimitGtc {
+                order_id: 9,
+                instrument,
+                side: Side::Buy,
+                qty: 1,
+                price: 200 * crate::types::PRICE_SCALE,
+                outside_rth: false,
+            },
+        );
+        let tag = |number| {
+            tags.iter()
+                .find(|(candidate, _)| *candidate == number)
+                .map(|(_, value)| value.as_str())
+        };
+        let has = |number| tag(number).is_some();
+        assert!(has(167) && has(15) && has(6008));
+        assert_eq!(
+            tag(231),
+            Some("1.00"),
+            "the existing stock multiplier is unchanged"
+        );
+        assert!(![200, 201, 202].into_iter().any(has));
     }
 }
 
