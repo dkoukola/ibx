@@ -266,7 +266,7 @@ pub(super) fn execution_component(
 }
 
 /// Every value of `tag` in a message, in wire order.
-fn all_values(msg: &[u8], tag: u32) -> impl Iterator<Item = &str> {
+pub(super) fn all_values(msg: &[u8], tag: u32) -> impl Iterator<Item = &str> {
     let prefix = format!("{tag}=");
     msg.split(|&b| b == fix::SOH)
         .filter_map(|p| std::str::from_utf8(p).ok())
@@ -457,6 +457,9 @@ pub(crate) struct CcpState {
     /// The per-leg prices (6879) of the report being read, in leg order
     /// (ibx#470): the parsed map keeps one value per tag.
     pub(crate) report_leg_prices: Vec<f64>,
+    /// Query-local BAG terms from this raw report, before repeated tags flatten.
+    pub(super) report_history_combo:
+        Result<Option<crate::bridge::ComboView>, &'static str>,
     pub(crate) exec_realized_order: VecDeque<String>,
     pub(crate) disconnected: bool,
     /// (req_id, is_single_shot). Single-shot = known-conId lookup whose
@@ -872,6 +875,7 @@ impl CcpState {
             exec_realized: std::collections::HashMap::with_capacity(256),
             order_messages_sent: HashSet::new(),
             report_leg_prices: Vec::new(),
+            report_history_combo: Ok(None),
             exec_realized_order: VecDeque::with_capacity(256),
             disconnected: false,
             pending_secdef: Vec::new(),
@@ -1240,8 +1244,14 @@ impl CcpState {
             fix::MSG_LOGON => self.handle_logon_update(&parsed, shared, event_tx),
             fix::MSG_EXEC_REPORT => {
                 self.report_leg_prices = all_values(msg, 6879).filter_map(|v| v.parse().ok()).collect();
+                self.report_history_combo = if self.completed_history.active() {
+                    super::completed_history::parse_direct_combo_report(msg, &parsed)
+                } else {
+                    Ok(None)
+                };
                 self.handle_exec_report(&parsed, context, shared, event_tx, account_id);
                 self.report_leg_prices.clear();
+                self.report_history_combo = Ok(None);
             }
             fix::MSG_CANCEL_REJECT => self.handle_cancel_reject(&parsed, ccp_conn, context, shared, event_tx, hb, account_id),
             fix::MSG_NEWS => self.handle_news_bulletin(&parsed, shared),
@@ -1643,7 +1653,9 @@ impl CcpState {
             .flatten();
         if history == super::completed_history::HistoryReport::Row && !known_current {
             if collect_history {
-                self.completed_history.collect(parsed, account_id, None, false);
+                self.completed_history.collect(
+                    parsed, account_id, None, false, &self.report_history_combo,
+                );
             }
             return;
         }
@@ -1682,7 +1694,10 @@ impl CcpState {
                 let terminal = previous.as_ref().filter(|info|
                     matches!(info.order_state.status.as_str(), "Filled" | "Cancelled" | "Inactive"));
                 self.completed_history
-                    .collect(parsed, account_id, terminal, combo_view.is_some());
+                    .collect(
+                        parsed, account_id, terminal, combo_view.is_some(),
+                        &self.report_history_combo,
+                    );
             }
             return;
         }
@@ -1723,6 +1738,7 @@ impl CcpState {
                     account_id,
                     previous.as_ref(),
                     combo_view.is_some(),
+                    &self.report_history_combo,
                 );
             }
             return;
@@ -2326,7 +2342,10 @@ impl CcpState {
             }
             if collect_history {
                 self.completed_history
-                    .collect(parsed, account_id, Some(&info), combo_view.is_some());
+                    .collect(
+                        parsed, account_id, Some(&info), combo_view.is_some(),
+                        &self.report_history_combo,
+                    );
             }
             if con_id != 0 {
                 shared.reference.cache_contract(con_id, info.contract.clone());

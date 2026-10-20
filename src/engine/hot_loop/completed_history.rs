@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::bridge::{CompletedHistoryReply, Event, RichOrderInfo, SharedState};
+use crate::api::types::{ComboLeg, Contract};
+use crate::bridge::{ComboView, CompletedHistoryReply, Event, RichOrderInfo, SharedState};
 use crate::config::chrono_free_timestamp;
 use crate::engine::context::Context;
 use crate::protocol::connection::Connection;
@@ -15,6 +16,156 @@ use super::ccp::{CcpState, order_status_request, perm_id_from_clord_id};
 use super::report::{ReportProjection, project_report, report_revision, report_time, stale_report};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Read only self-contained, direct-routed BAG terms. The ordinary FIX map
+/// loses repeated legs; the original message is the authority, not BAG conId.
+/// SMART may have different leg routes and remains unsupported here.
+pub(super) fn parse_direct_combo_report(
+    msg: &[u8],
+    fields: &HashMap<u32, String>,
+) -> Result<Option<ComboView>, &'static str> {
+    use super::ccp::all_values;
+
+    if fields.get(&167).map(String::as_str) != Some("BAG") {
+        return Ok(None);
+    }
+    let counts: Vec<_> = all_values(msg, 6079).collect();
+    if counts.is_empty()
+        && [6080, 6081, 6082, 616, 6879]
+            .iter()
+            .all(|tag| all_values(msg, *tag).next().is_none())
+    {
+        return Ok(None);
+    }
+    let [count] = counts.as_slice() else {
+        return Err("Completed-order BAG has missing or repeated leg count");
+    };
+    let count = count
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or("Completed-order BAG has invalid leg count")?;
+    let mut route = None;
+    for tag in [6004, 6210, 100, 207] {
+        for value in all_values(msg, tag) {
+            if value.is_empty()
+                || value.trim() != value
+                || ["BEST", "SMART", "ZERO", "ANYEXCH"]
+                    .iter()
+                    .any(|reserved| value.eq_ignore_ascii_case(reserved))
+                || route.is_some_and(|previous| previous != value)
+            {
+                return Err("Completed-order BAG has unsupported or conflicting direct route");
+            }
+            route = Some(value);
+        }
+    }
+    let route = route.ok_or("Completed-order BAG has no explicit direct route")?;
+    let leg_routes: Vec<_> = all_values(msg, 616).collect();
+    if !leg_routes.is_empty()
+        && (leg_routes.len() != count || leg_routes.iter().any(|value| *value != route))
+    {
+        return Err("Completed-order BAG leg routes do not match its direct route");
+    }
+    // Gateway jexec.eO.f(fb) reads 6087/6680/6679/6401/6216/1689/8211
+    // into per-leg auxiliary terms, and e(fb) reads 6442 into combo-order
+    // metadata. Those explicit mappings are not implemented here. Absence
+    // uses ordinary API defaults; explicit terms must not be erased.
+    if [6087, 6680, 6679, 6401, 6216, 1689, 8211, 6442]
+        .iter()
+        .any(|tag| all_values(msg, *tag).next().is_some())
+    {
+        return Err("Completed-order BAG has unsupported explicit leg terms");
+    }
+    let mut legs: Vec<ComboLeg> = Vec::new();
+    let mut count_seen = false;
+    for part in msg.split(|byte| *byte == crate::protocol::fix::SOH) {
+        let Some((tag, value)) = std::str::from_utf8(part)
+            .ok()
+            .and_then(|part| part.split_once('='))
+        else {
+            continue;
+        };
+        match tag {
+            "6079" => count_seen = true,
+            "6080" => {
+                if !count_seen
+                    || legs.last().is_some_and(|leg| leg.ratio == 0 || leg.action.is_empty())
+                {
+                    return Err("Completed-order BAG has incomplete leg groups");
+                }
+                let con_id = value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|id| *id > 0)
+                    .ok_or("Completed-order BAG has invalid leg identity")?;
+                legs.push(ComboLeg {
+                    con_id,
+                    exchange: route.into(),
+                    ..ComboLeg::default()
+                });
+            }
+            "6081" => {
+                let leg = legs.last_mut().ok_or("Completed-order BAG has unordered leg groups")?;
+                if leg.ratio != 0 {
+                    return Err("Completed-order BAG has repeated leg ratio");
+                }
+                leg.ratio = value
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|ratio| *ratio > 0)
+                    .ok_or("Completed-order BAG has invalid leg ratio")?;
+            }
+            "6082" => {
+                let leg = legs.last_mut().ok_or("Completed-order BAG has unordered leg groups")?;
+                if leg.ratio == 0 || !leg.action.is_empty() {
+                    return Err("Completed-order BAG has unordered or repeated leg orientation");
+                }
+                leg.action = match value {
+                    "1" => "BUY",
+                    "0" => "SELL",
+                    _ => return Err("Completed-order BAG has invalid leg orientation"),
+                }
+                .into();
+            }
+            _ => {}
+        }
+    }
+    if legs.len() != count || legs.iter().any(|leg| leg.ratio == 0 || leg.action.is_empty()) {
+        return Err("Completed-order BAG has incomplete leg groups");
+    }
+    // Gateway reads 6879 as an independent repeated-value array in leg order.
+    // Do not drop a malformed element or infer a missing leg price as zero.
+    let leg_prices = all_values(msg, 6879)
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .ok()
+                .filter(|price| price.is_finite())
+                .ok_or("Completed-order BAG has invalid leg prices")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !leg_prices.is_empty()
+        && (leg_prices.len() != count
+            || (leg_prices.contains(&f64::MAX)
+                && leg_prices.iter().any(|price| *price != f64::MAX)))
+    {
+        return Err("Completed-order BAG has incomplete leg prices");
+    }
+    Ok(Some(ComboView {
+        contract: Contract {
+            con_id: fields.get(&6008).and_then(|id| id.parse().ok()).unwrap_or(0),
+            sec_type: "BAG".into(),
+            exchange: route.into(),
+            currency: fields.get(&15).cloned().unwrap_or_default(),
+            symbol: fields.get(&55).cloned().unwrap_or_default(),
+            local_symbol: fields.get(&6035).cloned().unwrap_or_default(),
+            combo_legs: legs,
+            ..Contract::default()
+        },
+        leg_prices,
+    }))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum HistoryReport {
@@ -203,11 +354,12 @@ impl HistoryRequests {
         account: &str,
         known: Option<&RichOrderInfo>,
         known_combo: bool,
+        reported_combo: &Result<Option<ComboView>, &'static str>,
     ) {
         if let Some(active) = self.active.as_mut()
             && !active.timed_out
         {
-            active.rows.push(fields, account);
+            active.rows.push_report(fields, account, reported_combo);
             if let Some(known) = known
                 && let Some(row) = active
                     .rows
@@ -238,7 +390,7 @@ impl HistoryRequests {
     ) -> HistoryReport {
         let report = self.classify(fields, shared, account);
         if report == HistoryReport::Row {
-            self.collect(fields, account, None, false);
+            self.collect(fields, account, None, false, &Ok(None));
         }
         report
     }
@@ -362,6 +514,9 @@ struct Row {
     // The live receiver has an exact per-order ComboView. A contract cached
     // by BAG conId alone is not authority: different combos share that conId.
     known_combo: bool,
+    // Kept only in this query; never installed into the live order/contract
+    // cache. Sparse cancellations preserve the previous report's terms.
+    reported_combo: Result<Option<ComboView>, &'static str>,
 }
 
 #[derive(Default)]
@@ -373,16 +528,31 @@ struct Reducer {
 }
 
 impl Reducer {
+    #[cfg(test)]
     fn push(&mut self, fields: &HashMap<u32, String>, account: &str) {
+        self.push_report(fields, account, &Ok(None));
+    }
+
+    fn push_report(
+        &mut self,
+        fields: &HashMap<u32, String>,
+        account: &str,
+        reported_combo: &Result<Option<ComboView>, &'static str>,
+    ) {
         if self.error.is_some() {
             return;
         }
-        if let Err(message) = self.add(fields, account) {
+        if let Err(message) = self.add(fields, account, reported_combo) {
             self.error = Some(message.into());
         }
     }
 
-    fn add(&mut self, fields: &HashMap<u32, String>, account: &str) -> Result<(), &'static str> {
+    fn add(
+        &mut self,
+        fields: &HashMap<u32, String>,
+        account: &str,
+        reported_combo: &Result<Option<ComboView>, &'static str>,
+    ) -> Result<(), &'static str> {
         let tag = |t| fields.get(&t).map(String::as_str);
         let owner = tag(1).ok_or("History row has no account")?;
         if owner != account {
@@ -455,6 +625,7 @@ impl Reducer {
                 status,
                 known: None,
                 known_combo: false,
+                reported_combo: reported_combo.clone(),
             },
         );
         Ok(())
@@ -490,9 +661,22 @@ impl Reducer {
             if api_only && !from_api {
                 continue;
             }
-            if fields.get(&167).map(String::as_str) == Some("BAG") && !row.known_combo {
-                return Err("Completed-order BAG snapshot has no known per-order combo".into());
-            }
+            let reported_combo = if fields.get(&167).map(String::as_str) == Some("BAG")
+                && !row.known_combo
+            {
+                Some(
+                    row.reported_combo
+                        .as_ref()
+                        .map_err(|message| message.to_string())?
+                        .as_ref()
+                        .ok_or("Completed-order BAG snapshot has no known per-order combo")?,
+                )
+            } else {
+                None
+            };
+            // A generic cached BAG contract is not per-order authority.
+            // A cold direct report must be projected from its own full terms.
+            let known = row.known.as_ref().filter(|_| reported_combo.is_none());
             // STANDARD supplies complete typed order snapshots. Do not turn
             // an incomplete row or an unsupported native container into a
             // successful recovery record by using the projector's defaults.
@@ -510,7 +694,7 @@ impl Reducer {
                 && number(38) == Some(0.0)
                 && number(14) == Some(0.0)
                 && number(151) == Some(0.0);
-            if row.known.is_none()
+            if known.is_none()
                 && (!fields
                     .get(&6008)
                     .and_then(|v| v.parse::<i64>().ok())
@@ -520,13 +704,13 @@ impl Reducer {
                     || !fields.get(&15).is_some_and(|v| !v.is_empty())
                     || !fields
                         .get(&167)
-                        .is_some_and(|v| !v.is_empty() && v != "BAG")
+                        .is_some_and(|v| !v.is_empty() && (v != "BAG" || reported_combo.is_some()))
                     || fields.get(&8302).is_some_and(|v| v == "1")
                     || fields.get(&6406).is_some_and(|v| v == "1"))
             {
                 return Err("Incomplete or unsupported completed-order snapshot".into());
             }
-            if row.known.is_none() {
+            if known.is_none() {
                 match fields.get(&40).map(String::as_str) {
                     Some("1") => {}
                     Some("2") if number(44).is_some() => {}
@@ -535,7 +719,7 @@ impl Reducer {
                     _ => return Err("Incomplete or unsupported completed-order terms".into()),
                 }
             }
-            if row.known.is_none()
+            if known.is_none()
                 && !number(14)
                     .is_some_and(|v| v >= 0.0 && (row.status != OrderStatus::Filled || v > 0.0))
             {
@@ -548,7 +732,7 @@ impl Reducer {
                 .get(&(account.as_str(), parent))
                 .copied()
                 .unwrap_or(parent);
-            let mut projected = row.known.clone().unwrap_or_else(|| {
+            let mut projected = known.cloned().unwrap_or_else(|| {
                 project_report(
                     fields,
                     ReportProjection {
@@ -559,14 +743,16 @@ impl Reducer {
                         fallback_order: None,
                         fallback_con_id: 0,
                         cached_contract: None,
-                        combo: None,
+                        combo: reported_combo,
                         trail_limit: None,
-                        combo_leg_prices: Vec::new(),
+                        combo_leg_prices: reported_combo
+                            .map(|combo| combo.leg_prices.clone())
+                            .unwrap_or_default(),
                     },
                 )
             });
             let combo = projected.contract.sec_type == "BAG";
-            if combo && !row.known_combo {
+            if combo && !row.known_combo && reported_combo.is_none() {
                 return Err("Completed-order BAG snapshot has no known per-order combo".into());
             }
             // Match openOrder's existing ComboView convention: per-leg prices
@@ -819,16 +1005,295 @@ mod tests {
     ) -> Result<Vec<RichOrderInfo>, String> {
         let mut history = active();
         let shared = SharedState::new();
-        history.collect(fields, "DUXXXXXXX", known, known_combo);
+        history.collect(fields, "DUXXXXXXX", known, known_combo, &Ok(None));
         history.report(&capture()[2], &shared, "DUXXXXXXX");
         assert!(shared.orders.drain_fills().is_empty());
         assert!(shared.orders.drain_order_updates().is_empty());
         assert!(shared.orders.drain_open_orders().is_empty());
+        assert!(shared.portfolio.position_infos().is_empty());
         shared
             .orders
             .drain_completed_history_replies()
             .remove(0)
             .result
+    }
+
+    fn direct_report(filled: bool) -> Vec<(u32, String)> {
+        let fixture = if filled {
+            include_str!("../../../tests/fixtures/gw1040/scenarios/20260930/i105_combo_fill.jsonl")
+        } else {
+            include_str!("../../../tests/fixtures/gw1040/scenarios/20260926b/i105_combo_leg_prices.jsonl")
+        };
+        for line in fixture.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["leg"] != "fix_in" || value["conn"] != "CCP" {
+                continue;
+            }
+            let Some(values) = value["fields"].as_array() else { continue };
+            let mut fields: Vec<_> = values
+                .iter()
+                .map(|field| (
+                    field[0].as_str().unwrap().parse::<u32>().unwrap(),
+                    field[1].as_str().unwrap().to_string(),
+                ))
+                .collect();
+            let get = |tag| fields.iter().find(|(key, _)| *key == tag).map(|(_, value)| value.as_str());
+            if get(167) != Some("BAG")
+                || get(39) != Some(if filled { "2" } else { "4" })
+                || get(54) != Some("1")
+            {
+                continue;
+            }
+            // These are captured LIVE SMART reports. Only the repeated leg
+            // layout/prices are captured: history classification and this
+            // direct route are synthetic, not cold STANDARD acceptance.
+            for (tag, value) in &mut fields {
+                match tag {
+                    1 => *value = "DU123456".into(),
+                    20 => *value = "3".into(),
+                    100 | 207 | 6004 | 6210 => *value = "CBOE".into(),
+                    _ => {}
+                }
+            }
+            if !fields.iter().any(|(tag, _)| *tag == 6004) {
+                fields.push((6004, "CBOE".into()));
+            }
+            return fields;
+        }
+        panic!("missing captured BAG report");
+    }
+
+    fn replace_tag(fields: &mut Vec<(u32, String)>, tag: u32, value: &str) {
+        fields.retain(|(key, _)| *key != tag);
+        fields.push((tag, value.into()));
+    }
+
+    fn cold_direct_history(
+        rows: &[Vec<(u32, String)>],
+    ) -> Result<Vec<(Contract, crate::api::Order, crate::api::types::OrderState)>, String> {
+        use crate::api::{EClient, Wrapper};
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Callback {
+            rows: Vec<(Contract, crate::api::Order, crate::api::types::OrderState)>,
+            ends: usize,
+            errors: Vec<String>,
+        }
+        impl Wrapper for Callback {
+            fn completed_order(
+                &mut self,
+                contract: &Contract,
+                order: &crate::api::Order,
+                state: &crate::api::types::OrderState,
+            ) {
+                self.rows.push((contract.clone(), order.clone(), state.clone()));
+            }
+            fn completed_orders_end(&mut self) { self.ends += 1; }
+            fn error(&mut self, _: i64, _: i64, message: &str, _: &str) {
+                self.errors.push(message.into());
+            }
+        }
+        let mut ccp = CcpState::new();
+        ccp.completed_history = active();
+        let mut context = Context::new();
+        let shared = Arc::new(SharedState::new());
+        shared.orders.begin_execution_history("today4");
+        shared.orders.complete_execution_history("today4");
+        for row in rows {
+            let fields: Vec<_> = row.iter().map(|(tag, value)| (*tag, value.as_str())).collect();
+            ccp.process_ccp_message(
+                &fix::fix_build(&fields, 1),
+                &mut None,
+                &mut context,
+                &shared,
+                &None,
+                &mut HeartbeatState::new(),
+                "DU123456",
+            );
+        }
+        deliver(&mut ccp, &mut context, &shared, &capture()[2]);
+        assert!(context.combos.orders.is_empty());
+        assert!(shared.orders.drain_fills().is_empty());
+        assert!(shared.orders.drain_order_updates().is_empty());
+        assert!(shared.orders.drain_open_orders().is_empty());
+        assert!(shared.portfolio.position_infos().is_empty());
+        for row in rows {
+            if let Some((_, id)) = row.iter().find(|(tag, _)| *tag == 6121) {
+                let id = id.parse().unwrap();
+                assert!(context.order(id).is_none());
+                assert!(shared.orders.combo_view(id).is_none());
+                assert!(shared.orders.get_order_info(id).is_none());
+            }
+        }
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let client = EClient::from_parts(
+            shared,
+            sender,
+            std::thread::spawn(|| {}),
+            "DU123456".into(),
+        );
+        let mut callback = Callback::default();
+        client.process_msgs(&mut callback);
+        if callback.errors.is_empty() {
+            assert_eq!(callback.ends, 1);
+            Ok(callback.rows)
+        } else {
+            assert_eq!(callback.ends, 0);
+            assert!(callback.rows.is_empty());
+            Err(callback.errors.join("; "))
+        }
+    }
+
+    #[test]
+    fn completed_cold_direct_bag_raw_reports_reach_callbacks_with_signed_prices() {
+        for price in ["0.05", "-0.05", "0"] {
+            let mut fields = direct_report(true);
+            replace_tag(&mut fields, 44, price);
+            let rows = cold_direct_history(&[fields]).unwrap();
+            let (contract, order, state) = &rows[0];
+            assert_eq!(contract.exchange, "CBOE");
+            assert_eq!(contract.combo_legs.len(), 2);
+            assert_eq!(contract.combo_legs[0].con_id, 756_733);
+            assert_eq!(contract.combo_legs[0].ratio, 1);
+            assert_eq!(contract.combo_legs[0].action, "BUY");
+            assert_eq!(contract.combo_legs[1].con_id, 320_227_571);
+            assert_eq!(contract.combo_legs[1].action, "SELL");
+            assert!(contract.combo_legs.iter().all(|leg| leg.exchange == "CBOE"));
+            assert_eq!(order.lmt_price, price.parse::<f64>().unwrap());
+            assert!(order.order_combo_legs.is_empty());
+            assert_eq!(state.status, "Filled");
+        }
+        let mut fields = direct_report(false);
+        // Prices are read as an ordered array even when outside the leg blocks.
+        fields.retain(|(tag, _)| *tag != 6879);
+        fields.extend([(6879, "0".into()), (6879, "1.25".into())]);
+        fields.extend([(616, "CBOE".into()), (616, "CBOE".into())]);
+        let rows = cold_direct_history(&[fields]).unwrap();
+        assert_eq!(rows[0].1.order_combo_legs, vec![0.0, 1.25]);
+        assert_eq!(rows[0].1.lmt_price, f64::MAX);
+        assert_eq!(rows[0].2.status, "Cancelled");
+    }
+
+    #[test]
+    fn completed_cold_direct_bag_keeps_amendment_on_sparse_cancel_and_ignores_stale_terms() {
+        for per_leg in [false, true] {
+        let mut first = direct_report(true);
+        for (tag, value) in [
+            (11, "42.0"), (6121, "42"), (39, "0"), (150, "0"),
+            (14, "0"), (151, "1"), (60, "20260930-19:03:40"), (44, "0.05"),
+        ] {
+            replace_tag(&mut first, tag, value);
+        }
+        if per_leg {
+            first.extend([(6879, "0.06".into()), (6879, "0.01".into())]);
+        }
+        let mut amended = first.clone();
+        replace_tag(&mut amended, 11, "42.1");
+        replace_tag(&mut amended, 60, "20260930-19:03:45");
+        replace_tag(&mut amended, 44, "-0.10");
+        amended.iter_mut().filter(|(tag, _)| *tag == 6080).nth(1).unwrap().1 =
+            "920261651".into();
+        if per_leg {
+            amended.retain(|(tag, _)| *tag != 6879);
+            amended.extend([(6879, "0.25".into()), (6879, "0.05".into())]);
+        }
+        let cancel: Vec<_> = [
+            (35, "8"), (1, "DU123456"), (11, "42.2"), (20, "3"),
+            (39, "4"), (150, "4"), (60, "20260930-19:03:50"), (14, "0"), (151, "0"),
+        ].into_iter().map(|(tag, value)| (tag, value.into())).collect();
+        let mut stale = first.clone();
+        // Even an unusable older report must not replace admitted terms.
+        stale.push((100, "SMART".into()));
+        let rows = cold_direct_history(&[first, amended, cancel, stale]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.combo_legs[1].con_id, 920_261_651);
+        if per_leg {
+            assert_eq!(rows[0].1.order_combo_legs, vec![0.25, 0.05]);
+            assert_eq!(rows[0].1.lmt_price, f64::MAX);
+        } else {
+            assert_eq!(rows[0].1.lmt_price, -0.10);
+        }
+        assert_eq!(rows[0].2.status, "Cancelled");
+        }
+    }
+
+    #[test]
+    fn completed_cold_direct_bags_do_not_share_legs_through_generic_bag_id() {
+        let first = direct_report(true);
+        let mut second = first.clone();
+        replace_tag(&mut second, 11, "900000001.0");
+        replace_tag(&mut second, 6121, "43");
+        second.iter_mut().filter(|(tag, _)| *tag == 6080).nth(1).unwrap().1 =
+            "920261651".into();
+        let rows = cold_direct_history(&[first, second]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.con_id, rows[1].0.con_id);
+        let ids: std::collections::BTreeSet<_> =
+            rows.iter().map(|row| row.0.combo_legs[1].con_id).collect();
+        assert_eq!(ids, [320_227_571, 920_261_651].into());
+    }
+
+    #[test]
+    fn direct_bag_decoder_preserves_native_single_leg_and_repeated_id_shapes() {
+        let mut fields = direct_report(true);
+        for (_, value) in fields.iter_mut().filter(|(tag, _)| *tag == 6080) {
+            *value = "756733".into();
+        }
+        let encode = |fields: &[(u32, String)]| {
+            let values: Vec<_> = fields.iter().map(|(tag, value)| (*tag, value.as_str())).collect();
+            fix::fix_build(&values, 1)
+        };
+        let raw = encode(&fields);
+        let parsed = parse_direct_combo_report(&raw, &fix::fix_parse(&raw)).unwrap().unwrap();
+        assert_eq!(parsed.contract.combo_legs.len(), 2);
+        assert_eq!(parsed.contract.combo_legs[0].con_id, parsed.contract.combo_legs[1].con_id);
+        assert_ne!(parsed.contract.combo_legs[0].action, parsed.contract.combo_legs[1].action);
+        // Keep a single exact leg without imposing Daytrader's package policy.
+        fields.retain(|(tag, _)| ![6080, 6081, 6082].contains(tag));
+        replace_tag(&mut fields, 6079, "1");
+        fields.extend([(6080, "756733".into()), (6081, "2".into()), (6082, "1".into())]);
+        let raw = encode(&fields);
+        let parsed = parse_direct_combo_report(&raw, &fix::fix_parse(&raw)).unwrap().unwrap();
+        assert_eq!(parsed.contract.combo_legs.len(), 1);
+        assert_eq!(parsed.contract.combo_legs[0].ratio, 2);
+    }
+
+    #[test]
+    fn completed_cold_direct_bag_rejects_incomplete_or_ambiguous_native_terms() {
+        let base = direct_report(true);
+        let mut invalid = Vec::new();
+        for missing in [6079, 6080, 6081, 6082] {
+            let mut fields = base.clone();
+            fields.retain(|(tag, _)| *tag != missing);
+            invalid.push(fields);
+        }
+        for (tag, value) in [
+            (6079, "3"), (6079, "2"), (100, "BEST"), (100, "SMART"),
+            (100, "ISE"), (616, "CBOE"), (6081, "1"), (6082, "0"),
+            (6879, "NaN"), (6879, "invalid"), (6879, "0.25"), (6087, "O"),
+        ] {
+            let mut fields = base.clone();
+            fields.push((tag, value.into()));
+            invalid.push(fields);
+        }
+        let mut missing_route = base.clone();
+        missing_route.retain(|(tag, _)| ![6004, 6210, 100, 207].contains(tag));
+        invalid.push(missing_route);
+        for values in [
+            ["CBOE", "ISE"],
+            ["", ""],
+        ] {
+            let mut fields = base.clone();
+            fields.extend(values.map(|value| (616, value.into())));
+            invalid.push(fields);
+        }
+        let mut mixed_prices = base;
+        mixed_prices.extend([(6879, f64::MAX.to_string()), (6879, "0.25".into())]);
+        invalid.push(mixed_prices);
+        for (index, fields) in invalid.into_iter().enumerate() {
+            assert!(cold_direct_history(&[fields]).is_err(), "accepted variant {index}");
+        }
     }
 
     #[test]
@@ -987,7 +1452,7 @@ mod tests {
             } else {
                 assert_eq!(
                     result.unwrap_err(),
-                    "Completed-order BAG snapshot has no known per-order combo"
+                    "Completed-order BAG has unsupported or conflicting direct route"
                 );
             }
             assert!(shared.orders.drain_fills().is_empty());
@@ -1004,7 +1469,7 @@ mod tests {
         working.order_state.status = "Submitted".into();
         let mut history = active();
         let shared = SharedState::new();
-        history.collect(&fields, "DUXXXXXXX", Some(&working), true);
+        history.collect(&fields, "DUXXXXXXX", Some(&working), true, &Ok(None));
         let cancel: HashMap<u32, String> = [
             (1, fields[&1].clone()),
             (11, fields[&11].clone()),
@@ -1019,7 +1484,7 @@ mod tests {
         cancelled.order_state.status = "Cancelled".into();
         cancelled.order_state.commission_and_fees = 0.25;
         cancelled.report_time = Some(cancel[&60].clone());
-        history.collect(&cancel, "DUXXXXXXX", Some(&cancelled), true);
+        history.collect(&cancel, "DUXXXXXXX", Some(&cancelled), true, &Ok(None));
         history.report(&capture()[2], &shared, "DUXXXXXXX");
         let rows = shared
             .orders
@@ -1048,6 +1513,7 @@ mod tests {
                 "DUXXXXXXX",
                 known_parent.then_some(&known),
                 known_parent,
+                &Ok(None),
             );
             let mut leg = fields.clone();
             for (tag, value) in [
