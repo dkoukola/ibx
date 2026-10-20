@@ -6575,6 +6575,135 @@ fn open_order_requests_wait_for_the_order_replay() {
 }
 
 #[test]
+fn shared_only_combo_open_orders_preserve_per_order_legs_and_prices() {
+    #[derive(Default)]
+    struct Recorder {
+        rows: Vec<(i64, Contract, Order)>,
+        ends: usize,
+    }
+    impl Wrapper for Recorder {
+        fn open_order(
+            &mut self,
+            id: i64,
+            contract: &Contract,
+            order: &Order,
+            _: &crate::api::types::OrderState,
+        ) {
+            self.rows.push((id, contract.clone(), order.clone()));
+        }
+        fn open_order_end(&mut self) {
+            self.ends += 1;
+        }
+    }
+
+    // Synthetic broker rows, not a native fill fixture. Guarded submissions
+    // deliberately have no optimistic ClientCore::track_order entry.
+    for with_view in [false, true] {
+        let (client, _rx, shared) = test_client();
+        let generic = Contract {
+            con_id: 14_474_330,
+            symbol: "F".into(),
+            sec_type: "BAG".into(),
+            exchange: "CBOE".into(),
+            currency: "USD".into(),
+            ..Default::default()
+        };
+        shared
+            .reference
+            .cache_contract(generic.con_id, generic.clone());
+        let mut expected = Vec::new();
+        for (index, (net_price, leg_prices)) in [
+            (0.40, vec![f64::MAX; 2]),
+            (-0.40, vec![f64::MAX; 2]),
+            (0.0, vec![f64::MAX; 2]),
+            (0.40, vec![0.80, 0.40]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Per-leg price normalization belongs to the existing ComboView
+            // projection; this fixture does not claim to decode a cold BAG.
+            if index == 3 && !with_view {
+                continue;
+            }
+            let id = index as i64 + 1;
+            let contract = Contract {
+                combo_legs: ["BUY", "SELL"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(leg, action)| crate::api::types::ComboLeg {
+                        con_id: 922_376_731 + id * 10 + leg as i64,
+                        ratio: leg as i32 + 1,
+                        action: action.into(),
+                        exchange: "CBOE".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..generic.clone()
+            };
+            let limit = if index == 3 { f64::MAX } else { net_price };
+            shared.orders.push_order_info(
+                id,
+                crate::bridge::RichOrderInfo {
+                    contract: if with_view {
+                        generic.clone()
+                    } else {
+                        contract.clone()
+                    },
+                    order: Order {
+                        order_id: id,
+                        perm_id: 900_000 + id,
+                        action: "BUY".into(),
+                        total_quantity: 1.0,
+                        order_type: "LMT".into(),
+                        lmt_price: if with_view { net_price } else { limit },
+                        order_combo_legs: if with_view {
+                            Vec::new()
+                        } else {
+                            leg_prices.clone()
+                        },
+                        ..Default::default()
+                    },
+                    order_state: crate::api::types::OrderState {
+                        status: "Submitted".into(),
+                        ..Default::default()
+                    },
+                    last_exec: Default::default(),
+                    parent_id_known: true,
+                    report_revision: None,
+                    report_time: None,
+                },
+            );
+            if with_view {
+                shared.orders.set_combo_view(
+                    id,
+                    crate::bridge::ComboView {
+                        contract: contract.clone(),
+                        leg_prices: leg_prices.clone(),
+                    },
+                );
+            }
+            assert!(client.core.tracked_order(id).is_none());
+            expected.push((id, contract, limit, leg_prices));
+        }
+
+        let mut recorder = Recorder::default();
+        client.req_all_open_orders(&mut recorder);
+        client.process_msgs(&mut recorder);
+        assert_eq!(recorder.ends, 1);
+        assert_eq!(recorder.rows.len(), expected.len());
+        for (id, contract, limit, leg_prices) in expected {
+            let (_, actual_contract, actual_order) =
+                recorder.rows.iter().find(|(oid, ..)| *oid == id).unwrap();
+            assert_eq!(actual_contract, &contract, "view={with_view}, order={id}");
+            assert_eq!(actual_order.lmt_price, limit);
+            assert_eq!(actual_order.order_combo_legs, leg_prices);
+        }
+        assert_eq!(shared.reference.get_contract(generic.con_id), Some(generic));
+    }
+}
+
+#[test]
 fn login_end_cannot_complete_an_explicit_snapshot_waiting_for_parent_authority() {
     for explicit in [false, true] {
         let (client, _rx, shared) = test_client();

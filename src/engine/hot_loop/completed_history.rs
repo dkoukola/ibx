@@ -67,11 +67,11 @@ pub(super) fn parse_direct_combo_report(
     {
         return Err("Completed-order BAG leg routes do not match its direct route");
     }
-    // Gateway jexec.eO.f(fb) reads 6087/6680/6679/6401/6216/1689/8211
-    // into per-leg auxiliary terms, and e(fb) reads 6442 into combo-order
-    // metadata. Those explicit mappings are not implemented here. Absence
-    // uses ordinary API defaults; explicit terms must not be erased.
-    if [6087, 6680, 6679, 6401, 6216, 1689, 8211, 6442]
+    // Gateway eO.f(fb) reads 6680/6679 as leg clearing account/firm;
+    // its outgoing API ComboLeg projection does not expose those fields.
+    // Keep refusing the remaining unimplemented cross/short/exempt terms
+    // rather than silently replacing their explicit values with defaults.
+    if [6401, 6216, 1689, 8211, 6442]
         .iter()
         .any(|tag| all_values(msg, *tag).next().is_some())
     {
@@ -133,6 +133,19 @@ pub(super) fn parse_direct_combo_report(
     }
     if legs.len() != count || legs.iter().any(|leg| leg.ratio == 0 || leg.action.is_empty()) {
         return Err("Completed-order BAG has incomplete leg groups");
+    }
+    // Like Gateway eO.f(fb), read open/close as an independent ordered array.
+    // Unlike its best-effort display, an incomplete history array is an error.
+    let open_close: Vec<_> = all_values(msg, 6087).collect();
+    if !open_close.is_empty() && open_close.len() != count {
+        return Err("Completed-order BAG has incomplete leg open/close terms");
+    }
+    for (leg, value) in legs.iter_mut().zip(open_close) {
+        leg.open_close = match value {
+            "O" => 1,
+            "C" => 2,
+            _ => 0,
+        };
     }
     // Gateway reads 6879 as an independent repeated-value array in leg order.
     // Do not drop a malformed element or infer a missing leg price as zero.
@@ -1185,6 +1198,110 @@ mod tests {
         assert_eq!(rows[0].1.order_combo_legs, vec![0.0, 1.25]);
         assert_eq!(rows[0].1.lmt_price, f64::MAX);
         assert_eq!(rows[0].2.status, "Cancelled");
+    }
+
+    #[test]
+    fn completed_cold_direct_bag_projects_captured_clearing_and_open_close_fields() {
+        // Reduced native STANDARD cancelled BAG report captured 2026-10-20.
+        // Account, order identity and reference are sanitized. The empty
+        // 6087/6705 and IB/DEMO clearing values are exactly as received.
+        let captured: Vec<(u32, String)> = [
+            (35, "8"),
+            (52, "20261020-15:44:30"),
+            (11, "42.1"),
+            (6010, "fixture-direct-cancel"),
+            (150, "4"),
+            (20, "3"),
+            (39, "4"),
+            (167, "BAG"),
+            (55, "F"),
+            (6210, "CBOE"),
+            (38, "1"),
+            (44, "0.4"),
+            (32, "0"),
+            (31, "0.00"),
+            (14, "0"),
+            (151, "0"),
+            (6, "0"),
+            (54, "1"),
+            (1, "DU123456"),
+            (60, "20261020-15:44:30"),
+            (6571, "20261020-15:44:30"),
+            (40, "2"),
+            (6085, "922376731/1,922376919/-1"),
+            (59, "0"),
+            (6008, "14474330"),
+            (15, "USD"),
+            (6004, "CBOE"),
+            (6035, "14474330"),
+            (6079, "2"),
+            (6080, "922376731"),
+            (6081, "1"),
+            (6082, "1"),
+            (6087, ""),
+            (6679, "IB"),
+            (6680, "DEMO"),
+            (6705, ""),
+            (6080, "922376919"),
+            (6081, "1"),
+            (6082, "0"),
+            (6087, ""),
+            (6679, "IB"),
+            (6680, "DEMO"),
+            (6705, ""),
+            (6419, "IB"),
+            (6817, "20261020-15:35:05"),
+        ]
+        .into_iter()
+        .map(|(tag, value)| (tag, value.into()))
+        .collect();
+        // Nonempty open/close values below are synthetic mapping variants,
+        // not a claim that the paper order explicitly opened or closed legs.
+        for (values, expected) in [
+            (["", ""], [0, 0]),
+            (["O", "C"], [1, 2]),
+            (["C", "O"], [2, 1]),
+            (["?", "other"], [0, 0]),
+        ] {
+            let mut fields = captured.clone();
+            for ((_, value), replacement) in fields
+                .iter_mut()
+                .filter(|(tag, _)| *tag == 6087)
+                .zip(values)
+            {
+                *value = replacement.into();
+            }
+            let rows = cold_direct_history(&[fields]).unwrap();
+            assert_eq!(rows.len(), 1);
+            let (contract, order, state) = &rows[0];
+            assert_eq!(contract.con_id, 14_474_330);
+            assert_eq!(contract.exchange, "CBOE");
+            assert_eq!(contract.combo_legs.len(), 2);
+            for (index, leg) in contract.combo_legs.iter().enumerate() {
+                assert_eq!(leg.con_id, [922_376_731, 922_376_919][index]);
+                assert_eq!(leg.ratio, 1);
+                assert_eq!(leg.action, ["BUY", "SELL"][index]);
+                assert_eq!(leg.exchange, "CBOE");
+                assert_eq!(leg.open_close, expected[index]);
+                assert_eq!(leg.short_sale_slot, 0);
+                assert_eq!(leg.designated_location, "");
+                assert_eq!(leg.exempt_code, -1);
+            }
+            assert_eq!(order.lmt_price, 0.4);
+            assert_eq!(order.total_quantity, 1.0);
+            assert_eq!(order.filled_quantity, 0.0);
+            assert_eq!(state.status, "Cancelled");
+        }
+        for count in [1, 3] {
+            let mut fields = captured.clone();
+            fields.retain(|(tag, _)| *tag != 6087);
+            fields.extend((0..count).map(|_| (6087, "O".into())));
+            assert!(
+                cold_direct_history(&[fields])
+                    .unwrap_err()
+                    .contains("open/close")
+            );
+        }
     }
 
     #[test]

@@ -4019,13 +4019,22 @@ impl ClientCore {
                 if require_known_parent && !info.parent_id_known {
                     return None;
                 }
-                let contract = if info.contract.con_id != 0 {
-                    shared.reference.get_contract(info.contract.con_id).unwrap_or(info.contract)
+                // A BAG conId is not its per-order leg definition. Guarded
+                // orders have no optimistic local tracking; project their
+                // combo exactly as order_view does for live callbacks.
+                let mut contract = if info.contract.con_id != 0
+                    && !info.contract.sec_type.eq_ignore_ascii_case("BAG")
+                {
+                    shared
+                        .reference
+                        .get_contract(info.contract.con_id)
+                        .unwrap_or(info.contract)
                 } else {
                     info.contract
                 };
                 let mut order = info.order;
                 reported_unset_values(&mut order);
+                Self::apply_combo_view(oid, &mut contract, &mut order, shared);
                 result.push((oid, TrackedOrder {
                     contract,
                     order,
