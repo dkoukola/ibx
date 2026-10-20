@@ -2183,7 +2183,16 @@ impl ClientCore {
             shared.orders.push_order_error(req_id, MD_DELAYED_NOT_ENABLED.0, MD_DELAYED_NOT_ENABLED.1.to_string());
             return false;
         }
-        self.start_md_stream(shared, req_id, instrument, joining, had_data, kind, at);
+        // Existing observers may themselves still await the farm. Only
+        // an acknowledged target quote (or the existing P&L data) starts
+        // a joining snapshot's collection window immediately.
+        let top_acked = had_data || (joining && {
+            let streams = self.last_quotes.lock().unwrap();
+            observers.get(&instrument).is_some_and(|reqs| {
+                reqs.iter().any(|id| streams.get(id).is_some_and(|st| st.top_acked))
+            })
+        });
+        self.start_md_stream(shared, req_id, instrument, joining, had_data, top_acked, kind, at);
         observers.entry(instrument).or_default().push(req_id);
         drop(observers);
         self.req_to_instrument.lock().unwrap().insert(req_id, instrument);
@@ -2403,7 +2412,7 @@ impl ClientCore {
             let mut observers = self.instrument_to_req.lock().unwrap();
             // Its steps queued so far are still its own (ibx#446).
             self.end_md_stream(shared, req_id, instrument, cancelled);
-            match observers.get_mut(&instrument) {
+            let last = match observers.get_mut(&instrument) {
                 Some(reqs) => {
                     reqs.retain(|r| *r != req_id);
                     let last = reqs.is_empty();
@@ -2413,7 +2422,11 @@ impl ClientCore {
                     last
                 }
                 None => true,
+            };
+            if last {
+                shared.market.discard_top_acks(instrument);
             }
+            last
         };
         self.mdt_sent.lock().unwrap().remove(&req_id);
         let delayed = self.delayed_reqs.lock().unwrap().remove(&req_id);

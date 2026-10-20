@@ -657,6 +657,9 @@ impl HotLoop {
                 }
             }
         }
+        // Clear an ack queued after the client's cancel but before the
+        // engine removed the old subscription's native request ids.
+        self.shared.market.discard_top_acks(instrument);
         // Its generic tick entries, then its news entry, after its top of
         // book, as the reference's cancels (ibx#450, ibx#458).
         let msgs = self.farm.stop_generic(instrument);
@@ -4322,9 +4325,11 @@ mod tests {
         assert_eq!(engine.context.market.round_lot(id), 40);
 
         // Cancelled and asked again: the lot is kept, no second lookup.
+        shared.market.push_top_ack(id, Instant::now());
         tx.send(ControlCommand::Unsubscribe { instrument: id }).unwrap();
         tx.send(subscribe_cmd(265598, "STK")).unwrap();
         engine.poll_once();
+        assert!(shared.market.drain_top_acks().is_empty(), "no queued ack survives the engine cancel");
         assert!(plain_messages_sent(&mut ccp_side).is_empty());
         let id = engine.context.market.instrument_by_con_id(265598).unwrap();
         assert_eq!(engine.context.market.round_lot(id), 40);

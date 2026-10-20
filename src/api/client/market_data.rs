@@ -12,8 +12,9 @@ impl EClient {
     /// reference's: each tick type is sent once, then `tick_snapshot_end`
     /// when the bid, ask, last, open and close came (with the option
     /// computations for an option; the types a contract has none of are not
-    /// waited for), or 11 seconds after the start; then the request is
-    /// gone. A snapshot with generic ticks, or beyond the per-second
+    /// waited for), or 11 seconds after the top of book is acknowledged;
+    /// an unacknowledged request ends after 60 seconds. Then the request
+    /// is gone. A snapshot with generic ticks, or beyond the per-second
     /// snapshot limit, is refused with error 321.
     ///
     /// `generic_tick_list` is checked as the reference checks it: a list

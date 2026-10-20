@@ -68,6 +68,9 @@ pub struct StreamState {
     pub(crate) mdt_done: bool,
     /// Delayed data: delayed tick types, the delayed sender's order.
     pub(crate) delayed: bool,
+    /// An actual farm acknowledgement, or a join onto an already
+    /// acknowledged quote. Observer count alone is not proof of readiness.
+    pub(super) top_acked: bool,
     /// The bid and ask auto-execution comes from the farm.
     farm_auto: bool,
     /// `mdoff`: no top of book ticks.
@@ -412,7 +415,7 @@ impl ClientCore {
     /// with the instrument's requests locked.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start_md_stream(
-        &self, shared: &SharedState, req_id: i64, instrument: InstrumentId, joining: bool, had_data: bool,
+        &self, shared: &SharedState, req_id: i64, instrument: InstrumentId, joining: bool, had_data: bool, top_acked: bool,
         kind: Option<NewRequest>, at: Option<u64>,
     ) {
         let queue = &shared.market.md_events;
@@ -437,6 +440,9 @@ impl ClientCore {
             snaps.insert(req_id, PlainSnapshot::new(sec_type, std::time::Instant::now()));
             self.snapshot_count.store(snaps.len(), Ordering::Release);
         }
+        if top_acked && let Some(snap) = self.snapshot_reqs.lock().unwrap().get_mut(&req_id) {
+            snap.acked_at(std::time::Instant::now());
+        }
         let delayed = self.delayed_reqs.lock().unwrap().contains(&req_id);
         let mut streams = self.last_quotes.lock().unwrap();
         let old = streams.remove(&req_id).unwrap_or_default();
@@ -449,7 +455,7 @@ impl ClientCore {
         }
         let (top_off, farm_auto) = kind.map_or((old.top_off, old.farm_auto), |k| (k.top_off, k.farm_auto));
         streams.insert(req_id, StreamState {
-            start: head, waiting_join, delayed, top_off, farm_auto, mdt_done: old.mdt_done, ..StreamState::default()
+            start: head, waiting_join, delayed, top_off, farm_auto, top_acked, mdt_done: old.mdt_done, ..StreamState::default()
         });
     }
 
@@ -494,10 +500,29 @@ impl ClientCore {
     /// The market data callbacks of the steps queued since the last call,
     /// in their order, for every request (see the module), and the ends of
     /// the plain snapshots that completed or reached their time limit
-    /// (11 s, at `now`, the current time when None). A request with
+    /// (11 s after acknowledgement, at `now`, the current time when None).
+    /// An unacknowledged request has a finite 60 s setup limit. A request with
     /// `mdoff` gets no top of book tick; its snapshot still ends as the
     /// quote completes (ibx#444).
     pub fn poll_market_data(&self, shared: &SharedState, now: Option<std::time::Instant>, out: &mut Vec<MdOut>) {
+        // Drain even without snapshots or quote steps: a later snapshot
+        // can join an acknowledged stream whose first price has not come.
+        {
+            let observers = self.instrument_to_req.lock().unwrap();
+            for (instrument, at) in shared.market.drain_top_acks() {
+                let Some(reqs) = observers.get(&instrument) else { continue };
+                let mut streams = self.last_quotes.lock().unwrap();
+                let mut snaps = self.snapshot_reqs.lock().unwrap();
+                for req_id in reqs {
+                    if let Some(st) = streams.get_mut(req_id) {
+                        st.top_acked = true;
+                    }
+                    if let Some(snap) = snaps.get_mut(req_id) {
+                        snap.acked_at(at);
+                    }
+                }
+            }
+        }
         let queue = &shared.market.md_events;
         let head = queue.head();
         let tail = queue.tail();
@@ -801,6 +826,147 @@ mod tests {
 
     fn stream(core: &ClientCore, shared: &SharedState, req_id: i64, instrument: InstrumentId) {
         assert!(core.attach_md_request(shared, req_id, instrument, false, "STK", "SMART", None, false, false));
+    }
+
+    fn snapshot(core: &ClientCore, shared: &SharedState, req_id: i64, instrument: InstrumentId) {
+        assert!(core.attach_md_request(shared, req_id, instrument, true, "OPT", "SMART", None, false, false));
+    }
+
+    fn poll_at(core: &ClientCore, shared: &SharedState, at: std::time::Instant) -> Vec<MdOut> {
+        let mut out = Vec::new();
+        core.poll_market_data(shared, Some(at), &mut out);
+        out
+    }
+
+    // Synthetic timing regression for upstream 0ed6407, not a recording:
+    // a farm that acknowledges after 13 s must still deliver its quote.
+    // Exercise the native acknowledgement parser, bridge, and callback
+    // projection together without a live broker or a wall-clock sleep.
+    #[test]
+    fn late_farm_ack_starts_the_option_snapshot_window() {
+        use crate::engine::context::Context;
+        use crate::engine::hot_loop::farm::{FarmState, MdSubscribe};
+        use crate::engine::hot_loop::pool::{FixSink, PRIMARY_MD};
+        use crate::engine::hot_loop::HeartbeatState;
+        use std::time::{Duration, Instant};
+
+        #[derive(Default)]
+        struct Sink(Vec<Vec<(u32, String)>>);
+        impl FixSink for Sink {
+            fn send_plain(&mut self, fields: &[(u32, &str)]) -> bool { self.send_comp(fields) }
+            fn send_comp(&mut self, fields: &[(u32, &str)]) -> bool {
+                self.0.push(fields.iter().map(|(tag, value)| (*tag, value.to_string())).collect());
+                true
+            }
+        }
+        let (core, shared) = (ClientCore::new(), SharedState::new());
+        let mut context = Context::new();
+        let mut farm = FarmState::new();
+        let instrument = context.market.register(929914886);
+        context.market.set_routing(instrument, "OPT", "");
+        snapshot(&core, &shared, 1, instrument);
+        let start = Instant::now() - Duration::from_secs(13);
+        core.snapshot_reqs.lock().unwrap().get_mut(&1).unwrap().started = start;
+        assert!(poll_at(&core, &shared, start + Duration::from_secs(12)).is_empty());
+
+        let mut sink = Sink::default();
+        let mut hb = HeartbeatState::new();
+        farm.subscribe_top(&MdSubscribe {
+            con_id: 929914886, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "OPT".into(),
+            last_trade_date: "20261014".into(), strike: 332.5, right: "C".into(), multiplier: "100".into(),
+            instrument, mode_9887: 0, snapshot: true,
+        }, PRIMARY_MD, &mut sink, &mut hb);
+        let request = &sink.0[0].iter().find(|(tag, _)| *tag == 262).unwrap().1;
+        let ack = format!("8=O\x0135=Q\x0154,{request},0.01,0,3,9c,,1,1");
+        farm.process_farm_message(ack.as_bytes(), &mut None, &mut context, &shared, &None, &mut hb);
+        assert!(poll_at(&core, &shared, Instant::now()).is_empty());
+        let acked = core.snapshot_reqs.lock().unwrap()[&1].started;
+        assert!(acked >= start + Duration::from_secs(13));
+        book(&shared, instrument, 100);
+        let quote = lines(&poll_at(&core, &shared, acked + Duration::from_secs(1)));
+        assert!(quote.contains(&"price:1:1:100".to_string()), "{quote:?}");
+        assert!(quote.contains(&"price:1:2:101".to_string()), "{quote:?}");
+        shared.market.push_top_ack(instrument, acked + Duration::from_secs(5));
+        assert!(poll_at(&core, &shared, acked + Duration::from_secs(10)).is_empty());
+        assert_eq!(poll_at(&core, &shared, acked + crate::control::snapshot::TIMEOUT), [MdOut::SnapshotEnd(1)]);
+        assert!(poll_at(&core, &shared, acked + Duration::from_secs(20)).is_empty());
+        assert!(core.unregister_mkt_data(&shared, 1).is_some());
+        assert!(core.last_quotes.lock().unwrap().is_empty());
+        assert!(core.snapshot_reqs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshots_joining_unacknowledged_streams_wait_for_the_same_ack() {
+        use std::time::{Duration, Instant};
+        let (core, shared) = (ClientCore::new(), SharedState::new());
+        stream(&core, &shared, 1, 5);
+        snapshot(&core, &shared, 2, 5);
+        let start = core.snapshot_reqs.lock().unwrap()[&2].started;
+        assert!(poll_at(&core, &shared, start + Duration::from_secs(13)).is_empty());
+        let ack = start + Duration::from_secs(14);
+        shared.market.push_top_ack(5, ack);
+        assert!(poll_at(&core, &shared, ack).is_empty());
+        assert!(poll_at(&core, &shared, ack + Duration::from_secs(10)).is_empty());
+        assert_eq!(poll_at(&core, &shared, ack + Duration::from_secs(11)), [MdOut::SnapshotEnd(2)]);
+        assert!(!core.last_quotes.lock().unwrap()[&1].ended, "the shared stream remains live");
+        assert!(core.unregister_mkt_data(&shared, 2).is_some());
+        assert!(core.last_quotes.lock().unwrap().contains_key(&1));
+
+        // Its acknowledgement was consumed with no active snapshot:
+        // a new join starts immediately, not another 60 s wait.
+        snapshot(&core, &shared, 3, 5);
+        let joined = core.snapshot_reqs.lock().unwrap()[&3].started;
+        assert_eq!(poll_at(&core, &shared, joined + Duration::from_secs(11)), [MdOut::SnapshotEnd(3)]);
+        assert!(joined <= Instant::now());
+    }
+
+    #[test]
+    fn an_unacknowledged_snapshot_ends_once_and_cancel_discards_old_ack() {
+        use std::time::{Duration, Instant};
+        let (core, shared) = (ClientCore::new(), SharedState::new());
+        snapshot(&core, &shared, 1, 5);
+        let start = core.snapshot_reqs.lock().unwrap()[&1].started;
+        assert!(poll_at(&core, &shared, start + Duration::from_secs(59)).is_empty());
+        assert_eq!(poll_at(&core, &shared, start + Duration::from_secs(60)), [MdOut::SnapshotEnd(1)]);
+        assert!(poll_at(&core, &shared, start + Duration::from_secs(61)).is_empty());
+        shared.market.push_top_ack(5, Instant::now());
+        assert!(core.unregister_mkt_data(&shared, 1).is_some());
+        snapshot(&core, &shared, 2, 5);
+        let next = core.snapshot_reqs.lock().unwrap()[&2].started;
+        assert!(poll_at(&core, &shared, next + Duration::from_secs(12)).is_empty(),
+            "the previous subscription's queued ack cannot acknowledge a reused slot");
+        assert!(core.unregister_mkt_data(&shared, 2).is_some());
+        assert!(core.snapshot_reqs.lock().unwrap().is_empty());
+        assert!(core.last_quotes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_remap_uses_the_target_ack_without_restarting_its_window() {
+        use std::time::{Duration, Instant};
+        for source_acked in [false, true] {
+            let (core, shared) = (ClientCore::new(), SharedState::new());
+            stream(&core, &shared, 1, 5);
+            shared.market.push_top_ack(5, Instant::now());
+            assert!(poll(&core, &shared).is_empty());
+            snapshot(&core, &shared, 2, 6);
+            let start = Instant::now() - Duration::from_secs(5);
+            core.snapshot_reqs.lock().unwrap().get_mut(&2).unwrap().started = start;
+            if source_acked {
+                shared.market.push_top_ack(6, start);
+                assert!(poll(&core, &shared).is_empty());
+            }
+            let before_merge = Instant::now();
+            shared.market.push_md_merge(6, 5);
+            core.take_md_rejects(&shared);
+            let window = core.snapshot_reqs.lock().unwrap()[&2].started;
+            if source_acked {
+                assert_eq!(window, start, "moving an acknowledged snapshot cannot extend it");
+            } else {
+                assert!(window >= before_merge, "the acknowledged target starts the waiting snapshot");
+            }
+            assert!(poll_at(&core, &shared, window + Duration::from_secs(10)).is_empty());
+            assert_eq!(poll_at(&core, &shared, window + Duration::from_secs(11)), [MdOut::SnapshotEnd(2)]);
+        }
     }
 
     // ibx#446: the reference sent a request's ticks before its cancel: a

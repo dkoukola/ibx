@@ -1,14 +1,19 @@
 //! Plain snapshot of reqMktData (ibx#446), as the reference's API
 //! subscriber does it: each tick type of the answer is sent once; the
 //! snapshot ends when the bid, ask, last, open and close were sent (with the
-//! option computations for an option), or 11 s after it started. A snapshot
+//! option computations for an option), or 11 s after its top of book was
+//! acknowledged. A snapshot
 //! with generic ticks is refused, and so is a snapshot beyond the per-second
 //! limit.
 
 use std::time::{Duration, Instant};
 
-/// A snapshot that is not complete ends this long after it started.
+/// A snapshot that is not complete ends this long after its top of book
+/// was acknowledged (ibx#494; upstream 0ed6407).
 pub const TIMEOUT: Duration = Duration::from_millis(11_000);
+/// A snapshot whose top of book is never acknowledged has this finite
+/// setup limit, as in upstream 0ed6407.
+pub const UNACKED_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The refusal of a snapshot with generic ticks.
 pub const GENERIC_TICKS_REFUSED: &str =
@@ -109,11 +114,21 @@ pub struct PlainSnapshot {
     /// The tick types sent (or never to be sent), as `tick_bit`s.
     pub sent: u64,
     option: bool,
+    acked: bool,
 }
 
 impl PlainSnapshot {
     pub fn new(sec_type: &str, started: Instant) -> Self {
-        Self { started, sent: premarked(sec_type), option: is_option(sec_type) }
+        Self { started, sent: premarked(sec_type), option: is_option(sec_type), acked: false }
+    }
+
+    /// The first top-of-book acknowledgement starts the collection
+    /// window. A request joining an acknowledged quote starts now.
+    pub fn acked_at(&mut self, at: Instant) {
+        if !self.acked {
+            self.acked = true;
+            self.started = at.max(self.started);
+        }
     }
 
     /// Whether the tick type is to be sent now: the first time only, and
@@ -135,7 +150,7 @@ impl PlainSnapshot {
     }
 
     pub fn timed_out(&self, now: Instant) -> bool {
-        now.duration_since(self.started) >= TIMEOUT
+        now.duration_since(self.started) >= if self.acked { TIMEOUT } else { UNACKED_TIMEOUT }
     }
 }
 
@@ -233,11 +248,26 @@ mod tests {
     }
 
     #[test]
-    fn eleven_seconds_end_it() {
+    fn eleven_seconds_after_the_first_acknowledgement_end_it() {
         let start = Instant::now();
-        let s = PlainSnapshot::new("STK", start);
-        assert!(!s.timed_out(start + Duration::from_millis(10_999)));
-        assert!(s.timed_out(start + Duration::from_millis(11_000)));
+        let mut s = PlainSnapshot::new("STK", start);
+        assert!(!s.timed_out(start + Duration::from_secs(30)));
+        assert!(s.timed_out(start + UNACKED_TIMEOUT));
+        let ack = start + Duration::from_secs(13);
+        s.acked_at(ack);
+        assert!(!s.timed_out(ack + Duration::from_millis(10_999)));
+        assert!(s.timed_out(ack + TIMEOUT));
+        s.acked_at(ack + Duration::from_secs(5));
+        assert_eq!(s.started, ack, "repeated acknowledgements do not extend the window");
+    }
+
+    #[test]
+    fn an_earlier_queued_ack_does_not_backdate_a_joined_snapshot() {
+        let start = Instant::now();
+        let mut s = PlainSnapshot::new("OPT", start);
+        s.acked_at(start - Duration::from_secs(20));
+        assert_eq!(s.started, start);
+        assert!(!s.timed_out(start + Duration::from_secs(10)));
     }
 
     #[test]

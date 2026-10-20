@@ -972,6 +972,7 @@ impl FarmState {
         // The bid/ask entry of the pair (the first of each pair of ids)
         // gives the request parameters (ibx#449).
         if bid_ask {
+            shared.market.push_top_ack(instrument, Instant::now());
             let sec_type = context.market.order_routing(instrument).0;
             if let Some(params) = tick_req_params(instrument, min_tick, &parts, &sec_type) {
                 if let Some(con_id) = context.market.con_id(instrument) {

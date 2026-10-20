@@ -12,6 +12,7 @@
 
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use std::collections::HashMap;
 use crate::control::historical::{HistoricalBar, HistoricalResponse, HeadTimestampResponse};
@@ -364,6 +365,8 @@ pub struct MarketDataState {
     /// Slots of requests without a conId whose contract was found, with
     /// its conId (ibx#444).
     md_resolved: Mutex<Vec<(InstrumentId, i64)>>,
+    /// Top-of-book acknowledgements start the snapshot collection window.
+    top_acks: Mutex<Vec<(InstrumentId, Instant)>>,
     /// The request parameters of acked subscriptions (ibx#449).
     tick_req_params: Mutex<Vec<TickReqParams>>,
     snapshot_acks: Mutex<Vec<TickReqParams>>,
@@ -451,6 +454,7 @@ impl MarketDataState {
             md_rejects: Mutex::new(Vec::new()),
             md_merges: Mutex::new(Vec::new()),
             md_resolved: Mutex::new(Vec::new()),
+            top_acks: Mutex::new(Vec::new()),
             tick_req_params: Mutex::new(Vec::new()),
             snapshot_acks: Mutex::new(Vec::new()),
             tbt_errors: Mutex::new(Vec::new()),
@@ -474,6 +478,23 @@ impl MarketDataState {
 
     pub fn drain_tick_req_params(&self) -> Vec<TickReqParams> {
         self.tick_req_params.lock().unwrap().drain(..).collect()
+    }
+
+    /// The bid/ask entry was acknowledged at `at` (ibx#494).
+    pub(crate) fn push_top_ack(&self, instrument: InstrumentId, at: Instant) {
+        self.top_acks.lock().unwrap().push((instrument, at));
+    }
+
+    pub(crate) fn drain_top_acks(&self) -> Vec<(InstrumentId, Instant)> {
+        let mut acks = self.top_acks.lock().unwrap();
+        if acks.is_empty() { return Vec::new(); }
+        acks.drain(..).collect()
+    }
+
+    /// A cancelled subscription's queued acknowledgement cannot start a
+    /// later request that reuses its instrument slot.
+    pub(crate) fn discard_top_acks(&self, instrument: InstrumentId) {
+        self.top_acks.lock().unwrap().retain(|(id, _)| *id != instrument);
     }
 
     /// Acknowledgement of a regulatory snapshot request (ibx#446): the

@@ -7359,14 +7359,14 @@ fn option_stream_auto_execution_comes_from_the_farm() {
     drop(engine);
 }
 
-// A snapshot that never completes ends 11 s after its start; a stream
-// never ends.
+// A snapshot that never completes ends 11 s after its acknowledgement.
 #[test]
 fn plain_snapshot_ends_at_the_time_limit() {
     let start = std::time::Instant::now();
     let (client, rx, shared) = test_client();
     let engine = top_engine(rx);
     client.req_mkt_data(1, &spy_stk(), "", true, false).unwrap();
+    shared.market.push_top_ack(5, start);
     let s = crate::types::PRICE_SCALE;
     shared.market.push_test_message(5, &crate::types::Quote { bid: 100 * s, ..Default::default() }, &Default::default());
     let mut w = SnapRec::default();
@@ -7381,6 +7381,32 @@ fn plain_snapshot_ends_at_the_time_limit() {
     client.core.poll_market_data(&shared, Some(start + 2 * crate::control::snapshot::TIMEOUT), &mut out);
     assert!(out.is_empty(), "gone after its end: {out:?}");
     drop(engine);
+}
+
+// Synthetic clock advance: the finite unacknowledged setup window must
+// reach the public callback once and release its engine subscription.
+#[test]
+fn unacknowledged_snapshot_callback_automatically_cancels_its_subscription() {
+    for delayed in [false, true] {
+        let (client, rx, shared) = test_client();
+        let engine = top_engine(rx);
+        client.req_mkt_data(1, &spy_stk(), "", true, false).unwrap();
+        if delayed {
+            client.core.set_delayed(1);
+        }
+        let after_setup_limit = std::time::Instant::now() + crate::control::snapshot::UNACKED_TIMEOUT;
+        client.core.poll_market_data(&shared, Some(after_setup_limit), &mut client.core.md_out.lock().unwrap());
+        let mut wrapper = SnapRec::default();
+        client.process_msgs(&mut wrapper);
+        assert_eq!(wrapper.events, ["end:1"]);
+        assert!(!client.core.req_to_instrument.lock().unwrap().contains_key(&1));
+        assert!(!client.core.instrument_to_req.lock().unwrap().contains_key(&5));
+        assert!(!client.core.last_quotes.lock().unwrap().contains_key(&1));
+        wrapper.events.clear();
+        client.process_msgs(&mut wrapper);
+        assert!(wrapper.events.is_empty(), "no second completion or stale callback");
+        assert_eq!(engine.join().unwrap(), ["subscribe:756733:true", "unsubscribe:5"]);
+    }
 }
 
 // A snapshot with legal generic ticks is refused with 321, before the
