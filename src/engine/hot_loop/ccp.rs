@@ -1635,8 +1635,16 @@ impl CcpState {
             && !key_collision
             && context.last_clord.get(&clord_id).map_or(clord_id == server_id,
                 |id| perm_id_from_clord_id(id) == server_id));
+        let combo_view = context
+            .combos
+            .orders
+            .contains_key(&clord_id)
+            .then(|| shared.orders.combo_view(clord_id))
+            .flatten();
         if history == super::completed_history::HistoryReport::Row && !known_current {
-            if collect_history { self.completed_history.collect(parsed, account_id, None); }
+            if collect_history {
+                self.completed_history.collect(parsed, account_id, None, false);
+            }
             return;
         }
         let cancelled = matches!(parsed.get(&39).map(String::as_str), Some("4" | "C"));
@@ -1673,7 +1681,8 @@ impl CcpState {
                 // otherwise the historical lifecycle stays query-local.
                 let terminal = previous.as_ref().filter(|info|
                     matches!(info.order_state.status.as_str(), "Filled" | "Cancelled" | "Inactive"));
-                self.completed_history.collect(parsed, account_id, terminal);
+                self.completed_history
+                    .collect(parsed, account_id, terminal, combo_view.is_some());
             }
             return;
         }
@@ -1709,7 +1718,12 @@ impl CcpState {
             && context.last_clord.get(&clord_id).map(|id| perm_id_from_clord_id(id)) == Some(server_id)
         {
             if collect_history {
-                self.completed_history.collect(parsed, account_id, previous.as_ref());
+                self.completed_history.collect(
+                    parsed,
+                    account_id,
+                    previous.as_ref(),
+                    combo_view.is_some(),
+                );
             }
             return;
         }
@@ -1875,8 +1889,6 @@ impl CcpState {
         // the combo's fill, one fill per leg under the order's id, with
         // 6013 = leg index : leg count). The combo's own reports keep its
         // totals for the legs' callbacks.
-        let combo_view = context.combos.orders.contains_key(&clord_id)
-            .then(|| shared.orders.combo_view(clord_id)).flatten();
         if let Some(combo) = context.combos.orders.get_mut(&clord_id) {
             if is_leg_report(parsed) {
                 if !is_status_report {
@@ -2313,7 +2325,8 @@ impl CcpState {
                 if info.report_revision.is_none() { info.report_revision = previous.report_revision; }
             }
             if collect_history {
-                self.completed_history.collect(parsed, account_id, Some(&info));
+                self.completed_history
+                    .collect(parsed, account_id, Some(&info), combo_view.is_some());
             }
             if con_id != 0 {
                 shared.reference.cache_contract(con_id, info.contract.clone());

@@ -202,6 +202,7 @@ impl HistoryRequests {
         fields: &HashMap<u32, String>,
         account: &str,
         known: Option<&RichOrderInfo>,
+        known_combo: bool,
     ) {
         if let Some(active) = self.active.as_mut()
             && !active.timed_out
@@ -214,6 +215,7 @@ impl HistoryRequests {
                     .get_mut(&(account.to_string(), known.order.perm_id))
             {
                 row.known = Some(known.clone());
+                row.known_combo = known_combo;
                 row.version = known.report_revision.unwrap_or(row.version);
                 if let Some(time) = &known.report_time {
                     row.time = time.clone();
@@ -236,7 +238,7 @@ impl HistoryRequests {
     ) -> HistoryReport {
         let report = self.classify(fields, shared, account);
         if report == HistoryReport::Row {
-            self.collect(fields, account, None);
+            self.collect(fields, account, None, false);
         }
         report
     }
@@ -357,6 +359,9 @@ struct Row {
     // A fresh accepted report of a known current order uses the same typed
     // reduction as the live receiver, including cancellation's retained terms.
     known: Option<RichOrderInfo>,
+    // The live receiver has an exact per-order ComboView. A contract cached
+    // by BAG conId alone is not authority: different combos share that conId.
+    known_combo: bool,
 }
 
 #[derive(Default)]
@@ -382,6 +387,13 @@ impl Reducer {
         let owner = tag(1).ok_or("History row has no account")?;
         if owner != account {
             return Err("History row belongs to a different account");
+        }
+        match super::ccp::execution_component(fields) {
+            crate::api::types::ExecutionComponent::ComboLeg { .. } => return Ok(()),
+            crate::api::types::ExecutionComponent::UnsupportedCombo { .. } => {
+                return Err("Completed-order history has unsupported combo component metadata");
+            }
+            _ => {}
         }
         let clord = tag(11).ok_or("History row has no broker order identity")?;
         let base = perm_id_from_clord_id(clord);
@@ -415,6 +427,7 @@ impl Reducer {
                 // not the existing rich terms, at any accepted revision.
                 previous.status = status;
                 previous.known = None;
+                previous.known_combo = false;
                 previous.version = previous.version.max(version);
                 previous.time = time.to_string();
                 for t in [39, 150, 6699, 60, 52] {
@@ -441,6 +454,7 @@ impl Reducer {
                 fields: fields.clone(),
                 status,
                 known: None,
+                known_combo: false,
             },
         );
         Ok(())
@@ -475,6 +489,9 @@ impl Reducer {
                     .is_some_and(|id| id != 0 && id != i64::from(i32::MAX));
             if api_only && !from_api {
                 continue;
+            }
+            if fields.get(&167).map(String::as_str) == Some("BAG") && !row.known_combo {
+                return Err("Completed-order BAG snapshot has no known per-order combo".into());
             }
             // STANDARD supplies complete typed order snapshots. Do not turn
             // an incomplete row or an unsupported native container into a
@@ -531,7 +548,7 @@ impl Reducer {
                 .get(&(account.as_str(), parent))
                 .copied()
                 .unwrap_or(parent);
-            let projected = row.known.clone().unwrap_or_else(|| {
+            let mut projected = row.known.clone().unwrap_or_else(|| {
                 project_report(
                     fields,
                     ReportProjection {
@@ -548,13 +565,32 @@ impl Reducer {
                     },
                 )
             });
+            let combo = projected.contract.sec_type == "BAG";
+            if combo && !row.known_combo {
+                return Err("Completed-order BAG snapshot has no known per-order combo".into());
+            }
+            // Match openOrder's existing ComboView convention: per-leg prices
+            // are the order limits, while FIX 44 is their derived net price.
+            // Missing/partly populated leg prices must not become zero limits.
+            let leg_prices = &projected.order.order_combo_legs;
+            let per_leg_priced = combo && leg_prices.iter().any(|price| *price != f64::MAX);
+            if combo
+                && ((!leg_prices.is_empty()
+                    && leg_prices.len() != projected.contract.combo_legs.len())
+                    || leg_prices.iter().any(|price| !price.is_finite())
+                    || (per_leg_priced && leg_prices.contains(&f64::MAX)))
+            {
+                return Err("Incomplete completed-order combo leg prices".into());
+            }
+            if per_leg_priced {
+                projected.order.lmt_price = f64::MAX;
+            }
             // A known order may have started with a partial acknowledgement;
             // retaining it on a sparse cancellation must not invent terms.
             let order = &projected.order;
             if projected.contract.con_id <= 0
                 || projected.contract.currency.is_empty()
                 || projected.contract.sec_type.is_empty()
-                || projected.contract.sec_type == "BAG"
                 || !matches!(order.action.as_str(), "BUY" | "SELL" | "SSHORT")
                 || !order.total_quantity.is_finite()
                 || order.total_quantity < 0.0
@@ -571,7 +607,9 @@ impl Reducer {
             }
             match order.order_type.as_str() {
                 "MKT" => {}
-                "LMT" if order.lmt_price.is_finite() && order.lmt_price != f64::MAX => {}
+                "LMT"
+                    if per_leg_priced
+                        || (order.lmt_price.is_finite() && order.lmt_price != f64::MAX) => {}
                 "STP" if order.aux_price.is_finite() && order.aux_price != f64::MAX => {}
                 "STP LMT"
                     if order.lmt_price.is_finite()
@@ -681,6 +719,363 @@ mod tests {
         }
         row.remove(&44);
         row
+    }
+
+    fn captured_combo(filled: bool, side: &str) -> (HashMap<u32, String>, Vec<f64>) {
+        let fixture = if filled {
+            include_str!("../../../tests/fixtures/gw1040/scenarios/20260930/i105_combo_fill.jsonl")
+        } else {
+            include_str!(
+                "../../../tests/fixtures/gw1040/scenarios/20260926b/i105_combo_leg_prices.jsonl"
+            )
+        };
+        for line in fixture.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["leg"] != "fix_in" || value["conn"] != "CCP" {
+                continue;
+            }
+            let Some(values) = value["fields"].as_array() else {
+                continue;
+            };
+            let mut fields: HashMap<u32, String> = values
+                .iter()
+                .map(|field| {
+                    (
+                        field[0].as_str().unwrap().parse().unwrap(),
+                        field[1].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            if fields.get(&167).map(String::as_str) != Some("BAG")
+                || fields.get(&39).map(String::as_str) != Some(if filled { "2" } else { "4" })
+                || fields.get(&54).map(String::as_str) != Some(side)
+            {
+                continue;
+            }
+            let prices = values
+                .iter()
+                .filter(|field| field[0] == "6879")
+                .map(|field| field[1].as_str().unwrap().parse().unwrap())
+                .collect();
+            // These are captured live reports, not a captured STANDARD reply.
+            // Restate the same typed order for this history regression.
+            fields.insert(20, "3".into());
+            return (fields, prices);
+        }
+        panic!("missing captured terminal combo");
+    }
+
+    fn known_combo(fields: &HashMap<u32, String>, prices: Vec<f64>) -> RichOrderInfo {
+        use crate::api::types::{ComboLeg, Contract};
+        use crate::bridge::ComboView;
+        // This exact view comes from the submitted contract in the captured
+        // session. SMART is not inferred from a cold BAG history report.
+        let combo = ComboView {
+            contract: Contract {
+                con_id: 28_812_380,
+                symbol: "QQQ,SPY".into(),
+                sec_type: "BAG".into(),
+                exchange: "SMART".into(),
+                currency: "USD".into(),
+                combo_legs: [(756_733, "BUY"), (320_227_571, "SELL")]
+                    .into_iter()
+                    .map(|(con_id, action)| ComboLeg {
+                        con_id,
+                        ratio: 1,
+                        action: action.into(),
+                        exchange: "SMART".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            leg_prices: prices,
+        };
+        project_report(
+            fields,
+            ReportProjection {
+                order_id: fields[&6121].parse().unwrap(),
+                parent_id: 0,
+                status: if fields[&39] == "2" {
+                    OrderStatus::Filled
+                } else {
+                    OrderStatus::Cancelled
+                },
+                account_id: "DUXXXXXXX",
+                fallback_order: None,
+                fallback_con_id: 0,
+                cached_contract: None,
+                combo: Some(&combo),
+                trail_limit: None,
+                combo_leg_prices: combo.leg_prices.clone(),
+            },
+        )
+    }
+
+    fn finish_combo_query(
+        fields: &HashMap<u32, String>,
+        known: Option<&RichOrderInfo>,
+        known_combo: bool,
+    ) -> Result<Vec<RichOrderInfo>, String> {
+        let mut history = active();
+        let shared = SharedState::new();
+        history.collect(fields, "DUXXXXXXX", known, known_combo);
+        history.report(&capture()[2], &shared, "DUXXXXXXX");
+        assert!(shared.orders.drain_fills().is_empty());
+        assert!(shared.orders.drain_order_updates().is_empty());
+        assert!(shared.orders.drain_open_orders().is_empty());
+        shared
+            .orders
+            .drain_completed_history_replies()
+            .remove(0)
+            .result
+    }
+
+    #[test]
+    fn completed_known_combo_preserves_captured_fill_topology_and_signed_net_limits() {
+        for side in ["1", "2"] {
+            let (fields, prices) = captured_combo(true, side);
+            assert!(prices.is_empty());
+            let known = known_combo(&fields, vec![f64::MAX; 2]);
+            let rows = finish_combo_query(&fields, Some(&known), true).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].contract, known.contract);
+            assert_eq!(rows[0].order.lmt_price, known.order.lmt_price);
+            assert_eq!(rows[0].order.action, known.order.action);
+            assert_eq!(rows[0].order.filled_quantity, 1.0);
+            assert_eq!(rows[0].order_state.status, "Filled");
+        }
+        for price in ["-1.25", "0", "1.25"] {
+            let (mut fields, _) = captured_combo(true, "1");
+            fields.insert(44, price.into());
+            let known = known_combo(&fields, vec![f64::MAX; 2]);
+            let rows = finish_combo_query(&fields, Some(&known), true).unwrap();
+            assert_eq!(rows[0].order.lmt_price, price.parse::<f64>().unwrap());
+        }
+    }
+
+    #[test]
+    fn completed_known_combo_preserves_captured_per_leg_limits_without_inventing_net() {
+        let (fields, prices) = captured_combo(false, "1");
+        assert_eq!(prices, vec![721.35, 794.5]);
+        assert_eq!(fields[&44], "-73.15");
+        let known = known_combo(&fields, prices.clone());
+        let rows = finish_combo_query(&fields, Some(&known), true).unwrap();
+        assert_eq!(rows[0].order_state.status, "Cancelled");
+        assert_eq!(rows[0].order.order_combo_legs, prices);
+        assert_eq!(rows[0].order.lmt_price, f64::MAX);
+        let known = known_combo(&fields, vec![0.0, 1.25]);
+        let rows = finish_combo_query(&fields, Some(&known), true).unwrap();
+        assert_eq!(rows[0].order.order_combo_legs, vec![0.0, 1.25]);
+        assert_eq!(rows[0].order.lmt_price, f64::MAX);
+        for prices in [
+            vec![1.25],
+            vec![1.25, f64::MAX],
+            vec![f64::NAN, 1.25],
+            vec![1.25, f64::INFINITY],
+        ] {
+            let known = known_combo(&fields, prices);
+            assert!(finish_combo_query(&fields, Some(&known), true).is_err());
+        }
+    }
+
+    #[test]
+    fn completed_combo_requires_exact_per_order_view_not_shared_bag_contract_cache() {
+        let (fields, _) = captured_combo(true, "1");
+        let cached = known_combo(&fields, vec![f64::MAX; 2]);
+        for known in [None, Some(&cached)] {
+            assert_eq!(
+                finish_combo_query(&fields, known, false).unwrap_err(),
+                "Completed-order BAG snapshot has no known per-order combo"
+            );
+        }
+        let mut other_order = cached.clone();
+        other_order.order.perm_id += 1;
+        assert!(finish_combo_query(&fields, Some(&other_order), true).is_err());
+        for price in [f64::MAX, f64::NAN, f64::INFINITY] {
+            let mut known = cached.clone();
+            known.order.lmt_price = price;
+            assert!(finish_combo_query(&fields, Some(&known), true).is_err());
+        }
+    }
+
+    #[test]
+    fn completed_combo_receiver_requires_exact_per_order_view_not_cached_bag_legs() {
+        use crate::bridge::ComboView;
+        use crate::engine::combo::{Combo, ComboOrder, Leg};
+        use crate::types::{Order, PRICE_SCALE, Side};
+
+        for exact_view in [false, true] {
+            let (mut fields, _) = captured_combo(true, "1");
+            fields.insert(1, "DU123456".into());
+            let contract = known_combo(&fields, vec![f64::MAX; 2]).contract;
+            let order_id = perm_id_from_clord_id(&fields[&11]);
+            let (mut ccp, mut context, shared) =
+                (CcpState::new(), Context::new(), SharedState::new());
+            let instrument = context.register_instrument(contract.con_id);
+            context.insert_order(Order::new(
+                order_id,
+                instrument,
+                Side::Buy,
+                1,
+                23 * PRICE_SCALE,
+                b'2',
+                b'0',
+                0,
+            ));
+            // Both branches have cached BAG legs. Only one has the exact
+            // per-order authority established by local combo submission.
+            shared
+                .reference
+                .cache_contract(contract.con_id, contract.clone());
+            if exact_view {
+                context.combos.orders.insert(
+                    order_id,
+                    ComboOrder {
+                        combo: Combo {
+                            bag_con_id: contract.con_id,
+                            exchange: "SMART".into(),
+                            routed: "BEST".into(),
+                            currency: "USD".into(),
+                            trading_class: "COMB".into(),
+                            legs: [(756_733, "SPY", true), (320_227_571, "QQQ", false)]
+                                .into_iter()
+                                .map(|(con_id, symbol, buy)| Leg {
+                                    con_id,
+                                    ratio: 1,
+                                    buy,
+                                    exchange: "SMART".into(),
+                                    symbol: symbol.into(),
+                                    sec_type: "STK".into(),
+                                    currency: "USD".into(),
+                                    multiplier: 1.0,
+                                })
+                                .collect(),
+                            multiplier: 1.0,
+                        },
+                        spec: Default::default(),
+                        leg_prices: Vec::new(),
+                        price: None,
+                        cum_qty: 0,
+                        leaves_qty: crate::types::QTY_SCALE,
+                        avg_price: 0,
+                        last_price: 0,
+                    },
+                );
+                shared.orders.set_combo_view(
+                    order_id,
+                    ComboView {
+                        contract: contract.clone(),
+                        leg_prices: vec![f64::MAX; 2],
+                    },
+                );
+            }
+            ccp.completed_history = active();
+            deliver(&mut ccp, &mut context, &shared, &fields);
+            deliver(&mut ccp, &mut context, &shared, &capture()[2]);
+            let result = shared
+                .orders
+                .drain_completed_history_replies()
+                .remove(0)
+                .result;
+            if exact_view {
+                let rows = result.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].contract, contract);
+                assert_eq!(rows[0].order_state.status, "Filled");
+                assert_eq!(rows[0].order.filled_quantity, 1.0);
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "Completed-order BAG snapshot has no known per-order combo"
+                );
+            }
+            assert!(shared.orders.drain_fills().is_empty());
+            assert_eq!(context.position_fixed(instrument), 0);
+            assert_eq!(shared.portfolio.position_fixed(instrument), 0);
+        }
+    }
+
+    #[test]
+    fn completed_known_combo_sparse_cancel_keeps_exact_amended_terms() {
+        let (mut fields, prices) = captured_combo(false, "1");
+        fields.insert(39, "0".into());
+        let mut working = known_combo(&fields, prices.clone());
+        working.order_state.status = "Submitted".into();
+        let mut history = active();
+        let shared = SharedState::new();
+        history.collect(&fields, "DUXXXXXXX", Some(&working), true);
+        let cancel: HashMap<u32, String> = [
+            (1, fields[&1].clone()),
+            (11, fields[&11].clone()),
+            (20, "3".into()),
+            (39, "4".into()),
+            (60, "20260926-20:26:00".into()),
+            (14, "0".into()),
+            (12, "0.25".into()),
+        ]
+        .into();
+        let mut cancelled = working.clone();
+        cancelled.order_state.status = "Cancelled".into();
+        cancelled.order_state.commission_and_fees = 0.25;
+        cancelled.report_time = Some(cancel[&60].clone());
+        history.collect(&cancel, "DUXXXXXXX", Some(&cancelled), true);
+        history.report(&capture()[2], &shared, "DUXXXXXXX");
+        let rows = shared
+            .orders
+            .drain_completed_history_replies()
+            .remove(0)
+            .result
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].contract, working.contract);
+        assert_eq!(rows[0].order.order_combo_legs, prices);
+        assert_eq!(rows[0].order.lmt_price, f64::MAX);
+        assert_eq!(rows[0].order_state.status, "Cancelled");
+        assert_eq!(rows[0].order_state.commission_and_fees, 0.25);
+        assert!(shared.orders.drain_fills().is_empty());
+    }
+
+    #[test]
+    fn completed_combo_leg_status_cannot_replace_its_parent_or_hide_unsupported_history() {
+        for known_parent in [false, true] {
+            let (fields, _) = captured_combo(true, "1");
+            let known = known_combo(&fields, vec![f64::MAX; 2]);
+            let mut history = active();
+            let shared = SharedState::new();
+            history.collect(
+                &fields,
+                "DUXXXXXXX",
+                known_parent.then_some(&known),
+                known_parent,
+            );
+            let mut leg = fields.clone();
+            for (tag, value) in [
+                (167, "CS"),
+                (6008, "756733"),
+                (442, "2"),
+                (6013, "0:2"),
+                (6400, fields[&17].as_str()),
+            ] {
+                leg.insert(tag, value.into());
+            }
+            history.report(&leg, &shared, "DUXXXXXXX");
+            history.report(&capture()[2], &shared, "DUXXXXXXX");
+            let result = shared
+                .orders
+                .drain_completed_history_replies()
+                .remove(0)
+                .result;
+            if known_parent {
+                let rows = result.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].contract, known.contract);
+            } else {
+                assert!(result.is_err());
+            }
+            leg.remove(&6013);
+            assert!(finish_combo_query(&leg, None, false).is_err());
+        }
     }
 
     #[test]
