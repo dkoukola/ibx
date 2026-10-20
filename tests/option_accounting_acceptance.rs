@@ -1826,6 +1826,13 @@ fn qualify_and_register(
     );
     receipt.check()?;
 
+    if matches!(purpose, QualificationPurpose::NewLongCallEntry) {
+        // Snapshot cancellation can reclaim an instrument slot when no market
+        // data or order still owns it. Observe first, then acquire the slot used
+        // by the order; never retain that bare ID across the cancellation.
+        capture_quote(session, probe, contract, receipt)?;
+    }
+
     let (reply_tx, reply_rx) = RegistrationReply::channel();
     session
         .control_tx
@@ -2984,7 +2991,7 @@ fn entry_acceptance_run() -> Check<()> {
         session.shutdown();
         return Err(error);
     }
-    let (contract, instrument) = match qualify_and_register(
+    let (_, instrument) = match qualify_and_register(
         &session,
         &mut probe,
         &plan,
@@ -2998,9 +3005,7 @@ fn entry_acceptance_run() -> Check<()> {
             return Err(error);
         }
     };
-    if let Err(error) = capture_quote(&session, &mut probe, &contract, &receipt)
-        .and_then(|()| ensure_no_selected_working(&session, &mut probe, &plan))
-    {
+    if let Err(error) = ensure_no_selected_working(&session, &mut probe, &plan) {
         session.shutdown();
         return Err(error);
     }

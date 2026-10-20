@@ -31,6 +31,46 @@ impl EClient {
         expected_connection: String,
         authorize: impl FnOnce() -> Result<(), String> + Send + 'static,
     ) -> Result<crate::protocol::order_write::OrderWriteReceipt, String> {
+        self.queue_guarded_order(request, None, expected_connection, authorize)
+    }
+
+    /// Queue a new single-contract stock or option order with its exact
+    /// qualified identity, not a previously registered market-data slot.
+    ///
+    /// The request's instrument is replaced during engine preparation. The
+    /// contract survives quote cancellation, slot reuse and metadata parking;
+    /// option terms come from the existing resolved native definition cache.
+    /// Invalid or unavailable terms refuse the receipt before any order write.
+    /// Protected single-contract brackets use the same path. Modifications,
+    /// cancellations, previews and BAG orders use their existing APIs.
+    pub fn send_order_for_contract_guarded(
+        &self,
+        mut request: OrderRequest,
+        contract: &Contract,
+        expected_connection: String,
+        authorize: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> Result<crate::protocol::order_write::OrderWriteReceipt, String> {
+        if matches!(request, OrderRequest::Guarded { .. } | OrderRequest::SubmitWhatIf { .. })
+            || request.combo().is_some()
+            || request.new_order_instrument_mut().is_none()
+        {
+            return Err("exact-contract guarded send requires a new single-contract order".into());
+        }
+        self.queue_guarded_order(
+            request,
+            Some(contract.clone()),
+            expected_connection,
+            authorize,
+        )
+    }
+
+    fn queue_guarded_order(
+        &self,
+        request: OrderRequest,
+        contract: Option<Contract>,
+        expected_connection: String,
+        authorize: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> Result<crate::protocol::order_write::OrderWriteReceipt, String> {
         let shared = self.shared.clone();
         let (guard, receipt) = crate::protocol::order_write::OrderWriteGuard::new(move || {
             if !shared
@@ -48,6 +88,10 @@ impl EClient {
             }
             Ok(())
         });
+        let guard = match contract {
+            Some(contract) => guard.with_contract(contract),
+            None => guard,
+        };
         self.send(ControlCommand::Order(OrderRequest::Guarded {
             request: Box::new(request),
             guard,

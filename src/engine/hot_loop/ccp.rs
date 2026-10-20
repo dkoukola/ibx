@@ -2353,6 +2353,16 @@ impl CcpState {
             if let Some((execution, exec)) = untracked_out.take() {
                 shared.orders.push_untracked_execution(info.contract.clone(), execution, exec);
             }
+            // A guarded/native order has no optimistic API order cache.
+            // Its first ACK may omit the parent link indefinitely; ask for
+            // authoritative status instead of withholding openOrder and every
+            // subsequent open-order snapshot forever. Existing status/history
+            // serialization deduplicates repeated ACKs of this native order.
+            if !info.parent_id_known && crate::client_core::is_open_status(&info.order_state.status)
+                && server_id > 0 && let Some(clord) = parsed.get(&11)
+            {
+                self.completed_history.ensure_status(clord);
+            }
             shared.orders.push_order_info(clord_id, info);
         } else if let (Some(_), Some((execution, exec))) = (&previous, untracked_out.take()) {
             // Execution revisions do not follow the order-state clock. A
@@ -5938,6 +5948,64 @@ mod tests {
                 assert!(shared.orders.get_order_info(42).unwrap().parent_id_known);
                 client.process_msgs(&mut observed);
                 assert_eq!(observed.ends, 1);
+                client.disconnect();
+            }
+        }
+    }
+
+    #[test]
+    fn parent_readiness_fetches_one_status_then_releases_public_order_and_snapshot() {
+        for shared_only in [false, true] {
+            for parent in [None, Some("15.0")] {
+                let (mut ccp, mut context, shared) = ord_status_test_state();
+                if shared_only { context.forget_order(42); }
+                let shared = std::sync::Arc::new(shared);
+                let client = parent_readiness_client(&shared);
+                let mut observed = ParentReadinessCallbacks::default();
+                let (socket, mut peer) = socket_pair();
+                let mut conn = Some(Connection::new_mem(socket));
+                let mut hb = HeartbeatState::new();
+                let mut report = exec_report_frame(&[
+                    (11, "42.0"), (20, "0"), (39, "0"), (150, "0"), (100, "SMART"),
+                    (1, "DU1"), (6008, "756733"), (38, "1"), (151, "1"),
+                    (54, "1"), (40, "2"), (44, "100"), (59, "0"), (6010, "parent-status"),
+                ]);
+                ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+                assert!(!shared.orders.get_order_info(42).unwrap().parent_id_known);
+                client.req_all_open_orders(&mut observed);
+                client.process_msgs(&mut observed);
+                assert_eq!(observed.statuses, ["Submitted"]);
+                assert!(observed.parents.is_empty());
+                assert_eq!(observed.ends, 0);
+
+                // Repeated sparse ACKs share one queued status request.
+                ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+                ccp.progress_completed_history(&mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+                assert_eq!(ccp_messages_sent(&mut peer),
+                    ["35=H|11=42.0|55=*|54=*|6471=1|1=DU1"]);
+                assert!(ccp.completed_history.status_reply_pending());
+                // The in-flight request also suppresses duplicate reads.
+                ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+                ccp.progress_completed_history(&mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+                assert!(ccp_messages_sent(&mut peer).is_empty());
+                client.process_msgs(&mut observed);
+                assert!(observed.parents.is_empty());
+                assert_eq!(observed.ends, 0);
+
+                report.insert(20, "3".into());
+                if let Some(parent) = parent { report.insert(6107, parent.into()); }
+                ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+                client.process_msgs(&mut observed);
+                let expected = if parent.is_some() { 15 } else { 0 };
+                assert_eq!(observed.parents, [expected, expected]);
+                assert_eq!(observed.ends, 1);
+                assert!(shared.orders.get_order_info(42).unwrap().parent_id_known);
+                assert!(!ccp.completed_history.status_reply_pending());
+                report.insert(20, "0".into());
+                report.remove(&6107);
+                ccp.handle_exec_report(&report, &mut context, &shared, &None, "DU1");
+                ccp.progress_completed_history(&mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+                assert!(ccp_messages_sent(&mut peer).is_empty(), "known parent needs no refresh");
                 client.disconnect();
             }
         }

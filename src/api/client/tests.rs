@@ -2034,6 +2034,29 @@ fn place_order_non_stk_contract_rejected() {
 }
 
 #[test]
+fn exact_contract_guarded_send_rejects_non_submit_operations_before_queueing() {
+    let (client, rx, _) = test_client();
+    for request in [
+        OrderRequest::Cancel { order_id: 1 },
+        OrderRequest::CancelAll { instrument: 0 },
+        OrderRequest::GlobalCancel,
+        OrderRequest::SubmitWhatIf {
+            request: Box::new(OrderRequest::SubmitLimit {
+                order_id: 1, instrument: 0, side: Side::Buy, qty: 1, price: 100,
+            }),
+            option_terms: None,
+        },
+    ] {
+        assert!(
+            client.send_order_for_contract_guarded(
+                request, &spy(), "fixture".into(), || panic!("unsupported operation authorized"),
+            ).is_err()
+        );
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn guarded_combo_rejects_non_combo_and_what_if_before_authorization_or_queueing() {
     let (client, rx, _) = test_client();
     let authorizations = Arc::new(std::sync::atomic::AtomicUsize::new(0));

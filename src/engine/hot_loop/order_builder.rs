@@ -120,6 +120,48 @@ pub(crate) fn cancel_what_if(context: &mut Context, order_id: OrderId) {
     context.what_ifs.retain(|_, (id, _)| *id != order_id);
 }
 
+/// Restore the request's exact identity immediately before preparation, on
+/// the engine thread. No quote cleanup can intervene before its frames are
+/// encoded; a parked retry repeats this operation with the same contract.
+fn prepare_guarded_contract(
+    request: &mut OrderRequest,
+    contract: &crate::api::types::Contract,
+    context: &mut Context,
+    shared: &SharedState,
+) -> Result<(), String> {
+    let option = if contract.sec_type.eq_ignore_ascii_case("OPT") {
+        Some(crate::client_core::ClientCore::option_registration_terms(
+            contract,
+            &shared.reference,
+        )?)
+    } else if contract.sec_type.eq_ignore_ascii_case("STK")
+        && contract.con_id > 0
+        && !contract.symbol.is_empty()
+        && !contract.currency.is_empty()
+        && !contract.exchange.is_empty()
+    {
+        None
+    } else {
+        return Err("exact-contract guarded send requires an exact STK or resolved OPT contract".into());
+    };
+    let instrument = request
+        .new_order_instrument_mut()
+        .ok_or("exact-contract guarded send requires a new order")?;
+    let id = context
+        .market
+        .try_register(contract.con_id)
+        .ok_or("instrument table full during guarded contract preparation")?;
+    shared.market.set_instrument_count(context.market.count());
+    context.market.set_symbol(id, contract.symbol.clone());
+    context.market.set_routing(id, &contract.sec_type, &contract.exchange);
+    context.market.set_currency(id, &contract.currency);
+    if let Some(terms) = option {
+        context.market.set_option_terms(id, terms);
+    }
+    *instrument = id;
+    Ok(())
+}
+
 pub(crate) fn drain_and_send_orders(
     ccp_conn: &mut Option<Connection>,
     context: &mut Context,
@@ -168,6 +210,13 @@ pub(crate) fn drain_and_send_orders(
             }
         };
         let oid = order_req.order_id();
+        if let Some(contract) = guard.as_ref().and_then(|guard| guard.contract())
+            && let Err(message) = prepare_guarded_contract(&mut order_req, contract, context, shared)
+        {
+            shared.orders.push_order_error(oid, 321, message);
+            refuse_guard();
+            continue;
+        }
         // A what-if preview is the order as it would be placed, written by
         // its own encoder (ibx#462); it is unwrapped here and wrapped again
         // if it has to wait.
@@ -4058,6 +4107,217 @@ mod tests {
             qty: 1,
             price: 100 * P,
         }
+    }
+
+    fn guarded_option_contract(shared: &SharedState) -> crate::api::types::Contract {
+        use crate::control::contracts::{ContractDefinition, OptionRight, SecurityType};
+        shared.reference.cache_option_order_terms(&ContractDefinition {
+            con_id: 922376919,
+            symbol: "F".into(),
+            sec_type: SecurityType::Option,
+            exchange: "SMART".into(),
+            currency: "USD".into(),
+            last_trade_date: "20261030".into(),
+            contract_month: "202610".into(),
+            strike: 12.0,
+            right: Some(OptionRight::Call),
+            multiplier: 100.0,
+            multiplier_text: "100".into(),
+            ..Default::default()
+        });
+        crate::api::types::Contract {
+            con_id: 922376919,
+            symbol: "F".into(),
+            sec_type: "OPT".into(),
+            exchange: "CBOE".into(),
+            currency: "USD".into(),
+            last_trade_date_or_contract_month: "20261030".into(),
+            strike: 12.0,
+            right: "C".into(),
+            multiplier: "100".into(),
+            ..Default::default()
+        }
+    }
+
+    fn assert_guarded_option_frame(frame: &[(u32, String)]) {
+        for (number, value) in [
+            (35, "D"), (55, "F"), (200, "202610"), (201, "1"),
+            (202, "12"), (167, "OPT"), (231, "100.00"),
+            (15, "USD"), (100, "CBOE"), (6008, "922376919"),
+        ] {
+            assert_eq!(tag(frame, number), Some(value), "tag {number}");
+        }
+    }
+
+    #[test]
+    fn exact_guarded_order_survives_queued_unsubscribe_and_slot_reuse_once() {
+        use crate::types::ControlCommand;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (mut engine, shared, _farm, tx) = super::super::news_tests::engine();
+        shared.orders.begin_execution_history("initial");
+        let contract = guarded_option_contract(&shared);
+        tx.send(ControlCommand::RegisterOptionInstrument {
+            contract: Box::new(contract.clone()), reply_tx: None,
+        }).unwrap();
+        engine.poll_once();
+        let original = engine.context.market.instrument_by_con_id(contract.con_id).unwrap();
+        let client = crate::api::EClient::from_parts(
+            shared.clone(), tx.clone(), std::thread::spawn(|| {}), "DU1".into(),
+        );
+        let authorizations = Arc::new(AtomicUsize::new(0));
+        let calls = authorizations.clone();
+        let receipt = client.send_order_for_contract_guarded(
+            OrderRequest::SubmitLimit {
+                order_id: 60, instrument: original, side: Side::Buy, qty: 1, price: P,
+            },
+            &contract, "initial".into(),
+            move || { calls.fetch_add(1, Ordering::SeqCst); Ok(()) },
+        ).unwrap();
+        // The same control batch contains quote cleanup after the order was
+        // queued but before pending orders are prepared. Its slot is reused.
+        tx.send(ControlCommand::Unsubscribe { instrument: original }).unwrap();
+        tx.send(ControlCommand::RegisterInstrument {
+            con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(),
+            exchange: "SMART".into(), reply_tx: None,
+        }).unwrap();
+        engine.poll_once();
+        assert_eq!(engine.context.market.con_id(original), Some(265598));
+        assert!(engine.context.market.option_terms(original).is_none());
+        let requests: Vec<_> = engine.context.drain_pending_orders().collect();
+        assert_eq!(requests.len(), 1);
+        engine.context.pending_orders.push(requests[0].clone());
+        engine.context.pending_orders.push(requests[0].clone());
+        let (transport, mut server) = crate::protocol::connection::mem_pair();
+        let mut conn = Some(Connection::new_mem(transport));
+        let frames = drain_frames(&mut engine.context, &shared, &mut conn, &mut server);
+        assert_eq!(frames.len(), 1, "cloned command sends once");
+        assert_guarded_option_frame(&frames[0]);
+        assert_eq!(authorizations.load(Ordering::SeqCst), 1);
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::Written));
+        assert_eq!(engine.context.market.con_id(original), Some(265598));
+        assert_ne!(engine.context.order(60).unwrap().instrument, original);
+    }
+
+    #[test]
+    fn exact_guarded_contract_survives_parking_without_weakening_cancel_or_connection_guard() {
+        for outcome in ["write", "cancel", "connection_changed"] {
+            let (mut context, shared, mut conn, mut server) = guarded_fixture();
+            let contract = guarded_option_contract(&shared);
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let client = crate::api::EClient::from_parts(
+                shared.clone(), tx, std::thread::spawn(|| {}), "DU1".into(),
+            );
+            let receipt = client.send_order_for_contract_guarded(
+                OrderRequest::SubmitLimitEx {
+                    order_id: 60, instrument: 0, side: Side::Buy, qty: 1, price: P,
+                    tif: b'0', attrs: crate::types::OrderAttrs {
+                        outside_rth: true, ..Default::default()
+                    },
+                },
+                &contract, "initial".into(),
+                move || { assert_eq!(outcome, "write"); Ok(()) },
+            ).unwrap();
+            let crate::types::ControlCommand::Order(request) = rx.recv().unwrap() else {
+                panic!("guarded order command")
+            };
+            context.pending_orders.push(request);
+            let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(tag(&frames[0], 35), Some("c"), "metadata, not an order");
+            assert_eq!(receipt.outcome(), None);
+            let original = context.market.instrument_by_con_id(contract.con_id).unwrap();
+            context.market.unregister(original);
+            assert_eq!(context.market.register(123456), original);
+            context.market.set_symbol(original, "OTHER".into());
+            context.market.set_routing(original, "STK", "SMART");
+            if outcome == "cancel" {
+                assert_eq!(receipt.cancel(), OrderWriteOutcome::NotSent);
+            } else if outcome == "connection_changed" {
+                shared.orders.invalidate_execution_history();
+                shared.orders.begin_execution_history("replacement");
+            }
+            context.rth_types.insert(
+                (contract.con_id, "CBOE".into()),
+                crate::engine::outside_rth::RthTypes {
+                    rth: true, sec_type: "OPT".into(), ..Default::default()
+                },
+            );
+            release_rth_parked(&mut context);
+            let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+            if outcome == "write" {
+                assert_eq!(frames.len(), 1);
+                assert_guarded_option_frame(&frames[0]);
+                assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::Written));
+            } else {
+                assert!(frames.is_empty(), "{outcome}");
+                assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+                assert!(context.order(60).is_none());
+            }
+            assert_eq!(context.market.con_id(original), Some(123456));
+            assert_eq!(context.market.symbol(original), "OTHER");
+        }
+    }
+
+    #[test]
+    fn exact_guarded_option_refuses_missing_or_conflicting_native_terms_before_mutation() {
+        for unresolved in [false, true] {
+            let (mut context, shared, mut conn, mut server) = guarded_fixture();
+            let mut contract = guarded_option_contract(&shared);
+            if unresolved { contract.con_id += 1; } else { contract.strike += 1.0; }
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let client = crate::api::EClient::from_parts(
+                shared.clone(), tx, std::thread::spawn(|| {}), "DU1".into(),
+            );
+            let receipt = client.send_order_for_contract_guarded(
+                guarded_limit(60), &contract, "initial".into(),
+                || panic!("invalid contract authorized"),
+            ).unwrap();
+            let crate::types::ControlCommand::Order(request) = rx.recv().unwrap() else {
+                panic!("guarded order command")
+            };
+            context.pending_orders.push(request);
+            assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+            assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+            assert!(context.order(60).is_none());
+            assert!(context.market.instrument_by_con_id(contract.con_id).is_none());
+            let errors = shared.orders.drain_order_errors();
+            assert_eq!(errors.len(), 1);
+            assert_eq!((errors[0].0, errors[0].1), (60, 321));
+        }
+    }
+
+    #[test]
+    fn exact_guarded_stock_protection_uses_the_same_contract_for_every_frame() {
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        let contract = crate::api::types::Contract {
+            con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(),
+            exchange: "SMART".into(), currency: "USD".into(), ..Default::default()
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let client = crate::api::EClient::from_parts(
+            shared.clone(), tx, std::thread::spawn(|| {}), "DU1".into(),
+        );
+        let receipt = client.send_order_for_contract_guarded(
+            protected_bracket(true), &contract, "initial".into(), || Ok(()),
+        ).unwrap();
+        let crate::types::ControlCommand::Order(request) = rx.recv().unwrap() else {
+            panic!("guarded order command")
+        };
+        context.pending_orders.push(request);
+        context.market.unregister(0);
+        context.market.register(123456);
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        assert_eq!(frames.len(), 3);
+        for frame in &frames {
+            assert_eq!(tag(frame, 35), Some("D"));
+            assert_eq!(tag(frame, 55), Some("AAPL"));
+            assert_eq!(tag(frame, 6008), Some("265598"));
+            assert_eq!(tag(frame, 167), Some("STK"));
+            assert_eq!(tag(frame, 231), Some("1.00"));
+            assert_eq!(tag(frame, 200), None);
+        }
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::Written));
+        assert_eq!(context.market.con_id(0), Some(123456));
     }
 
     fn protected_bracket(take_profit: bool) -> OrderRequest {

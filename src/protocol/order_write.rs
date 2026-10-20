@@ -51,7 +51,10 @@ impl Drop for GuardOwner {
 
 /// Clones share one authorization and one write claim, never another send.
 #[derive(Clone)]
-pub struct OrderWriteGuard(Arc<GuardOwner>);
+pub struct OrderWriteGuard(
+    Arc<GuardOwner>,
+    Option<Arc<crate::api::types::Contract>>,
+);
 
 impl std::fmt::Debug for OrderWriteGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -125,9 +128,20 @@ impl OrderWriteGuard {
             changed: Condvar::new(),
         });
         (
-            Self(Arc::new(GuardOwner(completion.clone()))),
+            Self(Arc::new(GuardOwner(completion.clone())), None),
             OrderWriteReceipt(completion),
         )
+    }
+
+    /// Request-owned identity, not a lease on a reclaimable market-data slot.
+    /// Clones and metadata-parked retries retain the same immutable contract.
+    pub(crate) fn with_contract(mut self, contract: crate::api::types::Contract) -> Self {
+        self.1 = Some(Arc::new(contract));
+        self
+    }
+
+    pub(crate) fn contract(&self) -> Option<&crate::api::types::Contract> {
+        self.1.as_deref()
     }
 
     pub(crate) fn claim(&self) -> bool {

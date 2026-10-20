@@ -248,6 +248,17 @@ impl HistoryRequests {
         self.status_deferred.push_back(clord);
     }
 
+    /// Complete a sparse working-order report without overlapping an existing
+    /// request for the same native order or an untagged STANDARD history phase.
+    pub(super) fn ensure_status(&mut self, clord: &str) {
+        let base = perm_id_from_clord_id(clord);
+        if !self.status_pending.contains_key(&base)
+            && !self.status_deferred.iter().any(|pending| perm_id_from_clord_id(pending) == base)
+        {
+            self.defer_status(clord.to_owned());
+        }
+    }
+
     pub(super) fn sent_status(&mut self, clord: &str) {
         *self
             .status_pending
@@ -435,8 +446,9 @@ impl CcpState {
             return;
         }
         let Some(socket) = conn.as_mut() else { return };
-        // A cancel/modify rejection may ask for an order status during the
-        // history phase. Release it first; never overlap untagged H replies.
+        // A cancel/modify rejection or incomplete working-order report may
+        // ask for a status during history. Release it first; never overlap
+        // untagged H replies.
         while let Some(clord) = self.completed_history.status_deferred.pop_front() {
             if socket
                 .send_fix(&order_status_request(
@@ -2421,7 +2433,9 @@ mod tests {
             "6533=1|6536=20260102-00:00:00|6537=20260102-23:59:59|6556=IBX.Completed.1|"
         ));
         assert!(!request.contains("6471="));
-        ccp.completed_history.defer_status("987.2".into());
+        ccp.completed_history.ensure_status("987.2");
+        ccp.completed_history.ensure_status("987.2");
+        ccp.completed_history.ensure_status("987.3");
         ccp.progress_completed_history(
             &mut conn,
             &mut context,
@@ -2445,8 +2459,20 @@ mod tests {
             &mut hb,
             "DU123456",
         );
-        assert!(sent(&mut peer).contains("11=987.2|55=*|54=*|6471=1|1=DU123456|"));
+        let request = sent(&mut peer);
+        assert_eq!(request.matches("35=H|").count(), 1);
+        assert!(request.contains("11=987.2|55=*|54=*|6471=1|1=DU123456|"));
         assert!(ccp.completed_history.status_pending.contains_key(&987));
+        ccp.completed_history.ensure_status("987.3");
+        ccp.progress_completed_history(
+            &mut conn,
+            &mut context,
+            &shared,
+            &None,
+            &mut hb,
+            "DU123456",
+        );
+        assert!(sent(&mut peer).is_empty(), "one native order already has a status request");
     }
 
     #[test]
