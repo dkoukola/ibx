@@ -398,7 +398,8 @@ impl HistoryRequests {
                 }
                 row.status = match known.order_state.status.as_str() {
                     "Filled" => OrderStatus::Filled,
-                    "Cancelled" | "Inactive" => OrderStatus::Cancelled,
+                    "Cancelled" => OrderStatus::Cancelled,
+                    "Inactive" => OrderStatus::Rejected,
                     _ => OrderStatus::Submitted,
                 };
             }
@@ -600,7 +601,8 @@ impl Reducer {
         let time = report_time(fields).ok_or("History row has no effective report time")?;
         let status = match tag(39) {
             Some("2") => OrderStatus::Filled,
-            Some("4" | "C" | "8") => OrderStatus::Cancelled,
+            Some("4" | "C") => OrderStatus::Cancelled,
+            Some("8") => OrderStatus::Rejected,
             Some("0" | "5" | "A") => OrderStatus::Submitted,
             Some("1") => OrderStatus::PartiallyFilled,
             Some("6" | "D") => OrderStatus::PendingCancel,
@@ -719,11 +721,25 @@ impl Reducer {
                 && number(38) == Some(0.0)
                 && number(14) == Some(0.0)
                 && number(151) == Some(0.0);
+            // A broker-rejected unknown contract has no 6008 (captured paper
+            // STANDARD reply, 2026-10-20). Retain its order identity and exact
+            // zero-fill rejection with API conId=0, not an invented instrument.
+            let rejected_unknown_contract = fields.get(&20).map(String::as_str) == Some("3")
+                && fields.get(&39).map(String::as_str) == Some("8")
+                && fields.get(&150).map(String::as_str) == Some("8")
+                && !fields.contains_key(&6008)
+                && number(38).is_some_and(|quantity| quantity > 0.0)
+                && number(14) == Some(0.0)
+                && number(32) == Some(0.0)
+                && fields
+                    .get(&167)
+                    .is_some_and(|kind| !kind.is_empty() && kind != "BAG");
             if known.is_none()
-                && (!fields
-                    .get(&6008)
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .is_some_and(|v| v > 0)
+                && ((!rejected_unknown_contract
+                    && !fields
+                        .get(&6008)
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .is_some_and(|v| v > 0))
                     || !(number(38).is_some_and(|v| v > 0.0) || zero_quantity_cancel)
                     || !matches!(fields.get(&54).map(String::as_str), Some("1" | "2" | "5"))
                     || !fields.get(&15).is_some_and(|v| !v.is_empty())
@@ -799,7 +815,10 @@ impl Reducer {
             // A known order may have started with a partial acknowledgement;
             // retaining it on a sparse cancellation must not invent terms.
             let order = &projected.order;
-            if projected.contract.con_id <= 0
+            if (projected.contract.con_id <= 0
+                && !(rejected_unknown_contract
+                    && projected.contract.con_id == 0
+                    && order.filled_quantity == 0.0))
                 || projected.contract.currency.is_empty()
                 || projected.contract.sec_type.is_empty()
                 || !matches!(order.action.as_str(), "BUY" | "SELL" | "SSHORT")
@@ -1168,6 +1187,105 @@ mod tests {
             assert!(callback.rows.is_empty());
             Err(callback.errors.join("; "))
         }
+    }
+
+    #[test]
+    fn completed_unknown_contract_rejection_remains_an_unfilled_inactive_order() {
+        // Reduced native STANDARD rejection from the pre-fix registration
+        // test on 2026-10-20. No 6008 was reported. Account, broker order ID
+        // and reference are sanitized; zero price/fills and '?' are native.
+        let captured: Vec<(u32, String)> = [
+            (35, "8"),
+            (20, "3"),
+            (150, "8"),
+            (39, "8"),
+            (103, "-1"),
+            (167, "CS"),
+            (55, "?"),
+            (38, "1"),
+            (44, "0.00"),
+            (32, "0"),
+            (31, "0"),
+            (14, "0"),
+            (151, "1"),
+            (6, "0"),
+            (54, "1"),
+            (40, "2"),
+            (59, "0"),
+            (15, "USD"),
+            (198, "NONE"),
+            (6115, "0"),
+            (6088, "Socket"),
+            (6419, "IB"),
+            (6004, "BEST"),
+            (6210, "BEST"),
+            (11, "42.0"),
+            (6010, "fixture-rejected-entry"),
+            (1, "DU123456"),
+            (60, "20261020-14:02:35"),
+        ]
+        .into_iter()
+        .map(|(tag, value)| (tag, value.into()))
+        .collect();
+        let rows = cold_direct_history(std::slice::from_ref(&captured)).unwrap();
+        assert_eq!(rows.len(), 1);
+        let (contract, order, state) = &rows[0];
+        assert_eq!(contract.con_id, 0);
+        assert_eq!(contract.symbol, "?");
+        assert_eq!(contract.sec_type, "STK");
+        assert_eq!(contract.currency, "USD");
+        assert_eq!(order.order_id, 42);
+        assert_eq!(order.perm_id, 42);
+        assert_eq!(order.order_ref, "fixture-rejected-entry");
+        assert_eq!(order.action, "BUY");
+        assert_eq!(order.total_quantity, 1.0);
+        assert_eq!(order.filled_quantity, 0.0);
+        assert_eq!(order.lmt_price, 0.0);
+        assert_eq!(state.status, "Inactive");
+        assert_eq!(state.completed_status, "Rejected");
+        assert_eq!(state.completed_time, "20261020-14:02:35");
+
+        for (tag, value) in [
+            (14, None),
+            (14, Some("1")),
+            (14, Some("-1")),
+            (32, None),
+            (32, Some("1")),
+            (38, None),
+            (38, Some("0")),
+            (6008, Some("0")),
+            (6008, Some("-1")),
+            (6008, Some("invalid")),
+            (167, None),
+            (167, Some("BAG")),
+            (150, None),
+            (150, Some("4")),
+            (39, Some("2")),
+            (39, Some("4")),
+            (15, None),
+            (54, None),
+            (44, None),
+            (60, None),
+        ] {
+            let mut invalid = captured.clone();
+            invalid.retain(|(key, _)| *key != tag);
+            if let Some(value) = value {
+                invalid.push((tag, value.into()));
+            }
+            assert!(
+                cold_direct_history(&[invalid]).is_err(),
+                "accepted {tag}={value:?}"
+            );
+        }
+        let mut working = captured.clone();
+        replace_tag(&mut working, 39, "0");
+        replace_tag(&mut working, 150, "0");
+        assert!(cold_direct_history(&[working]).unwrap().is_empty());
+        let mut known_contract = captured;
+        known_contract.push((6008, "922376919".into()));
+        let rows = cold_direct_history(&[known_contract]).unwrap();
+        assert_eq!(rows[0].0.con_id, 922_376_919);
+        assert_eq!(rows[0].2.status, "Inactive");
     }
 
     #[test]
