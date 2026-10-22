@@ -5257,13 +5257,21 @@ impl ClientCore {
     /// The contract and order openOrder shows for a combo order (ibx#470):
     /// the combo contract with its legs, and the per-leg prices the server
     /// reports in leg order (no limit price with per-leg prices).
-    pub fn apply_combo_view(order_id: OrderId, contract: &mut ApiContract, order: &mut ApiOrder, shared: &SharedState) {
-        let Some(view) = shared.orders.combo_view(order_id) else { return };
-        *contract = view.contract;
-        if view.leg_prices.iter().any(|p| *p != f64::MAX) {
+    pub fn apply_combo_view(
+        order_id: OrderId,
+        contract: &mut ApiContract,
+        order: &mut ApiOrder,
+        shared: &SharedState,
+    ) {
+        if let Some(view) = shared.orders.combo_view(order_id) {
+            *contract = view.contract;
+            order.order_combo_legs = view.leg_prices;
+        }
+        // Cold native reports already carry their per-order contract and
+        // prices; the generic unset-value pass must not invent a net limit.
+        if contract.sec_type == "BAG" && order.order_combo_legs.iter().any(|p| *p != f64::MAX) {
             order.lmt_price = f64::MAX;
         }
-        order.order_combo_legs = view.leg_prices;
     }
 
     /// The execution a combo report shows (ibx#470): the combo contract on

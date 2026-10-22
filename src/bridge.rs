@@ -60,7 +60,8 @@ pub struct ExecutionHistoryReply {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FillExec {
     /// The print is new accounting, but its order snapshot failed the native
-    /// revision/time guard. Dispatch executions without stale order callbacks.
+    /// revision/time guard or contains no parent state (a recovered combo leg).
+    /// Dispatch executions without replaying or mutating the parent order.
     pub stale_order_state: bool,
     /// Full replacement of an earlier execution, including when its order
     /// has already left the active book. Never a synthetic delta execution.

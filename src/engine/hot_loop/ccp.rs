@@ -211,6 +211,13 @@ fn is_leg_report(parsed: &std::collections::HashMap<u32, String>) -> bool {
     )
 }
 
+/// Borrow the parent totals without constructing a submitted order for a
+/// broker-reported working combo. Both variants use the same leg accounting.
+enum ComboLegParent<'a> {
+    Submitted(&'a crate::engine::combo::ComboOrder),
+    Observed(&'a crate::bridge::RichOrderInfo),
+}
+
 /// Decode only native, self-contained combo execution identity. The captured
 /// combo parent reports `6013=-1:N`; each leg reports `6013=I:N` and tag 6400
 /// equal to the parent's tag 17. Partial or malformed evidence remains
@@ -457,7 +464,7 @@ pub(crate) struct CcpState {
     /// The per-leg prices (6879) of the report being read, in leg order
     /// (ibx#470): the parsed map keeps one value per tag.
     pub(crate) report_leg_prices: Vec<f64>,
-    /// Query-local BAG terms from this raw report, before repeated tags flatten.
+    /// Report-local BAG terms, before repeated tags flatten.
     pub(super) report_history_combo:
         Result<Option<crate::bridge::ComboView>, &'static str>,
     pub(crate) exec_realized_order: VecDeque<String>,
@@ -1244,11 +1251,8 @@ impl CcpState {
             fix::MSG_LOGON => self.handle_logon_update(&parsed, shared, event_tx),
             fix::MSG_EXEC_REPORT => {
                 self.report_leg_prices = all_values(msg, 6879).filter_map(|v| v.parse().ok()).collect();
-                self.report_history_combo = if self.completed_history.active() {
-                    super::completed_history::parse_direct_combo_report(msg, &parsed)
-                } else {
-                    Ok(None)
-                };
+                self.report_history_combo =
+                    super::completed_history::parse_direct_combo_report(msg, &parsed);
                 self.handle_exec_report(&parsed, context, shared, event_tx, account_id);
                 self.report_leg_prices.clear();
                 self.report_history_combo = Ok(None);
@@ -1650,7 +1654,42 @@ impl CcpState {
             .orders
             .contains_key(&clord_id)
             .then(|| shared.orders.combo_view(clord_id))
-            .flatten();
+            .flatten()
+            .or_else(|| match &self.report_history_combo {
+                Ok(Some(view)) => Some(view.clone()),
+                // A later sparse report may omit the groups. Retain only
+                // this native order's previously observed complete terms,
+                // never another BAG sharing the generic contract ID.
+                Ok(None) => previous
+                    .as_ref()
+                    .filter(|info| {
+                        info.contract.sec_type == "BAG"
+                            && !info.contract.combo_legs.is_empty()
+                            && parsed.get(&167).is_none_or(|kind| kind == "BAG")
+                            && parsed.get(&6008).is_none_or(|id| {
+                                id.parse::<i64>().ok() == Some(info.contract.con_id)
+                            })
+                            && [
+                                6079, 6080, 6081, 6082, 6087, 616, 6879, 6401, 6216, 1689, 8211,
+                                6442,
+                            ]
+                            .iter()
+                            .all(|tag| !parsed.contains_key(tag))
+                            && [6004, 6210, 100, 207].iter().all(|tag| {
+                                parsed
+                                    .get(tag)
+                                    .is_none_or(|route| *route == info.contract.exchange)
+                            })
+                            && parsed
+                                .get(&15)
+                                .is_none_or(|currency| *currency == info.contract.currency)
+                    })
+                    .map(|info| crate::bridge::ComboView {
+                        contract: info.contract.clone(),
+                        leg_prices: info.order.order_combo_legs.clone(),
+                    }),
+                Err(_) => None,
+            });
         if history == super::completed_history::HistoryReport::Row && !known_current {
             if collect_history {
                 self.completed_history.collect(
@@ -1684,6 +1723,26 @@ impl CcpState {
             self.exec_realized.get(base).and_then(|entry| entry.print)
                 .is_some_and(|print| revision < print.revision)
         }) {
+            return;
+        }
+        // A cold working BAG has broker-observed terms, not a local combo
+        // submission. Its physical fills must not replace the parent's
+        // contract, status or totals with those of an individual leg.
+        if !context.combos.orders.contains_key(&clord_id)
+            && is_leg_report(parsed)
+            && let Some(parent) = previous.as_ref().filter(|info| {
+                info.contract.sec_type == "BAG" && !info.contract.combo_legs.is_empty()
+            })
+        {
+            if real_print {
+                self.handle_combo_leg_report(
+                    parsed,
+                    context,
+                    shared,
+                    clord_id,
+                    ComboLegParent::Observed(parent),
+                );
+            }
             return;
         }
         if !state_admitted && !real_print {
@@ -1909,7 +1968,13 @@ impl CcpState {
             if is_leg_report(parsed) {
                 if !is_status_report {
                     let combo = combo.clone();
-                    self.handle_combo_leg_report(parsed, context, shared, clord_id, &combo);
+                    self.handle_combo_leg_report(
+                        parsed,
+                        context,
+                        shared,
+                        clord_id,
+                        ComboLegParent::Submitted(&combo),
+                    );
                 }
                 return;
             }
@@ -2282,16 +2347,28 @@ impl CcpState {
                     account_id,
                     fallback_order,
                     fallback_con_id,
-                    cached_contract: shared.reference.get_contract(resolved_con_id),
+                    cached_contract: shared
+                        .reference
+                        .get_contract(resolved_con_id)
+                        .filter(|contract| contract.sec_type != "BAG"),
                     combo: combo_view.as_ref(),
                     trail_limit: context.trail_limit_reported.get(&clord_id).copied(),
                     combo_leg_prices: shared
                         .orders
                         .combo_view(clord_id)
                         .map(|v| v.leg_prices)
+                        .or_else(|| combo_view.as_ref().map(|v| v.leg_prices.clone()))
                         .unwrap_or_default(),
                 },
             );
+            if info
+                .order
+                .order_combo_legs
+                .iter()
+                .any(|price| *price != f64::MAX)
+            {
+                info.order.lmt_price = f64::MAX;
+            }
             info.order.outside_rth |= shared.orders.get_order_info(clord_id).is_some_and(|i| i.order.outside_rth);
             if let Some(entry) = context.book.get(&clord_id) {
                 shared.orders.note_book(clord_id, entry.seq, context.book_peak);
@@ -2347,7 +2424,7 @@ impl CcpState {
                         &self.report_history_combo,
                     );
             }
-            if con_id != 0 {
+            if con_id != 0 && info.contract.sec_type != "BAG" {
                 shared.reference.cache_contract(con_id, info.contract.clone());
             }
             if let Some((execution, exec)) = untracked_out.take() {
@@ -2428,7 +2505,7 @@ impl CcpState {
         context: &mut Context,
         shared: &SharedState,
         order_id: OrderId,
-        combo: &crate::engine::combo::ComboOrder,
+        parent: ComboLegParent<'_>,
     ) {
         let exec_id = parsed.get(&17).map(|s| s.as_str()).unwrap_or("");
         let last_shares: Qty = parsed.get(&32).and_then(|s| parse_qty(s)).unwrap_or(0);
@@ -2448,7 +2525,33 @@ impl CcpState {
         let quantity = if buy { last_shares } else { -last_shares };
         let Some(delta) = self.record_fill_economics(parsed, shared, exec_id, con_id, quantity, price) else { return };
         if !exec_id.is_empty() { self.record_exec_id(exec_id); }
-        let leg = combo.combo.legs.iter().find(|l| l.con_id == con_id);
+        let observed_parent = matches!(parent, ComboLegParent::Observed(_));
+        let (observed_account, other_client) = match &parent {
+            ComboLegParent::Observed(info) => (
+                Some(info.order.account.as_str()),
+                context.api_client_id != 0
+                    && context.api_client_id != i64::from(info.order.client_id),
+            ),
+            ComboLegParent::Submitted(_) => (None, false),
+        };
+        let (leg, last_price, leaves_qty, cum_qty, avg_price) = match &parent {
+            ComboLegParent::Submitted(combo) => (
+                combo.combo.legs.iter().find(|l| l.con_id == con_id),
+                combo.last_price,
+                combo.leaves_qty,
+                combo.cum_qty,
+                combo.avg_price,
+            ),
+            ComboLegParent::Observed(info) => (
+                None,
+                (info.last_exec.price * PRICE_SCALE as f64).round() as Price,
+                ((info.order.total_quantity - info.order.filled_quantity).max(0.0)
+                    * QTY_SCALE as f64)
+                    .round() as Qty,
+                (info.order.filled_quantity * QTY_SCALE as f64).round() as Qty,
+                (info.last_exec.avg_price * PRICE_SCALE as f64).round() as Price,
+            ),
+        };
         if con_id != 0 {
             if let Some(instrument) = context.market.try_register(con_id) {
                 shared.market.set_instrument_count(context.market.count());
@@ -2461,6 +2564,10 @@ impl CcpState {
         }
         let mut exec = fill_exec_of(parsed, exec_id);
         exec.correction = delta.correction;
+        // The physical print does not establish any new parent order state.
+        // Keep its live execution callback without replaying or mutating the
+        // separately observed parent's status (even if already terminal).
+        exec.stale_order_state = observed_parent;
         let sec_type = match parsed.get(&167).map(|s| s.as_str()) {
             Some("CS") | Some("COMMON") | None => "STK".to_string(),
             Some(other) => other.to_string(),
@@ -2474,6 +2581,18 @@ impl CcpState {
             local_symbol: parsed.get(&6035).cloned().unwrap_or_default(),
             ..Default::default()
         };
+        if let Some(account) = observed_account.filter(|_| other_client || exec.replayed) {
+            // Retained native client ownership still applies after a terminal
+            // parent has left the active engine book. Client zero sees all.
+            exec.other_client = other_client;
+            let side = if buy { Side::Buy } else { Side::Sell };
+            let execution =
+                report_execution(parsed, exec_id, side, last_shares, price, account, order_id);
+            shared
+                .orders
+                .push_untracked_execution(contract, execution, exec);
+            return;
+        }
         let qty = |tag: u32| parsed.get(&tag).and_then(|s| parse_qty(s)).unwrap_or(0) as f64 / QTY_SCALE as f64;
         exec.combo = Some(Box::new(crate::bridge::ComboExec {
             contract,
@@ -2490,11 +2609,11 @@ impl CcpState {
             instrument: order.map_or(0, |o| o.instrument),
             order_id,
             side: order.map_or(Side::Buy, |o| o.side),
-            price: combo.last_price,
+            price: last_price,
             qty_fixed: last_shares,
-            remaining_fixed: combo.leaves_qty,
-            cum_qty_fixed: combo.cum_qty,
-            avg_price: combo.avg_price,
+            remaining_fixed: leaves_qty,
+            cum_qty_fixed: cum_qty,
+            avg_price,
             commission: 0,
             timestamp_ns: context.now_ns(),
         };
@@ -4792,8 +4911,20 @@ mod tests {
         let fill = exec_report_frame(&[
             (17, "option-leg.01"), (6008, "42"), (54, "1"), (31, "2.5"), (32, "1"),
         ]);
-        ccp.handle_combo_leg_report(&fill, &mut context, &shared, 90, &combo);
-        ccp.handle_combo_leg_report(&fill, &mut context, &shared, 90, &combo);
+        ccp.handle_combo_leg_report(
+            &fill,
+            &mut context,
+            &shared,
+            90,
+            ComboLegParent::Submitted(&combo),
+        );
+        ccp.handle_combo_leg_report(
+            &fill,
+            &mut context,
+            &shared,
+            90,
+            ComboLegParent::Submitted(&combo),
+        );
         assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], None);
         assert_eq!(shared.portfolio.position_info(42).unwrap().position_fixed, QTY_SCALE);
         assert_eq!(shared.portfolio.position_info(42).unwrap().avg_cost, 0);
@@ -4806,7 +4937,13 @@ mod tests {
         revision.insert(20, "2".into());
         revision.insert(19, "option-leg.01".into());
         revision.insert(31, "3".into());
-        ccp.handle_combo_leg_report(&revision, &mut context, &shared, 90, &combo);
+        ccp.handle_combo_leg_report(
+            &revision,
+            &mut context,
+            &shared,
+            90,
+            ComboLegParent::Submitted(&combo),
+        );
         assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(-300.0));
         assert_eq!(shared.portfolio.position_info(42).unwrap().position_fixed, QTY_SCALE);
         revision.insert(17, "option-leg.03".into());
@@ -4814,8 +4951,20 @@ mod tests {
         revision.insert(19, "option-leg.02".into());
         revision.insert(150, "2".into());
         revision.insert(32, "0".into());
-        ccp.handle_combo_leg_report(&revision, &mut context, &shared, 90, &combo);
-        ccp.handle_combo_leg_report(&fill, &mut context, &shared, 90, &combo);
+        ccp.handle_combo_leg_report(
+            &revision,
+            &mut context,
+            &shared,
+            90,
+            ComboLegParent::Submitted(&combo),
+        );
+        ccp.handle_combo_leg_report(
+            &fill,
+            &mut context,
+            &shared,
+            90,
+            ComboLegParent::Submitted(&combo),
+        );
         assert_eq!(shared.portfolio.money_since_seed(&shared.reference)[&42], Some(0.0));
         assert_eq!(shared.portfolio.position_info(42).unwrap().position_fixed, 0);
         let callbacks = shared.orders.drain_fills_with_exec();
@@ -6331,6 +6480,799 @@ mod tests {
 
     fn pipe_frame(text: &str) -> Vec<u8> {
         text.replace('|', "\x01").into_bytes()
+    }
+
+    fn cold_working_bag() -> String {
+        // Reduced native working-order replay, 2026-10-22. Account,
+        // permanent/API IDs and reference are sanitized. The direct route,
+        // repeated native leg groups and signed ratios are captured terms.
+        "35=8|11=900001.0|6010=test-butterfly|150=0|20=3|39=0|167=BAG|55=F|100=CBOE|207=CBOE|6210=CBOE|38=1|44=0.01|32=0|31=0.00|14=0|151=1|6=0|54=2|1=DU1|60=20261022-18:53:51|40=2|6121=2|59=0|6008=14474330|15=USD|6004=CBOE|6088=Socket|6035=14474330|6079=3|6080=922376857|6081=2|6082=0|6705=|6080=922376919|6081=1|6082=1|6705=|6080=922377054|6081=1|6082=1|6705=|".into()
+    }
+
+    #[test]
+    fn cold_working_bag_replay_preserves_per_order_groups_through_sparse_reports() {
+        use crate::api::{EClient, Wrapper};
+        use std::sync::Arc;
+        #[derive(Default)]
+        struct Callback {
+            rows: Vec<(api::Contract, api::Order)>,
+            ends: usize,
+        }
+        impl Wrapper for Callback {
+            fn open_order(
+                &mut self,
+                _: i64,
+                contract: &api::Contract,
+                order: &api::Order,
+                _: &api::OrderState,
+            ) {
+                self.rows.push((contract.clone(), order.clone()));
+            }
+            fn open_order_end(&mut self) {
+                self.ends += 1;
+            }
+        }
+        for prices in ["", "6879=0.20|6879=0.30|6879=0.40|"] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = Arc::new(SharedState::new());
+            let full = cold_working_bag() + prices;
+            ccp.process_ccp_message(
+                &pipe_frame(&full),
+                &mut None,
+                &mut context,
+                &shared,
+                &None,
+                &mut HeartbeatState::new(),
+                "DU1",
+            );
+            let original = shared.orders.get_order_info(2).unwrap();
+            assert!(original.parent_id_known);
+            assert_eq!(
+                original
+                    .contract
+                    .combo_legs
+                    .iter()
+                    .map(|leg| (leg.con_id, leg.ratio, leg.action.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (922376857, 2, "SELL"),
+                    (922376919, 1, "BUY"),
+                    (922377054, 1, "BUY")
+                ]
+            );
+            assert_eq!(original.contract.exchange, "CBOE");
+            assert_eq!(
+                (
+                    original.order.perm_id,
+                    original.order.action.as_str(),
+                    original.order.total_quantity
+                ),
+                (900001, "SELL", 1.0)
+            );
+            assert_eq!(
+                original.order.lmt_price,
+                if prices.is_empty() { 0.01 } else { f64::MAX }
+            );
+            assert!(
+                shared.reference.get_contract(14474330).is_none(),
+                "BAG topology is not a generic security definition"
+            );
+            assert!(
+                shared.orders.combo_view(2).is_none(),
+                "no new combo registry entry is needed"
+            );
+            assert!(context.combos.orders.is_empty());
+
+            let sparse = full
+                .split("6079=")
+                .next()
+                .unwrap()
+                .replace("6010=test-butterfly|", "");
+            ccp.process_ccp_message(
+                &pipe_frame(&sparse),
+                &mut None,
+                &mut context,
+                &shared,
+                &None,
+                &mut HeartbeatState::new(),
+                "DU1",
+            );
+            let retained = shared.orders.get_order_info(2).unwrap();
+            assert_eq!(retained.contract, original.contract);
+            assert_eq!(
+                retained.order.order_combo_legs,
+                original.order.order_combo_legs
+            );
+            assert_eq!(retained.order.lmt_price, original.order.lmt_price);
+            assert_eq!(retained.order.order_ref, "test-butterfly");
+            assert!(shared.portfolio.position_infos().is_empty());
+            assert!(shared.orders.drain_fills().is_empty());
+
+            let (sender, _receiver) = crossbeam_channel::unbounded();
+            let client =
+                EClient::from_parts(shared, sender, std::thread::spawn(|| {}), "DU1".into());
+            client.process_msgs(&mut Callback::default());
+            let mut callback = Callback::default();
+            client.req_all_open_orders(&mut callback);
+            client.process_msgs(&mut callback);
+            assert_eq!(callback.ends, 1);
+            assert_eq!(callback.rows.len(), 1);
+            assert_eq!(callback.rows[0].0, original.contract);
+            assert_eq!(
+                callback.rows[0].1.order_combo_legs,
+                original.order.order_combo_legs
+            );
+            assert_eq!(callback.rows[0].1.lmt_price, original.order.lmt_price);
+        }
+    }
+
+    #[test]
+    fn cold_working_bag_groups_do_not_leak_across_generic_contract_ids() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let first = cold_working_bag();
+        let second = first
+            .replace("900001", "900002")
+            .replace("6121=2|", "6121=3|")
+            .replace("922376857", "922378038");
+        for row in [&first, &second] {
+            ccp.process_ccp_message(
+                &pipe_frame(row),
+                &mut None,
+                &mut context,
+                &shared,
+                &None,
+                &mut HeartbeatState::new(),
+                "DU1",
+            );
+        }
+        let a = shared.orders.get_order_info(2).unwrap();
+        let b = shared.orders.get_order_info(3).unwrap();
+        assert_eq!(a.contract.con_id, b.contract.con_id);
+        assert_ne!(a.contract.combo_legs, b.contract.combo_legs);
+        // Even a preexisting generic cache entry cannot supply another order's legs.
+        shared
+            .reference
+            .cache_contract(a.contract.con_id, a.contract.clone());
+        for (id, row) in [
+            (4, first.split("6079=").next().unwrap().to_string()),
+            (5, first.replace("6079=3|", "6079=4|")),
+        ] {
+            let row = row
+                .replace("900001", &format!("90000{id}"))
+                .replace("6121=2|", &format!("6121={id}|"));
+            ccp.process_ccp_message(
+                &pipe_frame(&row),
+                &mut None,
+                &mut context,
+                &shared,
+                &None,
+                &mut HeartbeatState::new(),
+                "DU1",
+            );
+            assert!(
+                shared
+                    .orders
+                    .get_order_info(id)
+                    .unwrap()
+                    .contract
+                    .combo_legs
+                    .is_empty()
+            );
+        }
+        // Malformed explicit groups on the same order are not silently replaced
+        // with its previous terms; only genuinely absent groups retain them.
+        let malformed = second.replace("6079=3|", "6079=4|");
+        ccp.process_ccp_message(
+            &pipe_frame(&malformed),
+            &mut None,
+            &mut context,
+            &shared,
+            &None,
+            &mut HeartbeatState::new(),
+            "DU1",
+        );
+        assert!(
+            shared
+                .orders
+                .get_order_info(3)
+                .unwrap()
+                .contract
+                .combo_legs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cold_working_bag_sparse_terms_cannot_hide_explicit_contradictions() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let full = cold_working_bag();
+        let sparse = full.split("6079=").next().unwrap();
+        for contradictory in [
+            full.replace("167=BAG|", "").replace("6079=3|", "6079=4|"),
+            sparse.replace("6004=CBOE|", "6004=ISE|"),
+            sparse.replace("15=USD|", "15=EUR|"),
+        ] {
+            ccp.process_ccp_message(
+                &pipe_frame(&full),
+                &mut None,
+                &mut context,
+                &shared,
+                &None,
+                &mut HeartbeatState::new(),
+                "DU1",
+            );
+            ccp.process_ccp_message(
+                &pipe_frame(&contradictory),
+                &mut None,
+                &mut context,
+                &shared,
+                &None,
+                &mut HeartbeatState::new(),
+                "DU1",
+            );
+            assert!(
+                shared
+                    .orders
+                    .get_order_info(2)
+                    .unwrap()
+                    .contract
+                    .combo_legs
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn known_working_bag_keeps_native_leg_price_updates_and_known_topology() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let full = cold_working_bag();
+        ccp.process_ccp_message(
+            &pipe_frame(&full),
+            &mut None,
+            &mut context,
+            &shared,
+            &None,
+            &mut HeartbeatState::new(),
+            "DU1",
+        );
+        let contract = shared.orders.get_order_info(2).unwrap().contract;
+        shared.orders.set_combo_view(
+            2,
+            crate::bridge::ComboView {
+                contract: contract.clone(),
+                leg_prices: vec![0.10; 3],
+            },
+        );
+        context.combos.orders.insert(
+            2,
+            crate::engine::combo::ComboOrder {
+                combo: crate::engine::combo::Combo {
+                    bag_con_id: contract.con_id,
+                    exchange: "CBOE".into(),
+                    routed: "CBOE".into(),
+                    currency: "USD".into(),
+                    trading_class: "COMB".into(),
+                    multiplier: 1.0,
+                    legs: contract
+                        .combo_legs
+                        .iter()
+                        .map(|leg| crate::engine::combo::Leg {
+                            con_id: leg.con_id,
+                            ratio: leg.ratio,
+                            buy: leg.action == "BUY",
+                            exchange: "CBOE".into(),
+                            symbol: "F".into(),
+                            sec_type: "OPT".into(),
+                            currency: "USD".into(),
+                            multiplier: 100.0,
+                        })
+                        .collect(),
+                },
+                spec: Default::default(),
+                leg_prices: Vec::new(),
+                price: None,
+                cum_qty: 0,
+                leaves_qty: QTY_SCALE,
+                avg_price: 0,
+                last_price: 0,
+            },
+        );
+        for prices in ["6879=0.20|6879=0.30|6879=0.40|", ""] {
+            // Known submitted topology remains authoritative, as before;
+            // reported prices are the current report, not the early view clone.
+            let report = full.replace("6080=922376857|", "6080=922378038|") + prices;
+            ccp.process_ccp_message(
+                &pipe_frame(&report),
+                &mut None,
+                &mut context,
+                &shared,
+                &None,
+                &mut HeartbeatState::new(),
+                "DU1",
+            );
+            let info = shared.orders.get_order_info(2).unwrap();
+            assert_eq!(info.contract, contract);
+            assert_eq!(
+                info.order.order_combo_legs,
+                if prices.is_empty() {
+                    vec![f64::MAX; 3]
+                } else {
+                    vec![0.20, 0.30, 0.40]
+                }
+            );
+            assert_eq!(
+                info.order.lmt_price,
+                if prices.is_empty() { 0.01 } else { f64::MAX }
+            );
+        }
+    }
+
+    #[test]
+    fn cold_working_bag_summary_fill_uses_observed_per_order_topology() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let full = cold_working_bag();
+        ccp.process_ccp_message(
+            &pipe_frame(&full),
+            &mut None,
+            &mut context,
+            &shared,
+            &None,
+            &mut HeartbeatState::new(),
+            "DU1",
+        );
+        let fill = full
+            .split("6079=")
+            .next()
+            .unwrap()
+            .replace("20=3|", "20=0|")
+            .replace("150=0|", "150=2|")
+            .replace("39=0|", "39=2|")
+            .replace("32=0|", "32=1|")
+            .replace("14=0|", "14=1|")
+            .replace("151=1|", "151=0|")
+            + "17=cold-parent.01|442=3|6013=-1:3|";
+        ccp.process_ccp_message(
+            &pipe_frame(&fill),
+            &mut None,
+            &mut context,
+            &shared,
+            &None,
+            &mut HeartbeatState::new(),
+            "DU1",
+        );
+        let fills = shared.orders.drain_fills_with_exec();
+        assert_eq!(fills.len(), 1);
+        assert!(matches!(
+            fills[0].1.component,
+            api::ExecutionComponent::ComboParent { leg_count: 3 }
+        ));
+        assert!(fills[0].1.combo.is_some());
+        let instrument = context.market.try_register(14474330).unwrap();
+        assert_eq!(context.position_fixed(instrument), 0);
+        assert!(shared.portfolio.position_infos().is_empty());
+        assert!(!ccp.exec_realized["cold-parent"].moves_position);
+    }
+
+    #[test]
+    fn cold_working_bag_physical_fills_preserve_parent_and_deliver_exact_executions() {
+        use crate::api::{EClient, Wrapper};
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Callback {
+            executions: Vec<(api::Contract, api::Execution)>,
+            parent_reports: usize,
+            statuses: Vec<(String, f64, f64)>,
+        }
+        impl Wrapper for Callback {
+            fn exec_details(
+                &mut self,
+                request: i64,
+                contract: &api::Contract,
+                execution: &api::Execution,
+            ) {
+                assert_eq!(request, -1);
+                self.executions.push((contract.clone(), execution.clone()));
+            }
+            fn open_order(
+                &mut self,
+                _: i64,
+                _: &api::Contract,
+                _: &api::Order,
+                _: &api::OrderState,
+            ) {
+                self.parent_reports += 1;
+            }
+            fn order_status(
+                &mut self,
+                _: i64,
+                status: &str,
+                filled: f64,
+                remaining: f64,
+                _: f64,
+                _: i64,
+                _: i64,
+                _: f64,
+                _: i64,
+                _: &str,
+                _: f64,
+            ) {
+                self.parent_reports += 1;
+                self.statuses.push((status.into(), filled, remaining));
+            }
+        }
+
+        // Reduced physical prints captured 2026-10-22; identifiers sanitized.
+        // Native leg indexes differ from the contract's stored leg ordering.
+        let legs: Vec<_> = [(922377054, "2", 1, "0.08"), (922376919, "2", 1, "0.38"), (922376857, "1", 2, "0.20")]
+            .into_iter().enumerate().map(|(index, (con_id, side, quantity, price))| format!(
+                "35=8|11=900001.0|17=cold-leg-{index}.01|6010=test-butterfly|150=2|20=0|39=2|167=OPT|55=F|100=CBOE|207=CBOE|38={quantity}|32={quantity}|30=CBOE|31={price}|14={quantity}|151=0|6={price}|54={side}|1=DU1|60=20261022-19:52:48|442=2|6013={index}:3|40=2|231=100|6121=2|6008={con_id}|15=USD|6400=cold-parent.01|"
+            )).collect();
+        for (state, queued) in [
+            ("working", false),
+            ("working", true),
+            ("filled", false),
+            ("cancelled", false),
+        ] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = Arc::new(SharedState::new());
+            for con_id in [922377054, 922376919, 922376857] {
+                shared.reference.cache_contract(
+                    con_id,
+                    api::Contract {
+                        con_id,
+                        sec_type: "OPT".into(),
+                        multiplier: "100".into(),
+                        currency: "USD".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+            let (sender, _receiver) = crossbeam_channel::unbounded();
+            let client = EClient::from_parts(
+                shared.clone(),
+                sender,
+                std::thread::spawn(|| {}),
+                "DU1".into(),
+            );
+            let mut callback = Callback::default();
+            let defer_dispatch = std::cell::Cell::new(false);
+            let mut feed = |row: &str, callback: &mut Callback| {
+                ccp.process_ccp_message(
+                    &pipe_frame(row),
+                    &mut None,
+                    &mut context,
+                    &shared,
+                    &None,
+                    &mut HeartbeatState::new(),
+                    "DU1",
+                );
+                if !defer_dispatch.get() {
+                    client.process_msgs(callback);
+                }
+            };
+            let working = cold_working_bag();
+            let parent_fill = working
+                .replace("150=0|", "150=2|")
+                .replace("39=0|", "39=2|")
+                .replace("20=3|", "20=0|")
+                .replace("32=0|", "32=1|")
+                .replace("31=0.00|", "31=0.06|")
+                .replace("14=0|", "14=1|")
+                .replace("151=1|", "151=0|")
+                .replace("6=0|", "6=0.06|")
+                .replace("18:53:51", "19:52:48")
+                + "17=cold-parent.01|442=3|6013=-1:3|";
+            feed(&working, &mut callback);
+            if state == "filled" {
+                feed(&parent_fill, &mut callback);
+            } else if state == "cancelled" {
+                feed(
+                    &working
+                        .replace("150=0|", "150=4|")
+                        .replace("39=0|", "39=4|")
+                        .replace("151=1|", "151=0|"),
+                    &mut callback,
+                );
+            }
+            callback = Callback::default();
+            let parent = shared.orders.get_order_info(2).unwrap();
+            // A status restatement is not a print and must not consume its ID.
+            feed(&legs[0].replace("20=0|", "20=3|"), &mut callback);
+            assert!(callback.executions.is_empty());
+            assert!(shared.portfolio.position_infos().is_empty());
+            defer_dispatch.set(queued);
+            for row in &legs {
+                feed(row, &mut callback);
+                feed(row, &mut callback);
+                let current = shared.orders.get_order_info(2).unwrap();
+                assert_eq!(current.contract, parent.contract);
+                assert_eq!(
+                    format!("{:?}", current.order),
+                    format!("{:?}", parent.order)
+                );
+                assert_eq!(
+                    format!("{:?}", current.order_state),
+                    format!("{:?}", parent.order_state)
+                );
+            }
+            if queued {
+                // The parent cache advances before callbacks drain. Earlier
+                // leg prints must not replay their old parent totals over it.
+                feed(&parent_fill, &mut callback);
+                defer_dispatch.set(false);
+                client.process_msgs(&mut callback);
+                assert!(!callback.statuses.is_empty());
+                assert!(
+                    callback
+                        .statuses
+                        .iter()
+                        .all(|row| *row == ("Filled".into(), 1.0, 0.0))
+                );
+            } else {
+                assert_eq!(
+                    callback.parent_reports, 0,
+                    "physical prints do not restate the parent"
+                );
+            }
+            assert_eq!(callback.executions.len(), if queued { 4 } else { 3 });
+            for (index, ((contract, execution), (con_id, side, quantity, price))) in callback
+                .executions
+                .iter()
+                .filter(|(_, execution)| {
+                    matches!(
+                        execution.component,
+                        api::ExecutionComponent::ComboLeg { .. }
+                    )
+                })
+                .zip([
+                    (922377054, "SLD", 1.0, 0.08),
+                    (922376919, "SLD", 1.0, 0.38),
+                    (922376857, "BOT", 2.0, 0.20),
+                ])
+                .enumerate()
+            {
+                assert_eq!(
+                    (contract.con_id, contract.sec_type.as_str()),
+                    (con_id, "OPT")
+                );
+                assert_eq!(
+                    (
+                        execution.order_id,
+                        execution.perm_id,
+                        execution.acct_number.as_str()
+                    ),
+                    (2, 900001, "DU1")
+                );
+                assert_eq!(
+                    (execution.side.as_str(), execution.shares, execution.price),
+                    (side, quantity, price)
+                );
+                assert_eq!(
+                    execution.component,
+                    api::ExecutionComponent::ComboLeg {
+                        index: index as u32,
+                        leg_count: 3,
+                        parent_execution_id: "cold-parent.01".into(),
+                    }
+                );
+            }
+            assert_eq!(
+                shared
+                    .portfolio
+                    .position_info(922377054)
+                    .unwrap()
+                    .position_fixed,
+                -QTY_SCALE
+            );
+            assert_eq!(
+                shared
+                    .portfolio
+                    .position_info(922376919)
+                    .unwrap()
+                    .position_fixed,
+                -QTY_SCALE
+            );
+            assert_eq!(
+                shared
+                    .portfolio
+                    .position_info(922376857)
+                    .unwrap()
+                    .position_fixed,
+                2 * QTY_SCALE
+            );
+            assert!(shared.portfolio.position_info(14474330).is_none());
+            let cash = shared.portfolio.money_since_seed(&shared.reference);
+            assert_eq!(
+                (cash[&922377054], cash[&922376919], cash[&922376857]),
+                (Some(8.0), Some(38.0), Some(-40.0))
+            );
+            if state == "working" && !queued {
+                feed(&parent_fill, &mut callback);
+                assert_eq!(
+                    shared.orders.get_order_info(2).unwrap().order_state.status,
+                    "Filled"
+                );
+                assert!(shared.portfolio.position_info(14474330).is_none());
+                assert_eq!(shared.portfolio.money_since_seed(&shared.reference), cash);
+            }
+
+            // Synthetic revision and bust of the captured BUY2 physical leg:
+            // replace its economics, never add another print or mutate parent.
+            let terminal = shared.orders.get_order_info(2).unwrap();
+            callback = Callback::default();
+            let correction = legs[2]
+                .replace("cold-leg-2.01", "cold-leg-2.02")
+                .replace("20=0|", "20=2|")
+                .replace("32=2|", "32=1|")
+                .replace("14=2|", "14=1|")
+                .replace("0.20", "0.25")
+                + "19=cold-leg-2.01|";
+            feed(&correction, &mut callback);
+            feed(&correction, &mut callback);
+            feed(&legs[2], &mut callback);
+            assert_eq!(callback.executions.len(), 1);
+            assert_eq!(
+                (
+                    callback.executions[0].1.shares,
+                    callback.executions[0].1.price
+                ),
+                (1.0, 0.25)
+            );
+            assert_eq!(
+                shared
+                    .portfolio
+                    .position_info(922376857)
+                    .unwrap()
+                    .position_fixed,
+                QTY_SCALE
+            );
+            assert_eq!(
+                shared.portfolio.money_since_seed(&shared.reference)[&922376857],
+                Some(-25.0)
+            );
+            let bust = correction
+                .replace("cold-leg-2.02", "cold-leg-2.03")
+                .replace("20=2|", "20=1|")
+                .replace("32=1|", "32=0|")
+                .replace("14=1|", "14=0|")
+                .replace("19=cold-leg-2.01|", "19=cold-leg-2.02|");
+            feed(&bust, &mut callback);
+            assert_eq!(callback.executions.len(), 2);
+            assert_eq!(callback.executions[1].1.shares, 0.0);
+            assert_eq!(callback.parent_reports, 0);
+            assert_eq!(
+                shared
+                    .portfolio
+                    .position_info(922376857)
+                    .unwrap()
+                    .position_fixed,
+                0
+            );
+            assert_eq!(
+                shared.portfolio.money_since_seed(&shared.reference)[&922376857],
+                Some(0.0)
+            );
+            let current = shared.orders.get_order_info(2).unwrap();
+            assert_eq!(current.contract, terminal.contract);
+            assert_eq!(
+                format!("{:?}", current.order),
+                format!("{:?}", terminal.order)
+            );
+            assert_eq!(
+                format!("{:?}", current.order_state),
+                format!("{:?}", terminal.order_state)
+            );
+        }
+    }
+
+    #[test]
+    fn cold_working_bag_physical_fills_preserve_native_client_visibility() {
+        for client_id in [0, 7, 8] {
+            for terminal in [false, true] {
+                for replayed in [false, true] {
+                    let mut ccp = CcpState::new();
+                    let mut context = Context::new();
+                    let shared = SharedState::new();
+                    shared.reference.set_api_client_id(client_id);
+                    let working = cold_working_bag() + "6119=8|";
+                    ccp.process_ccp_message(
+                        &pipe_frame(&working),
+                        &mut None,
+                        &mut context,
+                        &shared,
+                        &None,
+                        &mut HeartbeatState::new(),
+                        "DU1",
+                    );
+                    if terminal {
+                        let cancelled = working
+                            .replace("39=0|", "39=4|")
+                            .replace("150=0|", "150=4|");
+                        ccp.process_ccp_message(
+                            &pipe_frame(&cancelled),
+                            &mut None,
+                            &mut context,
+                            &shared,
+                            &None,
+                            &mut HeartbeatState::new(),
+                            "DU1",
+                        );
+                    }
+                    let parent = shared.orders.get_order_info(2).unwrap();
+                    let mut leg = working
+                        .split("6079=")
+                        .next()
+                        .unwrap()
+                        .replace("167=BAG|", "167=OPT|")
+                        .replace("6008=14474330|", "6008=922377054|")
+                        .replace("20=3|", "20=0|")
+                        .replace("39=0|", "39=2|")
+                        .replace("150=0|", "150=2|")
+                        .replace("32=0|", "32=1|")
+                        .replace("31=0.00|", "31=0.08|")
+                        .replace("14=0|", "14=1|")
+                        + "17=owned-leg.01|442=2|6013=0:3|6400=owned-parent.01|6119=8|";
+                    if replayed {
+                        leg.push_str("97=Y|");
+                    }
+                    ccp.process_ccp_message(
+                        &pipe_frame(&leg),
+                        &mut None,
+                        &mut context,
+                        &shared,
+                        &None,
+                        &mut HeartbeatState::new(),
+                        "DU1",
+                    );
+                    assert_eq!(
+                        shared
+                            .portfolio
+                            .position_info(922377054)
+                            .unwrap()
+                            .position_fixed,
+                        -QTY_SCALE
+                    );
+                    assert_eq!(
+                        shared.orders.get_order_info(2).unwrap().contract,
+                        parent.contract
+                    );
+                    let live = shared.orders.drain_fills_with_exec();
+                    let silent = shared.orders.drain_untracked_executions();
+                    if client_id == 7 || replayed {
+                        assert!(live.is_empty());
+                        assert_eq!(silent.len(), 1);
+                        assert_eq!(silent[0].2.other_client, client_id == 7);
+                        assert_eq!(silent[0].2.replayed, replayed);
+                        assert_eq!(
+                            (silent[0].0.con_id, silent[0].1.perm_id),
+                            (922377054, 900001)
+                        );
+                        assert_eq!(
+                            (
+                                silent[0].1.acct_number.as_str(),
+                                silent[0].1.side.as_str(),
+                                silent[0].1.shares
+                            ),
+                            ("DU1", "SLD", 1.0)
+                        );
+                    } else {
+                        assert_eq!(live.len(), 1);
+                        assert!(silent.is_empty());
+                    }
+                }
+            }
+        }
     }
 
     // ibx#466: an order of this session is held under its API order id and
