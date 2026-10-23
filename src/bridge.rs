@@ -45,6 +45,7 @@ pub struct RichOrderInfo {
 pub struct CompletedHistoryReply {
     pub connection: String,
     pub result: Result<Vec<RichOrderInfo>, String>,
+    pub lifecycle_reports: Vec<api::OptionLifecycleReport>,
 }
 
 #[derive(Debug)]
@@ -52,6 +53,7 @@ pub struct ExecutionHistoryReply {
     pub connection: String,
     pub req_id: i64,
     pub result: Result<Vec<crate::client_core::StoredExecution>, String>,
+    pub lifecycle_reports: Vec<api::OptionLifecycleReport>,
 }
 
 /// What a fill report says about its execution, beyond the `Fill` numbers

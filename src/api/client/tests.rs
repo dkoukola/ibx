@@ -88,6 +88,74 @@ fn execution_range_validates_interval_and_owns_filter_and_connection() {
 }
 
 #[test]
+fn lifecycle_inclusion_requires_explicit_range_methods() {
+    let (client, rx, _) = test_client();
+    let mut wrapper = RecordingWrapper::default();
+    client.req_executions_range_including_lifecycles(73, "bad", "20261005-00:00:00", &Default::default(), &mut wrapper);
+    assert!(rx.try_recv().is_err());
+    client.req_executions_range_including_lifecycles(74, "20261003-00:00:00", "20261005-00:00:00", &Default::default(), &mut wrapper);
+    assert!(matches!(rx.try_recv().unwrap(), ControlCommand::RequestExecutionsRangeIncludingLifecycles { req_id: 74, .. }));
+    client.req_completed_orders_range_including_lifecycles("20261003-00:00:00", "20261005-00:00:00", false, &mut wrapper);
+    assert!(matches!(rx.try_recv().unwrap(), ControlCommand::RequestCompletedOrdersIncludingLifecycles { api_only: false, .. }));
+    client.req_completed_orders_range("20261003-00:00:00", "20261005-00:00:00", false, &mut wrapper);
+    assert!(matches!(rx.try_recv().unwrap(), ControlCommand::RequestCompletedOrders { .. }));
+}
+
+#[test]
+fn lifecycle_history_callback_is_query_scoped_and_precedes_end_without_ordinary_fill() {
+    use crate::api::types::{OptionLifecycleReport, OptionLifecycleReportKind};
+    for replace_connection in [false, true] {
+        let (client, _, shared) = test_client();
+        let report = OptionLifecycleReport {
+            observation: lifecycle_observation(),
+            kind: OptionLifecycleReportKind::EconomicExecution,
+            contract: Contract::default(),
+            execution: crate::api::types::Execution { exec_id: "life.01".into(), ..Default::default() },
+            time_secs: 0, requested_quantity: 1.0,
+            exec_transaction_type: "0".into(), exec_type: "2".into(), order_status: "2".into(),
+            native_order_id: Some("opaque-order".into()), native_report_time: None, native_side: "2".into(),
+            commission_and_fees: Some(crate::api::types::CommissionAndFeesReport {
+                exec_id: "life.01".into(), commission_and_fees: 0.25, currency: "USD".into(),
+                realized_pnl: f64::MAX, yield_amount: f64::MAX, yield_redemption_date: String::new(),
+            }),
+        };
+        shared.orders.push_execution_range_reply(crate::bridge::ExecutionHistoryReply {
+            connection: "fixture".into(), req_id: 75, result: Ok(Vec::new()), lifecycle_reports: vec![report.clone()],
+        });
+        shared.orders.push_completed_history_reply(crate::bridge::CompletedHistoryReply {
+            connection: "fixture".into(), result: Ok(Vec::new()), lifecycle_reports: vec![report],
+        });
+        struct Capture { shared: Arc<SharedState>, replace: bool, events: Vec<String> }
+        impl Wrapper for Capture {
+            fn option_lifecycle_history(&mut self, req_id: Option<i64>, _: &OptionLifecycleReport) {
+                self.events.push(format!("lifecycle:{req_id:?}"));
+                if self.replace {
+                    self.shared.orders.begin_execution_history("replacement");
+                    self.shared.orders.complete_execution_history("replacement");
+                }
+            }
+            fn exec_details(&mut self, _: i64, _: &Contract, _: &crate::api::types::Execution) { panic!("lifecycle is not ordinary fill"); }
+            fn completed_order(&mut self, _: &Contract, _: &crate::api::types::Order, _: &crate::api::types::OrderState) { panic!("lifecycle is not ordinary order"); }
+            fn exec_details_end(&mut self, id: i64) { self.events.push(format!("end:{id}")); }
+            fn completed_orders_end(&mut self) { self.events.push("completed_end".into()); }
+            fn commission_and_fees_report(&mut self, _: &crate::api::types::CommissionAndFeesReport) { self.events.push("fee".into()); }
+            fn error(&mut self, _: i64, code: i64, _: &str, _: &str) { assert_eq!(code, 10159); self.events.push("error".into()); }
+        }
+        let mut wrapper = Capture { shared, replace: replace_connection, events: Vec::new() };
+        client.process_msgs(&mut wrapper);
+        if replace_connection {
+            assert!(wrapper.events.iter().any(|event| event == "error"));
+            assert!(!wrapper.events.iter().any(|event| event.contains("end")));
+        } else {
+            let index = |name: &str| wrapper.events.iter().position(|event| event == name).unwrap();
+            assert!(index("lifecycle:Some(75)") < index("fee"));
+            assert!(index("fee") < index("end:75"));
+            assert!(index("lifecycle:None") < index("completed_end"));
+        }
+    }
+}
+
+#[test]
 fn execution_range_changed_connection_during_callback_stops_rows_and_end() {
     let (client, _rx, shared) = test_client();
     struct Replace { shared: Arc<SharedState>, rows: usize, ends: usize, errors: usize }
@@ -104,6 +172,7 @@ fn execution_range_changed_connection_during_callback_stops_rows_and_end() {
         execution: Default::default(), time_secs: None, commission_and_fees: None };
     shared.orders.push_execution_range_reply(crate::bridge::ExecutionHistoryReply {
         connection: "fixture".into(), req_id: 5, result: Ok(vec![row.clone(), row]),
+        lifecycle_reports: Vec::new(),
     });
     let mut wrapper = Replace { shared: shared.clone(), rows: 0, ends: 0, errors: 0 };
     client.process_msgs(&mut wrapper);
@@ -3160,6 +3229,7 @@ fn option_lifecycle_callback_precedes_ordinary_fill_and_history_failure() {
             connection: "fixture".into(),
             req_id: 7,
             result: Err("Execution history contains unsupported option lifecycle report".into()),
+            lifecycle_reports: Vec::new(),
         });
 
     let mut wrapper = RecordingWrapper::default();
@@ -3223,6 +3293,7 @@ fn lifecycle_arriving_during_dispatch_precedes_a_later_taken_history_reply() {
                     crate::bridge::CompletedHistoryReply {
                         connection: "fixture".into(),
                         result: Ok(Vec::new()),
+                        lifecycle_reports: Vec::new(),
                     },
                 );
                 self.shared.orders.push_execution_range_reply(
@@ -3230,6 +3301,7 @@ fn lifecycle_arriving_during_dispatch_precedes_a_later_taken_history_reply() {
                         connection: "fixture".into(),
                         req_id: 8,
                         result: Ok(Vec::new()),
+                        lifecycle_reports: Vec::new(),
                     },
                 );
             }

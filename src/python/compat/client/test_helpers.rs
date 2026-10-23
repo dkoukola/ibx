@@ -798,7 +798,7 @@ impl EClient {
             None => Ok(shared.orders.drain_completed_orders().into_iter()
                 .filter_map(|order| shared.orders.get_order_info(order.order_id)).collect()),
         };
-        shared.orders.push_completed_history_reply(crate::bridge::CompletedHistoryReply { connection, result });
+        shared.orders.push_completed_history_reply(crate::bridge::CompletedHistoryReply { connection, result, lifecycle_reports: Vec::new() });
         Ok(())
     }
 
@@ -811,7 +811,7 @@ impl EClient {
             Some(error) => Err(error),
             None => Ok(self.core.matching_executions(&Default::default())),
         };
-        shared.orders.push_execution_range_reply(crate::bridge::ExecutionHistoryReply { connection, req_id, result });
+        shared.orders.push_execution_range_reply(crate::bridge::ExecutionHistoryReply { connection, req_id, result, lifecycle_reports: Vec::new() });
         Ok(())
     }
 

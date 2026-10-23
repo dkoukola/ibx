@@ -172,7 +172,7 @@ pub(super) fn is_execution_print(parsed: &std::collections::HashMap<u32, String>
 /// 6809 and its canonical ordinary value `-1` stay on the ordinary execution
 /// path. Every other present value is quarantined, including unknown and
 /// malformed values.
-fn option_lifecycle_observation(
+pub(super) fn option_lifecycle_observation(
     parsed: &std::collections::HashMap<u32, String>,
 ) -> Option<OptionLifecycleObservation> {
     let raw_value = parsed.get(&6809)?.clone();
@@ -1570,9 +1570,9 @@ impl CcpState {
                 .push_option_lifecycle_observation(observation.clone());
             emit(event_tx, Event::OptionLifecycle(observation));
             self.execution_ranges
-                .reject_option_lifecycle(parsed, account_id);
+                .collect_option_lifecycle(parsed, shared, account_id);
             self.completed_history
-                .reject_option_lifecycle(parsed, account_id);
+                .collect_option_lifecycle(parsed, shared, account_id);
             self.completed_history
                 .option_lifecycle_status_reply(parsed, account_id);
             shared.notify();

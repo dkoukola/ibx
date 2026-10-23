@@ -459,6 +459,23 @@ impl EClient {
     pub fn req_completed_orders_range(
         &self, start: &str, end: &str, api_only: bool, wrapper: &mut impl Wrapper,
     ) {
+        self.request_completed_range(start, end, api_only, false, wrapper);
+    }
+
+    /// Fresh history including supported exercise/lapse instruction status.
+    /// Lifecycle rows use `option_lifecycle_history(None, ...)`, not ordinary
+    /// completed_order callbacks. Errors never produce completed_orders_end.
+    /// The side channel includes validated in-range nonterminal instructions
+    /// received during this query's native status phase. Native status rows are
+    /// untagged; the end completes requested history, NOT an inventory of all
+    /// pending instructions. Ordinary completed_order remains terminal-only.
+    pub fn req_completed_orders_range_including_lifecycles(
+        &self, start: &str, end: &str, api_only: bool, wrapper: &mut impl Wrapper,
+    ) {
+        self.request_completed_range(start, end, api_only, true, wrapper);
+    }
+
+    fn request_completed_range(&self, start: &str, end: &str, api_only: bool, include_lifecycles: bool, wrapper: &mut impl Wrapper) {
         if !crate::client_core::valid_completed_history_range(start, end) {
             wrapper.error(-1, 321, "Invalid completed-order UTC history interval", "");
             return;
@@ -467,9 +484,12 @@ impl EClient {
             wrapper.error(-1, 504, "Not connected", "");
             return;
         };
-        if let Err(message) = self.send(ControlCommand::RequestCompletedOrders {
-            connection, api_only, start: start.to_string(), end: end.to_string(),
-        }) {
+        let command = if include_lifecycles {
+            ControlCommand::RequestCompletedOrdersIncludingLifecycles { connection, api_only, start: start.into(), end: end.into() }
+        } else {
+            ControlCommand::RequestCompletedOrders { connection, api_only, start: start.into(), end: end.into() }
+        };
+        if let Err(message) = self.send(command) {
             wrapper.error(-1, 10159, &message, "");
         }
     }
@@ -490,6 +510,10 @@ impl EClient {
             for row in rows {
                 if !current() { break; }
                 wrapper.completed_order(&row.contract, &row.order, &row.order_state);
+            }
+            for report in &reply.lifecycle_reports {
+                if !current() { break; }
+                wrapper.option_lifecycle_history(None, report);
             }
             if current() {
                 wrapper.completed_orders_end();
@@ -537,6 +561,20 @@ impl EClient {
     /// executions; a future end or same-second boundary can remain ambiguous.
     pub fn req_executions_range(&self, req_id: i64, start: &str, end: &str,
         filter: &ExecutionFilter, wrapper: &mut impl Wrapper) {
+        self.request_execution_range(req_id, start, end, filter, false, wrapper);
+    }
+
+    /// Fresh execution history including supported lifecycle economic reports.
+    /// Lifecycle rows use `option_lifecycle_history(Some(req_id), ...)`, never
+    /// ordinary exec_details; all rows/fees precede the successful end callback.
+    /// The same frozen-interval/PossResend limitations as the strict query apply.
+    pub fn req_executions_range_including_lifecycles(&self, req_id: i64, start: &str, end: &str,
+        filter: &ExecutionFilter, wrapper: &mut impl Wrapper) {
+        self.request_execution_range(req_id, start, end, filter, true, wrapper);
+    }
+
+    fn request_execution_range(&self, req_id: i64, start: &str, end: &str,
+        filter: &ExecutionFilter, include_lifecycles: bool, wrapper: &mut impl Wrapper) {
         if !crate::client_core::ClientCore::ids_fit("req_executions_range", &[req_id]) { return; }
         if !crate::client_core::valid_completed_history_range(start, end) {
             wrapper.error(req_id, 321, "Invalid execution UTC history interval", "");
@@ -546,9 +584,12 @@ impl EClient {
             wrapper.error(req_id, 504, "Not connected", "");
             return;
         };
-        if let Err(message) = self.send(ControlCommand::RequestExecutionsRange {
-            connection, req_id, start: start.into(), end: end.into(), filter: filter.clone(),
-        }) {
+        let command = if include_lifecycles {
+            ControlCommand::RequestExecutionsRangeIncludingLifecycles { connection, req_id, start: start.into(), end: end.into(), filter: filter.clone() }
+        } else {
+            ControlCommand::RequestExecutionsRange { connection, req_id, start: start.into(), end: end.into(), filter: filter.clone() }
+        };
+        if let Err(message) = self.send(command) {
             wrapper.error(req_id, 10159, &message, "");
         }
     }
@@ -566,7 +607,15 @@ impl EClient {
                 if !current() { break; }
                 wrapper.exec_details(reply.req_id, &row.contract, &row.execution);
             }
+            for report in &reply.lifecycle_reports {
+                if !current() { break; }
+                wrapper.option_lifecycle_history(Some(reply.req_id), report);
+            }
             for commission in rows.iter().filter_map(|row| row.commission_and_fees.as_ref()) {
+                if !current() { break; }
+                wrapper.commission_and_fees_report(commission);
+            }
+            for commission in reply.lifecycle_reports.iter().filter_map(|row| row.commission_and_fees.as_ref()) {
                 if !current() { break; }
                 wrapper.commission_and_fees_report(commission);
             }

@@ -18,6 +18,38 @@ pub fn price_from_f64(v: f64) -> crate::types::Price {
 /// Fixed-point quantities (fills, positions) to decimal shares.
 pub const QTY_SCALE_F: f64 = QTY_SCALE as f64;
 
+/// A filled instruction with last quantity zero is not an economic movement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptionLifecycleReportKind {
+    EconomicExecution,
+    InstructionStatus,
+}
+
+/// Evidence from an explicitly lifecycle-inclusive history query. Never
+/// projected into ordinary order or position accounting. Currently supports
+/// manual-exercise executions and exercise/lapse instruction status; other
+/// lifecycle semantics fail the query until supported explicitly.
+#[derive(Clone, Debug)]
+pub struct OptionLifecycleReport {
+    pub observation: OptionLifecycleObservation,
+    pub kind: OptionLifecycleReportKind,
+    pub contract: Contract,
+    /// For InstructionStatus these are instruction fields, not a fill.
+    /// Last/cumulative quantities and prices preserve reported zero values.
+    pub execution: Execution,
+    pub time_secs: i64,
+    pub requested_quantity: f64,
+    pub exec_transaction_type: String,
+    pub exec_type: String,
+    pub order_status: String,
+    /// Exact opaque tag 37, distinct from ClOrdID (11) in observation.order_id.
+    pub native_order_id: Option<String>,
+    pub native_report_time: Option<String>,
+    pub native_side: String,
+    /// Missing fees remain unknown, never synthesized as zero.
+    pub commission_and_fees: Option<CommissionAndFeesReport>,
+}
+
 // ── ComboLeg ──
 
 /// ibapi-compatible ComboLeg for combination orders.

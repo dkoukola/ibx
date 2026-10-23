@@ -193,12 +193,14 @@ struct Request {
     start: String,
     end: String,
     deadline: Instant,
+    include_lifecycles: bool,
 }
 
 struct Active {
     request: Request,
     wire_id: String,
     rows: Reducer,
+    lifecycle_rows: BTreeMap<i64, (u32, crate::api::types::OptionLifecycleReport)>,
     // A timeout ends the API request but not the untagged wire phase. Drain
     // until its real end or link loss before allowing another status query.
     timed_out: bool,
@@ -216,11 +218,47 @@ pub(super) struct HistoryRequests {
 fn reply(shared: &SharedState, connection: String, result: Result<Vec<RichOrderInfo>, String>) {
     shared
         .orders
-        .push_completed_history_reply(CompletedHistoryReply { connection, result });
+        .push_completed_history_reply(CompletedHistoryReply { connection, result, lifecycle_reports: Vec::new() });
     shared.notify();
 }
 
 impl HistoryRequests {
+    pub(super) fn queue_including_lifecycles(&mut self, connection: String, api_only: bool, start: String, end: String) {
+        self.queue(connection, api_only, start, end);
+        self.waiting.back_mut().unwrap().include_lifecycles = true;
+    }
+
+    pub(super) fn collect_option_lifecycle(&mut self, fields: &HashMap<u32, String>, shared: &SharedState, account: &str) {
+        if !self.active.as_ref().is_some_and(|active| active.request.include_lifecycles) {
+            self.reject_option_lifecycle(fields, account);
+            return;
+        }
+        let Some(active) = self.active.as_mut().filter(|active| !active.timed_out) else { return };
+        if fields.get(&6556).is_some_and(|id| !id.starts_with("PT."))
+            || fields.get(&20).map(String::as_str) != Some("3")
+            || fields.get(&11).map(String::as_str) == Some("*")
+            || fields.get(&1).is_some_and(|owner| !owner.is_empty() && owner != account) { return; }
+        let result = super::lifecycle_history::project(fields, shared, account).and_then(|row| {
+            let version = report_revision(fields).ok_or("Invalid lifecycle order revision")?;
+            Ok((version, row))
+        });
+        match result {
+            Ok((version, row)) => {
+                let Some(start) = super::ccp::fix_utc_to_unix_secs(&active.request.start) else { return };
+                let Some(end) = super::ccp::fix_utc_to_unix_secs(&active.request.end) else { return };
+                if row.time_secs < start || row.time_secs > end { return; }
+                if active.request.api_only && !fields.get(&6088).is_some_and(|origin| origin == "Socket")
+                    && !row.observation.api_order_id.is_some_and(|id| id > 0 && id != i64::from(i32::MAX)) { return; }
+                let key = row.execution.perm_id;
+                if active.lifecycle_rows.get(&key).is_none_or(|(old_version, old)| {
+                    row.time_secs >= old.time_secs && (matches!(row.order_status.as_str(), "4" | "C") || version >= *old_version)
+                }) {
+                    active.lifecycle_rows.insert(key, (version, row));
+                }
+            }
+            Err(error) => { active.rows.error.get_or_insert(error); }
+        }
+    }
     /// Mark an active completed-order query incomplete when a row it would
     /// otherwise collect is instead quarantined as an option lifecycle
     /// report. Explicit foreign-account rows are unrelated; absent or empty
@@ -250,6 +288,7 @@ impl HistoryRequests {
             start,
             end,
             deadline: Instant::now() + QUERY_TIMEOUT,
+            include_lifecycles: false,
         });
     }
 
@@ -354,11 +393,14 @@ impl HistoryRequests {
         {
             let active = self.active.take().unwrap();
             if !active.timed_out {
-                reply(
-                    shared,
-                    active.request.connection,
-                    active.rows.finish(active.request.api_only),
-                );
+                let result = active.rows.finish(active.request.api_only);
+                let lifecycle_reports = if result.is_ok() {
+                    active.lifecycle_rows.into_values().map(|(_, row)| row).collect()
+                } else { Vec::new() };
+                shared.orders.push_completed_history_reply(CompletedHistoryReply {
+                    connection: active.request.connection, result, lifecycle_reports,
+                });
+                shared.notify();
             }
             return HistoryReport::End;
         }
@@ -427,6 +469,7 @@ impl HistoryRequests {
         {
             active.timed_out = true;
             active.rows = Reducer::default();
+            active.lifecycle_rows.clear();
             reply(
                 shared,
                 active.request.connection.clone(),
@@ -524,6 +567,7 @@ impl CcpState {
             request,
             wire_id,
             rows: Reducer::default(),
+            lifecycle_rows: BTreeMap::new(),
             timed_out: false,
         });
     }
@@ -896,9 +940,88 @@ mod tests {
             request: requests.waiting.pop_front().unwrap(),
             wire_id: "SANITIZED_HISTORY_QUERY_2".into(),
             rows: Reducer::default(),
+            lifecycle_rows: BTreeMap::new(),
             timed_out: false,
         });
         requests
+    }
+
+    #[test]
+    fn inclusive_lifecycle_completed_history_returns_instruction_not_economics() {
+        use super::super::lifecycle_history::{captured_instruction, captured_manual_rows};
+        for include in [false, true] {
+            let shared = SharedState::new();
+            let mut requests = active();
+            let request = &mut requests.active.as_mut().unwrap().request;
+            request.include_lifecycles = include;
+            request.start = "20261003-00:00:00".into();
+            request.end = "20261003-23:59:59".into();
+            for row in captured_manual_rows() {
+                requests.collect_option_lifecycle(&row, &shared, "DU123456");
+            }
+            for pending in [false, true] {
+                requests.collect_option_lifecycle(&captured_instruction(pending), &shared, "DU123456");
+                requests.collect_option_lifecycle(&captured_instruction(pending), &shared, "DU123456");
+            }
+            assert_eq!(requests.classify(&HashMap::from([(6556, "other".into()), (55, "*".into())]), &shared, "DU123456"), HistoryReport::Unrelated);
+            assert!(shared.orders.drain_completed_history_replies().is_empty());
+            assert_eq!(requests.classify(&HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into())]), &shared, "DU123456"), HistoryReport::End);
+            let reply = shared.orders.drain_completed_history_replies().pop().unwrap();
+            assert_eq!(reply.result.is_ok(), include);
+            if include {
+                assert!(reply.result.unwrap().is_empty());
+                assert_eq!(reply.lifecycle_reports.len(), 2);
+                let row = reply.lifecycle_reports.iter().find(|row| row.order_status == "2").unwrap();
+                assert_eq!(row.kind, crate::api::types::OptionLifecycleReportKind::InstructionStatus);
+                assert_eq!(row.execution.shares, 0.0);
+                assert_eq!(row.execution.cum_qty, 1.0);
+                assert!(row.observation.api_order_id.is_none());
+                let pending = reply.lifecycle_reports.iter().find(|row| row.order_status == "0").unwrap();
+                assert_eq!(pending.kind, crate::api::types::OptionLifecycleReportKind::InstructionStatus);
+                assert_eq!(pending.observation.classification, crate::types::OptionLifecycleClassification::Lapse);
+                assert_eq!(pending.execution.shares, 0.0);
+                assert_eq!(pending.execution.cum_qty, 0.0);
+            } else { assert!(reply.lifecycle_reports.is_empty()); }
+        }
+    }
+
+    #[test]
+    fn inclusive_lifecycle_completed_history_keeps_errors_and_api_filter_honest() {
+        use super::super::lifecycle_history::captured_instruction;
+        for malformed in [false, true] {
+            let shared = SharedState::new();
+            let mut requests = active();
+            let request = &mut requests.active.as_mut().unwrap().request;
+            request.include_lifecycles = true;
+            request.api_only = true;
+            request.start = "20261003-00:00:00".into();
+            request.end = "20261003-23:59:59".into();
+            let mut row = captured_instruction(false);
+            if malformed { row.remove(&32); }
+            requests.collect_option_lifecycle(&row, &shared, "DU123456");
+            requests.classify(&HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into())]), &shared, "DU123456");
+            let reply = shared.orders.drain_completed_history_replies().pop().unwrap();
+            assert_eq!(reply.result.is_err(), malformed);
+            assert!(reply.lifecycle_reports.is_empty(), "do not infer missing API ownership");
+        }
+    }
+
+    #[test]
+    fn inclusive_instruction_rows_are_phase_local_not_a_pending_inventory() {
+        use super::super::lifecycle_history::captured_instruction;
+        let shared = SharedState::new();
+        let mut requests = HistoryRequests::default();
+        requests.collect_option_lifecycle(&captured_instruction(true), &shared, "DU123456");
+        assert!(requests.waiting.is_empty());
+        assert!(shared.orders.drain_completed_history_replies().is_empty());
+        requests = active();
+        requests.active.as_mut().unwrap().request.include_lifecycles = true;
+        // The request is for January: the October instruction is not admitted.
+        requests.collect_option_lifecycle(&captured_instruction(true), &shared, "DU123456");
+        requests.classify(&HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into())]), &shared, "DU123456");
+        let reply = shared.orders.drain_completed_history_replies().pop().unwrap();
+        assert!(reply.result.is_ok());
+        assert!(reply.lifecycle_reports.is_empty());
     }
 
     fn working_row(version: u32, time: &str) -> HashMap<u32, String> {
@@ -2245,6 +2368,7 @@ mod tests {
             .push_completed_history_reply(CompletedHistoryReply {
                 connection: "today4".into(),
                 result: Ok(Vec::new()),
+                lifecycle_reports: Vec::new(),
             });
         let retired = shared.orders.completed_retirement_candidates();
         assert_eq!(retired.len(), 1);
@@ -2550,6 +2674,7 @@ mod tests {
             .push_completed_history_reply(CompletedHistoryReply {
                 connection: "test".into(),
                 result: Ok(Vec::new()),
+                lifecycle_reports: Vec::new(),
             });
         let retired = shared.orders.completed_retirement_candidates();
         // A later terminal update's rich data must also survive, not just

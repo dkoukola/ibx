@@ -26,15 +26,24 @@ struct Request {
     end_secs: i64,
     filter: ExecutionFilter,
     deadline: Instant,
+    include_lifecycles: bool,
 }
 
 struct Active {
     request: Request,
     wire_id: String,
     rows: BTreeMap<String, StoredExecution>,
-    commissions: HashMap<String, CommissionAndFeesReport>,
+    lifecycle_rows: BTreeMap<String, crate::api::types::OptionLifecycleReport>,
+    commissions: HashMap<String, CollectedCommission>,
     failure: Option<String>,
     timed_out: bool,
+}
+
+struct CollectedCommission {
+    report: CommissionAndFeesReport,
+    // The legacy fee-marker path permits an absent amount. Lifecycle evidence
+    // must distinguish that from a genuinely reported zero commission.
+    lifecycle_complete: bool,
 }
 
 #[derive(Default)]
@@ -51,11 +60,38 @@ fn reply(shared: &SharedState, request: &Request, result: Result<Vec<StoredExecu
             connection: request.connection.clone(),
             req_id: request.req_id,
             result,
+            lifecycle_reports: Vec::new(),
         });
     shared.notify();
 }
 
 impl ExecutionRequests {
+    pub(super) fn collect_option_lifecycle(&mut self, fields: &HashMap<u32, String>, shared: &SharedState, account: &str) {
+        if !self.active.as_ref().is_some_and(|active| active.request.include_lifecycles) {
+            self.reject_option_lifecycle(fields, account);
+            return;
+        }
+        let Some(active) = self.active.as_mut().filter(|active| !active.timed_out) else { return };
+        if fields.get(&1).is_some_and(|owner| !owner.is_empty() && owner != account) { return; }
+        if let Some(time) = fill_exec_of(fields, fields.get(&17).map(String::as_str).unwrap_or("")).time_secs
+            && (time < active.request.start_secs || time > active.request.end_secs) { return; }
+        match super::lifecycle_history::project(fields, shared, account) {
+            Ok(row) if row.kind == crate::api::types::OptionLifecycleReportKind::EconomicExecution => {
+                let (base, revision) = split_exec_revision(&row.execution.exec_id);
+                if active.lifecycle_rows.get(base).is_none_or(|old| split_exec_revision(&old.execution.exec_id).1 <= revision) {
+                    active.lifecycle_rows.insert(base.to_owned(), row);
+                }
+            }
+            Ok(_) => {} // Validated instruction status is not an execution.
+            Err(error) => { active.failure.get_or_insert(error); }
+        }
+    }
+
+    pub(super) fn queue_including_lifecycles(&mut self, connection: String, req_id: i64, start: String, end: String, filter: ExecutionFilter) -> Result<(), ExecutionHistoryReply> {
+        self.queue(connection, req_id, start, end, filter)?;
+        self.waiting.back_mut().unwrap().include_lifecycles = true;
+        Ok(())
+    }
     /// Fail the one active native U72 request when it encounters a passive
     /// option lifecycle report for its authenticated account. U72 rows carry
     /// no row-level request id, so a concurrent own-account lifecycle report
@@ -91,6 +127,7 @@ impl ExecutionRequests {
                 connection,
                 req_id,
                 result: Err("Invalid execution history UTC interval".into()),
+                lifecycle_reports: Vec::new(),
             });
         };
         self.waiting.push_back(Request {
@@ -102,6 +139,7 @@ impl ExecutionRequests {
             end_secs,
             filter,
             deadline: Instant::now() + TIMEOUT,
+            include_lifecycles: false,
         });
         Ok(())
     }
@@ -149,12 +187,28 @@ impl ExecutionRequests {
                         row.commission_and_fees = active
                             .commissions
                             .remove(base)
+                            .map(|fee| fee.report)
                             .filter(|fee| fee.exec_id == row.execution.exec_id);
                     }
                     let rows: Vec<_> = active.rows.into_values().collect();
                     Ok(ClientCore::filter_executions(&rows, &active.request.filter))
                 };
-                reply(shared, &active.request, result);
+                let lifecycle_reports = if result.is_ok() {
+                    active.lifecycle_rows.into_iter().filter_map(|(base, mut row)| {
+                        row.commission_and_fees = active.commissions.remove(&base)
+                            .filter(|fee| fee.lifecycle_complete)
+                            .map(|fee| fee.report)
+                            .filter(|fee| fee.exec_id == row.execution.exec_id);
+                        super::lifecycle_history::matches_filter(&row, &active.request.filter).then_some(row)
+                    }).collect()
+                } else { Vec::new() };
+                shared.orders.push_execution_range_reply(ExecutionHistoryReply {
+                    connection: active.request.connection,
+                    req_id: active.request.req_id,
+                    result,
+                    lifecycle_reports,
+                });
+                shared.notify();
             }
             return true;
         }
@@ -220,13 +274,16 @@ impl ExecutionRequests {
         if active
             .commissions
             .get(base)
-            .is_some_and(|old| split_exec_revision(&old.exec_id).1 > revision)
+            .is_some_and(|old| split_exec_revision(&old.report.exec_id).1 > revision)
         {
             return;
         }
         active.commissions.insert(
             base.to_owned(),
-            CommissionAndFeesReport {
+            CollectedCommission {
+                lifecycle_complete: commission.is_some_and(f64::is_finite)
+                    && fields.get(&6381).is_some_and(|currency| !currency.is_empty()),
+                report: CommissionAndFeesReport {
                 exec_id: exec_id.clone(),
                 commission_and_fees: commission.unwrap_or(0.0),
                 currency: fields.get(&6381).cloned().unwrap_or_default(),
@@ -244,6 +301,7 @@ impl ExecutionRequests {
                     .filter(|value| value.len() == 8)
                     .cloned()
                     .unwrap_or_default(),
+                },
             },
         );
     }
@@ -359,6 +417,7 @@ impl CcpState {
         {
             active.timed_out = true;
             active.rows.clear();
+            active.lifecycle_rows.clear();
             active.commissions.clear();
             reply(
                 shared,
@@ -425,6 +484,7 @@ impl CcpState {
             request,
             wire_id,
             rows: BTreeMap::new(),
+            lifecycle_rows: BTreeMap::new(),
             commissions: HashMap::new(),
             failure: None,
             timed_out: false,
@@ -453,6 +513,7 @@ mod tests {
             request: requests.waiting.pop_front().unwrap(),
             wire_id: "range1".into(),
             rows: BTreeMap::new(),
+            lifecycle_rows: BTreeMap::new(),
             commissions: HashMap::new(),
             failure: None,
             timed_out: false,
@@ -597,6 +658,158 @@ mod tests {
         );
         let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
         assert!(requests.report(&end, &shared, "DU123456"));
+        assert!(shared.orders.drain_execution_range_replies().is_empty());
+    }
+
+    #[test]
+    fn inclusive_lifecycle_range_keeps_economics_corrections_fees_and_exact_completion() {
+        use super::super::lifecycle_history::{captured_instruction, captured_manual_rows};
+        let shared = SharedState::new();
+        let mut requests = active();
+        requests.active.as_mut().unwrap().request.include_lifecycles = true;
+        for row in captured_manual_rows() {
+            requests.collect_option_lifecycle(&row, &shared, "DU123456");
+            requests.collect_option_lifecycle(&row, &shared, "DU123456");
+        }
+        for pending in [false, true] {
+            requests.collect_option_lifecycle(&captured_instruction(pending), &shared, "DU123456");
+        }
+        let mut corrected = captured_manual_rows().remove(0);
+        corrected.insert(17, "call.01.02".into());
+        corrected.insert(31, "11.01".into());
+        requests.collect_option_lifecycle(&corrected, &shared, "DU123456");
+        requests.collect_option_lifecycle(&captured_manual_rows()[0], &shared, "DU123456");
+        for exec in ["call.01.01", "call.01.02"] {
+            requests.commission(&[(17, exec), (6378, "0.25"), (6381, "USD")]
+                .into_iter().map(|(tag, value)| (tag, value.into())).collect());
+        }
+        assert!(!requests.report(&HashMap::from([(6556, "other".into()), (32, "*".into())]), &shared, "DU123456"));
+        assert!(shared.orders.drain_execution_range_replies().is_empty());
+        assert!(requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456"));
+        let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+        assert!(reply.result.unwrap().is_empty());
+        assert_eq!(reply.lifecycle_reports.len(), 4);
+        let corrected = reply.lifecycle_reports.iter().find(|row| row.execution.exec_id == "call.01.02").unwrap();
+        assert_eq!(corrected.execution.price, 11.01);
+        assert_eq!(corrected.commission_and_fees.as_ref().unwrap().exec_id, "call.01.02");
+        assert_eq!(reply.lifecycle_reports.iter().filter(|row| row.commission_and_fees.is_some()).count(), 1);
+        assert!(shared.portfolio.position_infos().is_empty());
+        assert!(shared.orders.drain_fills_with_exec().is_empty());
+    }
+
+    #[test]
+    fn inclusive_lifecycle_range_filters_and_rejects_unknown_or_missing_semantics() {
+        use super::super::lifecycle_history::captured_manual_rows;
+        for include in [false, true] {
+            for malformed in [false, true] {
+                let shared = SharedState::new();
+                let mut requests = active();
+                requests.active.as_mut().unwrap().request.include_lifecycles = include;
+                let mut row = captured_manual_rows().remove(1);
+                if malformed { row.remove(&31); }
+                requests.collect_option_lifecycle(&row, &shared, "DU123456");
+                requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
+                let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+                assert_eq!(reply.result.is_ok(), include && !malformed);
+                if reply.result.is_err() { assert!(reply.lifecycle_reports.is_empty()); }
+            }
+        }
+        let shared = SharedState::new();
+        let mut requests = active();
+        requests.active.as_mut().unwrap().request.include_lifecycles = true;
+        requests.active.as_mut().unwrap().request.filter.sec_type = "OPT".into();
+        for row in captured_manual_rows() {
+            requests.collect_option_lifecycle(&row, &shared, "DU123456");
+        }
+        for (tag, value) in [(1, "OTHER"), (60, "20261006-12:00:00")] {
+            let mut row = captured_manual_rows().remove(0);
+            row.insert(tag, value.into());
+            row.insert(6809, "unknown".into());
+            requests.collect_option_lifecycle(&row, &shared, "DU123456");
+        }
+        requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
+        let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+        assert!(reply.result.is_ok());
+        assert_eq!(reply.lifecycle_reports.len(), 2);
+        assert!(reply.lifecycle_reports.iter().all(|row| row.contract.sec_type == "OPT"));
+        let mut requests = active();
+        requests.active.as_mut().unwrap().request.include_lifecycles = true;
+        let mut row = captured_manual_rows().remove(0);
+        row.insert(6809, "101".into());
+        requests.collect_option_lifecycle(&row, &shared, "DU123456");
+        requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
+        assert!(shared.orders.drain_execution_range_replies().pop().unwrap().result.is_err());
+    }
+
+    #[test]
+    fn inclusive_lifecycle_fee_markers_never_fabricate_zero_or_nonfinite_fees() {
+        use super::super::lifecycle_history::captured_manual_rows;
+        for (amount, currency, expected) in [
+            (None, Some("USD"), None),
+            (Some("bad"), Some("USD"), None),
+            (Some("NaN"), Some("USD"), None),
+            (Some("inf"), Some("USD"), None),
+            (Some("0"), None, None),
+            (Some("0"), Some(""), None),
+            (Some("0"), Some("USD"), Some(0.0)),
+            (Some("0.25"), Some("USD"), Some(0.25)),
+        ] {
+            let shared = SharedState::new();
+            let mut requests = active();
+            requests.active.as_mut().unwrap().request.include_lifecycles = true;
+            requests.collect_option_lifecycle(&captured_manual_rows()[0], &shared, "DU123456");
+            let mut fee = HashMap::from([(17, "call.01.01".into()), (8189, "1".into())]);
+            if let Some(amount) = amount { fee.insert(6378, amount.into()); }
+            if let Some(currency) = currency { fee.insert(6381, currency.into()); }
+            requests.commission(&fee);
+            requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
+            let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+            assert!(reply.result.is_ok());
+            assert_eq!(reply.lifecycle_reports[0].commission_and_fees.as_ref().map(|fee| fee.commission_and_fees), expected);
+        }
+    }
+
+    #[test]
+    fn inclusive_lifecycle_replay_routes_through_ccp_without_booking_or_cached_success() {
+        use super::super::lifecycle_history::captured_manual_rows;
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        for row in captured_manual_rows() {
+            deliver(&mut ccp, &mut context, &shared, &row);
+        }
+        assert!(shared.orders.drain_execution_range_replies().is_empty());
+        assert_eq!(shared.orders.drain_option_lifecycle_observations().len(), 4);
+        for _ in 0..2 {
+            ccp.execution_ranges = active();
+            ccp.execution_ranges.active.as_mut().unwrap().request.include_lifecycles = true;
+            for row in captured_manual_rows() {
+                deliver(&mut ccp, &mut context, &shared, &row);
+                deliver(&mut ccp, &mut context, &shared, &row);
+            }
+            end(&mut ccp, &mut context, &shared);
+            let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+            assert!(reply.result.unwrap().is_empty());
+            assert_eq!(reply.lifecycle_reports.len(), 4);
+            assert!(shared.portfolio.position_infos().is_empty());
+            assert!(shared.orders.drain_fills_with_exec().is_empty());
+            assert!(shared.orders.drain_untracked_executions().is_empty());
+            assert!(shared.portfolio.money_since_seed(&shared.reference).is_empty());
+        }
+    }
+
+    #[test]
+    fn inclusive_lifecycle_connection_loss_does_not_deliver_partial_success() {
+        use super::super::lifecycle_history::captured_manual_rows;
+        let shared = SharedState::new();
+        let mut requests = active();
+        requests.active.as_mut().unwrap().request.include_lifecycles = true;
+        requests.collect_option_lifecycle(&captured_manual_rows()[0], &shared, "DU123456");
+        requests.disconnected(&shared);
+        let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+        assert!(reply.result.is_err());
+        assert!(reply.lifecycle_reports.is_empty());
+        requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
         assert!(shared.orders.drain_execution_range_replies().is_empty());
     }
 

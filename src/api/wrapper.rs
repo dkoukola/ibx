@@ -50,6 +50,10 @@ pub trait Wrapper {
     /// ordinary fill/history/accounting processing. Missing tag 6809 and its
     /// canonical ordinary value `-1` do not produce this callback.
     fn option_lifecycle(&mut self, observation: &crate::types::OptionLifecycleObservation) {}
+    /// Query-local lifecycle evidence. Some(req_id) identifies an execution
+    /// range; None a completed-order range. Only its successful end callback
+    /// establishes completion; the passive callback above does not.
+    fn option_lifecycle_history(&mut self, req_id: Option<i64>, report: &OptionLifecycleReport) {}
 
     // ── Account ──
 

@@ -3,6 +3,7 @@ pub mod ccp;
 pub(crate) mod report;
 mod completed_history;
 mod execution_history;
+mod lifecycle_history;
 pub mod hmds;
 pub(crate) mod pool;
 pub mod order_builder;
@@ -1446,6 +1447,15 @@ impl HotLoop {
                 }
                 ControlCommand::RequestCompletedOrders { connection, api_only, start, end } => {
                     self.ccp.completed_history.queue(connection, api_only, start, end);
+                }
+                ControlCommand::RequestExecutionsRangeIncludingLifecycles { connection, req_id, start, end, filter } => {
+                    if let Err(reply) = self.ccp.execution_ranges.queue_including_lifecycles(connection, req_id, start, end, filter) {
+                        self.shared.orders.push_execution_range_reply(reply);
+                        self.shared.notify();
+                    }
+                }
+                ControlCommand::RequestCompletedOrdersIncludingLifecycles { connection, api_only, start, end } => {
+                    self.ccp.completed_history.queue_including_lifecycles(connection, api_only, start, end);
                 }
                 ControlCommand::Subscribe { con_id, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier, mode_9887, snapshot, reply_tx } => {
                     // No conId: resolved first, as the reference (ibx#278).

@@ -2096,9 +2096,24 @@ pub enum ControlCommand {
         end: String,
         filter: crate::api::types::ExecutionFilter,
     },
+    /// Explicitly include supported option lifecycle evidence in range history.
+    RequestExecutionsRangeIncludingLifecycles {
+        connection: String,
+        req_id: i64,
+        start: String,
+        end: String,
+        filter: crate::api::types::ExecutionFilter,
+    },
     /// A fresh, isolated STANDARD completed-order history query. The connection
     /// is the U72 request identity captured when the caller requested it.
     RequestCompletedOrders {
+        connection: String,
+        api_only: bool,
+        start: String,
+        end: String,
+    },
+    /// Explicitly include supported exercise/lapse instruction status history.
+    RequestCompletedOrdersIncludingLifecycles {
         connection: String,
         api_only: bool,
         start: String,
