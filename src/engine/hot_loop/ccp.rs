@@ -290,6 +290,8 @@ pub(super) fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec
         exec_id: exec_id.to_string(),
         time_secs: tag(6699).or_else(|| tag(60)).or_else(|| tag(52))
             .and_then(|s| fix_utc_to_unix_secs(s)),
+        execution_time_secs: tag(6699).or_else(|| tag(60))
+            .and_then(|s| fix_utc_to_unix_secs(s)),
         // A smart route is shown as SMART, as on the report of a combo
         // (captured 30/09/2026: 100=BEST, execDetails exchange SMART).
         exchange: tag(100).or_else(|| tag(207))
@@ -5151,6 +5153,7 @@ mod tests {
         ccp.handle_exec_report(&fill, &mut context, &shared, &None, "");
         let (_, exec) = shared.orders.drain_fills_with_exec().remove(0);
         assert_eq!(exec.time_secs, Some(1790326194));
+        assert_eq!(exec.execution_time_secs, Some(1790326194));
         assert_eq!(exec.exchange, "ARCA");
         assert_eq!(exec.client_id, 250);
         assert_eq!(exec.order_ref, "pm0925-fill-BUY");
@@ -5166,6 +5169,7 @@ mod tests {
         ccp.handle_exec_report(&fill, &mut context, &shared, &None, "");
         let (_, exec) = shared.orders.drain_fills_with_exec().remove(0);
         assert_eq!(exec.time_secs, Some(1790326193));
+        assert_eq!(exec.execution_time_secs, Some(1790326193));
         assert_eq!(exec.exchange, "NASDAQ");
     }
 
@@ -5175,6 +5179,14 @@ mod tests {
         assert_eq!(fix_utc_to_unix_secs("20000301-12:30:15.250"), Some(951913815));
         assert_eq!(fix_utc_to_unix_secs("20260925 08:49:54"), None);
         assert_eq!(fix_utc_to_unix_secs("2026"), None);
+    }
+
+    #[test]
+    fn execution_chronology_does_not_use_sending_time_fallback() {
+        let fields = std::collections::HashMap::from([(52, "20260925-08:49:55.123".into())]);
+        let metadata = fill_exec_of(&fields, "execution.01");
+        assert_eq!(metadata.time_secs, Some(1790326195));
+        assert_eq!(metadata.execution_time_secs, None);
     }
 
     #[test]

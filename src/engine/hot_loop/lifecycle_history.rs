@@ -92,7 +92,7 @@ pub(super) fn project(
     };
     let metadata = fill_exec_of(fields, value(17)?);
     let time_secs = metadata
-        .time_secs
+        .execution_time_secs
         .ok_or("Missing lifecycle execution time")?;
     let projected = project_report(
         fields,
@@ -124,6 +124,7 @@ pub(super) fn project(
     execution.price = last_price;
     execution.avg_price = average_price;
     execution.time = format_exec_time(time_secs);
+    execution.time_unix_seconds = Some(time_secs);
     execution.exchange = metadata.exchange;
     execution.client_id = metadata.client_id;
     execution.model_code = metadata.model_code;
@@ -246,6 +247,7 @@ mod tests {
             assert_eq!(row.execution.cum_qty, quantity);
             assert_eq!(row.requested_quantity, quantity);
             assert_eq!(row.execution.price, price);
+            assert_eq!(row.execution.time_unix_seconds, Some(row.time_secs));
             assert_eq!(row.native_order_id.as_ref(), fields.get(&37));
             assert_eq!(row.observation.order_id.as_ref(), fields.get(&11));
             assert_eq!(row.native_report_time.as_ref(), fields.get(&60));
@@ -317,5 +319,21 @@ mod tests {
             }
             assert!(project(&row, &shared, "DU123456").is_err());
         }
+    }
+
+    #[test]
+    fn lifecycle_sending_time_alone_does_not_establish_economic_chronology() {
+        let shared = SharedState::new();
+        let mut fields = captured_manual_rows().remove(0);
+        fields.remove(&60);
+        fields.insert(52, "20261003-13:00:00".into());
+        assert!(project(&fields, &shared, "DU123456").is_err());
+        fields.insert(6699, "20261003-12:00:00".into());
+        let row = project(&fields, &shared, "DU123456").unwrap();
+        assert_eq!(row.execution.time_unix_seconds, Some(row.time_secs));
+        assert_eq!(
+            row.time_secs,
+            super::super::ccp::fix_utc_to_unix_secs("20261003-12:00:00").unwrap()
+        );
     }
 }

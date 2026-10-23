@@ -5175,6 +5175,32 @@ fn a_fill_takes_the_report_last_liquidity_and_placing_client() {
     assert_eq!((v.client_id, v.order.client_id), (198, 198));
 }
 
+#[test]
+fn execution_utc_seconds_survive_display_timezone_fold_and_never_reuse_missing_time() {
+    let (client, _, _) = test_client();
+    let parse = |time| crate::engine::hot_loop::ccp::fix_utc_to_unix_secs(time).unwrap();
+    let mut first = crate::api::types::Execution::default();
+    let mut second = crate::api::types::Execution::default();
+    let first_time = parse("20261101-05:30:00");
+    let second_time = parse("20261101-06:30:00");
+    client.core.apply_fill_exec(&mut first, &crate::bridge::FillExec {
+        time_secs: Some(first_time), execution_time_secs: Some(first_time), ..Default::default()
+    }, 1);
+    client.core.apply_fill_exec(&mut second, &crate::bridge::FillExec {
+        time_secs: Some(second_time), execution_time_secs: Some(second_time), ..Default::default()
+    }, 1);
+    assert_eq!(first.time_unix_seconds, Some(first_time));
+    assert_eq!(second.time_unix_seconds, Some(second_time));
+    assert_eq!(second_time - first_time, 3600);
+    if first.time.ends_with("US/Eastern") {
+        assert_eq!(first.time, second.time, "display formatting loses the DST fold");
+    }
+    client.core.apply_fill_exec(&mut first, &crate::bridge::FillExec {
+        time_secs: Some(second_time), execution_time_secs: None, ..Default::default()
+    }, 1);
+    assert_eq!(first.time_unix_seconds, None, "missing current time cannot inherit earlier execution time");
+}
+
 // Before the commission frame, req_executions replays the execution alone.
 #[test]
 fn req_executions_without_a_commission_report_sends_the_execution_only() {
@@ -5412,6 +5438,7 @@ fn captured_fill_exec() -> crate::bridge::FillExec {
         stale_order_state: false,
         exec_id: "0000e0d5.6ab5f36f.01.01".into(),
         time_secs: Some(1790326194),
+        execution_time_secs: Some(1790326194),
         exchange: "ARCA".into(),
         client_id: 250,
         model_code: String::new(),

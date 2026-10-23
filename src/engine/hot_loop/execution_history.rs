@@ -354,6 +354,7 @@ fn project_execution(
     execution.acct_number = projected.order.account;
     execution.side = side.into();
     execution.time = format_exec_time(time);
+    execution.time_unix_seconds = metadata.execution_time_secs;
     execution.exchange = metadata.exchange;
     execution.client_id = metadata.client_id;
     execution.model_code = metadata.model_code;
@@ -616,6 +617,22 @@ mod tests {
             assert!(error.result.is_err());
             assert!(requests.waiting.is_empty());
         }
+    }
+
+    #[test]
+    fn execution_range_preserves_native_utc_seconds_separately_from_display_time() {
+        let shared = SharedState::new();
+        let fields = row("time.01", true);
+        let projected = project_execution(&fields, "DU123456", 7, &shared).unwrap();
+        let expected = super::super::ccp::fix_utc_to_unix_secs("20261003-12:00:00").unwrap();
+        assert_eq!(projected.execution.time_unix_seconds, Some(expected));
+        assert_eq!(projected.time_secs, Some(expected));
+        let mut sending_only = fields;
+        sending_only.remove(&60);
+        sending_only.insert(52, "20261004-12:00:00".into());
+        let projected = project_execution(&sending_only, "DU123456", 7, &shared).unwrap();
+        assert!(projected.time_secs.is_some(), "legacy display/filter behavior is unchanged");
+        assert_eq!(projected.execution.time_unix_seconds, None, "SendingTime is not execution chronology");
     }
 
     #[test]

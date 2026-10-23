@@ -3480,11 +3480,13 @@ impl ClientCore {
     /// server's execution id, the time as the reference writes it, tag 100 /
     /// 207 as exchange, the placing client (this client when the report has
     /// none), modelCode, lastLiquidity, and the orderRef of the report or of
-    /// the tracked order. Fields the report did not carry keep their value.
+    /// the tracked order. Missing fields keep their value except the UTC
+    /// timestamp sidecar, which belongs to this execution, never an older one.
     pub fn apply_fill_exec(&self, ex: &mut ApiExecution, fe: &crate::bridge::FillExec, order_id: OrderId) {
         if !fe.exec_id.is_empty() {
             ex.exec_id = fe.exec_id.clone();
         }
+        ex.time_unix_seconds = fe.execution_time_secs;
         if let Some(secs) = fe.time_secs {
             ex.time = format_exec_time(secs);
         }

@@ -75,6 +75,9 @@ pub struct FillExec {
     pub exec_id: String,
     /// Execution time, Unix seconds: tag 6699, else 60, else 52.
     pub time_secs: Option<i64>,
+    /// Execution chronology from 6699/60 only, never SendingTime (52) alone.
+    /// The legacy time above retains its existing display/filter fallback.
+    pub execution_time_secs: Option<i64>,
     /// Tag 100, else 207.
     pub exchange: String,
     /// Placing client (tag 6119); 0 when absent.

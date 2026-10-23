@@ -864,6 +864,12 @@ impl ExecutionComponent {
 pub struct Execution {
     pub exec_id: String,
     pub time: String,
+    /// Native execution timestamp in UTC Unix seconds (6699, else60).
+    /// SendingTime (52) alone does not establish execution chronology.
+    /// Unlike the display time, this retains the distinction
+    /// between repeated US/Eastern local times across a daylight-saving fold.
+    /// None means the report did not provide a usable timestamp.
+    pub time_unix_seconds: Option<i64>,
     pub acct_number: String,
     pub exchange: String,
     pub side: String,
