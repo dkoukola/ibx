@@ -679,6 +679,88 @@ mod tests {
     }
 
     #[test]
+    fn captured_lapse_range_requires_opt_in_and_exact_end_without_booking_a_fill() {
+        use super::super::lifecycle_history::captured_lapse_rows;
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        for row in captured_lapse_rows() {
+            deliver(&mut ccp, &mut context, &shared, &row);
+        }
+        assert!(shared.orders.drain_execution_range_replies().is_empty());
+        assert_eq!(shared.orders.drain_option_lifecycle_observations().len(), 2);
+        for include in [false, true, true] {
+            ccp.execution_ranges = active();
+            ccp.execution_ranges
+                .active
+                .as_mut()
+                .unwrap()
+                .request
+                .include_lifecycles = include;
+            for row in captured_lapse_rows() {
+                deliver(&mut ccp, &mut context, &shared, &row);
+                deliver(&mut ccp, &mut context, &shared, &row);
+            }
+            assert!(!ccp.execution_ranges.report(
+                &HashMap::from([(6556, "other".into()), (32, "*".into())]),
+                &shared,
+                "DU123456",
+            ));
+            assert!(shared.orders.drain_execution_range_replies().is_empty());
+            end(&mut ccp, &mut context, &shared);
+            let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+            assert_eq!(reply.req_id, 7);
+            assert_eq!(reply.result.is_ok(), include);
+            if include {
+                assert!(reply.result.unwrap().is_empty());
+                assert_eq!(reply.lifecycle_reports.len(), 1);
+                let row = &reply.lifecycle_reports[0];
+                assert_eq!(row.execution.exec_id, "lapse.01.01");
+                assert_eq!(row.execution.side, "SLD");
+                assert_eq!(row.execution.shares, 1.0);
+                assert_eq!(row.execution.price, 0.0);
+                assert!(row.commission_and_fees.is_none());
+            } else {
+                assert!(reply.lifecycle_reports.is_empty());
+            }
+            assert!(shared.portfolio.position_infos().is_empty());
+            assert!(shared.orders.drain_fills_with_exec().is_empty());
+            assert!(shared.orders.drain_untracked_executions().is_empty());
+            assert!(
+                shared
+                    .portfolio
+                    .money_since_seed(&shared.reference)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn captured_lapse_range_keeps_account_time_filter_and_correction_boundaries() {
+        use super::super::lifecycle_history::captured_lapse_rows;
+        for (tag, value, succeeds) in [
+            (1, "OTHER", true),
+            (60, "20261006-21:25:28", true),
+            (17, "lapse.01.02", false),
+        ] {
+            let shared = SharedState::new();
+            let mut requests = active();
+            requests.active.as_mut().unwrap().request.include_lifecycles = true;
+            let [mut row, _] = captured_lapse_rows();
+            row.insert(tag, value.into());
+            requests.collect_option_lifecycle(&row, &shared, "DU123456");
+            requests.report(
+                &HashMap::from([(6556, "range1".into()), (32, "*".into())]),
+                &shared,
+                "DU123456",
+            );
+            let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+            assert_eq!(reply.result.is_ok(), succeeds, "{tag}={value}");
+            assert!(reply.lifecycle_reports.is_empty());
+        }
+    }
+
+    #[test]
     fn inclusive_lifecycle_range_keeps_economics_corrections_fees_and_exact_completion() {
         use super::super::lifecycle_history::{captured_instruction, captured_manual_rows};
         let shared = SharedState::new();

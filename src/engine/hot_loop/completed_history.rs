@@ -947,6 +947,68 @@ mod tests {
     }
 
     #[test]
+    fn captured_lapse_completed_history_reports_only_its_terminal_instruction() {
+        use super::super::lifecycle_history::captured_lapse_rows;
+        for include in [false, true] {
+            let shared = SharedState::new();
+            let mut requests = active();
+            let request = &mut requests.active.as_mut().unwrap().request;
+            request.include_lifecycles = include;
+            request.start = "20261003-00:00:00".into();
+            request.end = "20261003-23:59:59".into();
+            for row in captured_lapse_rows() {
+                requests.collect_option_lifecycle(&row, &shared, "DU123456");
+                requests.collect_option_lifecycle(&row, &shared, "DU123456");
+            }
+            assert_eq!(
+                requests.classify(
+                    &HashMap::from([(6556, "other".into()), (55, "*".into())]),
+                    &shared,
+                    "DU123456",
+                ),
+                HistoryReport::Unrelated
+            );
+            assert!(shared.orders.drain_completed_history_replies().is_empty());
+            assert_eq!(
+                requests.classify(
+                    &HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into()),]),
+                    &shared,
+                    "DU123456",
+                ),
+                HistoryReport::End
+            );
+            let reply = shared
+                .orders
+                .drain_completed_history_replies()
+                .pop()
+                .unwrap();
+            assert_eq!(reply.result.is_ok(), include);
+            if include {
+                assert!(reply.result.unwrap().is_empty());
+                assert_eq!(reply.lifecycle_reports.len(), 1);
+                let row = &reply.lifecycle_reports[0];
+                assert_eq!(
+                    row.kind,
+                    crate::api::types::OptionLifecycleReportKind::InstructionStatus
+                );
+                assert_eq!(
+                    row.observation.classification,
+                    crate::types::OptionLifecycleClassification::Lapse
+                );
+                assert_eq!(row.execution.exec_id, "status.789.0");
+                assert_eq!(row.execution.shares, 0.0);
+                assert_eq!(row.execution.cum_qty, 1.0);
+                assert_eq!(row.exec_transaction_type, "3");
+                assert_eq!(row.order_status, "2");
+            } else {
+                assert!(reply.lifecycle_reports.is_empty());
+            }
+            assert!(shared.portfolio.position_infos().is_empty());
+            assert!(shared.orders.drain_fills_with_exec().is_empty());
+        }
+    }
+
+    #[test]
     fn inclusive_lifecycle_completed_history_returns_instruction_not_economics() {
         use super::super::lifecycle_history::{captured_instruction, captured_manual_rows};
         for include in [false, true] {

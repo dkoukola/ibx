@@ -6,7 +6,9 @@ use crate::bridge::SharedState;
 use crate::client_core::{ClientCore, StoredExecution, format_exec_time};
 use crate::types::{OptionLifecycleClassification, OrderStatus};
 
-use super::ccp::{fill_exec_of, option_lifecycle_observation, perm_id_from_clord_id};
+use super::ccp::{
+    fill_exec_of, option_lifecycle_observation, perm_id_from_clord_id, split_exec_revision,
+};
 use super::report::{ReportProjection, project_report};
 
 pub(super) fn project(
@@ -56,9 +58,12 @@ pub(super) fn project(
     let exec_type = value(150)?;
     let status = value(39)?;
     let kind = match (observation.classification, transaction, exec_type, status) {
-        (OptionLifecycleClassification::Exercise, "0", "2", "2") if last_quantity > 0.0 => {
-            OptionLifecycleReportKind::EconomicExecution
-        }
+        (
+            OptionLifecycleClassification::Exercise | OptionLifecycleClassification::Lapse,
+            "0",
+            "2",
+            "2",
+        ) if last_quantity > 0.0 => OptionLifecycleReportKind::EconomicExecution,
         (
             OptionLifecycleClassification::Exercise | OptionLifecycleClassification::Lapse,
             "3",
@@ -114,6 +119,21 @@ pub(super) fn project(
     );
     if !matches!(projected.contract.sec_type.as_str(), "STK" | "OPT") {
         return Err("Unsupported lifecycle contract type".into());
+    }
+    // The captured lapse is one complete, zero-price option disposal. Do not
+    // infer delivery, partial-disposal or correction semantics from its status.
+    if observation.classification == OptionLifecycleClassification::Lapse
+        && kind == OptionLifecycleReportKind::EconomicExecution
+        && (projected.contract.sec_type != "OPT"
+            || side != "SLD"
+            || last_price != 0.0
+            || average_price != 0.0
+            || last_quantity.fract() != 0.0
+            || last_quantity != cumulative_quantity
+            || cumulative_quantity != requested_quantity
+            || split_exec_revision(value(17)?).1 != 1)
+    {
+        return Err("Unsupported option lapse execution semantics".into());
     }
     let mut execution = projected.last_exec;
     execution.perm_id = perm_id;
@@ -229,6 +249,52 @@ pub(super) fn captured_instruction(pending_lapse: bool) -> HashMap<u32, String> 
 }
 
 #[cfg(test)]
+pub(super) fn captured_lapse_rows() -> [HashMap<u32, String>; 2] {
+    // Official Gateway disposal at 2026-10-23 21:25:28 UTC, replayed natively
+    // at 21:52:39: economic row plus completed instruction. Account, date and
+    // order/execution identities are sanitized; quantities/prices/type retained.
+    let execution: HashMap<_, _> = [
+        (35, "8"),
+        (97, "Y"),
+        (11, "43.0"),
+        (37, "opaque-lapse-order"),
+        (17, "lapse.01.01"),
+        (150, "2"),
+        (20, "0"),
+        (39, "2"),
+        (38, "1"),
+        (32, "1"),
+        (31, "0.00"),
+        (14, "1"),
+        (6, "0"),
+        (54, "2"),
+        (1, "DU123456"),
+        (60, "20261003-21:25:28"),
+        (6121, "3"),
+        (6119, "1937"),
+        (6008, "920188659"),
+        (6809, "2"),
+        (167, "OPT"),
+        (55, "F"),
+        (15, "USD"),
+        (200, "202610"),
+        (201, "0"),
+        (202, "12"),
+        (231, "100"),
+    ]
+    .into_iter()
+    .map(|(tag, value)| (tag, value.to_owned()))
+    .collect();
+    let mut instruction = execution.clone();
+    for (tag, value) in [(17, "status.789.0"), (20, "3"), (32, "0"), (54, "1")] {
+        instruction.insert(tag, value.into());
+    }
+    instruction.remove(&6121);
+    instruction.remove(&6119);
+    [execution, instruction]
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -262,6 +328,93 @@ mod tests {
             assert_eq!(row.execution.cum_qty, if pending { 0.0 } else { 1.0 });
             assert!(row.observation.api_order_id.is_none());
         }
+    }
+
+    #[test]
+    fn captured_lapse_is_an_option_disposal_not_its_completed_instruction() {
+        let shared = SharedState::new();
+        let [economic, instruction] = captured_lapse_rows();
+        let economic = project(&economic, &shared, "DU123456").unwrap();
+        let instruction = project(&instruction, &shared, "DU123456").unwrap();
+        assert_eq!(economic.kind, OptionLifecycleReportKind::EconomicExecution);
+        assert_eq!(
+            economic.observation.classification,
+            OptionLifecycleClassification::Lapse
+        );
+        assert_eq!(economic.contract.con_id, 920188659);
+        assert_eq!(economic.contract.sec_type, "OPT");
+        assert_eq!(economic.contract.currency, "USD");
+        assert_eq!(economic.execution.exec_id, "lapse.01.01");
+        assert_eq!(economic.execution.perm_id, 43);
+        assert_eq!(economic.execution.side, "SLD");
+        assert_eq!(economic.execution.shares, 1.0);
+        assert_eq!(economic.execution.cum_qty, 1.0);
+        assert_eq!(economic.requested_quantity, 1.0);
+        assert_eq!(economic.execution.price, 0.0);
+        assert_eq!(economic.execution.avg_price, 0.0);
+        assert_eq!(economic.exec_transaction_type, "0");
+        assert_eq!(
+            economic.time_secs,
+            super::super::ccp::fix_utc_to_unix_secs("20261003-21:25:28").unwrap()
+        );
+        assert_eq!(
+            economic.execution.time_unix_seconds,
+            Some(economic.time_secs)
+        );
+        assert!(economic.commission_and_fees.is_none());
+        assert_eq!(
+            instruction.kind,
+            OptionLifecycleReportKind::InstructionStatus
+        );
+        assert_eq!(instruction.execution.exec_id, "status.789.0");
+        assert_eq!(instruction.execution.shares, 0.0);
+        assert_eq!(instruction.execution.cum_qty, 1.0);
+        assert_eq!(instruction.exec_transaction_type, "3");
+        assert_eq!(
+            instruction.observation.order_id,
+            economic.observation.order_id
+        );
+        assert_eq!(instruction.native_order_id, economic.native_order_id);
+        assert_eq!(instruction.native_report_time, economic.native_report_time);
+        assert!(shared.portfolio.position_infos().is_empty());
+        assert!(shared.orders.drain_fills_with_exec().is_empty());
+    }
+
+    #[test]
+    fn lapse_does_not_infer_unobserved_delivery_partial_or_correction_semantics() {
+        let shared = SharedState::new();
+        let [original, _] = captured_lapse_rows();
+        for (tag, value) in [
+            (6809, "100"),
+            (6809, "101"),
+            (6809, "102"),
+            (20, "1"),
+            (20, "2"),
+            (20, "3"),
+            (150, "0"),
+            (39, "0"),
+            (32, "0"),
+            (32, "0.5"),
+            (38, "2"),
+            (31, "1"),
+            (6, "1"),
+            (54, "1"),
+            (167, "CS"),
+            (17, "lapse.01.02"),
+            (17, "lapse"),
+        ] {
+            let mut fields = original.clone();
+            fields.insert(tag, value.into());
+            assert!(
+                project(&fields, &shared, "DU123456").is_err(),
+                "{tag}={value}"
+            );
+        }
+        let mut fractional = original;
+        for tag in [32, 14, 38] {
+            fractional.insert(tag, "0.5".into());
+        }
+        assert!(project(&fractional, &shared, "DU123456").is_err());
     }
 
     #[test]
