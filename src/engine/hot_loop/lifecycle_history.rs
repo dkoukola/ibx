@@ -59,7 +59,10 @@ pub(super) fn project(
     let status = value(39)?;
     let kind = match (observation.classification, transaction, exec_type, status) {
         (
-            OptionLifecycleClassification::Exercise | OptionLifecycleClassification::Lapse,
+            OptionLifecycleClassification::Exercise
+            | OptionLifecycleClassification::Lapse
+            | OptionLifecycleClassification::AutoExercise
+            | OptionLifecycleClassification::Expired,
             "0",
             "2",
             "2",
@@ -120,20 +123,34 @@ pub(super) fn project(
     if !matches!(projected.contract.sec_type.as_str(), "STK" | "OPT") {
         return Err("Unsupported lifecycle contract type".into());
     }
-    // The captured lapse is one complete, zero-price option disposal. Do not
-    // infer delivery, partial-disposal or correction semantics from its status.
-    if observation.classification == OptionLifecycleClassification::Lapse
-        && kind == OptionLifecycleReportKind::EconomicExecution
+    let complete_whole_first_print = last_quantity.fract() == 0.0
+        && last_quantity == cumulative_quantity
+        && cumulative_quantity == requested_quantity
+        && split_exec_revision(value(17)?).1 == 1;
+    // Captured lapse and natural expiry each dispose one complete long option
+    // at zero. Neither establishes stock delivery or correction semantics.
+    if matches!(
+        observation.classification,
+        OptionLifecycleClassification::Lapse | OptionLifecycleClassification::Expired
+    ) && kind == OptionLifecycleReportKind::EconomicExecution
         && (projected.contract.sec_type != "OPT"
             || side != "SLD"
             || last_price != 0.0
             || average_price != 0.0
-            || last_quantity.fract() != 0.0
-            || last_quantity != cumulative_quantity
-            || cumulative_quantity != requested_quantity
-            || split_exec_revision(value(17)?).1 != 1)
+            || !complete_whole_first_print)
     {
-        return Err("Unsupported option lapse execution semantics".into());
+        return Err("Unsupported option disposal execution semantics".into());
+    }
+    // The captured automatic exercise uses the same per-row economic fields
+    // as manual exercise. Pairing and qualified delivery ratios belong to the
+    // consumer; this decoder does not infer them from the classification.
+    if observation.classification == OptionLifecycleClassification::AutoExercise
+        && (!complete_whole_first_print
+            || last_price != average_price
+            || (projected.contract.sec_type == "OPT" && (side != "SLD" || last_price != 0.0))
+            || (projected.contract.sec_type == "STK" && last_price <= 0.0))
+    {
+        return Err("Unsupported automatic exercise execution semantics".into());
     }
     let mut execution = projected.last_exec;
     execution.perm_id = perm_id;
@@ -295,6 +312,79 @@ pub(super) fn captured_lapse_rows() -> [HashMap<u32, String>; 2] {
 }
 
 #[cfg(test)]
+pub(super) fn captured_automatic_rows() -> Vec<HashMap<u32, String>> {
+    // Native startup and U72 replay captured on 2026-10-24 at 03:40 UTC;
+    // economic time 02:13:01. Account/date/order/execution IDs sanitized.
+    // No API order/client ID was supplied on these automatic reports.
+    [
+        (
+            "44.0",
+            "auto.02.01",
+            "9599491",
+            "CS",
+            "100",
+            "11",
+            "1",
+            "101",
+            "auto-order",
+        ),
+        (
+            "44.0",
+            "auto.03.01",
+            "920187234",
+            "OPT",
+            "1",
+            "0",
+            "2",
+            "101",
+            "auto-order",
+        ),
+        (
+            "45.0",
+            "expiry.01.01",
+            "920187341",
+            "OPT",
+            "1",
+            "0",
+            "2",
+            "102",
+            "expiry-order",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(order, exec, contract, sec_type, quantity, price, side, class, key)| {
+            [
+                (35, "8"),
+                (11, order),
+                (37, key),
+                (17, exec),
+                (150, "2"),
+                (20, "0"),
+                (39, "2"),
+                (38, quantity),
+                (32, quantity),
+                (31, price),
+                (14, quantity),
+                (6, price),
+                (54, side),
+                (1, "DU123456"),
+                (60, "20261004-02:13:01"),
+                (6008, contract),
+                (6809, class),
+                (167, sec_type),
+                (55, "F"),
+                (15, "USD"),
+            ]
+            .into_iter()
+            .map(|(tag, value)| (tag, value.to_owned()))
+            .collect()
+        },
+    )
+    .collect()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -386,8 +476,6 @@ mod tests {
         let [original, _] = captured_lapse_rows();
         for (tag, value) in [
             (6809, "100"),
-            (6809, "101"),
-            (6809, "102"),
             (20, "1"),
             (20, "2"),
             (20, "3"),
@@ -415,6 +503,130 @@ mod tests {
             fractional.insert(tag, "0.5".into());
         }
         assert!(project(&fractional, &shared, "DU123456").is_err());
+    }
+
+    #[test]
+    fn captured_automatic_economics_preserve_classification_without_api_ids_or_fees() {
+        let shared = SharedState::new();
+        for (fields, class, contract, side, quantity, price, permanent) in captured_automatic_rows()
+            .into_iter()
+            .zip([
+                (
+                    OptionLifecycleClassification::AutoExercise,
+                    9599491,
+                    "BOT",
+                    100.0,
+                    11.0,
+                    44,
+                ),
+                (
+                    OptionLifecycleClassification::AutoExercise,
+                    920187234,
+                    "SLD",
+                    1.0,
+                    0.0,
+                    44,
+                ),
+                (
+                    OptionLifecycleClassification::Expired,
+                    920187341,
+                    "SLD",
+                    1.0,
+                    0.0,
+                    45,
+                ),
+            ])
+            .map(
+                |(fields, (class, contract, side, quantity, price, permanent))| {
+                    (fields, class, contract, side, quantity, price, permanent)
+                },
+            )
+        {
+            let row = project(&fields, &shared, "DU123456").unwrap();
+            assert_eq!(row.kind, OptionLifecycleReportKind::EconomicExecution);
+            assert_eq!(row.observation.classification, class);
+            assert_eq!(row.observation.raw_value, fields[&6809]);
+            assert_eq!(row.contract.con_id, contract);
+            assert_eq!(row.execution.side, side);
+            assert_eq!(row.execution.shares, quantity);
+            assert_eq!(row.execution.cum_qty, quantity);
+            assert_eq!(row.requested_quantity, quantity);
+            assert_eq!(row.execution.price, price);
+            assert_eq!(row.execution.avg_price, price);
+            assert_eq!(row.execution.perm_id, permanent);
+            assert_eq!(row.execution.exec_id, fields[&17]);
+            assert_eq!(row.observation.order_id.as_ref(), fields.get(&11));
+            assert_eq!(row.native_order_id.as_ref(), fields.get(&37));
+            assert_eq!(row.execution.time_unix_seconds, Some(row.time_secs));
+            assert_eq!(
+                row.time_secs,
+                super::super::ccp::fix_utc_to_unix_secs("20261004-02:13:01").unwrap()
+            );
+            assert!(row.observation.api_order_id.is_none());
+            assert!(row.commission_and_fees.is_none());
+        }
+        assert!(shared.portfolio.position_infos().is_empty());
+        assert!(shared.orders.drain_fills_with_exec().is_empty());
+    }
+
+    #[test]
+    fn automatic_reports_do_not_admit_assignment_instructions_partial_or_corrected_economics() {
+        let shared = SharedState::new();
+        for original in captured_automatic_rows() {
+            for (tag, value) in [
+                (6809, "100"),
+                (6809, "103"),
+                (6809, "200"),
+                (20, "1"),
+                (20, "2"),
+                (150, "0"),
+                (39, "0"),
+                (32, "0"),
+                (38, "200"),
+                (17, "automatic.01.02"),
+            ] {
+                let mut fields = original.clone();
+                fields.insert(tag, value.into());
+                assert!(
+                    project(&fields, &shared, "DU123456").is_err(),
+                    "{tag}={value}"
+                );
+            }
+            let mut fractional = original.clone();
+            for tag in [32, 14, 38] {
+                fractional.insert(tag, "0.5".into());
+            }
+            assert!(project(&fractional, &shared, "DU123456").is_err());
+            for status in ["0", "2", "4", "8"] {
+                let mut instruction = original.clone();
+                for (tag, value) in [(20, "3"), (32, "0"), (150, status), (39, status)] {
+                    instruction.insert(tag, value.into());
+                }
+                assert!(project(&instruction, &shared, "DU123456").is_err());
+            }
+            for tag in [1, 11, 17, 20, 150, 39, 6008, 32, 14, 38, 31, 6, 54, 60, 15] {
+                let mut missing = original.clone();
+                missing.remove(&tag);
+                assert!(
+                    project(&missing, &shared, "DU123456").is_err(),
+                    "missing {tag}"
+                );
+            }
+        }
+        for original in captured_automatic_rows().into_iter().skip(1) {
+            for (tag, value) in [(54, "1"), (31, "1"), (6, "1")] {
+                let mut fields = original.clone();
+                fields.insert(tag, value.into());
+                assert!(
+                    project(&fields, &shared, "DU123456").is_err(),
+                    "{tag}={value}"
+                );
+            }
+        }
+        let mut stock = captured_automatic_rows().remove(0);
+        stock.insert(31, "0".into());
+        stock.insert(6, "0".into());
+        assert!(project(&stock, &shared, "DU123456").is_err());
     }
 
     #[test]

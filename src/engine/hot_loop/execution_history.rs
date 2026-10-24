@@ -834,10 +834,71 @@ mod tests {
         let mut requests = active();
         requests.active.as_mut().unwrap().request.include_lifecycles = true;
         let mut row = captured_manual_rows().remove(0);
-        row.insert(6809, "101".into());
+        row.insert(6809, "100".into());
         requests.collect_option_lifecycle(&row, &shared, "DU123456");
         requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
         assert!(shared.orders.drain_execution_range_replies().pop().unwrap().result.is_err());
+    }
+
+    #[test]
+    fn captured_automatic_history_requires_opt_in_and_never_books_ordinary_fills() {
+        use super::super::lifecycle_history::captured_automatic_rows;
+        for include in [false, true] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            ccp.execution_ranges = active();
+            ccp.execution_ranges
+                .active
+                .as_mut()
+                .unwrap()
+                .request
+                .include_lifecycles = include;
+            for row in captured_automatic_rows() {
+                deliver(&mut ccp, &mut context, &shared, &row);
+                deliver(&mut ccp, &mut context, &shared, &row);
+            }
+            end(&mut ccp, &mut context, &shared);
+            let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
+            if include {
+                assert!(reply.result.unwrap().is_empty());
+                assert_eq!(reply.lifecycle_reports.len(), 3);
+                assert_eq!(
+                    reply
+                        .lifecycle_reports
+                        .iter()
+                        .filter(|row| row.observation.raw_value == "101")
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    reply
+                        .lifecycle_reports
+                        .iter()
+                        .filter(|row| row.observation.raw_value == "102")
+                        .count(),
+                    1
+                );
+                assert!(
+                    reply
+                        .lifecycle_reports
+                        .iter()
+                        .all(|row| row.commission_and_fees.is_none())
+                );
+            } else {
+                assert!(reply.result.is_err());
+                assert!(reply.lifecycle_reports.is_empty());
+            }
+            assert!(shared.portfolio.position_infos().is_empty());
+            assert!(shared.orders.drain_fills_with_exec().is_empty());
+            assert!(shared.orders.drain_untracked_executions().is_empty());
+            assert!(
+                shared
+                    .portfolio
+                    .money_since_seed(&shared.reference)
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
