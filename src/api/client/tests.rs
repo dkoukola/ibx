@@ -7102,6 +7102,9 @@ fn spy_stk() -> Contract {
     Contract { con_id: 756733, symbol: "SPY".into(), sec_type: "STK".into(), exchange: "SMART".into(), ..Default::default() }
 }
 
+#[path = "quote_refresh_tests.rs"]
+mod quote_refresh_tests;
+
 /// A farm message for instrument 5 with the given steps (ibx#446).
 fn message(shared: &SharedState, q: &crate::types::Quote, steps: &[crate::md_events::MdStep], halted: Option<i64>) {
     let message = crate::md_events::TestMessage { steps: Some(steps), halted, ..Default::default() };

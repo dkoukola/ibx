@@ -285,6 +285,10 @@ pub struct MdQueue {
     /// request asked for the whole quote.
     resync: [AtomicU64; WORDS],
     resync_any: AtomicBool,
+    /// Sequence + 1 of a genuine wire renewal. Kept outside the ring so an
+    /// overflow cannot discard the boundary and revive pre-refresh prices.
+    refresh_at: [AtomicU64; MAX_INSTRUMENTS],
+    refresh_revision: AtomicU64,
 }
 
 impl Default for MdQueue {
@@ -308,10 +312,28 @@ impl MdQueue {
             listened: std::array::from_fn(|_| AtomicU64::new(0)),
             resync: std::array::from_fn(|_| AtomicU64::new(0)),
             resync_any: AtomicBool::new(false),
+            refresh_at: std::array::from_fn(|_| AtomicU64::new(0)),
+            refresh_revision: AtomicU64::new(0),
         }
     }
 
     // ── Engine side (one thread) ──
+
+    /// The engine clears its quote/cache and old wire routes first, then
+    /// publishes this boundary before subscribing on fresh native ids.
+    pub(crate) fn begin_refresh(&self, instrument: InstrumentId) {
+        let at = self.writer.next.load(Ordering::Relaxed);
+        self.refresh_at[instrument as usize].store(at + 1, Ordering::Release);
+        self.refresh_revision.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn refresh_revision(&self) -> u64 {
+        self.refresh_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn refresh_boundary(&self, instrument: InstrumentId) -> Option<u64> {
+        self.refresh_at[instrument as usize].load(Ordering::Acquire).checked_sub(1)
+    }
 
     /// Whether an API request listens to the instrument.
     #[inline(always)]

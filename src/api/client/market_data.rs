@@ -128,6 +128,24 @@ impl EClient {
 
     // ── Option calculations ──
 
+    /// Request a fresh broker image for an existing streaming market-data
+    /// request. All requests sharing its contract keep their ids and data
+    /// mode; generic ticks and tick-by-tick streams are untouched.
+    ///
+    /// Unlike adding a snapshot, this renews the native top-of-book stream:
+    /// cached prices are not replayed as fresh ticks. Unchanged prices are
+    /// delivered again only after the broker sends them on the renewed feed.
+    /// Ok means queued, not refreshed; await ordinary price callbacks. A
+    /// shared feed that ended before dispatch receives error 300. Snapshot and
+    /// mdoff requests cannot initiate refreshes.
+    pub fn refresh_mkt_data(&self, req_id: i64) -> Result<(), String> {
+        if !self.is_connected() {
+            return Err("market data refresh requires a connected client".into());
+        }
+        let (instrument, con_id) = self.core.market_data_refresh_target(req_id)?;
+        self.send(ControlCommand::RefreshMarketData { req_id, instrument, con_id })
+    }
+
     /// Implied volatility of an option price. Matches
     /// `calculateImpliedVolatility` in C++. Computed locally by the option
     /// model, as the reference: one `tick_option_computation` with tick type

@@ -100,11 +100,12 @@ struct Mirror {
     /// record starts empty there (valid or not), after the steps of the
     /// earlier one.
     reset_at: Option<(u64, bool)>,
+    refreshed_at: Option<u64>,
 }
 
 impl Default for Mirror {
     fn default() -> Self {
-        Self { fields: [0; field::COUNT], halted: None, auto: QuoteMarks::default(), seen: 0, valid: true, reset_at: None }
+        Self { fields: [0; field::COUNT], halted: None, auto: QuoteMarks::default(), seen: 0, valid: true, reset_at: None, refreshed_at: None }
     }
 }
 
@@ -158,7 +159,7 @@ impl Mirror {
     fn reset_if_due(&mut self, seq: u64) -> bool {
         match self.reset_at {
             Some((at, valid)) if seq >= at => {
-                *self = Mirror { valid, ..Mirror::default() };
+                *self = Mirror { valid, refreshed_at: self.refreshed_at, ..Mirror::default() };
                 true
             }
             _ => false,
@@ -185,11 +186,12 @@ pub(crate) struct MdReader {
     /// Records with a reset to make.
     resets: usize,
     retired: Vec<Retired>,
+    refresh_revision: u64,
 }
 
 impl MdReader {
     pub(crate) fn new() -> Self {
-        Self { mirrors: vec![Mirror::default(); MAX_INSTRUMENTS], resets: 0, retired: Vec::new() }
+        Self { mirrors: vec![Mirror::default(); MAX_INSTRUMENTS], resets: 0, retired: Vec::new(), refresh_revision: 0 }
     }
 }
 
@@ -406,6 +408,55 @@ fn snapshot_pass(snap: &mut PlainSnapshot, m: &Mirror, pass: Pass, out: &mut Out
 }
 
 impl ClientCore {
+    pub(crate) fn market_data_refresh_target(&self, req_id: i64) -> Result<(InstrumentId, i64), String> {
+        if self.snapshot_reqs.lock().unwrap().contains_key(&req_id)
+            || self.md_top_off.lock().unwrap().contains(&req_id)
+        {
+            return Err("market data refresh requires a streaming top-of-book request".into());
+        }
+        let instrument = self.req_to_instrument.lock().unwrap().get(&req_id).copied()
+            .ok_or("market data refresh request is not active")?;
+        let con_id = self.con_id_to_instrument.lock().unwrap().iter()
+            .find_map(|(con_id, id)| (*id == instrument).then_some(*con_id))
+            .or_else(|| self.md_slot_con_ids.lock().unwrap().get(&instrument).copied())
+            .ok_or("market data refresh contract is not resolved")?;
+        Ok((instrument, con_id))
+    }
+
+    /// Apply the engine's non-droppable renewal boundary before any cached
+    /// join or queued step can be delivered. Fields start empty, so a new
+    /// LAST alone cannot accidentally confirm the previous bid and ask.
+    fn apply_md_refreshes(&self, shared: &SharedState) {
+        let revision = shared.market.md_events.refresh_revision();
+        let observers = self.instrument_to_req.lock().unwrap();
+        let mut reader = self.md_reader.lock().unwrap();
+        if reader.refresh_revision == revision { return; }
+        let mut streams = self.last_quotes.lock().unwrap();
+        for (&instrument, requests) in observers.iter() {
+            let Some(at) = shared.market.md_events.refresh_boundary(instrument) else { continue };
+            let m = &mut reader.mirrors[instrument as usize];
+            if m.refreshed_at.is_some_and(|old| old >= at) { continue; }
+            // A later new subscription has already discarded this old slot's
+            // data. Its own start boundary remains authoritative.
+            if m.reset_at.is_some_and(|(start, _)| start > at) {
+                m.refreshed_at = Some(at);
+                continue;
+            }
+            let had_reset = m.reset_at.is_some();
+            *m = Mirror { reset_at: Some((at, true)), refreshed_at: Some(at), ..Mirror::default() };
+            if !had_reset { reader.resets += 1; }
+            for req_id in requests {
+                if let Some(st) = streams.get_mut(req_id) {
+                    if st.waiting_join { self.md_joins_waiting.fetch_sub(1, Ordering::AcqRel); }
+                    *st = StreamState {
+                        start: at.max(st.start), delayed: st.delayed, top_off: st.top_off,
+                        farm_auto: st.farm_auto, mdt_done: st.mdt_done, ended: st.ended, ..StreamState::default()
+                    };
+                }
+            }
+        }
+        reader.refresh_revision = revision;
+    }
     /// Set up the stream state of a new request and, for the first request
     /// of an instrument, the instrument's record and its steps (ibx#446).
     /// The request reads the queue from its current end, or from `at`. A
@@ -505,6 +556,11 @@ impl ClientCore {
     /// `mdoff` gets no top of book tick; its snapshot still ends as the
     /// quote completes (ibx#444).
     pub fn poll_market_data(&self, shared: &SharedState, now: Option<std::time::Instant>, out: &mut Vec<MdOut>) {
+        // A refresh published after this cut cannot have any of its new
+        // native steps in this pass. Apply boundaries after taking the cut.
+        let queue = &shared.market.md_events;
+        let head = queue.head();
+        self.apply_md_refreshes(shared);
         // Drain even without snapshots or quote steps: a later snapshot
         // can join an acknowledged stream whose first price has not come.
         {
@@ -523,8 +579,6 @@ impl ClientCore {
                 }
             }
         }
-        let queue = &shared.market.md_events;
-        let head = queue.head();
         let tail = queue.tail();
         let snapshots = self.snapshot_count.load(Ordering::Acquire) > 0;
         // The generic tick blocks read before the queue's end (ibx#450).
@@ -537,7 +591,8 @@ impl ClientCore {
         let mut reader = self.md_reader.lock().unwrap();
         let mut streams = self.last_quotes.lock().unwrap();
         let mut snaps = self.snapshot_reqs.lock().unwrap();
-        let MdReader { mirrors, resets, retired } = &mut *reader;
+        let refresh_revision = reader.refresh_revision;
+        let MdReader { mirrors, resets, retired, .. } = &mut *reader;
         let mut d = Drain { core: self, shared, out, streams: &mut streams, snaps: &mut snaps };
         let mut step = |seq: u64, g: Option<&crate::bridge::GenericTicks>| {
             if let Some(g) = g {
@@ -546,6 +601,9 @@ impl ClientCore {
             }
             let ev = queue.read(seq);
             let instrument = ev.instrument;
+            if queue.refresh_boundary(instrument).is_some_and(|at| seq < at) {
+                return;
+            }
             let Some(m) = mirrors.get_mut(instrument as usize) else { return };
             if m.reset_if_due(seq) {
                 *resets -= 1;
@@ -623,7 +681,9 @@ impl ClientCore {
                 }
             }
         }
-        if self.md_joins_waiting.load(Ordering::Acquire) > 0 {
+        if self.md_joins_waiting.load(Ordering::Acquire) > 0
+            && queue.refresh_revision() == refresh_revision
+        {
             for (&instrument, reqs) in observers.iter() {
                 let Some(m) = mirrors.get(instrument as usize).filter(|m| m.valid && m.reset_at.is_none()) else { continue };
                 for &req_id in reqs {

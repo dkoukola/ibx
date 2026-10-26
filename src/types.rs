@@ -2154,6 +2154,9 @@ pub enum ControlCommand {
     },
     /// Unsubscribe from market data for an instrument.
     Unsubscribe { instrument: InstrumentId },
+    /// Renew an existing shared top-of-book stream on new native request ids.
+    /// `con_id` prevents a queued refresh from targeting a reused slot.
+    RefreshMarketData { req_id: i64, instrument: InstrumentId, con_id: i64 },
     /// The client's reqMarketDataType (1..4), applied to the engine's
     /// `MarketDataModes`: with delayed on, a subscription the server
     /// rejects switches to delayed data (ibx#447).

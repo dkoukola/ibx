@@ -1853,9 +1853,25 @@ impl FarmState {
         self.cancel_top_entries(instrument)
     }
 
+    /// Keep the exact active mode and contract while renewing just its
+    /// top-of-book entries. Generic/news/status/TBT consumers are not removed.
+    pub(crate) fn refresh_subscription(&self, instrument: InstrumentId, con_id: i64)
+        -> Option<MdSubscribe>
+    {
+        let (_, symbol, exchange, sec_type, ltd, strike, right, mult, mode, snapshot) =
+            self.md_resub_info.iter().find(|(id, ..)| *id == instrument)?.clone();
+        if snapshot || !self.instrument_md_reqs.iter().any(|(id, _)| *id == instrument) {
+            return None;
+        }
+        Some(MdSubscribe {
+            con_id, symbol, exchange, sec_type, last_trade_date: ltd, strike,
+            right, multiplier: mult, instrument, mode_9887: mode, snapshot: false,
+        })
+    }
+
     /// The cancels of an instrument's top-of-book entries on the wire,
     /// which are forgotten; the subscription itself is left as it is.
-    fn cancel_top_entries(&mut self, instrument: InstrumentId) -> Vec<(FarmId, Vec<(u32, String)>)> {
+    pub(crate) fn cancel_top_entries(&mut self, instrument: InstrumentId) -> Vec<(FarmId, Vec<(u32, String)>)> {
         let reqs = match self.instrument_md_reqs.iter()
             .position(|(id, _)| *id == instrument)
         {

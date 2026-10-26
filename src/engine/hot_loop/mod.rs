@@ -1539,6 +1539,22 @@ impl HotLoop {
                         self.try_reclaim_instrument(live);
                     }
                 }
+                ControlCommand::RefreshMarketData { req_id, instrument, con_id } => {
+                    let renewal = (self.context.market.con_id(instrument) == Some(con_id))
+                        .then(|| self.farm.refresh_subscription(instrument, con_id)).flatten();
+                    if let Some(subscription) = renewal {
+                        let cancels = self.farm.cancel_top_entries(instrument);
+                        self.context.market.refresh_quote(instrument);
+                        self.shared.market.push_quote(instrument, &crate::types::Quote::default());
+                        self.shared.market.discard_top_acks(instrument);
+                        self.shared.market.md_events.begin_refresh(instrument);
+                        self.send_farm_messages(cancels);
+                        self.route_md_subscribe(&subscription);
+                    } else {
+                        self.shared.orders.push_order_error(req_id, 300,
+                            "Market data refresh has no active streaming subscription".into());
+                    }
+                }
                 ControlCommand::SubscribeTbt { req_id, con_id, symbol, exchange, sec_type, tbt_type, number_of_ticks, ignore_size, reply_tx } => {
                     if let Some(id) = self.register_or_reject(con_id, symbol.clone(), &sec_type, &exchange, &reply_tx) {
                         // The farm of a SMART contract's route needs its
@@ -4298,6 +4314,59 @@ mod tests {
             con_id, symbol: String::new(), exchange: "SMART".into(), sec_type: sec_type.into(),
             last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
             mode_9887: 0, snapshot: false, reply_tx: None,
+        }
+    }
+
+    #[test]
+    fn quote_refresh_renews_only_current_feed_with_same_mode_and_new_wire_ids() {
+        for mode in [0, 1, 2, 3] {
+            let shared = Arc::new(SharedState::new());
+            let mut engine = HotLoop::new(shared.clone(), None, None);
+            let (client_side, mut farm_side) = socket_pair();
+            engine.farm_conn = Some(Connection::new_mem(client_side));
+            let (tx, rx) = crossbeam_channel::bounded(8);
+            engine.set_control_rx(rx);
+            let mut command = subscribe_cmd(756733, "STK");
+            if let ControlCommand::Subscribe { mode_9887, .. } = &mut command { *mode_9887 = mode; }
+            tx.send(command).unwrap();
+            engine.poll_once();
+            let initial = farm_messages_sent(&mut farm_side);
+            assert_eq!(initial.len(), 1, "{initial:?}");
+            let id = engine.context.market.instrument_by_con_id(756733).unwrap();
+            let old_ids: Vec<_> = engine.farm.md_req_to_instrument.iter().filter(|(_, i)| *i == id).map(|(r, _)| *r).collect();
+            let generic = engine.farm.start_generic(id, 756733, "SMART", "STK", "NYSE", &[233], PRIMARY_MD);
+            assert!(!generic.is_empty());
+            engine.send_farm_messages(generic);
+            farm_messages_sent(&mut farm_side);
+            engine.hmds.send_tbt_subscribe(42, 756733, id, "SPY", "SMART", "STK",
+                TbtType::BidAsk, 0, false, PRIMARY_HMDS, &mut engine.hmds_conn, &mut engine.hb);
+            assert_eq!(engine.hmds.tbt_subscriptions.len(), 1);
+            engine.context.market.register_server_tag(700, id, 0.01);
+            engine.context.market.register_trade_tag(0, 701, id, 0.01);
+            shared.market.md_events.listen(id, true);
+            shared.market.push_quote(id, &Quote { bid: 100 * PRICE_SCALE, ..Default::default() });
+            tx.send(ControlCommand::RefreshMarketData { req_id: 5, instrument: id, con_id: 756733 }).unwrap();
+            engine.poll_once();
+            let renewed = farm_messages_sent(&mut farm_side);
+            assert_eq!(renewed.len(), 2, "{renewed:?}");
+            assert!(renewed[0].contains("263=2|146=2|"), "{}", renewed[0]);
+            assert!(renewed[1].contains("263=1|146=2|"), "{}", renewed[1]);
+            assert!(old_ids.iter().all(|old| !engine.farm.md_req_to_instrument.iter().any(|(r, _)| r == old)));
+            assert!(engine.context.market.route_farm_tag(0, 700).is_none());
+            assert!(engine.context.market.route_farm_tag(0, 701).is_none());
+            assert_eq!(shared.market.quote(id).bid, 0);
+            assert!(shared.market.md_events.refresh_boundary(id).is_some());
+            assert_eq!(engine.hmds.tbt_subscriptions.len(), 1, "refresh keeps the TBT request");
+            assert!(!engine.farm.stop_generic(id).is_empty(), "refresh kept the generic subscription");
+            if mode == 0 { assert!(!renewed[1].contains("9887=")); }
+            else { assert_eq!(renewed[1].matches(&format!("9887={mode}|")).count(), 2); }
+            // Once the last consumer cancels, a queued refresh cannot revive it.
+            tx.send(ControlCommand::Unsubscribe { instrument: id }).unwrap();
+            engine.poll_once();
+            farm_messages_sent(&mut farm_side);
+            tx.send(ControlCommand::RefreshMarketData { req_id: 5, instrument: id, con_id: 756733 }).unwrap();
+            engine.poll_once();
+            assert!(farm_messages_sent(&mut farm_side).is_empty());
         }
     }
 

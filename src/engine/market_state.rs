@@ -336,6 +336,15 @@ impl MarketState {
         before - self.server_tags.len()
     }
 
+    /// A deliberate renewal invalidates both old quote and LAST routes;
+    /// generic and historical tick-by-tick routing belongs elsewhere.
+    pub(crate) fn refresh_quote(&mut self, instrument: InstrumentId) {
+        self.server_tags.retain(|_, route| route.instrument != instrument);
+        self.trade_tags.retain(|_, route| route.instrument != instrument);
+        self.zero_quote(instrument);
+        self.marks[instrument as usize] = QuoteMarks::default();
+    }
+
     /// Number of quote and trade tags held.
     pub fn tag_counts(&self) -> (usize, usize) {
         (self.server_tags.len(), self.trade_tags.len())
