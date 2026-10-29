@@ -362,6 +362,7 @@ fn send_orders(
             let (code, message) = crate::client_core::duplicate_order_id(*order_id);
             log::warn!("Modify of order {} refused: the order is not sent yet", order_id);
             shared.orders.push_order_error(*order_id, code, message);
+            refuse_guard();
             continue;
         }
         if waits_behind(&order_req, &context.rth_parked) {
@@ -559,6 +560,7 @@ fn send_orders(
                                 let parent = order_req.new_order_side().and_then(|(_, a)| a).map_or(0, |a| a.parent_id);
                                 context.keep_unsent(oid, (instrument, order_req.new_order_qty().unwrap_or(0), parent));
                             }
+                            refuse_guard();
                             continue;
                         }
                         None => {}
@@ -581,9 +583,10 @@ fn send_orders(
                         };
                         log::warn!("Combo order {} refused: {} {}", oid, code, message);
                         shared.orders.push_order_error(oid, code, message.to_string());
-                        if !what_if {
+                        if !what_if && guard.is_none() {
                             context.api_pending.insert(oid, order_req);
                         }
+                        refuse_guard();
                         continue;
                     }
                     combo_track = Some(combo_order_setup(context, shared, &mut order_req, built, spec));
@@ -779,7 +782,7 @@ fn send_orders(
         }
         // An option, futures option or warrant order without the trading
         // permission of its class (ibx#666).
-        match permission_refusal(&order_req, context, conn, hb, shared) {
+        match permission_refusal(&order_req, context, conn, hb, shared, !what_if && guard.is_none()) {
             Some(false) => { context.rth_parked.push(rewrap(order_req)); continue; }
             Some(true) => { refuse_guard(); continue; },
             None => {}
@@ -4227,6 +4230,7 @@ fn permission_refusal(
     conn: &mut Connection,
     hb: &mut HeartbeatState,
     shared: &Arc<SharedState>,
+    retain_pending: bool,
 ) -> Option<bool> {
     let (_, attrs) = req.new_order_side()?;
     if req.combo().is_some() { return None; }
@@ -4337,7 +4341,7 @@ fn permission_refusal(
         Some(false) if sec_type == "CRYPTO" => {
             let oid = req.order_id();
             log::warn!("Order {} kept pending: no trading permission for {}", oid, key);
-            if !matches!(req, OrderRequest::SubmitWhatIf { .. }) {
+            if retain_pending {
                 context.api_pending.insert(oid, req.clone());
             }
             Some(true)
@@ -7376,6 +7380,76 @@ mod tests {
         assert_eq!(tag(&frames[0], 11), Some(format!("{}.0", context.server_id(22)).as_str()));
         assert_eq!(context.server_id(21), 1_459_034_036);
         assert_eq!(context.order(21).unwrap().status, OrderStatus::PendingSubmit);
+    }
+
+    #[test]
+    fn guarded_modify_of_parked_order_settles_retained_clone() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        let (mut context, shared, mut conn, mut server) = guarded_fixture();
+        context.rth_parked.push(guarded_limit(10));
+        let (guard, receipt) = OrderWriteGuard::new(|| panic!("parked duplicate cannot authorize"));
+        let retained = OrderRequest::Guarded {
+            request: Box::new(OrderRequest::Modify {
+                new_order_id: 10, order_id: 10, qty: 2,
+                kind: crate::types::OrderKind::Limit { price: 101 * P },
+                tif: b'0', attrs: Default::default(),
+            }), guard,
+        };
+        context.pending_orders.push(retained.clone());
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+        assert_eq!(shared.orders.drain_order_errors()[0].1, 103);
+        assert_eq!(context.rth_parked.len(), 1, "the original order is unchanged");
+        context.pending_orders.push(retained);
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert!(shared.orders.drain_order_errors().is_empty());
+    }
+
+    #[test]
+    fn guarded_combo_preflight_refusals_settle_retained_clones() {
+        use crate::engine::combo::{Combo, Leg};
+        use crate::protocol::order_write::OrderWriteGuard;
+        use crate::types::{ComboLegSpec, ComboSpec, OrderAttrs};
+        for (denied_permission, leg_count, code) in [(true, 2, 460), (false, 2, 10043), (false, 3, 10045)] {
+            let (mut context, shared, mut conn, mut server) = guarded_fixture();
+            context.order_presets.insert("COMB".into(), None);
+            context.trading_permissions.insert("2/OPT/R".into(), false);
+            shared.reference.set_logon_features("REJGNONAT");
+            let legs: Vec<Leg> = (0..leg_count).map(|i| Leg {
+                con_id: 100 + i, ratio: 1, buy: i == 0,
+                exchange: "SMART".into(), symbol: "SPY".into(), currency: "USD".into(),
+                sec_type: if denied_permission { "OPT" } else { "STK" }.into(),
+                multiplier: 1.0,
+                permission_key: if denied_permission { "2/OPT/R" } else { "" }.into(),
+            }).collect();
+            let spec = ComboSpec {
+                exchange: "SMART".into(), currency: "USD".into(), symbol: "SPY".into(), smart_con_id: 28812380,
+                legs: legs.iter().map(|leg| ComboLegSpec {
+                    con_id: leg.con_id, ratio: leg.ratio, buy: leg.buy, exchange: leg.exchange.clone(),
+                }).collect(), ..Default::default()
+            };
+            context.combos.seed_built_for_test(Combo {
+                bag_con_id: spec.smart_con_id, exchange: "SMART".into(), routed: "BEST".into(),
+                currency: "USD".into(), trading_class: "COMB".into(), multiplier: 1.0, legs,
+            });
+            let (guard, receipt) = OrderWriteGuard::new(|| panic!("refused combo cannot authorize"));
+            let retained = OrderRequest::Guarded {
+                request: Box::new(OrderRequest::SubmitEx {
+                    order_id: 10, instrument: 0, side: Side::Buy, qty: 1,
+                    kind: crate::types::OrderKind::Limit { price: P }, tif: b'0',
+                    attrs: OrderAttrs { combo: Some(Box::new(spec)), ..Default::default() },
+                }), guard,
+            };
+            context.pending_orders.push(retained.clone());
+            assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+            assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+            assert_eq!(shared.orders.drain_order_errors()[0].1, code);
+            assert!(context.api_pending.is_empty(), "no unguarded command may survive refusal");
+            context.pending_orders.push(retained);
+            assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+            assert!(shared.orders.drain_order_errors().is_empty());
+            assert!(context.order(10).is_none());
+        }
     }
 
     #[test]
@@ -12136,6 +12210,27 @@ mod tests {
         let errors = shared.orders.drain_order_errors();
         assert_eq!(errors.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), [(97, 321)], "{errors:?}");
         assert!(context.api_pending.is_empty());
+    }
+
+    #[test]
+    fn guarded_crypto_permission_refusal_does_not_retain_unwrapped_order() {
+        use crate::protocol::order_write::OrderWriteGuard;
+        let (guard, receipt) = OrderWriteGuard::new(|| panic!("refused crypto cannot authorize"));
+        let retained = OrderRequest::Guarded {
+            request: Box::new(OrderRequest::SubmitLimit {
+                order_id: 95, instrument: 0, side: Side::Buy, qty: 1, price: px(1000.0),
+            }), guard,
+        };
+        let (frames, shared, mut context, mut conn, mut server) =
+            order_by_con_id("479624278", "PAXOS", retained.clone(), &BTC);
+        assert_eq!(frames.len(), 1, "the permission query");
+        permission_reply(&mut context, &fix::field_view(&permission_answer("PAXOS/CRYPTO/NONE", "0")));
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert_eq!(receipt.outcome(), Some(OrderWriteOutcome::NotSent));
+        assert!(context.api_pending.is_empty());
+        context.pending_orders.push(retained);
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty());
+        assert!(context.order(95).is_none());
     }
 
     // ibx#666 (the reference 10.51, paper, regular hours 16/10/2026,

@@ -349,6 +349,7 @@ fn combo_fill_session_is_the_captured_one() {
 
 #[test]
 fn guarded_combo_authorizes_only_at_first_order_write_and_refusal_is_byte_zero() {
+    crate::client_core::set_session_level_for_test(Some(214)); // the captured session permits its empty TIF
     let frames = fixture("20260930/i105_combo_fill.jsonl");
     let mut s = Session::new();
     s.engine
