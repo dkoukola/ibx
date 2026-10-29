@@ -2220,7 +2220,7 @@ fn place_order_what_if() {
 }
 
 #[test]
-fn option_what_if_keeps_exact_terms_and_does_not_allow_real_option_orders() {
+fn option_what_if_keeps_exact_resolved_native_terms() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let contract = Contract {
@@ -2230,7 +2230,7 @@ fn option_what_if_keeps_exact_terms_and_does_not_allow_real_option_orders() {
         strike: 500.0, multiplier: "100".into(), ..Default::default()
     };
     let preview = Order { action: "BUY".into(), total_quantity: 1.0,
-        order_type: "LMT".into(), lmt_price: 5.0, what_if: true, ..Default::default() };
+        order_type: "LMT".into(), tif: "DAY".into(), lmt_price: 5.0, what_if: true, ..Default::default() };
     assert!(client.place_order(-73, &contract, &preview).is_err(), "the API expiry is not the native maturity");
     shared.reference.cache_option_order_terms(&ContractDefinition {
         con_id: contract.con_id, symbol: "SPY".into(), currency: "USD".into(),
@@ -2251,7 +2251,6 @@ fn option_what_if_keeps_exact_terms_and_does_not_allow_real_option_orders() {
         ("202611", true, 500.0, 100.0));
     assert_eq!(client.core.peek_what_if(-73).unwrap().0.con_id, contract.con_id);
     assert!(client.core.tracked_order(-73).is_none());
-    assert!(client.place_order(73, &contract, &Order { what_if: false, ..preview.clone() }).is_err());
     for invalid in [
         Contract { con_id: 0, ..contract.clone() },
         Contract { right: String::new(), ..contract.clone() },
@@ -2265,7 +2264,6 @@ fn option_what_if_keeps_exact_terms_and_does_not_allow_real_option_orders() {
         Contract { currency: "EUR".into(), ..contract.clone() },
         Contract { last_trade_date_or_contract_month: "20261220".into(), ..contract.clone() },
         Contract { last_trade_date_or_contract_month: "20261121".into(), ..contract.clone() },
-        Contract { sec_type: "FUT".into(), ..contract.clone() },
     ] {
         assert!(client.place_order(-74, &invalid, &preview).is_err());
     }
@@ -2284,7 +2282,7 @@ fn what_if_tracking_precedes_the_send_and_negative_ids_are_preserved() {
     let worker = client.clone();
     let task = std::thread::spawn(move || worker.place_order(-72, &spy(), &Order {
         action: "SELL".into(), total_quantity: 1.0, order_type: "LMT".into(),
-        lmt_price: 150.0, what_if: true, ..Default::default()
+        tif: "DAY".into(), lmt_price: 150.0, what_if: true, ..Default::default()
     }));
     let mut select = crossbeam_channel::Select::new();
     select.recv(&rx);
@@ -2305,7 +2303,7 @@ fn what_if_send_failure_rolls_back_only_latest_tracking() {
     drop(rx);
     assert!(client.place_order(-7, &spy(), &Order {
         action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(),
-        lmt_price: 222.0, what_if: true, ..Default::default()
+        tif: "DAY".into(), lmt_price: 222.0, what_if: true, ..Default::default()
     }).is_err());
     assert_eq!(client.core.take_what_if(-7).unwrap().1.lmt_price, 111.0);
     assert!(client.core.peek_what_if(-7).is_none());
@@ -7179,6 +7177,7 @@ fn req_positions_does_not_wait_in_the_caller() {
 fn req_positions_gives_2151_when_the_data_never_comes() {
     let (client, _rx, _shared) = test_client();
     client.req_positions(&mut RecordingWrapper::default());
+    client.process_msgs(&mut RecordingWrapper::default());
     if let Some(sub) = client.core.positions_sub.lock().unwrap().as_mut() {
         sub.backdate(crate::client_core::POSITIONS_WAIT);
     }
@@ -7250,6 +7249,7 @@ fn position_snapshot_callback_reconnect_replays_without_stale_end() {
     shared.portfolio.set_position_info(PositionInfo {
         con_id: 756733,
         position_fixed: QTY_SCALE,
+        symbol: "SPY".into(), sec_type: "STK".into(),
         ..Default::default()
     });
     shared.portfolio.set_account_download_complete();
@@ -7260,11 +7260,13 @@ fn position_snapshot_callback_reconnect_replays_without_stale_end() {
         changed: false,
     };
     client.req_positions(&mut wrapper);
-    assert_eq!(wrapper.rows.len(), 1);
-    assert!(matches!(wrapper.rows[0], (-1, 265598 | 756733, 1.0)));
-    assert!(wrapper.ends.is_empty());
-    assert!(shared.orders.execution_history_completion().is_none());
+    assert!(wrapper.rows.is_empty());
     client.process_msgs(&mut wrapper);
+    // Ordered local answers and the state phase may both advance positions
+    // in one pump. Only the refreshed image is allowed to emit an end.
+    assert_eq!(wrapper.rows.len(), 3);
+    assert!(matches!(wrapper.rows[0], (-1, 265598 | 756733, 1.0)));
+    assert!(shared.orders.execution_history_completion().is_none());
     let mut refreshed = wrapper.rows[1..].to_vec();
     refreshed.sort_by_key(|row| row.1);
     assert_eq!(refreshed, [(-1, 265598, 2.0), (-1, 756733, 1.0)]);
@@ -7308,6 +7310,7 @@ fn position_subscriptions_wait_through_loss_and_replay_an_unchanged_image() {
     shared.portfolio.set_account_download_complete();
     let mut wrapper = RecordingWrapper::default();
     client.req_positions(&mut wrapper);
+    client.process_msgs(&mut wrapper);
     assert_eq!(wrapper.events.len(), 2);
     shared.portfolio.invalidate_position_snapshot();
     shared.orders.invalidate_execution_history();

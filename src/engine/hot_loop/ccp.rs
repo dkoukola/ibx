@@ -5994,9 +5994,6 @@ fn lightweight_positions(msg: &[u8]) -> Option<Vec<LightweightPositions<'_>>> {
         .then_some(images)
 }
 
-/// Apply account-wide U75 snapshots and deltas, never a model's partial view.
-/// Contract metadata is fetched through the existing read-only secdef path.
-
 /// The prices at midnight (ibx#511): a count, then (conId, price) for
 /// each position held at midnight.
 fn handle_midnight_prices(msg: &[u8], shared: &SharedState) {

@@ -6037,6 +6037,7 @@ pub(crate) fn order_contract_reply(context: &mut Context, shared: &SharedState, 
             for r in refused {
                 let oid = r.order_id();
                 shared.orders.push_order_error(oid, crate::engine::combo::NO_DEFINITION.0, crate::engine::combo::NO_DEFINITION.1.to_string());
+                if let OrderRequest::Guarded { guard, .. } = &r { guard.refuse_unprepared(); }
                 drop_refused_at_lookup(context, shared, &r);
             }
             // The orders of a group on another contract go on without it.
@@ -7987,6 +7988,7 @@ mod tests {
         let (mut context, shared, mut conn, mut server) = guarded_fixture();
         context.bypass_redirect_warning = false;
         context.market.set_routing(0, "STK", "ISLAND");
+        context.order_records.insert((265598, "ISLAND".into()));
         context.rth_types.insert((265598, "ISLAND".into()), crate::engine::outside_rth::RthTypes {
             rth: true, sec_type: "STK".into(), smart: true, ..Default::default()
         });
