@@ -1,4 +1,4 @@
-//! Issue #146 — per-request market-data mode (FIX field 9887).
+//! Issue #146 — per-request market-data mode (a field of the market data request).
 //!
 //! Subscribes to a thinly-traded ticker with parallel realtime + frozen subs
 //! and prints which feed delivers ticks. Frozen sub keeps streaming after-hours
@@ -70,6 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = EClient::connect(&EClientConfig {
         username, password, host, paper: true, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     })?;
 
     let contract = Contract { con_id, symbol: symbol.clone(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() };

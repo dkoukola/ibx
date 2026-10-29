@@ -15,8 +15,9 @@ use crate::types::ReqId;
 use super::HeartbeatState;
 
 /// Request numbers of the definition lookups of option calculations: a
-/// range of their own, below the other internal lookups.
-pub(crate) const OPTCALC_LOOKUP_FIRST_ID: u32 = 0xC000_0000;
+/// range of their own, below the other internal lookups. It shared the
+/// orders' range once, so an order could take an option's answer (ibx#699).
+pub(crate) const OPTCALC_LOOKUP_FIRST_ID: u32 = 0xA000_0000;
 pub(crate) const OPTCALC_LOOKUP_IDS: u32 = 0x1000_0000;
 /// A definition lookup with no answer in this time ends its calculations.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,8 +61,21 @@ pub(crate) struct OptCalc {
     next_lookup: u32,
     curves: HashMap<String, Known<inputs::RateCurve>>,
     dividends: HashMap<i64, Known<Vec<inputs::Dividend>>>,
+    /// The contract whose dividends an underlying's model reads, when not
+    /// its own: a future's index (ibx#730).
+    div_source: HashMap<i64, i64>,
     xml_queries: HashMap<String, XmlTarget>,
     next_xml: u32,
+    /// A model clock that does not move (tests).
+    fixed_clock: Option<i64>,
+}
+
+#[cfg(test)]
+impl OptCalc {
+    /// Whether the option's terms came with its lookup's answer.
+    pub(crate) fn knows_option(&self, con_id: i64) -> bool {
+        matches!(self.terms.get(&con_id), Some(Known::Ready(_)))
+    }
 }
 
 impl Default for OptCalc {
@@ -75,14 +89,27 @@ impl Default for OptCalc {
             next_lookup: 0,
             curves: HashMap::new(),
             dividends: HashMap::new(),
+            div_source: HashMap::new(),
             xml_queries: HashMap::new(),
             next_xml: 1,
+            fixed_clock: None,
         }
     }
 }
 
 fn now_ms() -> i64 {
     jiff::Timestamp::now().as_millisecond()
+}
+
+/// The dividend query of an option's model, on the contract whose
+/// dividends it reads (ibx#730): the underlying's own, as its terms ask
+/// them, or another's (a future's index).
+fn dividend_query(terms: &OptionTerms, div_con: i64) -> String {
+    if div_con == terms.under_con_id {
+        terms.dividend_query()
+    } else {
+        format!("div incSpecial {div_con}")
+    }
 }
 
 /// Terms of an option from its definition.
@@ -114,14 +141,23 @@ pub(crate) fn terms_of(def: &crate::control::contracts::ContractDefinition) -> O
 
 impl OptCalc {
     fn clock_ms(&mut self, now: i64) -> i64 {
+        if let Some(fixed) = self.fixed_clock {
+            return fixed;
+        }
         let clock = *self.clock.get_or_insert(inputs::ModelClock { start_ms: now });
         clock.at(now)
     }
 
     /// A new calculation. Its definition and inputs are asked when not known.
+    ///
+    /// The definition is asked as the reference asks it (ibx#589, paper
+    /// 11/10/2026, first request of a session): by conId on the contract's
+    /// exchange. Asked with no exchange, the server gave a stock's
+    /// definition and none for an option, and every calculation ended
+    /// with error 200.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
-        &mut self, req_id: ReqId, con_id: i64, kind: CalcKind, under_price: f64,
+        &mut self, req_id: ReqId, con_id: i64, exchange: &str, kind: CalcKind, under_price: f64,
         conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState,
     ) {
         // The model starts with the first calculation; its clock with it.
@@ -134,15 +170,19 @@ impl OptCalc {
             self.terms.insert(con_id, Known::Asked(Instant::now()));
             if let Some(c) = conn.as_mut() {
                 let ts = chrono_free_timestamp();
-                let number_str = number.to_string();
+                let name = format!("{}{}", crate::control::contracts::SECDEF_MSG_NAME, number);
                 let con_id_str = con_id.to_string();
+                // No exchange given reads as the smart one.
+                let on = if exchange.is_empty() { "SMART" } else { exchange };
                 let _ = c.send_fix(&[
                     (fix::TAG_MSG_TYPE, "c"),
                     (fix::TAG_SENDING_TIME, &ts),
-                    (crate::control::contracts::TAG_SECURITY_REQ_ID, &number_str),
+                    (crate::control::contracts::TAG_SECURITY_REQ_ID, &name),
                     (crate::control::contracts::TAG_SECURITY_REQ_TYPE, "2"),
-                    (crate::control::contracts::TAG_IB_CON_ID, &con_id_str),
                     (crate::control::contracts::TAG_IB_SOURCE, "Socket"),
+                    (146, "1"),
+                    (crate::control::contracts::TAG_IB_CON_ID, &con_id_str),
+                    (6004, crate::control::contracts::exchange_to_fix(on)),
                 ]);
                 hb.last_ccp_sent = Instant::now();
             }
@@ -200,9 +240,17 @@ impl OptCalc {
         true
     }
 
-    fn send_xml_query(&mut self, query: &str, target: XmlTarget, conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+    /// The id of the next reference-data request: one series for the
+    /// option model's queries and the trading-hours requests, as the
+    /// reference names both (ibx#670).
+    pub(crate) fn next_query_id(&mut self) -> String {
         let id = format!("{}{}", XML_QUERY_PREFIX, self.next_xml);
         self.next_xml = self.next_xml.wrapping_add(1);
+        id
+    }
+
+    fn send_xml_query(&mut self, query: &str, target: XmlTarget, conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+        let id = self.next_query_id();
         if let Some(c) = conn.as_mut() {
             let ts = chrono_free_timestamp();
             let _ = c.send_fix(&[
@@ -259,11 +307,12 @@ impl OptCalc {
                 self.curves.insert(terms.currency.clone(), Known::Asked(now));
                 self.send_xml_query(&terms.rate_query(), XmlTarget::Curve(terms.currency.clone()), conn, hb);
             }
-            if let std::collections::hash_map::Entry::Vacant(e) = self.dividends.entry(terms.under_con_id) {
+            let div_con = self.div_con(terms.under_con_id);
+            if let std::collections::hash_map::Entry::Vacant(e) = self.dividends.entry(div_con) {
                 e.insert(Known::Asked(now));
-                self.send_xml_query(&terms.dividend_query(), XmlTarget::Dividends(terms.under_con_id), conn, hb);
+                self.send_xml_query(&dividend_query(&terms, div_con), XmlTarget::Dividends(div_con), conn, hb);
             }
-            let ready = match (self.curves.get(&terms.currency), self.dividends.get(&terms.under_con_id)) {
+            let ready = match (self.curves.get(&terms.currency), self.dividends.get(&div_con)) {
                 (Some(Known::Ready(curve)), Some(Known::Ready(divs))) => Some((curve, divs)),
                 _ => None,
             };
@@ -302,6 +351,72 @@ impl OptCalc {
         // Calculations started while answering stay too.
         keep.append(&mut self.calcs);
         self.calcs = keep;
+    }
+
+    /// Ask the model inputs of an option that are not known or asked yet:
+    /// the rate curve of its currency and the dividends of its underlying,
+    /// as for a calculation; the model clock starts with the first use
+    /// (ibx#502: the reference asked both at its first option market data
+    /// request).
+    pub(crate) fn want_inputs(&mut self, terms: &OptionTerms, conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+        let _ = self.clock_ms(now_ms());
+        let now = Instant::now();
+        if !self.curves.contains_key(&terms.currency) {
+            self.curves.insert(terms.currency.clone(), Known::Asked(now));
+            self.send_xml_query(&terms.rate_query(), XmlTarget::Curve(terms.currency.clone()), conn, hb);
+        }
+        let div_con = self.div_con(terms.under_con_id);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.dividends.entry(div_con) {
+            e.insert(Known::Asked(now));
+            self.send_xml_query(&dividend_query(terms, div_con), XmlTarget::Dividends(div_con), conn, hb);
+        }
+    }
+
+    /// The model of options on a future reads the dividends of the
+    /// future's index (ibx#730; the reference 10.51, paper, 15/10/2026: an
+    /// ES futures option order's model asked those of the ES index, not
+    /// those of the future).
+    pub(crate) fn set_dividend_source(&mut self, under_con_id: i64, source: i64) {
+        if source > 0 && source != under_con_id {
+            self.div_source.insert(under_con_id, source);
+        }
+    }
+
+    /// The contract whose dividends an underlying's model reads.
+    fn div_con(&self, under_con_id: i64) -> i64 {
+        self.div_source.get(&under_con_id).copied().unwrap_or(under_con_id)
+    }
+
+    pub(crate) fn dividend_contract(&self, under_con_id: i64) -> i64 {
+        self.div_con(under_con_id)
+    }
+
+    /// Whether the rate curve of a currency and the dividends a model
+    /// reads for its underlying came (or gave up).
+    pub(crate) fn inputs_known(&self, currency: &str, under_con_id: i64) -> bool {
+        let done = |k: Option<&Known<_>>| matches!(k, Some(Known::Ready(_) | Known::Missing));
+        done(self.curves.get(currency)) && matches!(self.dividends.get(&self.div_con(under_con_id)), Some(Known::Ready(_) | Known::Missing))
+    }
+
+    /// `f` with the model inputs of an option at the model clock, None while
+    /// they are not known.
+    pub(crate) fn with_inputs<R>(&mut self, terms: &OptionTerms, f: impl FnOnce(Option<&optcalc::ModelInputs>) -> R) -> R {
+        let clock = self.clock_ms(now_ms());
+        match (self.curves.get(&terms.currency), self.dividends.get(&self.div_con(terms.under_con_id))) {
+            (Some(Known::Ready(curve)), Some(Known::Ready(divs))) => {
+                let inp = optcalc::ModelInputs { curve, dividends: divs, clock_ms: clock, local_zone: &self.local_zone };
+                f(Some(&inp))
+            }
+            _ => f(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inputs_for_test(&mut self, currency: &str, curve: inputs::RateCurve, under_con_id: i64, divs: Vec<inputs::Dividend>, clock_ms: i64, local_zone: &str) {
+        self.curves.insert(currency.to_string(), Known::Ready(curve));
+        self.dividends.insert(under_con_id, Known::Ready(divs));
+        self.fixed_clock = Some(clock_ms);
+        self.local_zone = local_zone.to_string();
     }
 
     #[cfg(test)]
@@ -411,21 +526,21 @@ mod tests {
         let text = |r: Option<(i64, String)>| r.map(|(code, t)| format!("{code} {t}"));
         let no_exch = crate::api::types::Contract { exchange: String::new(), ..c("OPT", 1) };
         assert_eq!(text(ClientCore::option_calc_refusal(&no_exch, true, None)).unwrap(),
-            "321 Error validating request.-'bJ' : cause - Please enter exchange");
+            "321 Error validating request.-'ReqCalcOptionPrice(55)' : cause - Please enter exchange");
         assert_eq!(text(ClientCore::option_calc_refusal(&c("STK", 0), false, None)).unwrap(),
-            "321 Error validating request.-'bI' : cause - Calculation of Implied Volatility supported for option securities only");
+            "321 Error validating request.-'ReqCalcImpliedVolatility(54)' : cause - Calculation of Implied Volatility supported for option securities only");
         assert_eq!(text(ClientCore::option_calc_refusal(&c("STK", 0), true, None)).unwrap(),
-            "321 Error validating request.-'bJ' : cause - Calculation of Option Price supported for option securities only");
+            "321 Error validating request.-'ReqCalcOptionPrice(55)' : cause - Calculation of Option Price supported for option securities only");
         // With a conId, a stock passes the local checks; the lookup answers 2114 / 2116.
         assert!(ClientCore::option_calc_refusal(&c("STK", 265598), true, None).is_none());
         assert_eq!(text(ClientCore::option_calc_refusal(&c("OPT", 0), true, None)).unwrap(),
-            "321 Error validating request.-'bJ' : cause - When the local symbol field is empty, please fill all option fields (right, strike, expiry)");
+            "321 Error validating request.-'ReqCalcOptionPrice(55)' : cause - When the local symbol field is empty, please fill all option fields (right, strike, expiry)");
         let full = crate::api::types::Contract { last_trade_date_or_contract_month: "20260306".into(), right: "C".into(), ..c("OPT", 0) };
         let features = vec!["ZEROSTRKOPT".to_string()];
         assert!(ClientCore::option_calc_refusal(&full, true, Some(&features)).is_none());
         assert!(ClientCore::option_calc_refusal(&full, true, None).is_some(), "strike 0 needs the account feature");
         assert_eq!(text(ClientCore::option_calc_refusal(&c("FOP", 0), true, None)).unwrap(),
-            "321 Error validating request.-'bJ' : cause - Please enter a local symbol or an expiry");
+            "321 Error validating request.-'ReqCalcOptionPrice(55)' : cause - Please enter a local symbol or an expiry");
         // The implied volatility request has only the first two checks.
         assert!(ClientCore::option_calc_refusal(&c("OPT", 0), false, None).is_none());
     }

@@ -39,6 +39,11 @@ pub trait Driver {
     /// The callbacks waiting, one line each in the form of
     /// [`super::record::canonical`].
     fn dispatch(&mut self) -> Vec<String>;
+    /// When the client computes next on its own clock (its P&L), if it
+    /// does (ibx#515).
+    fn next_due(&self) -> Option<std::time::Instant> {
+        None
+    }
 }
 
 /// The Rust API client.
@@ -66,6 +71,10 @@ impl Driver for RustDriver {
         let made = links.during(|| make(client, r, &mut rec));
         self.pending.extend(rec.lines);
         made
+    }
+
+    fn next_due(&self) -> Option<std::time::Instant> {
+        self.client.core.next_pnl_due()
     }
 
     fn dispatch(&mut self) -> Vec<String> {
@@ -110,6 +119,34 @@ impl Link {
 
 fn tag(f: &Fields, t: u32) -> Option<&str> {
     f.iter().find(|(k, _)| *k == t).map(|(_, v)| v.as_str())
+}
+
+/// A 10.40 market data request in the 10.51 form: the mark 1 at the end
+/// of each bid/ask and last entry, before the trailer (ibx#648).
+fn with_entry_marks(fields: Fields) -> Fields {
+    let mut out: Fields = Vec::with_capacity(fields.len() + 2);
+    let mut in_pair = false;
+    for (t, v) in fields {
+        if (t == 262 || t == 10) && in_pair {
+            out.push((9839, "1".to_string()));
+            in_pair = false;
+        }
+        if t == 264 && (v == "442" || v == "443") {
+            in_pair = true;
+        }
+        // The real-time volumes and the short-term volumes in their 10.51
+        // share forms (ibx#642, ibx#641).
+        let v = if t == 264 && matches!(v.as_str(), "233" | "375" | "595") {
+            crate::control::generic_values::wire_code(v.parse().unwrap_or(0)).to_string()
+        } else {
+            v
+        };
+        out.push((t, v));
+    }
+    if in_pair {
+        out.push((9839, "1".to_string()));
+    }
+    out
 }
 
 fn msg_type(f: &Fields) -> &str {
@@ -162,7 +199,7 @@ pub fn comparable(f: &Fields) -> Fields {
     out
 }
 
-/// A historical farm query (35=W) as compared: the framing dropped; in the
+/// A historical farm query as compared: the framing dropped; in the
 /// query, the id before its first `;;` (the reference's counter, cf76) and
 /// the end time of a request with none (the time it was made) masked.
 pub fn hmds_query(f: &Fields, mask_end: bool) -> String {
@@ -208,7 +245,37 @@ pub fn normalised(kind: &str, f: &Fields, mask_end: bool) -> String {
     }
 }
 
-/// The entries of a market data message (`35=V`): (262, 263, 6008, 207, 264).
+/// A message of the P&L's own quotes (ibx#511): entries of the P&L price,
+/// the second price kind and the dividends on BEST, without the API
+/// source. The reference's order of its contracts changes from one process
+/// to the next (observed 15/10/2026 on two fresh processes of 10.51 with
+/// the same five positions): its entries are compared as a set.
+fn pnl_quotes_frame(f: &Fields) -> bool {
+    let e = entries(f);
+    msg_type(f) == "V" && !e.is_empty() && !f.iter().any(|(t, _)| *t == 6088)
+        && e.iter().all(|(.., exch, kind)| exch == "BEST" && matches!(kind.as_str(), "232" | "504" | "456"))
+}
+
+/// The entries of a market data message in the order of their contract
+/// and kind (ibx#511).
+fn sorted_entries(f: &Fields) -> Fields {
+    let start = f.iter().position(|(t, _)| *t == 262).unwrap_or(f.len());
+    let mut blocks: Vec<Fields> = Vec::new();
+    for (t, v) in &f[start..] {
+        if *t == 262 || blocks.is_empty() {
+            blocks.push(Vec::new());
+        }
+        blocks.last_mut().unwrap().push((*t, v.clone()));
+    }
+    let key = |b: &Fields| (tag(b, 6008).unwrap_or("").to_string(), tag(b, 264).unwrap_or("").to_string());
+    blocks.sort_by_key(key);
+    let mut out = f[..start].to_vec();
+    out.extend(blocks.into_iter().flatten());
+    out
+}
+
+/// The entries of a market data message: (request id, subscription request type,
+/// contract id, security exchange, market depth).
 fn entries(f: &Fields) -> Vec<(String, String, String, String, String)> {
     let action = tag(f, 263).unwrap_or("").to_string();
     let mut out = Vec::new();
@@ -229,7 +296,7 @@ fn entries(f: &Fields) -> Vec<(String, String, String, String, String)> {
     out
 }
 
-/// A contract lookup (35=c) and its reply (35=d) name the same contract:
+/// A contract lookup and its reply name the same contract:
 /// the same conId when both have one, else the same symbol and type.
 /// A lookup names a stock `CS`, its reply `STK`.
 fn same_contract(a: &Fields, b: &Fields) -> bool {
@@ -260,15 +327,15 @@ struct Ids {
     clord: HashMap<String, String>,
     /// Order id bases (ClOrdID, permId, OCA group).
     order: HashMap<String, String>,
-    /// Farm request ids (262).
+    /// Farm request ids (the market data request id).
     farm: HashMap<String, String>,
     farm_taken: HashSet<String>,
-    /// Lookup ids (320); ibx's lookups paired or answered.
+    /// Lookup ids (the security request id); ibx's lookups paired or answered.
     lookup: HashMap<String, String>,
     lookup_taken: HashSet<String>,
     /// The reference's lookups whose reply answered one of ibx's.
     lookup_used: HashSet<String>,
-    /// Account subscription ids (6529).
+    /// Account subscription ids.
     subscription: Vec<(String, String)>,
     /// Historical query ids.
     query: Vec<(String, String)>,
@@ -299,12 +366,24 @@ pub struct Options {
     /// for the definitions the reference had before this one (see
     /// [`Options::replies_from`]).
     pub replies: Vec<Rec>,
+    /// Pace the requests and send the market data in passes, by the times
+    /// of the recording (ibx#563).
+    pub paced: bool,
+    /// Answer a lookup at the recorded point of its reply, not at once
+    /// (see [`Options::lookups_at_their_point`]).
+    pub lookups_at_their_point: bool,
     /// Other market data farms of the recording played on the farm link
     /// (see [`Options::farms`]).
     pub farms: Vec<&'static str>,
     /// Farms of the recording played on the historical link (see
     /// [`Options::hmds_farms`]).
     pub hmds_farms: Vec<&'static str>,
+    /// The account's positions before the replay, from the reference's
+    /// first reqPositions answer (see [`Options::positions_of_the_recording`]).
+    pub positions_of_the_recording: bool,
+    /// The recording's gateway process had served account updates in an
+    /// earlier session (see [`Options::after_account_updates`]).
+    pub after_account_updates: bool,
 }
 
 impl Default for Options {
@@ -319,13 +398,52 @@ impl Default for Options {
             frame_mask: |_| {},
             skip_frame: |_| false,
             replies: Vec::new(),
+            paced: false,
+            lookups_at_their_point: false,
             farms: Vec::new(),
             hmds_farms: Vec::new(),
+            positions_of_the_recording: false,
+            after_account_updates: false,
         }
     }
 }
 
 impl Options {
+    /// The recording's gateway process had served account updates in an
+    /// earlier session, so its account summary frames come twice
+    /// (ibx#752): the replayed client starts as one that asked them.
+    pub fn after_account_updates(mut self) -> Self {
+        self.after_account_updates = true;
+        self
+    }
+
+    /// The account's positions before the replay are those of the
+    /// reference's first reqPositions answer in the recording: its logon
+    /// held them, the recording does not (ibx#515, ibx#707).
+    pub fn positions_of_the_recording(mut self) -> Self {
+        self.positions_of_the_recording = true;
+        self
+    }
+
+    /// Replay with the pacing of requests and the market data passes on,
+    /// by the times of the recording (ibx#563). A message ibx sends later
+    /// than the reference did is waited for: the order is compared, not
+    /// the times.
+    pub fn paced(mut self) -> Self {
+        self.paced = true;
+        self
+    }
+
+    /// Answer a lookup ibx writes as the reference did at the recorded
+    /// point of the reference's reply, for a scenario where what follows
+    /// depends on when the contract became known (ibx#512: the order of
+    /// the requests on a shared 5-second stream). By default a lookup is
+    /// answered at once.
+    pub fn lookups_at_their_point(mut self) -> Self {
+        self.lookups_at_their_point = true;
+        self
+    }
+
     pub fn compare(mut self, kinds: &[&'static str]) -> Self {
         self.compare = kinds.to_vec();
         self
@@ -427,10 +545,33 @@ impl Outcome {
     }
 }
 
+/// A 321 of a 10.40 recording with the handler named as the reference
+/// 10.51 names it (ibx#591, observed 15/10/2026): 10.40 gave the short
+/// names of its older message form.
+pub fn handler_as_in_1051(line: &str) -> String {
+    const NAMES: &[(&str, &str)] = &[
+        ("v", "PlaceOrder(3)"), ("V", "ReqExchangeMapping(83)"), ("bQ", "ReqMktData(1)"), ("bM", "ReqHistoricalData(20)"),
+        ("bP", "ReqHistoricalTicks(96)"), ("bT", "ReqTickByTick(97)"), ("bK", "ReqContractData(9)"),
+        ("bN", "ReqHeadTimestamp(87)"), ("b0", "ReqMarketDataType(59)"),
+    ];
+    const LEAD: &str = "Error validating request.-'";
+    if let Some(a) = line.find(LEAD) {
+        let start = a + LEAD.len();
+        if let Some(len) = line[start..].find('\'')
+            && let Some((_, new)) = NAMES.iter().find(|(old, _)| *old == &line[start..start + len])
+        {
+            return format!("{}{}{}", &line[..start], new, &line[start + len..]);
+        }
+    }
+    line.to_string()
+}
+
 /// The two lists of callbacks are the same; on a difference, the first one
 /// and the callbacks around it.
 #[track_caller]
 pub fn assert_same_callbacks(ours: &[String], theirs: &[String]) {
+    let theirs: Vec<String> = theirs.iter().map(|l| handler_as_in_1051(l)).collect();
+    let theirs = theirs.as_slice();
     if std::env::var_os("IBX_GOLDEN_DUMP").is_some() {
         for k in 0..ours.len().max(theirs.len()) {
             let (a, b) = (ours.get(k).map_or("", |s| s.as_str()), theirs.get(k).map_or("", |s| s.as_str()));
@@ -466,8 +607,8 @@ pub fn session_values(line: &str, now: &HashSet<String>) -> String {
     if f[0] == "historicalDataEnd" && f.len() > 1 && now.contains(f[1]) {
         return format!("historicalDataEnd|{}|{{start}}|{{now}}", f[1]);
     }
-    // The RTVolume time is the time the reference read the block
-    // (`generictick.aB`, `jutils.d1.r()`, ibx#450): a session value.
+    // The RTVolume time is the time the reference read the block (code
+    // read, ibx#450): a session value.
     if f[0] == "tickString" && matches!(f.get(2), Some(&"48") | Some(&"77")) && f.len() == 4 {
         let mut parts: Vec<&str> = f[3].split(';').collect();
         if parts.len() == 6 {
@@ -490,7 +631,7 @@ pub fn session_values(line: &str, now: &HashSet<String>) -> String {
 /// on it: just before its first effect, the order message it sent or the
 /// error it gave at once. The reference reads a request on its API thread
 /// and may act on it after reports that came in the meantime (lmt_cancel
-/// of 26/09/2026: the cancel request, two reports, then the 35=F); the
+/// of 26/09/2026: the cancel request, two reports, then the cancel message); the
 /// replay makes ibx act at that same point.
 pub fn at_their_effect(recs: &[Rec]) -> Vec<Rec> {
     let mut by_base: HashMap<String, i64> = HashMap::new();
@@ -502,6 +643,9 @@ pub fn at_their_effect(recs: &[Rec]) -> Vec<Rec> {
         }
     };
     let mut effect_of: HashMap<usize, usize> = HashMap::new();
+    // The orders placed with transmit off so far: the request that
+    // transmits them sends their messages, before its own.
+    let mut held: Vec<i64> = Vec::new();
     for (i, r) in recs.iter().enumerate() {
         if r.leg == "fix_out" && r.msg == "D"
             && let (Some(c), Some(id)) = (r.get(11), r.get(6121).and_then(|v| v.parse::<i64>().ok()))
@@ -509,6 +653,12 @@ pub fn at_their_effect(recs: &[Rec]) -> Vec<Rec> {
             by_base.insert(base(&c).to_string(), id);
         }
         if !(r.leg == "api_out" && matches!(r.msg.as_str(), "PLACE_ORDER" | "CANCEL_ORDER")) { continue; }
+        // An order placed with transmit off is held: its message goes out
+        // with a later request, so the request stays where it was made.
+        if r.request["order"]["transmit"].as_bool() == Some(false) {
+            held.extend(r.request["orderId"].as_i64());
+            continue;
+        }
         let Some(id) = r.request["orderId"].as_i64() else { continue };
         let mut scan = by_base.clone();
         for (j, e) in recs.iter().enumerate().skip(i + 1) {
@@ -518,12 +668,13 @@ pub fn at_their_effect(recs: &[Rec]) -> Vec<Rec> {
             {
                 scan.insert(base(&c).to_string(), oid);
             }
-            let sent = e.leg == "fix_out" && order_of(e, &scan) == Some(id);
+            let sent = e.leg == "fix_out" && order_of(e, &scan).is_some_and(|o| o == id || held.contains(&o));
             let refused = e.leg == "api_in" && e.callbacks.as_array().into_iter().flatten().any(|c| {
                 c[0] == "error" && c[1].as_i64() == Some(id) && !matches!(c[3].as_i64(), Some(399 | 201 | 202))
             });
             if sent || refused {
                 effect_of.insert(i, j);
+                if r.msg == "PLACE_ORDER" { held.clear(); }
                 break;
             }
         }
@@ -589,10 +740,43 @@ struct Run<'a> {
     out: Outcome,
 }
 
+/// The session level of a recording: the level the reference answered
+/// its client (the first field of its server version message); the
+/// recordings without it are of a client at 214 (ibx#602).
+pub fn level_of(sc: &Scenario) -> i32 {
+    sc.recs.iter()
+        .find(|r| r.leg == "api_in" && r.msg == "SERVER_VERSION")
+        .and_then(|r| std::str::from_utf8(&r.raw).ok()?.split('\0').next()?.trim().parse::<i32>().ok())
+        .map_or(super::session::RECORDING_LEVEL, |n| n.min(crate::client_core::SERVER_VERSION))
+}
+
+/// The session of a recording: at the level its client was given
+/// (ibx#602); the order rules of 10.40 for a recording of 10.40, or one
+/// with no version (ibx#660), else the shares and entry marks of 10.51
+/// (ibx#663); the logon features of its session when its header has them
+/// (ibx#515). For the scenario replays and the codec replays (ibx#604).
+pub fn as_recorded(header: &serde_json::Value, level: i32, links: &mut Links) {
+    crate::client_core::set_session_level_for_test(Some(level));
+    let version = header.get("gateway_version")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|t| t.parse().ok())));
+    if version.is_none_or(|v| v < 10500) {
+        links.shared.reference.set_form_10_40(true);
+    } else {
+        links.engine.set_lot_sizes(false);
+    }
+    if let Some(features) = header.get("logon_features").and_then(|v| v.as_str()) {
+        links.shared.reference.set_logon_features(features);
+        links.shared.reference.set_api_features(crate::control::logon::ApiFeatures::parse(features));
+    }
+}
+
 /// Replay a scenario through the Rust API client.
 pub fn replay(sc: &Scenario, opts: &Options) -> Outcome {
     let mut links = Links::new();
     let mut driver = RustDriver::new(&links);
+    if opts.after_account_updates {
+        let _ = driver.client.core.subscribe_account_updates(true);
+    }
     run(sc, opts, &mut links, &mut driver)
 }
 
@@ -600,7 +784,56 @@ pub fn replay(sc: &Scenario, opts: &Options) -> Outcome {
 /// the recording (`session::zone_of`) on this thread.
 pub fn run(sc: &Scenario, opts: &Options, links: &mut Links, driver: &mut dyn Driver) -> Outcome {
     crate::gateway::set_machine_zone_for_test(Some(super::session::zone_of(&sc.header)));
+    as_recorded(&sc.header, level_of(sc), links);
     let recs = prepare(sc, opts);
+    // The contracts the recording orders on with no second lookup before
+    // its first order: the reference made it earlier in its session
+    // (ibx#706).
+    {
+        let con_of = |r: &Rec| r.get(6008).and_then(|v| v.parse::<i64>().ok());
+        let looked_up: HashSet<i64> = recs.iter()
+            .filter(|r| r.leg == "fix_out" && r.msg == "c" && r.get(320).is_some_and(|n| n.starts_with(crate::control::contracts::SECDEF_ORDER_TYPES_NAME)))
+            .filter_map(con_of).collect();
+        for con_id in recs.iter().filter(|r| r.leg == "fix_out" && r.msg == "D").filter_map(con_of) {
+            if !looked_up.contains(&con_id) {
+                links.engine.mark_order_types_done(con_id);
+            }
+        }
+        // The stock order preset, when the recording orders stocks and
+        // never asks it: the reference had it earlier in its session
+        // (ibx#728; it asks it at its first stock order, whatever the time
+        // in force).
+        let stock_order = recs.iter().any(|r| r.leg == "fix_out" && r.msg == "D" && r.get(167).as_deref() == Some("STK"));
+        let preset_asked = recs.iter().any(|r| r.leg == "fix_out" && r.msg == "U" && r.get(6040).as_deref() == Some("193")
+            && r.get(8168).is_some_and(|k| k == "s=STK" || k.starts_with("s=STK&")));
+        if stock_order && !preset_asked {
+            links.engine.mark_order_preset_known("STK");
+        }
+    }
+    if opts.positions_of_the_recording {
+        for r in recs.iter().filter(|r| r.msg == "POSITION_DATA") {
+            if recs.iter().any(|e| e.msg == "POSITION_END" && e.seq < r.seq) {
+                break;
+            }
+            for cb in r.callbacks.as_array().into_iter().flatten() {
+                let (Some(contract), Some(pos), Some(avg)) = (cb.get(2), cb.get(3), cb.get(4)) else { continue };
+                let num = |v: &serde_json::Value| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0);
+                links.shared.portfolio.set_position_info(crate::types::PositionInfo {
+                    con_id: contract["conId"].as_i64().unwrap_or(0),
+                    position_fixed: (num(pos) * crate::types::QTY_SCALE as f64).round() as i64,
+                    avg_cost: num(avg),
+                    symbol: contract["symbol"].as_str().unwrap_or("").to_string(),
+                    sec_type: contract["secType"].as_str().unwrap_or("").to_string(),
+                    currency: contract["currency"].as_str().unwrap_or("").to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+        links.shared.portfolio.set_account_download_complete();
+    }
+    if opts.paced {
+        links.pace();
+    }
     let mut run = Run {
         links, driver, opts, recs, at: 0,
         seen: [0; 3], queue: Default::default(), lookups: Vec::new(), ids: Ids::default(),
@@ -621,7 +854,12 @@ pub fn run(sc: &Scenario, opts: &Options, links: &mut Links, driver: &mut dyn Dr
         let pos = if l.starts_with("execDetails|") { 10 } else { 1 };
         run.opts.skip_orders.iter().any(|id| l.split('|').nth(pos) == Some(&id.to_string()))
     };
-    let keep = |l: &String| !session_notice(l) && !skip(l) && (run.opts.keep)(l);
+    // A recording of 10.40, which does not give the last trade's exchange;
+    // 10.51, which ibx copies, does (ibx#638): left out of the 10.40
+    // recordings only, those of 10.51 compare it (ibx#604).
+    let form_10_40 = run.links.shared.reference.form_10_40();
+    let last_exchange = |l: &str| form_10_40 && l.starts_with("tickString|") && l.split('|').nth(2) == Some("84");
+    let keep = |l: &String| !session_notice(l) && !skip(l) && !last_exchange(l) && (run.opts.keep)(l);
     // Historical requests with no end time: their end is the time they
     // were made.
     let now: HashSet<String> = run.recs.iter().filter(|r| r.msg == "REQ_HISTORICAL_DATA")
@@ -630,6 +868,16 @@ pub fn run(sc: &Scenario, opts: &Options, links: &mut Links, driver: &mut dyn Dr
     let line = |l: &String| (run.opts.mask)(&session_values(l, &now));
     run.out.ours = run.out.ours.iter().filter(|l| keep(l)).map(line).collect();
     run.out.theirs = run.out.theirs.iter().filter(|(_, l)| keep(l)).map(|(s, l)| (*s, line(l))).collect();
+    // A child order's OCA group is its parent's number: the reference's
+    // number read as ibx's number of the same order.
+    for (_, l) in run.out.theirs.iter_mut().filter(|(_, l)| l.starts_with("openOrder|")) {
+        for (theirs, mine) in &run.ids.order {
+            let group = format!(",ocaGroup={theirs},");
+            if l.contains(&group) {
+                *l = l.replace(&group, &format!(",ocaGroup={mine},"));
+            }
+        }
+    }
     run.out
 }
 
@@ -649,8 +897,24 @@ impl Run<'_> {
     }
 
     fn go(&mut self) {
+        let first = self.recs.first().map_or(0, |r| r.nanos);
         while self.at < self.recs.len() {
             let r = self.recs[self.at].clone();
+            // The time of the recording: what is due by then goes out.
+            if self.links.is_paced() {
+                // The client's own computations due before it, each at its
+                // time, as the reference's timer makes them (ibx#515).
+                let at = r.nanos.saturating_sub(first);
+                while let Some(due) = self.driver.next_due().and_then(|d| self.links.nanos_of(d)).filter(|d| *d < at) {
+                    self.links.at(due);
+                    self.settle();
+                    if self.driver.next_due().and_then(|d| self.links.nanos_of(d)) == Some(due) {
+                        break;
+                    }
+                }
+                self.links.at(at);
+                self.settle();
+            }
             match r.leg.as_str() {
                 "api_out" => self.request(&r),
                 "api_in" => {
@@ -681,6 +945,13 @@ impl Run<'_> {
             self.at += 1;
         }
         self.settle();
+        // What still waits for its turn or its pass.
+        for _ in 0..200 {
+            if !self.links.to_next_due() {
+                break;
+            }
+            self.settle();
+        }
         for link in [Link::Farm, Link::Ccp, Link::Hmds] {
             if let Some(f) = self.queue[link.index()].front() {
                 self.out.frame_error = Some(format!(
@@ -774,6 +1045,16 @@ impl Run<'_> {
                 .filter_map(|r| r.get(320)).find(|id| !self.ids.lookup_used.contains(id));
             let reply_to = |id: &str| self.recs.iter().chain(&self.opts.replies)
                 .find(|r| r.leg == "fix_in" && r.conn == "CCP" && r.get(320).as_deref() == Some(id)).cloned();
+            // The reply still to come in the records: sent at its point.
+            if self.opts.lookups_at_their_point
+                && let Some(id) = same.as_deref()
+                && self.recs[self.at.min(self.recs.len())..].iter()
+                    .any(|r| r.leg == "fix_in" && r.conn == "CCP" && r.get(320).as_deref() == Some(id))
+            {
+                self.ids.lookup_used.insert(id.to_string());
+                self.ids.lookup.insert(id.to_string(), our_id);
+                continue;
+            }
             let reply = match same.as_deref().and_then(reply_to) {
                 Some(d) => {
                     self.ids.lookup_used.insert(same.unwrap());
@@ -811,6 +1092,14 @@ impl Run<'_> {
             return;
         }
         if self.opts.compare.contains(&kd) && !(self.opts.skip_frame)(&gw) {
+            // Paced: ibx may send it at a later step or pass than the
+            // reference did; the time goes on until it does.
+            for _ in 0..200 {
+                if !self.queue[link.index()].is_empty() || !self.links.to_next_due() {
+                    break;
+                }
+                self.settle();
+            }
             let Some(ours) = self.queue[link.index()].pop_front() else {
                 self.out.frame_error = Some(format!(
                     "seq {} {}: ibx did not send {}", r.seq, r.conn, normalised(kd, &gw, self.no_end.front() == Some(&true)),
@@ -819,6 +1108,28 @@ impl Run<'_> {
             };
             let mask_end = kd == HISTORICAL && msg_type(&gw) == "W" && self.no_end.pop_front().unwrap_or(false);
             let (mut a, mut b) = (ours.clone(), gw.clone());
+            // Another order named in the reference's message (a child's
+            // parent link and group) is read as ibx's id of that order.
+            if kd == ORDER {
+                self.pair_orders();
+                for (t, v) in b.iter_mut() {
+                    if matches!(t, 6107 | 583) && let Some(mine) = self.ids.order.get(base(v)) {
+                        *v = v.replacen(base(v), mine, 1);
+                    }
+                }
+            }
+            // A recording of 10.40; 10.51, which ibx copies, ends each
+            // bid/ask and last entry of a market data request with its mark
+            // (ibx#648; 1 and 1, the replay's session having no extra price
+            // precision). A 10.40 recording is read in the 10.51 form; one of
+            // 10.51 is compared as recorded (ibx#604).
+            if kd == MARKET_DATA && msg_type(&b) == "V" && self.links.shared.reference.form_10_40() {
+                b = with_entry_marks(b);
+            }
+            if kd == MARKET_DATA && pnl_quotes_frame(&a) && pnl_quotes_frame(&b) {
+                a = sorted_entries(&a);
+                b = sorted_entries(&b);
+            }
             (self.opts.frame_mask)(&mut a);
             (self.opts.frame_mask)(&mut b);
             let (a, b) = (normalised(kd, &a, mask_end), normalised(kd, &b, mask_end));
@@ -858,6 +1169,17 @@ impl Run<'_> {
                 if let (Some(a), Some(b)) = (tag(gw, 11), tag(ours, 11)) {
                     self.ids.clord.entry(a.to_string()).or_insert_with(|| b.to_string());
                     self.ids.order.entry(base(a).to_string()).or_insert_with(|| base(b).to_string());
+                }
+            }
+            // The P&L's own quotes: each entry with ibx's of the same
+            // contract and kind (ibx#511).
+            MARKET_DATA if pnl_quotes_frame(gw) && pnl_quotes_frame(ours) => {
+                let mine = entries(ours);
+                for (g, _, con, _, kind) in entries(gw) {
+                    if let Some((o, ..)) = mine.iter().find(|(_, _, c, _, k)| *c == con && *k == kind) {
+                        self.ids.farm_taken.insert(o.clone());
+                        self.ids.farm.entry(g).or_insert_with(|| o.clone());
+                    }
                 }
             }
             MARKET_DATA => {
@@ -1016,6 +1338,10 @@ impl Run<'_> {
                             // An order the server had before the recording
                             // (the logon replay): the same id for ibx.
                             None if matches!(t, 11 | 41) && v != "*" && !self.placed_here(base(v)) => {}
+                            // The wildcard of an end marker (the end of an
+                            // order replay, of a completed orders answer):
+                            // the same for ibx (ibx#695).
+                            None if v == "*" => {}
                             None if matches!(t, 11 | 41) => known = false,
                             None => {}
                         }
@@ -1041,7 +1367,7 @@ impl Run<'_> {
             }
             Link::Ccp => {
                 // A binary frame: the subscription id is a text field, the
-                // last one of an end marker (35=EB|6529={id}).
+                // last one of an account end marker.
                 let body = self.ids.subscription.iter().fold(binary_body(&r.raw), |b, (gw, ours)| {
                     let b = b.replace(&format!("6529={gw}\x01"), &format!("6529={ours}\x01"));
                     match b.strip_suffix(&format!("6529={gw}")) {

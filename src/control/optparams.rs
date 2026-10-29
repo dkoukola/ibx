@@ -1,6 +1,6 @@
 //! Option chain parameters (ibx#440): the reference's request checks, its
 //! derivative queries on the auth connection and the API rows it builds
-//! from the chain answers (`jextend.cp`, `feature.derivatives`).
+//! from the chain answers.
 
 use std::collections::HashMap;
 
@@ -12,7 +12,7 @@ pub const NO_DERIVATIVES_FOUND: &str = "No derivatives found";
 pub const NO_DERIVATIVES_RETURNED: &str = "no derivatives returned";
 
 /// The security type the reference reads from an API string
-/// (`jfix.eh.a(String, boolean)`): case-insensitive, `CS` is a stock, an
+///: case-insensitive, `CS` is a stock, an
 /// unknown name is the empty type.
 pub fn sec_type_name(api: &str) -> &'static str {
     const NAMES: [&str; 24] = [
@@ -32,11 +32,11 @@ pub fn sec_type_name(api: &str) -> &'static str {
     NAMES.iter().find(|n| **n == upper && **n != "UNK").copied().unwrap_or("")
 }
 
-/// The local refusal of a request (`jextend.cp.n()`): 321 when the
+/// The local refusal of a request: 321 when the
 /// underlying type is not FUT, STK, IND or CASH, when a FUT has no
 /// exchange, or when the conId is not a valid id.
 pub fn refusal(sec_type: &str, fut_fop_exchange: &str, con_id: i64) -> Option<(i64, String)> {
-    let refuse = |cause: String| Some((321, format!("Error validating request.-'cp' : cause - {}", cause)));
+    let refuse = |cause: String| Some((321, format!("Error validating request.-'ReqSecDefOptParams(78)' : cause - {}", cause)));
     let name = sec_type_name(sec_type);
     if !matches!(name, "FUT" | "STK" | "IND" | "CASH") {
         return refuse(format!("Invalid security type - {}", name));
@@ -50,8 +50,7 @@ pub fn refusal(sec_type: &str, fut_fop_exchange: &str, con_id: i64) -> Option<(i
     None
 }
 
-/// An error after the checks: 322 with the reference's text
-/// (`jextend.cp.a(String)`).
+/// An error after the checks: 322 with the reference's text.
 pub fn processing_error(text: &str) -> (i64, String) {
     (322, format!("Error processing request: {}", text))
 }
@@ -68,20 +67,20 @@ fn fields(msg: &[u8]) -> impl Iterator<Item = (u32, &str)> {
     })
 }
 
-/// `;` separated values without the empty ones (`jutils.dO.m`).
+/// `;` separated values without the empty ones (as the reference reads them).
 fn split_list(value: &str) -> impl Iterator<Item = &str> {
     value.split(';').filter(|v| !v.trim().is_empty())
 }
 
-// ─── The derivative answer (6040=5) ───
+// ─── The derivative answer ───
 
 /// One underlying of a derivative answer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UnderlyingEntry {
     pub con_id: i64,
-    /// The derivative types listed (6070).
+    /// The derivative types listed.
     pub derivative_types: Vec<String>,
-    /// The exchanges of its futures options (6589).
+    /// The exchanges of its futures options.
     pub fop_exchanges: String,
 }
 
@@ -95,7 +94,7 @@ pub struct UnderlyingAnswer {
 impl UnderlyingAnswer {
     /// The answer can serve a later request on `con_id` without a new
     /// query: one of its underlyings is that conId and lists the
-    /// underlying's own type (`jclient.mw.a(String, int, eh)`).
+    /// underlying's own type.
     pub fn serves(&self, con_id: i64, sec_type: &str) -> bool {
         self.entries.iter().any(|e| e.con_id == con_id && e.derivative_types.iter().any(|t| t == sec_type))
     }
@@ -103,7 +102,7 @@ impl UnderlyingAnswer {
     /// The legs of a request on `con_id`, in their run order, with the
     /// futures option exchanges of the FOP leg; empty when no underlying
     /// of the answer is that conId or none lists a leg type
-    /// (`feature.derivatives.A`).
+    ///.
     pub fn legs(&self, con_id: i64) -> Vec<(&'static str, Vec<String>)> {
         let mut legs: Vec<(&'static str, Vec<String>)> = Vec::new();
         for entry in self.entries.iter().filter(|e| e.con_id == con_id) {
@@ -119,7 +118,7 @@ impl UnderlyingAnswer {
 }
 
 /// The derivative query of an underlying: symbol in upper case, the conId
-/// except for CASH (`jfix.cb`).
+/// except for CASH.
 pub fn underlying_query(symbol: &str, sec_type: &str, con_id: i64) -> Vec<(u32, String)> {
     let mut out = vec![(6040, "5".to_string()), (55, symbol.to_uppercase()), (310, sec_type.to_string())];
     if sec_type != "CASH" {
@@ -129,9 +128,9 @@ pub fn underlying_query(symbol: &str, sec_type: &str, con_id: i64) -> Vec<(u32, 
     out
 }
 
-/// Parse a derivative answer (6040=5): each conId (6457) starts an
-/// underlying; its derivative types (6070) and futures option exchanges
-/// (6589) follow it.
+/// Parse a derivative answer: each underlying's conId starts an
+/// underlying; its derivative types and futures option exchanges
+/// follow it.
 pub fn parse_underlying_answer(msg: &[u8]) -> Option<UnderlyingAnswer> {
     let mut answer = UnderlyingAnswer::default();
     let mut symbol = None;
@@ -152,10 +151,10 @@ pub fn parse_underlying_answer(msg: &[u8]) -> Option<UnderlyingAnswer> {
     Some(answer)
 }
 
-// ─── The chain query (6040=138) and its answer (6040=139) ───
+// ─── The chain query and its answer ───
 
 /// The key the reference matches a chain answer to its query with
-/// (`feature.derivatives.T.a(...)`, `jfix.az.k()`).
+///.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChainKey {
     pub con_id: i64,
@@ -166,7 +165,7 @@ pub struct ChainKey {
     pub by_6457: bool,
 }
 
-/// The chain query of a key (`jfix.cc`): 6995 only for a FUT type.
+/// The chain query of a key: the exchange only for a FUT type.
 pub fn chain_query(key: &ChainKey) -> Vec<(u32, String)> {
     let mut out = vec![
         (6040, "138".to_string()),
@@ -191,20 +190,19 @@ pub struct StrikeScale {
     pub decimals: i32,
 }
 
-/// One trading class of a chain answer (`jfix.Z` with its dates and
-/// strikes).
+/// One trading class of a chain answer, with its dates and strikes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainClass {
     pub con_id: i64,
-    /// Exchange of its group (100).
+    /// Exchange of its group.
     pub exchange: String,
     pub trading_class: Option<String>,
     pub multiplier: Option<String>,
-    /// The extra key 6957.
+    /// The extra key of the class.
     pub extra: Option<String>,
-    /// Expirations of 6775, 6777 and 6971.
+    /// Expirations, from the answer's three date lists.
     pub expirations: Vec<String>,
-    /// Strikes (6997); None when the class has none.
+    /// Strikes; None when the class has none.
     pub strikes: Option<Vec<f64>>,
     pub rule_id: Option<String>,
 }
@@ -228,12 +226,12 @@ struct ClassKey {
     multiplier: Option<String>,
 }
 
-/// Parse a chain answer (6040=139) as the reference reads it
-/// (`jfix.az`, `jfix.ay`, `jfix.cc`): a group exchange (100) starts a group
-/// and clears the trading class and multiplier; the conId of a class is
-/// the last 6346; dates (6775, 6777, 6971) and strikes, currency and rule
-/// (6997, 15, 6031) are kept per class, the last value of a tag winning;
-/// 6523 lists add to one exchange list; the market rule table follows 6019.
+/// Parse a chain answer as the reference reads it: a group exchange
+/// starts a group and clears the trading class and multiplier; the conId
+/// of a class is the last chain conId field; the three date lists and the
+/// strikes, currency and market rule id are kept per class, the last value
+/// of a field winning; the exchange lists add to one exchange list; the
+/// market rule table follows the market rule count.
 pub fn parse_chain_answer(msg: &[u8]) -> Option<ChainAnswer> {
     let mut symbol: Option<String> = None;
     let mut sec_type: Option<String> = None;
@@ -343,11 +341,11 @@ pub fn parse_chain_answer(msg: &[u8]) -> Option<ChainAnswer> {
     Some(ChainAnswer { key, classes, exchanges, rules: parse_strike_scales(msg) })
 }
 
-/// The strike scales of the market rule table of a chain answer
-/// (`jsecdef.n`): each rule id (6031) starts a rule; the first tier set
-/// (6022 entries) gives the magnifier, 10 to the power of 6021, and the
-/// decimals, the 6025 of its first entry. A rule without a first tier set
-/// gives no scale.
+/// The strike scales of the market rule table of a chain answer: each
+/// market rule id starts a rule; the first tier set (its counted entries)
+/// gives the magnifier, 10 to the power of the rule's exponent field, and
+/// the decimals, the value of its first entry. A rule without a first tier
+/// set gives no scale.
 pub fn parse_strike_scales(msg: &[u8]) -> HashMap<String, StrikeScale> {
     let mut out = HashMap::new();
     let mut in_table = false;
@@ -398,7 +396,7 @@ pub fn parse_strike_scales(msg: &[u8]) -> HashMap<String, StrikeScale> {
     out
 }
 
-/// A strike as the API gets it (`trader.common.b9.a(o, double, StrikeHint)`):
+/// A strike as the API gets it:
 /// unchanged with the logon feature NOMAGNFIX or without a rule; else
 /// times the rule's magnifier, rounded to its decimals (2 when not above
 /// 0, none for -3).
@@ -450,7 +448,7 @@ struct Group {
     multiplier_value: f64,
 }
 
-/// The order of the reference's rows (`feature.derivatives.I.a(I)`) for the
+/// The order of the reference's rows for the
 /// first row of two groups: expiry, strike, exchange, extra key, trading
 /// class, then the multiplier difference cut to an int.
 fn first_row_order(a: &Group, b: &Group) -> std::cmp::Ordering {
@@ -495,7 +493,7 @@ fn java_hashmap_order(hashes: &[i32]) -> Vec<usize> {
 }
 
 /// The API rows of a request from the chain answers of its leg, as the
-/// reference builds them (`feature.derivatives.D`, `jextend.cp.a(s)`):
+/// reference builds them:
 /// rows for each class of an allowed group exchange, again for every
 /// allowed exchange of 6523 when the group is BEST or SMART (reported as
 /// SMART); rows grouped by exchange, conId, trading class and multiplier;
@@ -587,7 +585,7 @@ mod tests {
 
     #[test]
     fn refusals_as_the_reference() {
-        let cause = |c: &str| Some((321, format!("Error validating request.-'cp' : cause - {}", c)));
+        let cause = |c: &str| Some((321, format!("Error validating request.-'ReqSecDefOptParams(78)' : cause - {}", c)));
         assert_eq!(refusal("OPT", "", 265598), cause("Invalid security type - OPT"));
         assert_eq!(refusal("xyz", "", 265598), cause("Invalid security type - "));
         assert_eq!(refusal("", "", 265598), cause("Invalid security type - "));

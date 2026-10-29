@@ -21,6 +21,8 @@ impl EClient {
         regulatory_snapshot: bool,
         mkt_data_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(req_id) { return r; }
         if !crate::client_core::ClientCore::ids_fit("req_mkt_data", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
@@ -28,8 +30,10 @@ impl EClient {
         // A contract with no exchange: 321, the reference's first check.
         // An invalid generic tick list of a request that is no snapshot:
         // 321 (ibx#450).
-        if let Some((code, text)) = crate::client_core::ClientCore::market_data_exchange_refusal(&contract.exchange, &contract.sec_type)
-            .or_else(|| self.core.generic_tick_list_refusal(generic_tick_list, snapshot, &contract.sec_type))
+        // A contract text the 10.51 reference refuses (ibx#658).
+        if let Some((code, text)) = crate::client_core::ClientCore::contract_text_refusal(&contract.to_api(), "MarketDataRequest")
+            .or_else(|| crate::client_core::ClientCore::market_data_exchange_refusal(&contract.exchange, &contract.sec_type))
+            .or_else(|| self.core.generic_tick_list_refusal(generic_tick_list, snapshot, &contract.sec_type, shared.reference.fundamentals_allowed()))
         {
             shared.orders.push_order_error(req_id, code, text);
             return Ok(());
@@ -58,7 +62,7 @@ impl EClient {
         if let Some((code, text)) = self.core.news_tick_refusal(&shared, generic_tick_list, contract.con_id, &contract.sec_type) {
             shared.orders.push_order_error(req_id, code, text);
             if !snapshot {
-                self.core.note_news_refused(&shared, req_id, contract.con_id);
+                self.core.note_news_refused(&shared, req_id, contract.con_id, std::time::Instant::now());
             }
             return Ok(());
         }
@@ -105,6 +109,8 @@ impl EClient {
 
     /// Cancel market data.
     pub fn cancel_mkt_data(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#555).
+        let _one = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(req_id) { return r; }
         if !crate::client_core::ClientCore::ids_fit("cancel_mkt_data", &[req_id]) { return Ok(()); }
         // A running regulatory snapshot stops silently (ibx#446).
@@ -139,6 +145,8 @@ impl EClient {
         number_of_ticks: i32,
         ignore_size: bool,
     ) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(req_id) { return r; }
         if !crate::client_core::ClientCore::ids_fit("req_tick_by_tick_data", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
@@ -179,11 +187,16 @@ impl EClient {
 
     /// Cancel tick-by-tick data.
     fn cancel_tick_by_tick_data(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("cancel_tick_by_tick_data", &[req_id]) { return Ok(()); }
         if self.core.unregister_tbt(req_id).is_some() {
             let tx = self.tx()?;
             send_cmd(py, &tx, ControlCommand::UnsubscribeTbt { req_id })?;
+        } else {
+            // No such request: 300, as the reference (ibx#720).
+            self.shared_state()?.orders.push_order_error(req_id, 300, format!("Can't find EId with tickerId:{}", req_id));
         }
         Ok(())
     }
@@ -193,6 +206,9 @@ impl EClient {
     /// contract caches, or pacing budgets. Poll `last_rtt_ms()` after a
     /// moment for the result.
     fn req_ping(&self, py: Python<'_>) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return Ok(()); }
         let tx = self.tx()?;
         send_cmd(py, &tx, ControlCommand::Ping)?;
         Ok(())
@@ -217,6 +233,8 @@ impl EClient {
     /// contract whose data is frozen gets the frozen top of book (type 2).
     /// A value outside 1..=4 gives error 321 with id -1.
     fn req_market_data_type(&self, py: Python<'_>, market_data_type: i32) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         let tx = self.tx()?;
         if let Some((code, text)) = py.detach(|| self.core.set_market_data_type(&tx, market_data_type)) {
@@ -236,28 +254,36 @@ impl EClient {
         is_smart_depth: bool,
         mkt_depth_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(req_id) { return r; }
         if !crate::client_core::ClientCore::ids_fit("req_mkt_depth", &[req_id, contract.con_id]) { return Ok(()); }
         let _ = mkt_depth_options;
         // An empty exchange is refused by the engine, as the reference
         // refuses it (#452).
         let exchange = contract.exchange.clone();
-        let sec_type = if contract.sec_type.is_empty() { "STK".to_string() } else { contract.sec_type.clone() };
+        // A contract given by its conId alone keeps no type: the engine
+        // takes its definition's (ibx#678).
+        let sec_type = if contract.sec_type.is_empty() && contract.con_id == 0 { "STK".to_string() } else { contract.sec_type.clone() };
         let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::SubscribeDepth {
+        // A contract with no conId is looked up first (ibx#643): the
+        // reference serves the book of a stock given by symbol.
+        send_cmd(py, &tx, crate::client_core::ClientCore::resolve_first(req_id, &contract.to_api(), ControlCommand::SubscribeDepth {
             req_id,
             con_id: contract.con_id,
             exchange,
             sec_type,
             num_rows,
             is_smart_depth,
-        })?;
+        }))?;
         Ok(())
     }
 
     /// Cancel market depth.
     #[pyo3(signature = (req_id, is_smart_depth=false))]
     fn cancel_mkt_depth(&self, py: Python<'_>, req_id: i64, is_smart_depth: bool) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("cancel_mkt_depth", &[req_id]) { return Ok(()); }
         let _ = is_smart_depth;
@@ -278,6 +304,8 @@ impl EClient {
         use_rth: i32,
         real_time_bars_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(req_id) { return r; }
         if !crate::client_core::ClientCore::ids_fit("req_real_time_bars", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
@@ -298,6 +326,8 @@ impl EClient {
 
     /// Cancel real-time bars.
     fn cancel_real_time_bars(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(req_id) { return r; }
         if !crate::client_core::ClientCore::ids_fit("cancel_real_time_bars", &[req_id]) { return Ok(()); }
         let tx = self.tx()?;

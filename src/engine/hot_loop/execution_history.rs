@@ -66,14 +66,14 @@ fn reply(shared: &SharedState, request: &Request, result: Result<Vec<StoredExecu
 }
 
 impl ExecutionRequests {
-    pub(super) fn collect_option_lifecycle(&mut self, fields: &HashMap<u32, String>, shared: &SharedState, account: &str) {
+    pub(super) fn collect_option_lifecycle(&mut self, fields: &crate::protocol::fix::FieldMap<'_>, shared: &SharedState, account: &str) {
         if !self.active.as_ref().is_some_and(|active| active.request.include_lifecycles) {
             self.reject_option_lifecycle(fields, account);
             return;
         }
         let Some(active) = self.active.as_mut().filter(|active| !active.timed_out) else { return };
-        if fields.get(&1).is_some_and(|owner| !owner.is_empty() && owner != account) { return; }
-        if let Some(time) = fill_exec_of(fields, fields.get(&17).map(String::as_str).unwrap_or("")).time_secs
+        if fields.get(&1).is_some_and(|owner| !owner.is_empty() && *owner != account) { return; }
+        if let Some(time) = fill_exec_of(fields, fields.get(&17).copied().unwrap_or("")).time_secs
             && (time < active.request.start_secs || time > active.request.end_secs) { return; }
         match super::lifecycle_history::project(fields, shared, account) {
             Ok(row) if row.kind == crate::api::types::OptionLifecycleReportKind::EconomicExecution => {
@@ -96,13 +96,13 @@ impl ExecutionRequests {
     /// option lifecycle report for its authenticated account. U72 rows carry
     /// no row-level request id, so a concurrent own-account lifecycle report
     /// cannot be omitted while still claiming a complete successful result.
-    pub(super) fn reject_option_lifecycle(&mut self, fields: &HashMap<u32, String>, account: &str) {
+    pub(super) fn reject_option_lifecycle(&mut self, fields: &crate::protocol::fix::FieldMap<'_>, account: &str) {
         let Some(active) = self.active.as_mut().filter(|active| !active.timed_out) else {
             return;
         };
         if fields
             .get(&1)
-            .is_some_and(|reported| !reported.is_empty() && reported != account)
+            .is_some_and(|reported| !reported.is_empty() && *reported != account)
         {
             return;
         }
@@ -167,7 +167,7 @@ impl ExecutionRequests {
     /// query, and its exact end. Other live reports continue through accounting.
     pub(super) fn report(
         &mut self,
-        fields: &HashMap<u32, String>,
+        fields: &crate::protocol::fix::FieldMap<'_>,
         shared: &SharedState,
         account: &str,
     ) -> bool {
@@ -175,8 +175,8 @@ impl ExecutionRequests {
         let Some(active) = self.active.as_mut() else {
             return historical;
         };
-        if fields.get(&6556) == Some(&active.wire_id)
-            && fields.get(&32).map(String::as_str) == Some("*")
+        if fields.get(&6556).copied() == Some(active.wire_id.as_str())
+            && fields.get(&32).copied() == Some("*")
         {
             let mut active = self.active.take().unwrap();
             if !active.timed_out {
@@ -212,9 +212,9 @@ impl ExecutionRequests {
             }
             return true;
         }
-        if fields.get(&20).map(String::as_str) == Some("3")
-            || fields.get(&1).is_some_and(|value| value != account)
-            || !matches!(fields.get(&150).map(String::as_str), Some("F" | "1" | "2"))
+        if fields.get(&20).copied() == Some("3")
+            || fields.get(&1).is_some_and(|value| *value != account)
+            || !matches!(fields.get(&150).copied(), Some("F" | "1" | "2"))
         {
             return historical;
         }
@@ -222,7 +222,7 @@ impl ExecutionRequests {
         // request ID. It must not rebook a fill already present in the U75
         // position image. PossResend is not globally historical: apply this
         // only to rows admitted to this explicit query's existing interval.
-        let possible_resend = fields.get(&97).map(String::as_str) == Some("Y");
+        let possible_resend = fields.get(&97).copied() == Some("Y");
         let mut consumed = historical;
         match project_execution(fields, account, active.request.req_id, shared) {
             Ok(row) => {
@@ -257,7 +257,7 @@ impl ExecutionRequests {
         consumed
     }
 
-    pub(super) fn commission(&mut self, fields: &HashMap<u32, String>) {
+    pub(super) fn commission(&mut self, fields: &crate::protocol::fix::FieldMap<'_>) {
         let Some(active) = self.active.as_mut().filter(|active| !active.timed_out) else {
             return;
         };
@@ -284,9 +284,9 @@ impl ExecutionRequests {
                 lifecycle_complete: commission.is_some_and(f64::is_finite)
                     && fields.get(&6381).is_some_and(|currency| !currency.is_empty()),
                 report: CommissionAndFeesReport {
-                exec_id: exec_id.clone(),
+                exec_id: (*exec_id).to_owned(),
                 commission_and_fees: commission.unwrap_or(0.0),
-                currency: fields.get(&6381).cloned().unwrap_or_default(),
+                currency: fields.get(&6381).map(|v| (*v).to_owned()).unwrap_or_default(),
                 realized_pnl: fields
                     .get(&6099)
                     .and_then(|value| value.parse().ok())
@@ -299,7 +299,7 @@ impl ExecutionRequests {
                 yield_redemption_date: fields
                     .get(&696)
                     .filter(|value| value.len() == 8)
-                    .cloned()
+                    .map(|v| (*v).to_owned())
                     .unwrap_or_default(),
                 },
             },
@@ -308,7 +308,7 @@ impl ExecutionRequests {
 }
 
 fn project_execution(
-    fields: &HashMap<u32, String>,
+    fields: &crate::protocol::fix::FieldMap<'_>,
     account: &str,
     req_id: i64,
     shared: &SharedState,
@@ -321,7 +321,7 @@ fn project_execution(
     let time = metadata
         .time_secs
         .ok_or("Execution history row has no valid UTC time")?;
-    let side = match fields.get(&54).map(String::as_str) {
+    let side = match fields.get(&54).copied() {
         Some("1") => "BOT",
         Some("2" | "5") => "SLD",
         _ => return Err("Execution history row has no valid side".into()),
@@ -578,7 +578,7 @@ mod tests {
             // No new claim about option fields in 35=8: identity was already
             // decoded from a separate definition for this exact conId.
             let mut requests = active();
-            assert!(requests.report(&fields, &shared, "DU123456"));
+            assert!(requests.report(&crate::protocol::fix::field_view(&fields), &shared, "DU123456"));
             let result = requests.active.as_ref().unwrap().rows.values().next().unwrap();
             let expected = if cached {
                 crate::api::types::Contract { currency: "EUR".into(), ..contract.clone() }
@@ -623,14 +623,14 @@ mod tests {
     fn execution_range_preserves_native_utc_seconds_separately_from_display_time() {
         let shared = SharedState::new();
         let fields = row("time.01", true);
-        let projected = project_execution(&fields, "DU123456", 7, &shared).unwrap();
+        let projected = project_execution(&crate::protocol::fix::field_view(&fields), "DU123456", 7, &shared).unwrap();
         let expected = super::super::ccp::fix_utc_to_unix_secs("20261003-12:00:00").unwrap();
         assert_eq!(projected.execution.time_unix_seconds, Some(expected));
         assert_eq!(projected.time_secs, Some(expected));
         let mut sending_only = fields;
         sending_only.remove(&60);
         sending_only.insert(52, "20261004-12:00:00".into());
-        let projected = project_execution(&sending_only, "DU123456", 7, &shared).unwrap();
+        let projected = project_execution(&crate::protocol::fix::field_view(&sending_only), "DU123456", 7, &shared).unwrap();
         assert!(projected.time_secs.is_some(), "legacy display/filter behavior is unchanged");
         assert_eq!(projected.execution.time_unix_seconds, None, "SendingTime is not execution chronology");
     }
@@ -649,9 +649,9 @@ mod tests {
             if let Some(reported_account) = reported_account {
                 lifecycle.insert(1, reported_account.into());
             }
-            requests.reject_option_lifecycle(&lifecycle, "DU123456");
+            requests.reject_option_lifecycle(&crate::protocol::fix::field_view(&lifecycle), "DU123456");
             let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
-            assert!(requests.report(&end, &shared, "DU123456"));
+            assert!(requests.report(&crate::protocol::fix::field_view(&end), &shared, "DU123456"));
             let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
             match (reply.result, expect_failure) {
                 (Err(message), true) => assert_eq!(
@@ -670,11 +670,11 @@ mod tests {
         let mut requests = active();
         requests.active.as_mut().unwrap().timed_out = true;
         requests.reject_option_lifecycle(
-            &HashMap::from([(6809, "2".into()), (1, "DU123456".into())]),
+            &crate::protocol::fix::field_view(&HashMap::from([(6809, "2".into()), (1, "DU123456".into())])),
             "DU123456",
         );
         let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
-        assert!(requests.report(&end, &shared, "DU123456"));
+        assert!(requests.report(&crate::protocol::fix::field_view(&end), &shared, "DU123456"));
         assert!(shared.orders.drain_execution_range_replies().is_empty());
     }
 
@@ -702,7 +702,7 @@ mod tests {
                 deliver(&mut ccp, &mut context, &shared, &row);
             }
             assert!(!ccp.execution_ranges.report(
-                &HashMap::from([(6556, "other".into()), (32, "*".into())]),
+                &crate::protocol::fix::field_view(&HashMap::from([(6556, "other".into()), (32, "*".into())])),
                 &shared,
                 "DU123456",
             ));
@@ -748,9 +748,9 @@ mod tests {
             requests.active.as_mut().unwrap().request.include_lifecycles = true;
             let [mut row, _] = captured_lapse_rows();
             row.insert(tag, value.into());
-            requests.collect_option_lifecycle(&row, &shared, "DU123456");
+            requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
             requests.report(
-                &HashMap::from([(6556, "range1".into()), (32, "*".into())]),
+                &crate::protocol::fix::field_view(&HashMap::from([(6556, "range1".into()), (32, "*".into())])),
                 &shared,
                 "DU123456",
             );
@@ -767,24 +767,24 @@ mod tests {
         let mut requests = active();
         requests.active.as_mut().unwrap().request.include_lifecycles = true;
         for row in captured_manual_rows() {
-            requests.collect_option_lifecycle(&row, &shared, "DU123456");
-            requests.collect_option_lifecycle(&row, &shared, "DU123456");
+            requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
+            requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
         }
         for pending in [false, true] {
-            requests.collect_option_lifecycle(&captured_instruction(pending), &shared, "DU123456");
+            requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&captured_instruction(pending)), &shared, "DU123456");
         }
         let mut corrected = captured_manual_rows().remove(0);
         corrected.insert(17, "call.01.02".into());
         corrected.insert(31, "11.01".into());
-        requests.collect_option_lifecycle(&corrected, &shared, "DU123456");
-        requests.collect_option_lifecycle(&captured_manual_rows()[0], &shared, "DU123456");
+        requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&corrected), &shared, "DU123456");
+        requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&captured_manual_rows()[0]), &shared, "DU123456");
         for exec in ["call.01.01", "call.01.02"] {
-            requests.commission(&[(17, exec), (6378, "0.25"), (6381, "USD")]
-                .into_iter().map(|(tag, value)| (tag, value.into())).collect());
+            requests.commission(&crate::protocol::fix::field_view(&[(17, exec), (6378, "0.25"), (6381, "USD")]
+                .into_iter().map(|(tag, value)| (tag, value.into())).collect()));
         }
-        assert!(!requests.report(&HashMap::from([(6556, "other".into()), (32, "*".into())]), &shared, "DU123456"));
+        assert!(!requests.report(&crate::protocol::fix::field_view(&HashMap::from([(6556, "other".into()), (32, "*".into())])), &shared, "DU123456"));
         assert!(shared.orders.drain_execution_range_replies().is_empty());
-        assert!(requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456"));
+        assert!(requests.report(&crate::protocol::fix::field_view(&HashMap::from([(6556, "range1".into()), (32, "*".into())])), &shared, "DU123456"));
         let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
         assert!(reply.result.unwrap().is_empty());
         assert_eq!(reply.lifecycle_reports.len(), 4);
@@ -806,8 +806,8 @@ mod tests {
                 requests.active.as_mut().unwrap().request.include_lifecycles = include;
                 let mut row = captured_manual_rows().remove(1);
                 if malformed { row.remove(&31); }
-                requests.collect_option_lifecycle(&row, &shared, "DU123456");
-                requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
+                requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
+                requests.report(&crate::protocol::fix::field_view(&HashMap::from([(6556, "range1".into()), (32, "*".into())])), &shared, "DU123456");
                 let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
                 assert_eq!(reply.result.is_ok(), include && !malformed);
                 if reply.result.is_err() { assert!(reply.lifecycle_reports.is_empty()); }
@@ -818,15 +818,15 @@ mod tests {
         requests.active.as_mut().unwrap().request.include_lifecycles = true;
         requests.active.as_mut().unwrap().request.filter.sec_type = "OPT".into();
         for row in captured_manual_rows() {
-            requests.collect_option_lifecycle(&row, &shared, "DU123456");
+            requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
         }
         for (tag, value) in [(1, "OTHER"), (60, "20261006-12:00:00")] {
             let mut row = captured_manual_rows().remove(0);
             row.insert(tag, value.into());
             row.insert(6809, "unknown".into());
-            requests.collect_option_lifecycle(&row, &shared, "DU123456");
+            requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
         }
-        requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
+        requests.report(&crate::protocol::fix::field_view(&HashMap::from([(6556, "range1".into()), (32, "*".into())])), &shared, "DU123456");
         let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
         assert!(reply.result.is_ok());
         assert_eq!(reply.lifecycle_reports.len(), 2);
@@ -835,8 +835,8 @@ mod tests {
         requests.active.as_mut().unwrap().request.include_lifecycles = true;
         let mut row = captured_manual_rows().remove(0);
         row.insert(6809, "100".into());
-        requests.collect_option_lifecycle(&row, &shared, "DU123456");
-        requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
+        requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
+        requests.report(&crate::protocol::fix::field_view(&HashMap::from([(6556, "range1".into()), (32, "*".into())])), &shared, "DU123456");
         assert!(shared.orders.drain_execution_range_replies().pop().unwrap().result.is_err());
     }
 
@@ -917,12 +917,12 @@ mod tests {
             let shared = SharedState::new();
             let mut requests = active();
             requests.active.as_mut().unwrap().request.include_lifecycles = true;
-            requests.collect_option_lifecycle(&captured_manual_rows()[0], &shared, "DU123456");
+            requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&captured_manual_rows()[0]), &shared, "DU123456");
             let mut fee = HashMap::from([(17, "call.01.01".into()), (8189, "1".into())]);
             if let Some(amount) = amount { fee.insert(6378, amount.into()); }
             if let Some(currency) = currency { fee.insert(6381, currency.into()); }
-            requests.commission(&fee);
-            requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
+            requests.commission(&crate::protocol::fix::field_view(&fee));
+            requests.report(&crate::protocol::fix::field_view(&HashMap::from([(6556, "range1".into()), (32, "*".into())])), &shared, "DU123456");
             let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
             assert!(reply.result.is_ok());
             assert_eq!(reply.lifecycle_reports[0].commission_and_fees.as_ref().map(|fee| fee.commission_and_fees), expected);
@@ -964,12 +964,12 @@ mod tests {
         let shared = SharedState::new();
         let mut requests = active();
         requests.active.as_mut().unwrap().request.include_lifecycles = true;
-        requests.collect_option_lifecycle(&captured_manual_rows()[0], &shared, "DU123456");
+        requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&captured_manual_rows()[0]), &shared, "DU123456");
         requests.disconnected(&shared);
         let reply = shared.orders.drain_execution_range_replies().pop().unwrap();
         assert!(reply.result.is_err());
         assert!(reply.lifecycle_reports.is_empty());
-        requests.report(&HashMap::from([(6556, "range1".into()), (32, "*".into())]), &shared, "DU123456");
+        requests.report(&crate::protocol::fix::field_view(&HashMap::from([(6556, "range1".into()), (32, "*".into())])), &shared, "DU123456");
         assert!(shared.orders.drain_execution_range_replies().is_empty());
     }
 
@@ -990,10 +990,10 @@ mod tests {
         leg.insert(6013, "0:2".into());
         leg.insert(6400, "package-parent.01".into());
         leg.insert(31, "0".into());
-        assert!(requests.report(&parent, &shared, "DU123456"));
-        assert!(requests.report(&leg, &shared, "DU123456"));
+        assert!(requests.report(&crate::protocol::fix::field_view(&parent), &shared, "DU123456"));
+        assert!(requests.report(&crate::protocol::fix::field_view(&leg), &shared, "DU123456"));
         let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
-        assert!(requests.report(&end, &shared, "DU123456"));
+        assert!(requests.report(&crate::protocol::fix::field_view(&end), &shared, "DU123456"));
         let rows = shared
             .orders
             .drain_execution_range_replies()
@@ -1086,10 +1086,10 @@ mod tests {
         for ambiguous in cases {
             let shared = SharedState::new();
             let mut requests = active();
-            assert!(requests.report(&row("valid-first.01", true), &shared, "DU123456"));
-            assert!(requests.report(&ambiguous, &shared, "DU123456"));
+            assert!(requests.report(&crate::protocol::fix::field_view(&row("valid-first.01", true)), &shared, "DU123456"));
+            assert!(requests.report(&crate::protocol::fix::field_view(&ambiguous), &shared, "DU123456"));
             let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
-            assert!(requests.report(&end, &shared, "DU123456"));
+            assert!(requests.report(&crate::protocol::fix::field_view(&end), &shared, "DU123456"));
             assert_eq!(
                 shared
                     .orders
@@ -1113,9 +1113,9 @@ mod tests {
             if let Some(price) = price {
                 missing_price.insert(31, price.into());
             }
-            assert!(requests.report(&missing_price, &shared, "DU123456"));
+            assert!(requests.report(&crate::protocol::fix::field_view(&missing_price), &shared, "DU123456"));
             let end = HashMap::from([(6556, "range1".into()), (32, "*".into())]);
-            assert!(requests.report(&end, &shared, "DU123456"));
+            assert!(requests.report(&crate::protocol::fix::field_view(&end), &shared, "DU123456"));
             assert_eq!(
                 shared
                     .orders
@@ -1251,13 +1251,13 @@ mod tests {
         let mut replay = row("replay.01", false);
         replay.insert(97, "Y".into());
         let mut inactive = ExecutionRequests::default();
-        assert!(!inactive.report(&replay, &shared, "DU123456"));
+        assert!(!inactive.report(&crate::protocol::fix::field_view(&replay), &shared, "DU123456"));
         for (tag, value) in [(20, "3"), (1, "DU654321")] {
             let mut request = active();
             let mut unrelated = replay.clone();
             unrelated.insert(tag, value.into());
             unrelated.remove(&6008);
-            assert!(!request.report(&unrelated, &shared, "DU123456"));
+            assert!(!request.report(&crate::protocol::fix::field_view(&unrelated), &shared, "DU123456"));
             assert!(request.active.as_ref().unwrap().failure.is_none());
             assert!(request.active.as_ref().unwrap().rows.is_empty());
         }
@@ -1325,16 +1325,16 @@ mod tests {
         request.active.as_mut().unwrap().timed_out = true;
         let mut replay = row("replay.01", false);
         replay.insert(97, "Y".into());
-        assert!(request.report(&replay, &shared, "DU123456"));
+        assert!(request.report(&crate::protocol::fix::field_view(&replay), &shared, "DU123456"));
         assert!(request.active.as_ref().unwrap().rows.is_empty());
         let mut marker = HashMap::from([(32, "*".into()), (6556, "wrong".into())]);
-        assert!(!request.report(&marker, &shared, "DU123456"));
+        assert!(!request.report(&crate::protocol::fix::field_view(&marker), &shared, "DU123456"));
         assert!(request.active.is_some());
         marker.insert(6556, "range1".into());
-        assert!(request.report(&marker, &shared, "DU123456"));
+        assert!(request.report(&crate::protocol::fix::field_view(&marker), &shared, "DU123456"));
         assert!(request.active.is_none());
         assert!(shared.orders.drain_execution_range_replies().is_empty());
-        assert!(!request.report(&replay, &shared, "DU123456"));
+        assert!(!request.report(&crate::protocol::fix::field_view(&replay), &shared, "DU123456"));
     }
 
     #[test]
@@ -1414,10 +1414,10 @@ mod tests {
         let mut requests = active();
         for fields in [[(6556, "wrong"), (32, "*")], [(6556, "range1"), (32, "1")]] {
             requests.report(
-                &fields
+                &crate::protocol::fix::field_view(&fields
                     .into_iter()
                     .map(|(tag, value)| (tag, value.into()))
-                    .collect(),
+                    .collect()),
                 &shared,
                 "DU123456",
             );
@@ -1427,7 +1427,7 @@ mod tests {
             .into_iter()
             .map(|(tag, value)| (tag, value.into()))
             .collect();
-        assert!(requests.report(&fields, &shared, "DU123456"));
+        assert!(requests.report(&crate::protocol::fix::field_view(&fields), &shared, "DU123456"));
         assert!(
             shared
                 .orders
@@ -1438,7 +1438,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        requests.report(&fields, &shared, "DU123456");
+        requests.report(&crate::protocol::fix::field_view(&fields), &shared, "DU123456");
         assert!(shared.orders.drain_execution_range_replies().is_empty());
     }
 
@@ -1449,25 +1449,25 @@ mod tests {
         requests.active.as_mut().unwrap().request.filter.symbol = "AAPL".into();
         for revision in ["old.02", "old.01"] {
             requests.commission(
-                &[(17, revision), (6378, "0.25"), (6381, "USD"), (6099, "3")]
+                &crate::protocol::fix::field_view(&[(17, revision), (6378, "0.25"), (6381, "USD"), (6099, "3")]
                     .into_iter()
                     .map(|(tag, value)| (tag, value.into()))
-                    .collect(),
+                    .collect()),
             );
         }
-        requests.report(&row("old.02", true), &shared, "DU123456");
+        requests.report(&crate::protocol::fix::field_view(&row("old.02", true)), &shared, "DU123456");
         let mut outside = row("outside.01", true);
         outside.insert(60, "20260930-23:59:59".into());
-        requests.report(&outside, &shared, "DU123456");
+        requests.report(&crate::protocol::fix::field_view(&outside), &shared, "DU123456");
         let mut other_account = row("other.01", true);
         other_account.insert(1, "DU654321".into());
         other_account.remove(&6008);
-        requests.report(&other_account, &shared, "DU123456");
+        requests.report(&crate::protocol::fix::field_view(&other_account), &shared, "DU123456");
         requests.report(
-            &[(6556, "range1"), (32, "*")]
+            &crate::protocol::fix::field_view(&[(6556, "range1"), (32, "*")]
                 .into_iter()
                 .map(|(tag, value)| (tag, value.into()))
-                .collect(),
+                .collect()),
             &shared,
             "DU123456",
         );
@@ -1544,12 +1544,12 @@ mod tests {
         let mut requests = active();
         let mut invalid = row("old.01", true);
         invalid.remove(&6008);
-        requests.report(&invalid, &shared, "DU123456");
+        requests.report(&crate::protocol::fix::field_view(&invalid), &shared, "DU123456");
         requests.report(
-            &[(6556, "range1"), (32, "*")]
+            &crate::protocol::fix::field_view(&[(6556, "range1"), (32, "*")]
                 .into_iter()
                 .map(|(tag, value)| (tag, value.into()))
-                .collect(),
+                .collect()),
             &shared,
             "DU123456",
         );
@@ -1570,17 +1570,17 @@ mod tests {
             let shared = SharedState::new();
             let mut requests = active();
             requests.commission(
-                &[(17, fee_id), (6378, "0.25"), (6381, "USD")]
+                &crate::protocol::fix::field_view(&[(17, fee_id), (6378, "0.25"), (6381, "USD")]
                     .into_iter()
                     .map(|(tag, value)| (tag, value.into()))
-                    .collect(),
+                    .collect()),
             );
-            requests.report(&row("old.02", true), &shared, "DU123456");
+            requests.report(&crate::protocol::fix::field_view(&row("old.02", true)), &shared, "DU123456");
             requests.report(
-                &[(6556, "range1"), (32, "*")]
+                &crate::protocol::fix::field_view(&[(6556, "range1"), (32, "*")]
                     .into_iter()
                     .map(|(tag, value)| (tag, value.into()))
-                    .collect(),
+                    .collect()),
                 &shared,
                 "DU123456",
             );

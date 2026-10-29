@@ -6,8 +6,8 @@ import time
 
 from ibx import Contract, EClient, EWrapper
 
-NO_SECDEFTA = "Error validating request.-'ce' : cause - Failed to request matching symbols"
-YEARS = ("Error validating request.-'bM' : cause - Historical data request for 2 year(s) rejected. "
+NO_SECDEFTA = "Error validating request.-'ReqMatchingSymbols(81)' : cause - Failed to request matching symbols"
+YEARS = ("Error validating request.-'ReqHistoricalData(20)' : cause - Historical data request for 2 year(s) rejected. "
          "Max API Backfill Years=1")
 
 
@@ -44,6 +44,7 @@ def connected(features="APIELOG,SECDEFTA", offset=None, years=199, cutoff=None, 
 def test_current_time_adds_the_logon_offset():
     c, w = connected(offset=60_000)
     c.req_current_time()
+    c._test_dispatch_once()
     (kind, t), = w.events
     assert kind == "time"
     assert abs(t - int(time.time()) - 60) <= 1
@@ -64,8 +65,12 @@ def test_years_above_the_logon_limit_are_refused():
 
 
 def test_version_cutoff_warning():
-    c, w = connected(cutoff="10411", date="20261201")
+    # ibx logs in as 10.51 since ibx#601: a cutoff above it warns, one below it does not.
+    c, w = connected(cutoff="10601", date="20271201")
     c._test_dispatch_once()
     warnings = [e for e in w.events if e[0] == "error" and e[2] == 2172]
     assert len(warnings) == 1 and warnings[0][1] == -1
-    assert "1040.1" in warnings[0][3] and "20261201" in warnings[0][3] and "1041.1" in warnings[0][3]
+    assert "1051.1" in warnings[0][3] and "20271201" in warnings[0][3] and "1060.1" in warnings[0][3]
+    c, w = connected(cutoff="10411", date="20261201")
+    c._test_dispatch_once()
+    assert not [e for e in w.events if e[0] == "error" and e[2] == 2172]

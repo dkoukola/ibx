@@ -1,6 +1,6 @@
 //! ibx#425 probe. Paper account only.
 //!
-//! The account config (6040=210) is read at login. On the paper account it
+//! The account config is read at login. On the paper account it
 //! has no CUSTACCT, so an order with customerAccount or with
 //! professionalCustomer=true is refused with error 145 and nothing is sent.
 //!
@@ -43,6 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         username: env::var("IB_USERNAME")?, password: env::var("IB_PASSWORD")?,
         host: env::var("IB_HOST").unwrap_or_else(|_| "cdc1.ibllc.com".into()),
         paper: true, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     })?;
     if !client.account_id.starts_with("DU") { client.disconnect(); return Err("not a paper account".into()); }
     let aapl = Contract { con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() };

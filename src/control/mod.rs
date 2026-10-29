@@ -1,6 +1,7 @@
 pub mod account;
 pub mod algo;
 pub mod contracts;
+pub mod fa;
 pub mod fundamental;
 pub mod generic_tick;
 pub mod generic_values;
@@ -12,4 +13,6 @@ pub mod optcalc;
 pub mod optparams;
 pub mod regsnapshot;
 pub mod scanner;
+pub mod scanner_params;
 pub mod snapshot;
+pub mod wsh;

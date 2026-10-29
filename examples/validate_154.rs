@@ -47,6 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("== Connecting fresh to paper ({})", host);
     let client = EClient::connect(&EClientConfig {
         username, password, host, paper: true, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     })?;
     println!("== Connected.");
 

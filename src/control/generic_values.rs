@@ -1,24 +1,22 @@
 //! The generic ticks on the wire (ibx#450): which ticks of a valid list go
 //! to the farm and when, the entry each one is, and how the values of their
-//! `35=G` blocks become API ticks, as the reference does it.
+//! generic tick blocks become API ticks, as the reference does it.
 //!
-//! - Each generic tick is its own `35=V` entry, `264` = its request code
-//!   (`generictick.b7.a(dy,MarketDataType,MarketDataRequestAction,List)@86`).
-//!   A tick whose `generictick.b.f()` is false (101, 106, 233, 375, 456,
+//! - Each generic tick is its own entry of the market data request, with
+//!   its request code.
+//!   A tick the reference does not hold back (101, 106, 233, 375, 456,
 //!   588) goes with the request, in a message of its own after the top of
 //!   book; the others wait for the top of book's acknowledgement
-//!   (`generictick.bp.onTopSubscriptionConfirmed()`, `bp.b(b7)`, `bp.e(b7)`)
 //!   and go in one message with the exchange map entry, if any, last. The
-//!   ticks of a message are in request code order (`bp.e` sorts its list).
-//! - A tick that is not valid for the contract (`generictick.b.a(dy,
-//!   OverrideValidityCheck)`) is never sent (411 on a stock, 233 on a
+//!   ticks of a message are in request code order (the reference sorts them).
+//! - A tick that is not valid for the contract (the reference's validity
+//!   check) is never sent (411 on a stock, 233 on a
 //!   currency pair).
-//! - A `35=G` block is a 32-bit server tag, an 8-bit length (16-bit for the
-//!   ticks of `jmdclient.br.ax`) and the payload (`jmdclient.br.a(byte[])`).
+//! - A block of the market data update is a 32-bit server code, an 8-bit
+//!   length (16-bit for the ticks of `LONG_LENGTH`) and the payload.
 //!   Each tick's decoder sets fields of the contract's record; a field
 //!   sends its API tick when its value changed (the record's change set),
-//!   in the order of the reference's sender (`jextend.dK.a(List,s,int,pa,
-//!   Map,o,h,Set)`), block after block.
+//!   in the order the reference sends them, block after block.
 
 use std::collections::HashMap;
 
@@ -29,6 +27,8 @@ pub enum GenTick {
     Size(i32, f64),
     Generic(i32, f64),
     Text(i32, String),
+    /// An option computation of an option's model (ibx#502).
+    Option(crate::control::optcalc::OptionComputation),
 }
 
 /// Request codes of the ticks ibx sends and decodes.
@@ -47,38 +47,52 @@ pub const LAST_RTH_TRADE: i32 = 318;
 pub const RT_TRADE_VOLUME: i32 = 375;
 pub const RT_HISTORICAL_VOLATILITY: i32 = 411;
 pub const DIVIDENDS: i32 = 456;
-/// Historical volatility, asked as 104 (`generictick.a7`, request code 512,
-/// alias 104).
+/// Historical volatility, asked as 104 (request code 512, alias 104).
 pub const HISTORICAL_VOLATILITY: i32 = 512;
 pub const FUTURES_OPEN_INTEREST: i32 = 588;
-/// Pl Price (`generictick.aw`, alias 221): the mark price, tick 37.
+/// Pl Price (alias 221): the mark price, tick 37.
 pub const PL_PRICE: i32 = 232;
-/// Fundamentals (`generictick.I`, alias 47): the ratios, tick 47.
+/// Fundamentals (alias 47): the ratios, tick 47.
 pub const FUNDAMENTALS: i32 = 258;
-/// IPOHLMPRC (`generictick.R`): asked, its ticks (101, 102) not read yet.
+/// IPOHLMPRC: asked, its ticks (101, 102) not read yet.
 pub const IPO_PRICES: i32 = 586;
-/// Short-Term Volume X Mins (`generictick.aK`): ticks 63, 64, 65.
+/// Short-Term Volume X Mins: ticks 63, 64, 65.
 pub const SHORT_TERM_VOLUME: i32 = 595;
-/// Creditman Slow Mark Price (`generictick.z`): tick 79.
+/// Creditman Slow Mark Price: tick 79.
 pub const SLOW_MARK_PRICE: i32 = 619;
+/// An ETF's net asset value, last and frozen last (ibx#641): one double
+/// each, ticks 96 and 97, asked for a stock of type ETF or ETMF once its
+/// top of book is acknowledged; -1 is no value (the reference 10.51, paper,
+/// 13/10/2026 regular hours, SPY: 577 answered 777.86932373, given as tick
+/// 96; 623 answered -1, nothing given), and so is 0 (SPY before the open,
+/// 19/10/2026: 577 answered 0, nothing given, ibx#604).
+pub const ETF_NAV_LAST: i32 = 577;
+pub const ETF_FROZEN_NAV_LAST: i32 = 623;
+/// Index Future Premium (ibx#495): one double, tick 31,
+/// for an index only (the reference 10.51 on SPX, paper 12/10/2026).
+pub const INDEX_FUTURE_PREMIUM: i32 = 162;
 
 /// The ticks ibx subscribes: the others of a valid list are accepted and
 /// not sent (their decoders are not read yet).
-const SENT: [i32; 23] = [
+const SENT: [i32; 27] = [
     OPTION_VOLUME, OPTION_OPEN_INTEREST, AVERAGE_OPTION_VOLUME, IMPLIED_VOLATILITY, MISC_STATS, AUCTION,
     RT_VOLUME, SHORTABLE, TRADE_COUNT, TRADE_RATE, VOLUME_RATE, LAST_RTH_TRADE, RT_TRADE_VOLUME,
     RT_HISTORICAL_VOLATILITY, DIVIDENDS, HISTORICAL_VOLATILITY, FUTURES_OPEN_INTEREST, 104,
-    PL_PRICE, FUNDAMENTALS, IPO_PRICES, SHORT_TERM_VOLUME, SLOW_MARK_PRICE,
+    PL_PRICE, FUNDAMENTALS, IPO_PRICES, SHORT_TERM_VOLUME, SLOW_MARK_PRICE, INDEX_FUTURE_PREMIUM,
+    ETF_NAV_LAST, ETF_FROZEN_NAV_LAST, ODD_LOT,
 ];
 
-/// The ticks whose block has a 16-bit length (`jmdclient.br.ax`).
+/// The odd-lot bid and ask quotes (ibx#616), from session level 225.
+pub const ODD_LOT: i32 = 787;
+
+/// The ticks whose block has a 16-bit length.
 const LONG_LENGTH: [i32; 29] = [
     257, 258, 256, 292, 247, 385, 386, 434, 433, 454, 481, 490, 491, 496, 546, 593, 594, 631, 628, 633, 705,
     669, 687, 691, 678, 699, 700, 703, 726,
 ];
 
-/// The ticks whose block has no length (`jmdclient.br.ay`).
-const NO_LENGTH: [i32; 6] = [376, 320, 530, 532, 221, 619];
+/// The ticks whose block has no length.
+const NO_LENGTH: [i32; 7] = [376, 320, 530, 532, 221, 619, ODD_LOT];
 
 /// How the length of a block of this tick is written: 1 or 2 bytes, 0
 /// when it has none (its payload is a list of quote entries, which ends
@@ -93,16 +107,27 @@ pub fn length_width(code: i32) -> usize {
     }
 }
 
+/// Whether the tick is asked only for a stock of type ETF or ETMF
+/// (ibx#641).
+pub fn etf_only(code: i32) -> bool {
+    matches!(code, ETF_NAV_LAST | ETF_FROZEN_NAV_LAST)
+}
+
+/// Whether a stock type is one the ETF ticks are asked for (ibx#641).
+pub fn is_etf_type(stock_type: &str) -> bool {
+    stock_type.eq_ignore_ascii_case("ETF") || stock_type.eq_ignore_ascii_case("ETMF")
+}
+
 /// Whether ibx sends this tick.
 pub fn sent(code: i32) -> bool {
     SENT.contains(&code)
 }
 
-/// Whether the tick goes with the request (`generictick.b.f()` false):
+/// Whether the tick goes with the request (the reference does not hold it):
 /// the others wait for the top of book's acknowledgement.
 pub fn at_once(code: i32) -> bool {
     matches!(code, OPTION_OPEN_INTEREST | IMPLIED_VOLATILITY | RT_VOLUME | RT_TRADE_VOLUME | DIVIDENDS | FUTURES_OPEN_INTEREST
-        | PL_PRICE | FUNDAMENTALS | SLOW_MARK_PRICE)
+        | PL_PRICE | FUNDAMENTALS | SLOW_MARK_PRICE | INDEX_FUTURE_PREMIUM | ODD_LOT)
 }
 
 fn one_of(sec_type: &str, set: &[&str]) -> bool {
@@ -111,17 +136,17 @@ fn one_of(sec_type: &str, set: &[&str]) -> bool {
 }
 
 /// Whether the tick is valid for a contract of this security type
-/// (`generictick.b.a(dy, OverrideValidityCheck)` of each tick, with the
-/// security type sets of `jfix.eh`); a combo is valid for none. Per tick:
-/// 100, 105, 106, 104/512: the option underlyings (`eh.ak()`: STK, IND,
-/// FUT); 101: those and the options (`eh.d()`: OPT, FOP, IOPT); 165, 293 to
+/// (the reference's validity check of each tick, with its security type
+/// sets); a combo is valid for none. Per tick:
+/// 100, 105, 106, 104/512: the option underlyings (STK, IND,
+/// FUT); 101: those and the options (OPT, FOP, IOPT); 165, 293 to
 /// 295, 318: any contract; 225: STK, FUT, OPT; 233, 375: a contract with a
 /// volume (not CASH, not CRYPTO); 236: STK, BOND, BILL, FIXED, IOPT; 456:
-/// `eh.K()` (STK, FUT, OPT, IND, FOP, CFD, SLB); 411, 588: FUT. 232 and
+/// STK, FUT, OPT, IND, FOP, CFD, SLB; 411, 588: FUT. 232 and
 /// 619: any contract (the reference sends them when the top of book is
-/// not restricted, `jextend.s.a(dy,ec,Set)@895-997`; captured 07/10/2026 on
+/// not restricted; captured 07/10/2026 on
 /// a stock, an option and a future); 258: not CFD, FOP, FUT, IOPT, OPT,
-/// SLB, WAR (`generictick.I`; the logon's fundamentals feature is taken as
+/// SLB, WAR (the logon's fundamentals feature is taken as
 /// on); 586: a stock; 595: any contract its list allows.
 pub fn valid_for(code: i32, sec_type: &str) -> bool {
     if one_of(sec_type, &["BAG"]) {
@@ -137,18 +162,22 @@ pub fn valid_for(code: i32, sec_type: &str) -> bool {
         SHORTABLE => one_of(sec_type, &["STK", "BOND", "BILL", "FIXED", "IOPT"]),
         DIVIDENDS => one_of(sec_type, &["STK", "FUT", "OPT", "IND", "FOP", "CFD", "SLB"]),
         RT_HISTORICAL_VOLATILITY | FUTURES_OPEN_INTEREST => one_of(sec_type, &["FUT"]),
-        PL_PRICE | SLOW_MARK_PRICE | SHORT_TERM_VOLUME => true,
+        PL_PRICE | SLOW_MARK_PRICE | SHORT_TERM_VOLUME | ODD_LOT => true,
         FUNDAMENTALS => !one_of(sec_type, &["CFD", "FOP", "FUT", "IOPT", "OPT", "SLB", "WAR"]),
         IPO_PRICES => one_of(sec_type, &["STK"]),
+        INDEX_FUTURE_PREMIUM => one_of(sec_type, &["IND"]),
+        // A stock; its type (ETF, ETMF) is checked when the top of book
+        // is acknowledged (`etf_only`).
+        ETF_NAV_LAST | ETF_FROZEN_NAV_LAST => one_of(sec_type, &["STK"]),
         _ => false,
     }
 }
 
-/// The exchange of a tick's entry: the contract's (`jclient.dy.d()`, the
+/// The exchange of a tick's entry: the contract's (in the reference, the
 /// routing exchange of its top of book), except the auction of a stock
 /// asked on SMART, which goes to its primary exchange when known
-/// (`generictick.h.b(dy)`; captured 05/10/2026: AAPL 225 on NASDAQ), and
-/// the fundamentals, always asked on `RTRSFND` (`generictick.I.b(dy)`).
+/// (captured 05/10/2026: AAPL 225 on NASDAQ), and
+/// the fundamentals, always asked on `RTRSFND`.
 pub fn entry_exchange<'a>(code: i32, sec_type: &str, exchange: &'a str, primary: &'a str) -> &'a str {
     if code == FUNDAMENTALS {
         return "RTRSFND";
@@ -201,15 +230,17 @@ impl<'a> Reader<'a> {
 
 // ── The record ──
 
-/// The record fields the generic ticks set (the reference's
-/// `jclient.pa` / `jclient.record.b` fields), each with its change.
+/// The record fields the generic ticks set (the fields of the reference's
+/// contract record), each with its change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Field {
     CallVolume, PutVolume, CallOpenInterest, PutOpenInterest, AvgCallVolume, AvgPutVolume,
     ImpliedVol, HistVol, AvgVolume, Week13Hi, Week13Lo, Week26Hi, Week26Lo, Week52Hi, Week52Lo,
     AuctionVolume, AuctionImbalance, AuctionPrice, RegulatoryImbalance, Shortable, ShortableShares,
     TradeCount, TradeRate, VolumeRate, LastRthTrade, FuturesOpenInterest,
-    PlPrice, SlowMarkPrice, Volume3Min, Volume5Min, Volume10Min,
+    PlPrice, SlowMarkPrice, Volume3Min, Volume5Min, Volume10Min, IndexPremium,
+    EtfNavLast, EtfFrozenNavLast,
+    OddBidPrice, OddAskPrice, OddBidSize, OddAskSize, OddBidExchange, OddAskExchange,
 }
 
 /// The unset value of an int field (the reference's `Integer.MAX_VALUE`).
@@ -253,15 +284,18 @@ impl GenericRecord {
 pub struct DecodeCtx {
     pub min_tick: f64,
     pub now_ms: i64,
-    /// The contract's size multiplier (`jclient.dy.et()`, its round lot):
+    /// The contract's size multiplier (its round lot, as the reference has it):
     /// the short-term volumes are counts of it.
     pub round_lot: i64,
     /// The price tick of the tick's own entry (the third field of its
     /// acknowledgement): the slow mark price is scaled by it.
     pub entry_min_tick: f64,
+    /// The real-time volume comes in shares and is given in round lots
+    /// (the 10.51 form asked as 765, ibx#642); false in the 10.40 lot form.
+    pub rt_in_shares: bool,
 }
 
-/// sqrt(252): a daily volatility to an annual one (`optionmodel.O.b`).
+/// sqrt(252): a daily volatility to an annual one, as the reference.
 fn annual(daily: f64) -> f64 {
     252f64.sqrt() * daily
 }
@@ -279,7 +313,7 @@ fn price(out: &mut Vec<GenTick>, tick: i32, v: f64) {
 }
 
 /// `(double)(int)(v * 60)`, Java's d2i: a rate per second as a rate per
-/// minute (`jextend.dK.a(...)@2089-2094`).
+/// minute.
 fn per_minute(v: f64) -> f64 {
     let m = v * 60.0;
     if m.is_nan() { 0.0 } else { m.clamp(i32::MIN as f64, i32::MAX as f64).trunc() }
@@ -293,22 +327,22 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
     let mut out = Vec::new();
     let mut r = Reader::new(payload);
     match code {
-        // `generictick.a6`: call and put volume (`pa.o(int)`, `pa.p(int)`).
+        // Call and put volume.
         OPTION_VOLUME => {
             let (Some(call), Some(put)) = (r.int(), r.int()) else { return out };
             let (c, p) = (rec.set_int(Field::CallVolume, call as i64), rec.set_int(Field::PutVolume, put as i64));
             if c { size(&mut out, 29, call as i64); }
             if p { size(&mut out, 30, put as i64); }
         }
-        // `generictick.as`: call and put open interest.
+        // Call and put open interest.
         OPTION_OPEN_INTEREST => {
             let (Some(call), Some(put)) = (r.int(), r.int()) else { return out };
             let (c, p) = (rec.set_int(Field::CallOpenInterest, call as i64), rec.set_int(Field::PutOpenInterest, put as i64));
             if c { size(&mut out, 27, call as i64); }
             if p { size(&mut out, 28, put as i64); }
         }
-        // `generictick.a3`: average call and put volume; tick 87 is their
-        // sum (`jclient.pa.eZ()`), or the one known.
+        // Average call and put volume; tick 87 is their
+        // sum (as the reference adds them), or the one known.
         AVERAGE_OPTION_VOLUME => {
             let (Some(call), Some(put)) = (r.int(), r.int()) else { return out };
             let c = rec.set_int(Field::AvgCallVolume, call as i64);
@@ -323,7 +357,7 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
                 size(&mut out, 87, sum);
             }
         }
-        // `generictick.a5`: the daily implied volatility; tick 24 is it a
+        // The daily implied volatility; tick 24 is it a
         // year.
         IMPLIED_VOLATILITY => {
             let Some(d) = r.double() else { return out };
@@ -332,15 +366,68 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
                 out.push(GenTick::Generic(24, annual(d)));
             }
         }
-        // `generictick.a7`: the daily historical volatility; tick 23.
+        // Historical volatility (512): the daily one; tick 23.
+        // The index future premium, tick 31, as it changes.
+        // The odd-lot quotes (ibx#616; the reference 10.51, paper,
+        // 12/10/2026, MSFT in regular hours, at level 225): a list of quote
+        // entries, the bid and ask prices (0, 1; in price ticks of the
+        // entry's acknowledgement), sizes (4, 5) and exchanges (16, 17; a
+        // set of the contract's exchanges). For the bid then the ask, the
+        // price (105, 106), size (107, 108) and exchanges (109, 110), each
+        // when it changed; an unset price (below 0) or exchange (0) gives
+        // none. The exchanges go as the set's number, written as letters
+        // by the farm.
+        ODD_LOT => {
+            let Some((entries, _)) = entry_list(payload) else { return out };
+            let get = |t: u64| entries.iter().find(|(e, _)| *e == t).map(|(_, v)| *v);
+            let sides = [
+                (0, 4, 16, Field::OddBidPrice, Field::OddBidSize, Field::OddBidExchange, (105, 107, 109)),
+                (1, 5, 17, Field::OddAskPrice, Field::OddAskSize, Field::OddAskExchange, (106, 108, 110)),
+            ];
+            for (p, s, x, pf, sf, xf, (pt, st, xt)) in sides {
+                if let Some(raw) = get(p) {
+                    let px = raw as f64 * ctx.entry_min_tick;
+                    if rec.set_double(pf, px) && raw >= 0 {
+                        price(&mut out, pt, px);
+                    }
+                }
+                if let Some(raw) = get(s)
+                    && rec.set_int(sf, raw) && raw > 0
+                {
+                    size(&mut out, st, raw);
+                }
+                if let Some(mask) = get(x)
+                    && rec.set_int(xf, mask) && mask != 0
+                {
+                    out.push(GenTick::Text(xt, mask.to_string()));
+                }
+            }
+        }
+        ETF_NAV_LAST | ETF_FROZEN_NAV_LAST => {
+            let Some(d) = r.double() else { return out };
+            let (field, tick) = if code == ETF_NAV_LAST { (Field::EtfNavLast, 96) } else { (Field::EtfFrozenNavLast, 97) };
+            if rec.set_double(field, d) && d != -1.0 && d != 0.0 {
+                price(&mut out, tick, d);
+            }
+        }
+        INDEX_FUTURE_PREMIUM => {
+            let Some(d) = r.double() else { return out };
+            if rec.set_double(Field::IndexPremium, d) && d.is_finite() && d != f64::MAX {
+                out.push(GenTick::Generic(31, d));
+            }
+        }
         HISTORICAL_VOLATILITY => {
             let Some(d) = r.double() else { return out };
             if rec.set_double(Field::HistVol, d) && d != f64::MAX {
                 out.push(GenTick::Generic(23, annual(d)));
             }
         }
-        // `generictick.ah`: int pairs, then float pairs; 207 is the
+        // Int pairs, then float pairs; 207 is the
         // average volume, 201 to 206 the 13, 26 and 52 week highs and lows.
+        // The 10.51 form gives the average volume in shares as 768, given in
+        // round lots, rounded down (the reference 10.51 at level 225, AAPL,
+        // 19/10/2026 regular hours: 44451884 shares, a lot of 40, gave
+        // 1111297; ibx#604). The 10.40 form gives none from it (05/10/2026).
         MISC_STATS => {
             let mut ints: HashMap<i32, i32> = HashMap::new();
             let mut floats: HashMap<i32, f64> = HashMap::new();
@@ -354,7 +441,9 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
                 let (Some(k), Some(v)) = (r.int(), r.float()) else { return out };
                 floats.insert(k, v);
             }
-            let avg = ints.get(&207).is_some_and(|&v| rec.set_int(Field::AvgVolume, v as i64));
+            let average = ints.get(&207).map(|&v| v as i64)
+                .or_else(|| ints.get(&768).filter(|_| ctx.rt_in_shares).map(|&v| v as i64 / ctx.round_lot.max(1)));
+            let avg = average.is_some_and(|v| rec.set_int(Field::AvgVolume, v));
             if avg { size(&mut out, 21, rec.int(Field::AvgVolume)); }
             for (key, field, tick) in [
                 (201, Field::Week13Hi, 16), (202, Field::Week13Lo, 15), (203, Field::Week26Hi, 18),
@@ -365,7 +454,7 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
                 }
             }
         }
-        // `generictick.h`: volume, imbalance, price, side, one int; then
+        // Volume, imbalance, price, side, one int; then
         // the regulatory imbalance seventh of the optional values.
         AUCTION => {
             let (Some(volume), Some(imbalance), Some(px), Some(_side), Some(_)) = (r.int(), r.int(), r.float(), r.int(), r.int()) else {
@@ -391,7 +480,7 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
             if p { price(&mut out, 35, px); }
             if g { size(&mut out, 61, regulatory); }
         }
-        // `generictick.aL`: the shortable value, then the shares when
+        // The shortable value, then the shares when
         // present.
         SHORTABLE => {
             let Some(value) = r.int() else { return out };
@@ -414,22 +503,22 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
                 out.push(GenTick::Generic(tick, per_minute(v)));
             }
         }
-        // `generictick.aa`: the price, then two ints.
+        // The price, then two ints.
         LAST_RTH_TRADE => {
             let (Some(px), Some(_), Some(_)) = (r.double(), r.int(), r.int()) else { return out };
             if rec.set_double(Field::LastRthTrade, px) {
                 price(&mut out, 57, px);
             }
         }
-        // `generictick.K`: the open interest.
+        // The open interest.
         FUTURES_OPEN_INTEREST => {
             let Some(v) = r.int() else { return out };
             if rec.set_int(Field::FuturesOpenInterest, v as i64) {
                 size(&mut out, 86, v as i64);
             }
         }
-        // `generictick.aw`: the price, then flags; valid with bit 0 and
-        // without bit 27 (`jclient.record.c1.a(int)`), else unset. Tick 37
+        // The price, then flags; valid with bit 0 and
+        // without bit 27, else unset. Tick 37
         // (captured 07/10/2026: 334.9805908203125 gives 334.98059082).
         PL_PRICE => {
             let (Some(px), Some(flags)) = (r.double(), r.int()) else { return out };
@@ -438,7 +527,7 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
                 price(&mut out, 37, px);
             }
         }
-        // `generictick.z`: a list of quote entries (no length); the price
+        // A list of quote entries (no length); the price
         // is the entry of type 2 times the price tick of this tick's own
         // acknowledgement. Tick 79 (captured 07/10/2026: 334890 with tick
         // 0.001 gives 334.89). A negative value is unset.
@@ -451,7 +540,7 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
                 price(&mut out, 79, px);
             }
         }
-        // `generictick.aK`: a count, then (minutes, volume) pairs; 3, 5
+        // A count, then (minutes, volume) pairs; 3, 5
         // and 10 minutes are ticks 63, 64, 65, each the volume times the
         // contract's size multiplier (captured 07/10/2026: 35, 76, 193 on
         // AAPL, round lot 40, give 1400, 3040, 7720).
@@ -470,12 +559,16 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
             for (v, field, tick) in [
                 (seen[0], Field::Volume3Min, 63), (seen[1], Field::Volume5Min, 64), (seen[2], Field::Volume10Min, 65),
             ] {
+                // In shares when asked as 773 (ibx#641; observed 14/10/2026 on
+                // AAPL: 352560 shares given as 352560), in round lots in the
+                // 10.40 form.
+                let unit = if ctx.rt_in_shares { 1 } else { ctx.round_lot.max(1) };
                 if let Some(v) = v && rec.set_int(field, v as i64) {
-                    size(&mut out, tick, v as i64 * ctx.round_lot.max(1));
+                    size(&mut out, tick, v as i64 * unit);
                 }
             }
         }
-        // `generictick.I`: a length, the text's size, then the zlib of
+        // A length, the text's size, then the zlib of
         // `KEY=VALUE;...`. Tick 47 is the pairs in the order of the
         // reference's map (`ratios_text`); `NOTAVAIL=1` gives nothing.
         FUNDAMENTALS => {
@@ -494,10 +587,10 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
                 }
             }
         }
-        // `generictick.R`: asked as the reference asks it; its ticks (101,
+        // Asked as the reference asks it; its ticks (101,
         // 102) are not read yet (no block with a value captured).
         IPO_PRICES => {}
-        // `generictick.C`: a 4-byte length, then one line of text.
+        // A 4-byte length, then one line of text.
         DIVIDENDS => {
             let Some(rest) = payload.get(4..) else { return out };
             let line = rest.split(|&b| b == b'\n' || b == b'\r').next().unwrap_or(&[]);
@@ -520,10 +613,10 @@ pub fn decode(code: i32, payload: &[u8], rec: &mut GenericRecord, ctx: DecodeCtx
     out
 }
 
-/// One RTVolume block (`generictick.aB.a(...)`): the total value, volume
+/// One RTVolume block: the total value, volume
 /// and trade count of the day. The first one only sets the record; a later
 /// one that changes anything gives "price;size;time;volume;vwap;single"
-/// (`jclient.nw.a(jmarketrules.o)`): the price of what traded since (the
+/// (as the reference writes it): the price of what traded since (the
 /// value traded over the volume, on the contract's tick), its size, the
 /// time it was read, the day's volume, its average price, and whether one
 /// trade at most made it.
@@ -535,9 +628,18 @@ fn rt_volume(rec: &mut GenericRecord, trade: bool, value: f64, volume: i64, coun
     let prev = slot.replace((value, volume, count));
     let (pv, pvol, pcount) = prev?;
     let d_count = count.wrapping_sub(pcount);
-    let d_vol = volume - pvol;
+    // Wrapping, as the count: a bad frame must not stop the farm handler.
+    let d_vol = volume.wrapping_sub(pvol);
     let d_value = value - pv;
-    if d_count == 0 && d_vol == 0 && d_value == 0.0 {
+    // The real-time volume is asked in its share form (ibx#642): the
+    // price comes from the shares traded, an odd lot included, and the
+    // size and volume are given in round lots, truncated; with a lot
+    // above 1 every block gives a string (observed 13/10/2026, MSFT,
+    // round lot 40, on the reference 10.51).
+    // So is the real-time trade volume, asked as 766 (ibx#641; observed
+    // 14/10/2026 on MSFT: 2451712 shares given as 61292).
+    let lot = if !ctx.rt_in_shares { 1 } else { ctx.round_lot.max(1) };
+    if lot == 1 && d_count == 0 && d_vol == 0 && d_value == 0.0 {
         return None;
     }
     let px = if d_vol == 0 { None } else { Some(round_to_tick(d_value / d_vol as f64, ctx.min_tick)) };
@@ -546,9 +648,22 @@ fn rt_volume(rec: &mut GenericRecord, trade: bool, value: f64, volume: i64, coun
     let text = |v: f64| rule_price_text(v, decimals);
     Some(format!(
         "{};{};{};{};{};{}",
-        px.map(text).unwrap_or_default(), decimal16(d_vol), ctx.now_ms, decimal16(volume),
+        px.map(text).unwrap_or_default(), decimal16(d_vol / lot), ctx.now_ms, decimal16(volume / lot),
         vwap.map(text).unwrap_or_default(), d_count < 2,
     ))
+}
+
+/// The code a generic tick is asked under on the wire: the reference 10.51
+/// asks the real-time volumes in their share forms, 233 as 765 and 375 as
+/// 766, and the short-term volumes (595) as 773 (ibx#641, observed on
+/// 13/10/2026 and 14/10/2026 on MSFT and AAPL, regular hours).
+pub fn wire_code(code: i32) -> i32 {
+    match code {
+        RT_VOLUME => 765,
+        RT_TRADE_VOLUME => 766,
+        SHORT_TERM_VOLUME => 773,
+        other => other,
+    }
 }
 
 fn round_to_tick(v: f64, tick: f64) -> f64 {
@@ -563,7 +678,7 @@ fn decimal16(v: i64) -> String {
 
 /// The decimals of a price tick (0.01: 2), the fewest decimals the
 /// market rule writes for a rule of that one increment
-/// (`jmarketrules.o.s()`, `o.b(int)`); 3 when the tick is not known.
+///; 3 when the tick is not known.
 fn tick_decimals(tick: f64) -> usize {
     if !(tick > 0.0 && tick.is_finite()) {
         return 3;
@@ -571,9 +686,8 @@ fn tick_decimals(tick: f64) -> usize {
     format!("{tick}").split_once('.').map_or(0, |(_, f)| f.len())
 }
 
-/// A price as the market rule writes it (`jmarketrules.o.e(double)`:
-/// `min_decimals` to eight decimals, half even; 0 is "0"; captured
-/// 05/10/2026: AAPL "334.50").
+/// A price as the market rule writes it (`min_decimals` to eight
+/// decimals, half even; 0 is "0"; captured 05/10/2026: AAPL "334.50").
 pub fn rule_price_text(v: f64, min_decimals: usize) -> String {
     if v == 0.0 {
         return "0".into();
@@ -591,9 +705,9 @@ pub fn java_price(v: f64) -> f64 {
     rule_price_text(v, 1).parse().unwrap_or(v)
 }
 
-/// The dividends of a 456 block (`generictick.bh.a(int,String)`, `bh.o()`):
+/// The dividends of a 456 block, as the reference writes them:
 /// "past 12 months,next 12 months,next date,next amount", each amount
-/// with two to six decimals (`feature.company.fundamentals.ui.h.a(double)`),
+/// with two to six decimals (`dividend_amount`),
 /// the date as yyyyMMdd; a token that is no number or no date is empty.
 pub fn dividends_text(line: &str) -> String {
     let mut tokens = line.split(',').filter(|t| !t.is_empty());
@@ -605,7 +719,7 @@ pub fn dividends_text(line: &str) -> String {
     format!("{ttm},{next12},{date},{next}")
 }
 
-/// `feature.company.fundamentals.ui.h.a(double)`: the value to ten
+/// A dividend amount as the reference writes it: the value to ten
 /// significant digits, half even, trailing zeros dropped, gives its
 /// decimals, kept between two and six; grouped thousands.
 fn dividend_amount(v: f64) -> String {
@@ -631,7 +745,7 @@ fn dividend_amount(v: f64) -> String {
 }
 
 /// The quote entries of a block without a length, as the top-of-book
-/// messages write them (`jmdclient.bl.a(byte[],am,true)`): per entry one
+/// messages write them: per entry one
 /// byte (type in 5 bits, "one more follows", width - 1 in 2 bits; type 31:
 /// the type and the width in the next two bytes), then the value, its top
 /// bit the sign. (type, value) of each, and the bytes read; None when cut
@@ -668,9 +782,8 @@ fn java_hash(s: &str) -> u32 {
     s.encode_utf16().fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(c as u32))
 }
 
-/// The fundamental ratios as tick 47 gives them (`generictick.I`,
-/// `feature.company.ratios.C.d()`): the `KEY=VALUE` pairs of the text
-/// joined with `;` in the order of a Java `HashMap` of their keys (bucket
+/// The fundamental ratios as tick 47 gives them: the `KEY=VALUE` pairs
+/// of the text joined with `;` in the order of a hash map of their keys (bucket
 /// of the key's hash in a table that starts at 16 and doubles while more
 /// than three quarters full; keys of one bucket in the order they came),
 /// without the contract id (`IBCONID`); the dividend per share
@@ -678,7 +791,7 @@ fn java_hash(s: &str) -> u32 {
 /// each other there. `NOTAVAIL=1`, or no pair, gives the empty text.
 /// Checked on the block and the callback captured on 07/10/2026 (AAPL: 66
 /// pairs in, 64 out and the empty place, the same text). The reference keeps the keys it knows
-/// (`ratios.a.c(key)`): every other key is taken as known.
+///: every other key is taken as known.
 pub fn ratios_text(text: &str) -> String {
     let mut pairs: Vec<(&str, &str)> = Vec::new();
     for part in text.split(';') {
@@ -707,7 +820,7 @@ pub fn ratios_text(text: &str) -> String {
         .collect::<Vec<_>>().join(";")
 }
 
-/// The blocks of a `35=G` body (after its 2-byte bit count): (server tag,
+/// The blocks of a generic tick message body (after its 2-byte bit count): (server tag,
 /// payload). `code_of` names the tick of a server tag (None: unknown, the
 /// reading stops, as the reference cannot know the block's length).
 pub fn blocks(body: &[u8], code_of: impl Fn(u32) -> Option<i32>) -> Vec<(u32, Option<i32>, &[u8])> {
@@ -746,7 +859,7 @@ mod tests {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 
-    const CTX: DecodeCtx = DecodeCtx { min_tick: 0.01, now_ms: 1791219886917, round_lot: 40, entry_min_tick: 0.001 };
+    const CTX: DecodeCtx = DecodeCtx { min_tick: 0.01, now_ms: 1791219886917, round_lot: 40, entry_min_tick: 0.001, rt_in_shares: false };
 
     // AAPL, 07/10/2026 (b4_generic_rest, frames 37, 333 and 258): the mark
     // price, the slow mark price (a block without a length, price tick
@@ -770,6 +883,46 @@ mod tests {
         assert_eq!(decode(SHORT_TERM_VOLUME, &volumes, &mut rec, CTX),
             vec![GenTick::Size(63, 1400.0), GenTick::Size(64, 3040.0), GenTick::Size(65, 7720.0)]);
         assert!(decode(SHORT_TERM_VOLUME, &volumes, &mut rec, CTX).is_empty());
+    }
+
+    // ibx#495: the index future premium is one double, tick 31 as it
+    // changes, for an index only (the reference 10.51 on SPX, 12/10/2026:
+    // tickGeneric 31 0.0004214518350973517).
+    // ibx#604: the average volume of the 10.51 form, in shares under 768,
+    // given in round lots rounded down (AAPL, a lot of 40, 19/10/2026:
+    // 44451884 gave 1111297); the 10.40 form gives none from it; 207 is
+    // given as it comes.
+    #[test]
+    fn average_volume_of_the_statistics_block() {
+        let ctx = |shares| DecodeCtx { min_tick: 0.01, now_ms: 0, round_lot: 40, entry_min_tick: 0.01, rt_in_shares: shares };
+        let shares = hex("000000010000030002a6482c00000000");
+        assert_eq!(decode(MISC_STATS, &shares, &mut GenericRecord::default(), ctx(true)), [GenTick::Size(21, 1111297.0)]);
+        assert!(decode(MISC_STATS, &shares, &mut GenericRecord::default(), ctx(false)).is_empty());
+        let lots = hex("00000001000000cf00118d2a00000000");
+        assert_eq!(decode(MISC_STATS, &lots, &mut GenericRecord::default(), ctx(true)), [GenTick::Size(21, 1150250.0)]);
+    }
+
+    #[test]
+    fn etf_net_asset_values() {
+        // ibx#641: the blocks of 13/10/2026 (SPY): 577 then 623.
+        let mut rec = GenericRecord::default();
+        let ctx = DecodeCtx { min_tick: 0.01, now_ms: 0, round_lot: 1, entry_min_tick: 0.01, rt_in_shares: true };
+        assert_eq!(decode(ETF_NAV_LAST, &hex("40884ef460000000"), &mut rec, ctx), [GenTick::Price(96, 777.86932373)]);
+        assert!(decode(ETF_FROZEN_NAV_LAST, &hex("bff0000000000000"), &mut rec, ctx).is_empty(), "-1 is no value");
+        assert!(decode(ETF_NAV_LAST, &hex("40884ef460000000"), &mut rec, ctx).is_empty(), "unchanged");
+        assert!(decode(ETF_NAV_LAST, &hex("0000000000000000"), &mut rec, ctx).is_empty(), "0 is no value (ibx#604)");
+        assert!(valid_for(ETF_NAV_LAST, "STK") && !valid_for(ETF_NAV_LAST, "OPT") && etf_only(ETF_FROZEN_NAV_LAST));
+        assert!(is_etf_type("ETF") && is_etf_type("ETMF") && !is_etf_type("COMMON"));
+    }
+
+    #[test]
+    fn index_future_premium() {
+        let mut rec = GenericRecord::default();
+        let d = 0.0004214518350973517_f64;
+        assert_eq!(decode(INDEX_FUTURE_PREMIUM, &d.to_be_bytes(), &mut rec, CTX), vec![GenTick::Generic(31, d)]);
+        assert!(decode(INDEX_FUTURE_PREMIUM, &d.to_be_bytes(), &mut rec, CTX).is_empty(), "no change");
+        assert!(sent(INDEX_FUTURE_PREMIUM) && at_once(INDEX_FUTURE_PREMIUM));
+        assert!(valid_for(INDEX_FUTURE_PREMIUM, "IND") && !valid_for(INDEX_FUTURE_PREMIUM, "STK"));
     }
 
     // The ratios in the order of the reference's map; the contract id and
@@ -802,7 +955,10 @@ mod tests {
     fn blocks_of_the_first_frame() {
         let mut rec = GenericRecord::default();
         let d = |code, h: &str, rec: &mut GenericRecord| decode(code, &hex(h), rec, CTX);
-        assert!(d(233, "4196af335ee3acb3000000000004589c000672c400000000", &mut rec).is_empty());
+        // The real-time volume of this 10.40 recording came in its lot form
+        // (the share form is #642's test).
+        let lots = |code, h: &str, rec: &mut GenericRecord| decode(code, &hex(h), rec, CTX);
+        assert!(lots(233, "4196af335ee3acb3000000000004589c000672c400000000", &mut rec).is_empty());
         assert!(d(375, "41910c15a777b785000000000003441d0001648d00000000", &mut rec).is_empty());
         assert_eq!(d(456, "00000018312e30362c312e312c32303236313130392c302e32372c34", &mut rec),
             vec![GenTick::Text(59, "1.06,1.10,20261109,0.27".into())]);
@@ -821,25 +977,76 @@ mod tests {
         assert_eq!(d(318, "00000000000000000800000100000000", &mut rec), vec![GenTick::Price(57, 0.0)]);
         assert_eq!(d(512, "3f8dc2be5611848d000000016ac32ef8", &mut rec), vec![GenTick::Generic(23, 0.23068199851119725)]);
         // Frame 9129: what traded since, then the shortable shares alone.
-        assert_eq!(d(233, "4196af870119def300000000000458ac000672ce00000000", &mut rec),
+        assert_eq!(lots(233, "4196af870119def300000000000458ac000672ce00000000", &mut rec),
             vec![GenTick::Text(48, "334.53;16.0000000000000000;1791219886917;284844.0000000000000000;334.04434805;false".into())]);
         assert_eq!(rule_price_text(334.5, tick_decimals(0.01)), "334.50");
         assert_eq!(d(375, "41910c599b4f1068000000000003442a0001649200000000", &mut rec),
             vec![GenTick::Text(77, "334.54;13.0000000000000000;1791219886917;214058.0000000000000000;334.04736486;false".into())]);
         assert_eq!(d(236, "000000030b566f1e", &mut rec), vec![GenTick::Size(89, 190213918.0)]);
         // Frames 9160 and 9213: one trade; a count change with no volume.
-        assert_eq!(d(233, "4196af8c3b48ec3a00000000000458ad000672cf00000000", &mut rec),
+        assert_eq!(lots(233, "4196af8c3b48ec3a00000000000458ad000672cf00000000", &mut rec),
             vec![GenTick::Text(48, "334.55;1.0000000000000000;1791219886917;284845.0000000000000000;334.04434981;true".into())]);
-        assert!(d(233, "4196af9175813e2500000000000458ae000672d200000000", &mut rec).len() == 1);
-        assert!(d(233, "4196af96afb29db400000000000458af000672d500000000", &mut rec).len() == 1);
-        assert_eq!(d(233, "4196af96afb29db400000000000458af000672d700000000", &mut rec),
+        assert!(lots(233, "4196af9175813e2500000000000458ae000672d200000000", &mut rec).len() == 1);
+        assert!(lots(233, "4196af96afb29db400000000000458af000672d500000000", &mut rec).len() == 1);
+        assert_eq!(lots(233, "4196af96afb29db400000000000458af000672d700000000", &mut rec),
             vec![GenTick::Text(48, ";0E-16;1791219886917;284847.0000000000000000;334.04435337;false".into())]);
+    }
+
+    // ibx#642: the real-time volume in its share form (asked as 765), two
+    // blocks of MSFT (round lot 40) of the reference 10.51's run of
+    // 13/10/2026, regular hours: one share traded, so the size is 0 lots
+    // and the price is that share's, as the reference gave it
+    // ('549.66;0E-16;...;151145...;548.54166701;false').
+    #[test]
+    fn share_forms_of_14_october() {
+        // ibx#641, the reference 10.51 on 14/10/2026: MSFT 766 blocks (round
+        // lot 40) and AAPL's 773 block, as the reference gave them.
+        let ctx = DecodeCtx { min_tick: 0.01, now_ms: 1791987034821, round_lot: 40, entry_min_tick: 0.01, rt_in_shares: true };
+        let mut rec = GenericRecord::default();
+        assert!(decode(RT_TRADE_VOLUME, &hex("41d3d6f13077d3ed00000000002565d200005d5100000000"), &mut rec, ctx).is_empty());
+        assert_eq!(decode(RT_TRADE_VOLUME, &hex("41d3d89e9508c9b0000000000025690000005d5f00000000"), &mut rec, ctx),
+            [GenTick::Text(77, "540.17;20.0000000000000000;1791987034821;61292.0000000000000000;543.23424127;false".into())]);
+        let ctx = DecodeCtx { round_lot: 100, ..ctx };
+        assert_eq!(decode(SHORT_TERM_VOLUME, &hex("00000004000000006acf8d380000000300056130000000050008a2000000000a000f2dc800000000"), &mut GenericRecord::default(), ctx),
+            [GenTick::Size(63, 352560.0), GenTick::Size(64, 565760.0), GenTick::Size(65, 994760.0)]);
+    }
+
+    #[test]
+    fn rt_volume_in_shares() {
+        let mut rec = GenericRecord::default();
+        let ctx = DecodeCtx { min_tick: 0.01, now_ms: 1791900393444, round_lot: 40, entry_min_tick: 0.01, rt_in_shares: true };
+        assert!(decode(RT_VOLUME, &hex("41e8b57e9b1c8ac300000000005c407600024a1600000000"), &mut rec, ctx).is_empty());
+        assert_eq!(decode(RT_VOLUME, &hex("41e8b57edfd1930500000000005c407700024a1a00000000"), &mut rec, ctx),
+            vec![GenTick::Text(48, "549.66;0E-16;1791900393444;151145.0000000000000000;548.54166701;false".into())]);
+        // With a lot above 1, a block with no change gives a string too.
+        assert_eq!(decode(RT_VOLUME, &hex("41e8b57edfd1930500000000005c407700024a1a00000000"), &mut rec, ctx).len(), 1);
+        assert_eq!((wire_code(RT_VOLUME), wire_code(RT_TRADE_VOLUME), wire_code(SHORT_TERM_VOLUME)), (765, 766, 773));
     }
 
     #[test]
     fn futures_open_interest() {
         let mut rec = GenericRecord::default();
         assert_eq!(decode(588, &hex("00020134"), &mut rec, CTX), vec![GenTick::Size(86, 131380.0)]);
+    }
+
+    // ibx#616, the blocks of the reference 10.51's odd-lot entry (paper,
+    // 12/10/2026, MSFT in regular hours, run r1 of `.tmp/632`, price tick
+    // 0.01): the first block unset gives nothing; then the ask 538.86 x 23
+    // on the exchange set 512; then 538.93 x 3 on 64; then an unset ask,
+    // nothing. The client got 106, 108, 110 twice.
+    #[test]
+    fn odd_lot_quotes_of_the_recording() {
+        let ctx = DecodeCtx { entry_min_tick: 0.01, ..CTX };
+        let mut rec = GenericRecord::default();
+        let mut ticks = |h: &str| decode(ODD_LOT, &hex(h), &mut rec, ctx);
+        assert!(ticks("04e424000ce42c003c0c84008c005800").is_empty());
+        assert_eq!(ticks("0e00d27e2c17890200"),
+            [GenTick::Price(106, 538.86), GenTick::Size(108, 23.0), GenTick::Text(110, "512".into())]);
+        assert_eq!(ticks("0e00d2852c038840"),
+            [GenTick::Price(106, 538.93), GenTick::Size(108, 3.0), GenTick::Text(110, "64".into())]);
+        assert!(ticks("0ce42c008800").is_empty());
+        assert_eq!(length_width(ODD_LOT), 0, "a list of quote entries");
+        assert!(at_once(ODD_LOT) && sent(ODD_LOT) && valid_for(ODD_LOT, "STK"));
     }
 
     #[test]

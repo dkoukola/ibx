@@ -4,7 +4,7 @@ open came; a snapshot with generic ticks is refused with 321."""
 
 from ibx import Contract, EClient, EWrapper
 
-GENERIC_REFUSAL = ("Error validating request.-'bQ' : cause - "
+GENERIC_REFUSAL = ("Error validating request.-'ReqMktData(1)' : cause - "
                    "Snapshot market data subscription is not applicable to generic ticks")
 
 
@@ -128,7 +128,8 @@ def test_currency_pair_snapshot_in_the_reference_order():
     c._test_dispatch_once()
     assert w.events == [
         ("mdt", 1), ("params", 0.00001),
-        ("string", 45, "1790921778"), ("generic", 49, 0.0),
+        # The reference 10.40 gave the halted state of 0 here; 10.51 gives none (ibx#494).
+        ("string", 45, "1790921778"),
         ("price", 6, 1.12585, False), ("price", 7, 1.1232, False), ("price", 9, 1.1243, False),
         ("price", 1, 1.12547, False), ("size", 0, 4_000_000.0),
         ("price", 2, 1.12549, False), ("size", 3, 12_000_000.0),

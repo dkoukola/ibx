@@ -44,9 +44,38 @@ fn connect_caches_reconnect_credentials() {
         host: "gw.example".into(),
         paper: true,
         core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     };
     cache_reconnect_credentials(&mut hot_loop, &config);
     assert!(hot_loop.has_reconnect_host());
+}
+
+/// The second-factor code provider of the client's config reaches the
+/// login, as the Python connect's does (ibx#350).
+#[test]
+fn code_provider_of_the_config_reaches_the_login() {
+    let provider: crate::auth::session::CodeProvider =
+        Arc::new(|c: crate::auth::session::IbKeyChallenge| Ok(format!("code-{}", c.display_id)));
+    let mut config = EClientConfig {
+        username: "user".into(),
+        password: "pass".into(),
+        host: "gw.example".into(),
+        paper: false,
+        core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: Some(provider),
+    };
+    let gw = gateway_config(&config);
+    let given = gw.code_provider.expect("provider forwarded");
+    let challenge = crate::auth::session::IbKeyChallenge { display_id: "123 456".into(), ..Default::default() };
+    assert_eq!(given(challenge).unwrap(), "code-123 456");
+    assert!(!gw.paper);
+
+    config.code_provider = None;
+    assert!(gateway_config(&config).code_provider.is_none());
 }
 
 /// Helper: create a test EClient backed by SharedState + channel.
@@ -261,8 +290,19 @@ fn parse_algo_pct_vol() {
 }
 
 #[test]
-fn parse_algo_unsupported() {
-    assert!(parse_algo_params("unknown", &[]).is_err());
+fn parse_algo_outside_the_list_goes_as_given() {
+    // ibx#622: no local refusal; the server's algo definitions check it.
+    let params = vec![
+        TagValue { tag: "timeBetweenOrders".into(), value: "60".into() },
+        TagValue { tag: "componentSize".into(), value: "1".into() },
+    ];
+    match parse_algo_params("AccuDistr", &params).unwrap() {
+        AlgoParams::Other { strategy, params } => {
+            assert_eq!(strategy, "AccuDistr");
+            assert_eq!(params, [("timeBetweenOrders".to_string(), "60".to_string()), ("componentSize".to_string(), "1".to_string())]);
+        }
+        other => panic!("wrong variant {other:?}"),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -312,18 +352,23 @@ fn next_order_id_monotonic() {
 // nothing.
 #[test]
 fn req_ids_calls_wrapper() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     let mut w = RecordingWrapper::default();
     client.req_ids(&mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, ["next_valid_id:1"]);
     shared.orders.note_reported_order_id(0, 68);
     client.req_ids(&mut w);
+    client.process_msgs(&mut w);
     client.req_ids(&mut w);
+    client.process_msgs(&mut w);
     shared.market.set_instrument_count(1);
     let lmt = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 1.0, ..Default::default() };
     client.place_order(80, &spy(), &lmt).unwrap();
     while rx.try_recv().is_ok() {}
     client.req_ids(&mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, ["next_valid_id:1", "next_valid_id:69", "next_valid_id:69", "next_valid_id:81"]);
     assert_eq!(client.next_order_id(), 81);
 }
@@ -471,8 +516,8 @@ fn req_tick_by_tick_data_types_and_local_refusals() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     for e in [
-        "error:20:321:Error validating request.-'bT' : cause - Tick-by-tick data type is incorrect/not set.",
-        "error:21:321:Error validating request.-'bT' : cause - 'BAG' security type is not supported in ReqTickByTick(97) request",
+        "error:20:321:Error validating request.-'ReqTickByTick(97)' : cause - Tick-by-tick data type is incorrect/not set.",
+        "error:21:321:Error validating request.-'ReqTickByTick(97)' : cause - 'BAG' security type is not supported in ReqTickByTick(97) request",
         "error:22:10189:Failed to request tick-by-tick data.AllLast tick-by-tick requests are not supported for SPY",
     ] {
         assert!(w.events.contains(&e.to_string()), "{e}: {:?}", w.events);
@@ -481,7 +526,7 @@ fn req_tick_by_tick_data_types_and_local_refusals() {
 
 fn tbt_trade(req_id: i64, tbt_type: TbtType, past_limit: bool, unreported: bool) -> TbtTrade {
     TbtTrade {
-        instrument: 0, req_id, tbt_type, price: 100 * PRICE_SCALE, size: 3, timestamp: 1,
+        instrument: 0, req_id, tbt_type, price: 100 * PRICE_SCALE, size: 3.0, timestamp: 1,
         exchange: "ARCA".into(), conditions: String::new(), past_limit, unreported,
     }
 }
@@ -552,7 +597,7 @@ fn cancel_tick_by_tick_unknown_req_id_no_panic() {
 fn place_order_market() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
-    let order = Order { action: "BUY".into(), total_quantity: 100.0, order_type: "MKT".into(), ..Default::default() };
+    let order = Order { action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "MKT".into(), ..Default::default() };
     client.place_order(1, &spy(), &order).unwrap();
 
     let cmd = rx.try_recv().unwrap();
@@ -567,7 +612,7 @@ fn place_order_limit() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 50.0, order_type: "LMT".into(),
+        action: "BUY".into(), total_quantity: 50.0, tif: "DAY".into(), order_type: "LMT".into(),
         lmt_price: 150.25, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -589,7 +634,7 @@ fn place_order_trailing_stop_carries_initial_trigger() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 1.0, order_type: "TRAIL".into(),
+        action: "SELL".into(), total_quantity: 1.0, tif: "DAY".into(), order_type: "TRAIL".into(),
         aux_price: 0.50,             // trail amount
         trail_stop_price: 10.00,     // initial stop trigger
         ..Default::default()
@@ -610,7 +655,7 @@ fn place_order_trailing_stop_without_trigger_is_unset() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 1.0, order_type: "TRAIL".into(),
+        action: "SELL".into(), total_quantity: 1.0, tif: "DAY".into(), order_type: "TRAIL".into(),
         aux_price: 0.50, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -629,7 +674,7 @@ fn place_order_adjustable_trail_carries_trailing_amount_and_unit() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 1.0, order_type: "STP".into(),
+        action: "SELL".into(), total_quantity: 1.0, tif: "DAY".into(), order_type: "STP".into(),
         aux_price: 11.00,                          // base stop price
         adjusted_order_type: "TRAIL".into(),
         trigger_price: 11.00,
@@ -673,6 +718,7 @@ fn place_order_adjustable_stop_child_keeps_parent_oca_and_tif() {
         tif: "GTC".into(),
         ..Default::default()
     };
+    known_parent(&client, 100);
     client.place_order(101, &spy(), &order).unwrap();
 
     match rx.try_recv().unwrap() {
@@ -701,7 +747,7 @@ fn place_order_adjustable_trail_percent_unit_passes_through() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 1.0, order_type: "STP".into(),
+        action: "SELL".into(), total_quantity: 1.0, tif: "DAY".into(), order_type: "STP".into(),
         aux_price: 11.00,
         adjusted_order_type: "TRAIL".into(),
         adjusted_trailing_amount: 1.00,            // 1.00%
@@ -741,6 +787,7 @@ fn place_order_limit_gtc_uses_limit_ex() {
 
 #[test]
 fn place_order_limit_hidden_uses_limit_ex() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -769,7 +816,8 @@ fn place_order_stop_with_parent_and_gtc_uses_submit_ex() {
         aux_price: 240.0, tif: "GTC".into(), parent_id: 42,
         oca_group: "77".into(), ..Default::default()
     };
-    client.place_order(1, &spy(), &order).unwrap();
+    known_parent(&client, 42);
+    client.place_order(43, &spy(), &order).unwrap();
 
     let cmd = rx.try_recv().unwrap();
     match cmd {
@@ -786,6 +834,7 @@ fn place_order_stop_with_parent_and_gtc_uses_submit_ex() {
 
 #[test]
 fn place_order_market_outside_rth_uses_submit_ex() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -830,8 +879,11 @@ fn place_order_trailing_amount_with_oca_uses_submit_ex() {
 }
 
 #[test]
-fn place_order_empty_tif_stays_plain() {
-    // tif "" is DAY (the official API default) — no extended routing.
+fn place_order_empty_tif_takes_the_preset() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    // ibx#660: at level 214 tif "" takes the account's order preset, which
+    // the engine reads: the order rides the extended path, marked for it;
+    // DAY does not.
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -839,25 +891,165 @@ fn place_order_empty_tif_stays_plain() {
         aux_price: 240.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
+    match rx.try_recv().unwrap() {
+        ControlCommand::Order(OrderRequest::SubmitEx { tif, attrs, .. }) => {
+            assert_eq!(tif, b'0');
+            assert!(attrs.tif_preset);
+        }
+        cmd => panic!("expected SubmitEx, got {:?}", cmd),
+    }
+    client.place_order(2, &spy(), &Order { tif: "DAY".into(), ..order.clone() }).unwrap();
     assert!(matches!(rx.try_recv().unwrap(),
         ControlCommand::Order(OrderRequest::SubmitStop { .. })));
+    // ibx#602: at the session's level (225) it is refused with 10052,
+    // nothing sent (the reference 10.51, paper, regular hours 13/10/2026).
+    crate::client_core::set_session_level_for_test(None);
+    shared.orders.drain_order_errors();
+    let _ = client.place_order(3, &spy(), &order);
+    assert!(rx.try_recv().is_err(), "nothing sent");
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert!(w.events.iter().any(|e| e.starts_with("error:3:10052:Invalid time in force:Empty")), "{:?}", w.events);
 }
 
-// ── ibx#226: transmit=false must be rejected, not silently ignored ──
+// ── ibx#509: an order with transmit off is held, and sent with its tree ──
 
+/// The order ids of the new orders in `rx`, in the order sent, and the
+/// ids of the held ones.
+fn sent_and_held(rx: &crossbeam_channel::Receiver<ControlCommand>) -> (Vec<i64>, Vec<i64>) {
+    let (mut sent, mut held) = (Vec::new(), Vec::new());
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            ControlCommand::Order(req) => sent.push(req.order_id()),
+            ControlCommand::OrderGroup(group) => sent.extend(group.iter().map(|req| req.order_id())),
+            ControlCommand::HoldOrder { order_id, .. } => held.push(order_id),
+            _ => {}
+        }
+    }
+    (sent, held)
+}
+
+fn limit(action: &str, price: f64, transmit: bool, parent_id: i64) -> Order {
+    Order {
+        action: action.into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: price,
+        transmit, parent_id, ..Default::default()
+    }
+}
+
+// The bracket recordings of 26/09/2026: parent and take-profit with
+// transmit off send nothing and answer nothing; the stop with transmit on
+// sends the three, in the order they were placed.
 #[test]
-fn place_order_transmit_false_is_rejected() {
+fn a_bracket_with_transmit_off_is_sent_together() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
-    let order = Order {
-        action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(),
-        lmt_price: 100.0, transmit: false, ..Default::default()
-    };
-    let err = client.place_order(1, &spy(), &order).unwrap_err();
-    assert!(err.to_string().contains("transmit=false"), "got: {}", err);
-    assert!(rx.try_recv().is_err(), "nothing may reach the engine");
+    client.place_order(3, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    client.place_order(4, &spy(), &limit("SELL", 400.0, false, 3)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![], vec![3, 4]));
+    assert!(shared.orders.drain_order_errors().is_empty());
+    assert!(client.core.collect_open_orders(&shared).is_empty(), "a held order is listed nowhere");
+    assert_eq!(client.core.next_valid_id(&shared), 5, "its id is used");
+
+    let stop = Order { order_type: "STP".into(), lmt_price: 0.0, aux_price: 50.0, ..limit("SELL", 0.0, true, 3) };
+    client.place_order(5, &spy(), &stop).unwrap();
+    // One group: the engine sends the three together (ibx#547).
+    assert!(matches!(rx.try_recv(), Ok(ControlCommand::OrderGroup(group))
+        if group.iter().map(|r| r.order_id()).collect::<Vec<_>>() == [3, 4, 5]));
+    assert!(rx.try_recv().is_err());
+    assert!(client.core.held_orders.lock().unwrap().is_empty());
+    let open: Vec<i64> = client.core.collect_open_orders(&shared).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(open.len(), 3, "{open:?}");
+    assert!(client.core.tracked_order(3).unwrap().transmit, "sent with transmit on");
 }
 
+// Paper 09/10/2026, the reference: a child with transmit on sends its
+// held parent; a parent placed again with transmit on goes out with its
+// new values and its held child; a held order with no link stays held,
+// also one of the same OCA group; placed again with transmit on, it is
+// sent with the new values.
+#[test]
+fn only_the_tree_of_the_placed_order_is_sent() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    // A held parent, an unrelated held order of an OCA group.
+    client.place_order(10, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    client.place_order(11, &spy(), &Order { oca_group: "g".into(), ..limit("BUY", 99.0, false, 0) }).unwrap();
+    client.place_order(12, &spy(), &limit("SELL", 400.0, true, 10)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![10, 12], vec![10, 11]));
+    client.place_order(13, &spy(), &Order { oca_group: "g".into(), ..limit("BUY", 98.0, true, 0) }).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![13], vec![]));
+    // The held order placed again: off, then on.
+    client.place_order(11, &spy(), &limit("BUY", 97.0, false, 0)).unwrap();
+    client.place_order(11, &spy(), &limit("BUY", 96.0, true, 0)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![11], vec![11]));
+    assert_eq!(client.core.tracked_order(11).unwrap().lmt_price, 96.0);
+
+    // A parent placed again with transmit on: its held child goes with it.
+    client.place_order(20, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    client.place_order(21, &spy(), &limit("SELL", 400.0, false, 20)).unwrap();
+    client.place_order(20, &spy(), &limit("BUY", 101.0, true, 0)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![20, 21], vec![20, 21]));
+    assert_eq!(client.core.tracked_order(20).unwrap().lmt_price, 101.0);
+}
+
+// ibx#547, paper 09/10/2026, the reference: an order placed with transmit
+// off is read and checked at once. One that a check refuses is not held;
+// the warnings of one that is held are given then, and not again when it
+// is sent.
+#[test]
+fn a_held_order_is_checked_when_it_is_placed() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    // A good-till date that is no date: refused, not held.
+    let bad = Order { tif: "GTD".into(), good_till_date: "notadate".into(), ..limit("BUY", 100.0, false, 0) };
+    client.place_order(60, &spy(), &bad).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![], vec![]));
+    assert_eq!(shared.orders.drain_order_errors().len(), 1);
+    assert!(client.core.held_orders.lock().unwrap().is_empty());
+    // An id below the highest one used: 103, not held.
+    client.place_order(70, &spy(), &limit("BUY", 100.0, true, 0)).unwrap();
+    client.place_order(65, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![70], vec![]));
+    assert_eq!(shared.orders.drain_order_errors().iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), [(65, 103)]);
+    // A time condition with no zone: the warning at the hold only.
+    let timed = |transmit| Order {
+        conditions: vec![OrderCondition::Time { time: "20991231 23:59:59".into(), is_more: true }],
+        ..limit("BUY", 100.0, transmit, 0)
+    };
+    client.place_order(80, &spy(), &timed(false)).unwrap();
+    assert_eq!(shared.orders.drain_order_errors().iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), [(80, 2174)]);
+    client.place_order(80, &spy(), &timed(true)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![80], vec![80]));
+    assert!(shared.orders.drain_order_errors().is_empty(), "no second warning");
+}
+
+// Paper 09/10/2026, the reference: a working order placed again with
+// transmit off stays as it is; the cancel of a held order goes to the
+// engine, which ends it, and the order is no longer held.
+#[test]
+fn a_working_order_with_transmit_off_is_left_and_a_held_order_can_be_cancelled() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    client.place_order(30, &spy(), &limit("BUY", 100.0, true, 0)).unwrap();
+    client.place_order(30, &spy(), &limit("BUY", 101.0, false, 0)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![30], vec![]));
+    assert_eq!(client.core.tracked_order(30).unwrap().lmt_price, 100.0);
+
+    client.place_order(31, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    client.cancel_order(31, "").unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![31], vec![31]), "the hold, then the cancel");
+    assert!(client.core.held_orders.lock().unwrap().is_empty());
+    client.place_order(32, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    client.req_global_cancel().unwrap();
+    assert!(client.core.held_orders.lock().unwrap().is_empty());
+}
+
+// ibx#688: a time in force that is not known is the reference's 10052
+// callback, nothing sent (observed on paper, 17/10/2026).
 #[test]
 fn place_order_unknown_tif_is_rejected() {
     let (client, rx, shared) = test_client();
@@ -866,16 +1058,17 @@ fn place_order_unknown_tif_is_rejected() {
         action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(),
         lmt_price: 100.0, tif: "XYZ".into(), ..Default::default()
     };
-    let err = client.place_order(1, &spy(), &order).unwrap_err();
-    assert!(err.to_string().contains("tif"), "got: {}", err);
-    assert!(rx.try_recv().is_err());
+    client.place_order(1, &spy(), &order).unwrap();
+    assert!(rx.try_recv().is_err(), "nothing sent");
+    assert_eq!(shared.orders.drain_order_errors(), [(1, 10052, "Invalid time in force:XYZ".to_string())]);
 }
 
 // ibx#263: the reference takes all-or-none on any order type; its
-// instruction field carries the type letter, then G (`jclient.pe.gI()`).
+// instruction field carries the type letter, then G.
 // ibx refused it on TRAIL and REL.
 #[test]
 fn place_order_all_or_none_trail_and_rel_are_sent() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     for (id, order_type, aux_price) in [(1, "TRAIL", 2.0), (2, "REL", 0.05)] {
@@ -892,9 +1085,10 @@ fn place_order_all_or_none_trail_and_rel_are_sent() {
 }
 
 // ibx#263: a trigger method the reference does not have is refused before
-// sending, 321 with error 146's text (`jextend.bH.S()@2257`).
+// sending, 321 with error 146's text.
 #[test]
 fn place_order_unknown_trigger_method_is_refused() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     for (id, trigger_method) in [(3, -1), (4, 5), (5, 6), (6, 9)] {
@@ -908,7 +1102,7 @@ fn place_order_unknown_trigger_method_is_refused() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     for id in 3..=6 {
-        let want = format!("error:{id}:321:Error validating request.-'bH' : cause - Invalid trigger method");
+        let want = format!("error:{id}:321:Error validating request.-'PlaceOrder(3)' : cause - Invalid trigger method");
         assert!(w.events.contains(&want), "{:?}", w.events);
     }
     for trigger_method in [0, 1, 2, 3, 4, 7, 8] {
@@ -938,7 +1132,7 @@ fn place_order_stop() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "STP".into(),
+        action: "SELL".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "STP".into(),
         aux_price: 145.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -958,7 +1152,7 @@ fn place_order_stop_limit() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "STP LMT".into(),
+        action: "SELL".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "STP LMT".into(),
         lmt_price: 144.0, aux_price: 145.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -978,7 +1172,7 @@ fn place_order_trailing_stop_amount() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "TRAIL".into(),
+        action: "SELL".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "TRAIL".into(),
         aux_price: 2.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -997,7 +1191,7 @@ fn place_order_trailing_stop_percent() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "TRAIL".into(),
+        action: "SELL".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "TRAIL".into(),
         trailing_percent: 5.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -1016,7 +1210,7 @@ fn place_order_trailing_stop_limit() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "TRAIL LIMIT".into(),
+        action: "SELL".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "TRAIL LIMIT".into(),
         lmt_price: 148.0, aux_price: 2.0, trail_stop_price: 150.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -1043,8 +1237,8 @@ fn fa_requests_on_a_non_fa_session_are_refused() {
     client.replace_fa(5, 1, "<ListOfGroups/>");
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
-    assert!(w.events.iter().any(|e| e == "error:2147483647:321:Error validating request.-'b9' : cause - FA data operations ignored for non FA customers."), "{:?}", w.events);
-    assert!(w.events.iter().any(|e| e == "error:5:321:Error validating request.-'b1' : cause - FA data operations ignored for non FA customers."), "{:?}", w.events);
+    assert!(w.events.iter().any(|e| e == "error:-1:321:Error validating request.-'ReqFA(18)' : cause - FA data operations ignored for non FA customers."), "{:?}", w.events);
+    assert!(w.events.iter().any(|e| e == "error:5:321:Error validating request.-'ReplaceFA(19)' : cause - FA data operations ignored for non FA customers."), "{:?}", w.events);
 
     // On an FA session there is no such error.
     shared.reference.set_fa_session(true);
@@ -1052,6 +1246,105 @@ fn fa_requests_on_a_non_fa_session_are_refused() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     assert!(!w.events.iter().any(|e| e.contains(":321:")), "{:?}", w.events);
+}
+
+// ibx#507 (the reference 10.51's rules, not observed yet): on an FA
+// session an FA method outside the list is refused (321, nothing sent);
+// an FA order sized by a percentage passes with size 0. Elsewhere the FA
+// fields are ignored: a size of 0 is refused as for any order.
+#[test]
+fn fa_method_and_percentage_sizing() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let lmt = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 1.0, tif: "DAY".into(),
+        fa_group: "Grp".into(), ..Default::default() };
+    let sized = Order { total_quantity: 0.0, fa_method: "PctChange".into(), fa_percentage: "50".into(), ..lmt.clone() };
+    client.place_order(1, &spy(), &sized).unwrap();
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert!(w.events.iter().any(|e| e.starts_with("error:1:321:") && e.contains("The size value cannot be zero")), "{:?}", w.events);
+    let _ = rx.try_iter().count();
+
+    shared.reference.set_fa_session(true);
+    client.place_order(2, &spy(), &Order { fa_method: "Percent".into(), ..lmt.clone() }).unwrap();
+    client.place_order(3, &spy(), &sized).unwrap();
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert!(w.events.iter().any(|e| e == "error:2:321:Error validating request.-'PlaceOrder(3)' : cause - Invalid FA method specified"), "{:?}", w.events);
+    // The first order on a group: warning 2184 only.
+    assert!(w.events.iter().filter(|e| e.starts_with("error:3:")).all(|e| e.starts_with("error:3:2184:")), "{:?}", w.events);
+    let sent: Vec<ControlCommand> = rx.try_iter().collect();
+    assert!(sent.iter().any(|c| matches!(c, ControlCommand::Order(r) if r.order_id() == 3)), "the sized order goes");
+    assert!(!sent.iter().any(|c| matches!(c, ControlCommand::Order(r) if r.order_id() == 2)), "nothing sent for 2");
+}
+
+// ibx#507 (the reference 10.51's rules, not observed yet: no FA account):
+// on an FA session, request_fa answers from the session's FA data and
+// replace_fa checks the document, replaces the data and sends its saves;
+// replace_fa_end when they are answered.
+#[test]
+fn fa_data_requests_on_an_fa_session() {
+    use crate::control::fa::{FaGroup, SAVED};
+    let (client, rx, shared) = test_client();
+    shared.reference.set_fa_session(true);
+    shared.reference.set_logon_features("FAONEGRP".into());
+    shared.reference.set_managed_accounts(vec!["U1".into(), "U2".into()]);
+    {
+        let mut data = shared.reference.fa_data();
+        data.groups = vec![FaGroup { name: "G".into(), accounts: vec!["U1".into()], method: Some("NetLiq".into()), ..Default::default() }];
+        data.aliases = vec![("U1".into(), "Main".into()), ("U2".into(), "U2".into())];
+    }
+    let events = |client: &EClient| {
+        let mut w = RecordingWrapper::default();
+        client.process_msgs(&mut w);
+        w.events
+    };
+    client.request_fa(1);
+    client.request_fa(2);
+    client.request_fa(3);
+    let got = events(&client);
+    assert!(got.iter().any(|e| e.starts_with("receive_fa:1:") && e.contains("<name>G</name>") && e.contains("<acct>U1</acct>")), "{got:?}");
+    assert!(got.iter().any(|e| e == "error:-1:321:Error validating request.-'ReqFA(18)' : cause - Non-existent FA data operation request."), "{got:?}");
+    assert!(got.iter().any(|e| e.starts_with("receive_fa:3:") && e.contains("<alias>Main</alias>")), "{got:?}");
+
+    client.replace_fa(5, 1, "");
+    client.replace_fa(6, 3, "<ListOfAccountAliases/>");
+    client.replace_fa(7, 1, "<ListOfGroups><Group><name>N</name><defaultMethod>NetLiq</defaultMethod>\
+        <ListOfAccts varName=\"list\"><Account><acct>U2</acct></Account></ListOfAccts></Group></ListOfGroups>");
+    client.request_fa(1);
+    let got = events(&client);
+    assert!(got.iter().any(|e| e == "error:5:321:Error validating request.-'ReplaceFA(19)' : cause - An XML string is required for this operation."), "{got:?}");
+    assert!(got.iter().any(|e| e.starts_with("error:6:10262:")), "{got:?}");
+    assert!(got.iter().any(|e| e.starts_with("error:-1:10230:You have unsaved FA changes")), "a save not answered: {got:?}");
+    let save = rx.try_iter().find_map(|c| match c { ControlCommand::FaSave { req_id, batches } => Some((req_id, batches)), _ => None });
+    let (req_id, batches) = save.expect("the saves sent");
+    assert_eq!(req_id, 7);
+    assert_eq!(batches[0].deletes, ["G"]);
+    assert_eq!(batches[0].saves.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["N"]);
+    assert_eq!(shared.reference.fa_data().groups[0].name, "N", "replaced at once");
+
+    // The saves answered: the end of the replace.
+    shared.reference.fa_data().pending_groups = 0;
+    shared.reference.push_fa_saved(7);
+    assert_eq!(events(&client), [format!("replace_fa_end:7:{SAVED}")]);
+
+    // A group whose own method is PctChange, used with no method: 321.
+    shared.reference.fa_data().groups.push(FaGroup { name: "Pct".into(), accounts: vec!["U1".into()], method: Some("PctChange".into()), ..Default::default() });
+    shared.market.set_instrument_count(1);
+    client.place_order(9, &spy(), &Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 1.0,
+        tif: "DAY".into(), fa_group: "Pct".into(), ..Default::default() }).unwrap();
+    let got = events(&client);
+    assert!(got.iter().any(|e| e == "error:9:321:Error validating request.-'PlaceOrder(3)' : cause - Group 'Pct' cannot be used \
+        without method specified. Use Advisor Setup tool to correct its definition"), "{got:?}");
+
+    // The first order on a group: 2184, once.
+    let on_group = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 1.0,
+        tif: "DAY".into(), account: "N".into(), ..Default::default() };
+    client.place_order(10, &spy(), &on_group).unwrap();
+    client.place_order(11, &spy(), &on_group).unwrap();
+    let got = events(&client);
+    assert_eq!(got.iter().filter(|e| e.contains(":2184:")).collect::<Vec<_>>(),
+        [&format!("error:10:2184:{}", crate::control::fa::GROUP_WARNING)], "{got:?}");
 }
 
 // ibx#443: the WSH requests get the reference's permission error from the
@@ -1086,12 +1379,58 @@ fn wsh_requests_get_the_permission_error() {
         "error:2:10277:News Feed requires permissions. Please login to Portal to subscribe.",
     ]);
 
+    // With the permission (ibx#443).
     shared.reference.set_news_sources(vec!["BRFG".into(), "wshe".into()]);
-    assert_eq!(answers(&client), [
-        "error:1:10279:Failed to request WSH meta data.The request is not supported.",
-        "error:2:10282:WSH meta data not requested.",
-    ]);
-    assert!(rx.try_recv().is_err(), "nothing sent");
+    let pass = |client: &EClient| {
+        let mut w = RecordingWrapper::default();
+        client.process_msgs(&mut w);
+        w.events.into_iter().filter(|e| e.starts_with("error:") || e.starts_with("wsh_")).collect::<Vec<_>>()
+    };
+    let sent = |rx: &crossbeam_channel::Receiver<ControlCommand>| -> Vec<(i64, bool, String)> {
+        rx.try_iter().filter_map(|c| match c {
+            ControlCommand::WshRequest { req_id, meta, body } => Some((req_id, meta, body)),
+            _ => None,
+        }).collect()
+    };
+    let contract = WshEventData { con_id: 8314, ..Default::default() };
+    // The event request needs the meta data first; one meta request at a time.
+    client.req_wsh_event_data(2, &contract);
+    client.req_wsh_meta_data(3);
+    client.req_wsh_meta_data(4);
+    assert_eq!(pass(&client), ["error:2:10282:WSH meta data not requested.", "error:4:10278:Duplicate WSH meta data request."]);
+    assert_eq!(sent(&rx), [(3, true, r#"{"calendar_request":{"client_capability":"Bw=="}}"#.to_string())]);
+    // The answer: rebuilt, held for the session, given at once to a later request.
+    let meta = crate::control::wsh::meta_answer("");
+    shared.reference.push_wsh_answer(crate::bridge::WshAnswer { req_id: 3, meta: true, ok: true, text: String::new() });
+    client.req_wsh_meta_data(5);
+    assert_eq!(pass(&client), [format!("wsh_meta_data:3:{meta}"), format!("wsh_meta_data:5:{meta}")]);
+    assert!(sent(&rx).is_empty(), "the meta data held is not asked again");
+    // The event request's checks, then one at a time.
+    client.req_wsh_event_data(6, &WshEventData { filter: "{}".into(), ..contract.clone() });
+    client.req_wsh_event_data(7, &WshEventData { con_id: i32::MAX, filter: "not json".into(), ..Default::default() });
+    client.req_wsh_event_data(8, &WshEventData { start_date: "2024-01-01".into(), ..contract.clone() });
+    client.req_wsh_event_data(9, &contract);
+    client.req_wsh_event_data(10, &contract);
+    assert_eq!(pass(&client), [
+        "error:6:10309:Invalid WSH event data request.",
+        "error:7:10283:Failed to request WSH event data.",
+        "error:10:10281:Duplicate WSH event data request.",
+    ], "a date that does not read gives nothing");
+    let asked = sent(&rx);
+    assert_eq!((asked.len(), asked[0].0, asked[0].1), (1, 9, false));
+    assert!(asked[0].2.contains(r#""filters":{"watchlist":["8314"]}"#), "{}", asked[0].2);
+    shared.reference.push_wsh_answer(crate::bridge::WshAnswer {
+        req_id: 9, meta: false, ok: true, text: r#"{"calendar":{"events":[{"b":1,"a":2}],"has_more":false}}"#.into(),
+    });
+    assert_eq!(pass(&client), [r#"wsh_event_data:9:[{"a":2,"b":1}]"#]);
+    // An error of the server, and an answer that does not read.
+    client.req_wsh_event_data(11, &contract);
+    shared.reference.push_wsh_answer(crate::bridge::WshAnswer { req_id: 11, meta: false, ok: false, text: "Server busy".into() });
+    client.req_wsh_event_data(12, &contract);
+    assert_eq!(pass(&client), ["error:11:10283:Failed to request WSH event data.Server busy"]);
+    shared.reference.push_wsh_answer(crate::bridge::WshAnswer { req_id: 12, meta: false, ok: true, text: "{}".into() });
+    assert_eq!(pass(&client), ["error:12:10283:Failed to request WSH event data.Unable to parse JSON object"]);
+    assert_eq!(sent(&rx).len(), 2);
 
     let unset = WshEventData::default();
     assert_eq!((unset.con_id, unset.total_limit), (i32::MAX, i32::MAX));
@@ -1125,9 +1464,17 @@ fn market_data_rejects_are_reported() {
     }
     shared.market.push_md_reject(crate::bridge::MdReject::Delayed { instrument: 0 });
     shared.market.push_md_reject(crate::bridge::MdReject::NotSubscribed {
-        instrument: 1, delayed_available: false, needs_api_subscription: false, description: String::new(), kept_params: None });
+        instrument: 1, delayed_available: false, needs_api_subscription: false, description: String::new(), kept_params: None, part: None, farm_text: String::new() });
+    let (tx, events) = crossbeam_channel::unbounded();
+    shared.attach_event_channel(&tx);
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
+    // The same errors on the event channel, with their request ids (ibx#498).
+    let on_channel: Vec<(i64, i64)> = events.try_iter().filter_map(|e| match e {
+        crate::bridge::Event::Error { req_id, code, .. } => Some((req_id, code)),
+        _ => None,
+    }).collect();
+    assert_eq!(on_channel, [(5, 10167), (6, 354)]);
     let at = |e: &str| w.events.iter().position(|x| x == e);
     let mdt = at("market_data_type:5:3").expect("type 3");
     let delayed = at("error:5:10167:Requested market data is not subscribed. Displaying delayed market data.").expect("10167");
@@ -1140,6 +1487,57 @@ fn market_data_rejects_are_reported() {
     assert_eq!(crate::client_core::delayed_tick_type(45), 88);
     assert!(!client.core.req_to_instrument.lock().unwrap().contains_key(&6));
     assert!(rx.try_iter().any(|c| matches!(c, ControlCommand::Unsubscribe { instrument: 1 })));
+}
+
+// ibx#650 (the reference 10.51, paper, 16/10/2026, BTC on PAXOS): one side
+// refused after the other was confirmed gives 10090 naming the side, then
+// 354 ending with the farm's text, and the request is gone.
+#[test]
+fn one_side_refused_gives_10090_then_354() {
+    let (client, _rx, shared) = test_client();
+    client.core.req_to_instrument.lock().unwrap().insert(9801, 1);
+    client.core.instrument_to_req.lock().unwrap().insert(1, vec![9801]);
+    shared.market.push_md_reject(crate::bridge::MdReject::NotSubscribed {
+        instrument: 1, delayed_available: false, needs_api_subscription: false,
+        description: "BTC Crypto (BTC) (BTC.USD) ".into(), kept_params: None, part: Some("BID_ASK"),
+        farm_text: "Error&PAXOS/CRYPTO/Top".into() });
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    let errors: Vec<&String> = w.events.iter().filter(|e| e.starts_with("error:")).collect();
+    assert_eq!(errors, [
+        "error:9801:10090:Part of requested market data is not subscribed. Subscription-independent ticks are still active.BTC Crypto (BTC) (BTC.USD) /TOP/BID_ASK",
+        &format!("error:9801:354:{}Error&PAXOS/CRYPTO/Top", crate::client_core::MD_NOT_SUBSCRIBED),
+    ]);
+    assert!(!client.core.req_to_instrument.lock().unwrap().contains_key(&9801));
+}
+
+// ibx#650 (the reference 10.51, paper, 16/10/2026, BMW on IBIS with
+// "233,236"): one side refused, a generic tick that works without it: 10090,
+// then 2117 listing it with the farm's text; the request goes on, its other
+// generic tick is cancelled, and no marketDataType follows.
+#[test]
+fn one_side_refused_with_a_kept_generic_tick_gives_2117() {
+    let (client, rx, shared) = test_client();
+    client.core.req_to_instrument.lock().unwrap().insert(813, 1);
+    client.core.instrument_to_req.lock().unwrap().insert(1, vec![813]);
+    client.core.md_generic.lock().unwrap().insert(813, crate::client_core::MdGeneric {
+        codes: vec![233, 236], exchange: "IBIS".into(), sec_type: "STK".into() });
+    shared.market.push_md_reject(crate::bridge::MdReject::NotSubscribed {
+        instrument: 1, delayed_available: false, needs_api_subscription: false,
+        description: "BMW IBIS".into(), kept_params: Some((f64::MAX, "250001".into(), 4)), part: Some("BID_ASK"),
+        farm_text: "Error&IBIS/STK/Top".into() });
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    let errors: Vec<&String> = w.events.iter().filter(|e| e.starts_with("error:")).collect();
+    assert_eq!(errors, [
+        "error:813:10090:Part of requested market data is not subscribed. Subscription-independent ticks are still active.BMW IBIS/TOP/BID_ASK",
+        "error:813:2117:Requested top market data is not subscribed. Subscription-independent ticks are still active.233; Error&IBIS/STK/Top",
+    ]);
+    assert!(w.events.iter().any(|e| e.starts_with("tick_req_params:813:")), "{:?}", w.events);
+    assert!(client.core.req_to_instrument.lock().unwrap().contains_key(&813), "the request goes on");
+    assert_eq!(client.core.md_generic.lock().unwrap()[&813].codes, [233]);
+    assert!(rx.try_iter().any(|c| matches!(c, ControlCommand::UnsubscribeGeneric { instrument: 1, ref codes } if *codes == [236])));
+    assert_eq!(client.core.check_mdt_needed(813, true), None, "no marketDataType");
 }
 
 // ibx#449: tickReqParams reaches the client once per request id, also
@@ -1189,7 +1587,7 @@ fn market_data_type_outside_one_to_four_is_refused() {
     assert_eq!(sent, [1, 2, 3, 4]);
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
-    let refused = "error:-1:321:Error validating request.-'b0' : cause - Invalid market data type".to_string();
+    let refused = "error:-1:321:Error validating request.-'ReqMarketDataType(59)' : cause - Invalid market data type".to_string();
     assert_eq!(w.events.iter().filter(|e| **e == refused).count(), 2, "{:?}", w.events);
 }
 
@@ -1198,6 +1596,7 @@ fn market_data_type_outside_one_to_four_is_refused() {
 // reference's text, and nothing is sent (captured 28/09/2026).
 #[test]
 fn customer_account_needs_the_account_config() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     shared.reference.set_account_config(vec!["OLP".into(), "EUCOSTCALC".into(), "EUILLS".into()], String::new());
@@ -1222,6 +1621,7 @@ fn customer_account_needs_the_account_config() {
 // order.
 #[test]
 fn customer_account_is_sent_when_the_account_config_allows_it() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     shared.reference.set_account_config(vec!["CUSTACCT".into()], String::new());
@@ -1238,11 +1638,13 @@ fn customer_account_is_sent_when_the_account_config_allows_it() {
 }
 
 // ibx#307: GTX and NMIN go out as GTC and the tracked order shows GTC, as
-// the reference (captured 28/09/2026: 59=1, openOrder tif GTC).
+// the reference 10.40 (captured 28/09/2026: time in force GTC on the wire,
+// openOrder tif GTC).
 #[test]
 fn gtx_and_nmin_go_out_as_gtc() {
     for tif in ["GTX", "nmin"] {
         let (client, rx, shared) = test_client();
+        shared.reference.set_form_10_40(true);
         shared.market.set_instrument_count(1);
         let order = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(),
             lmt_price: 100.0, tif: tif.into(), ..Default::default() };
@@ -1254,11 +1656,29 @@ fn gtx_and_nmin_go_out_as_gtc() {
     }
 }
 
+// ibx#604: the reference 10.51 refuses GTX and NMIN with 10052 and the text
+// as given, nothing sent (recorded 19/10/2026 pre-market, level 225).
+#[test]
+fn gtx_and_nmin_are_refused_on_10_51() {
+    for tif in ["GTX", "NMIN"] {
+        let (client, rx, shared) = test_client();
+        shared.market.set_instrument_count(1);
+        let order = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(),
+            lmt_price: 100.0, tif: tif.into(), ..Default::default() };
+        client.place_order(1, &spy(), &order).unwrap();
+        assert!(rx.try_recv().is_err(), "{tif}: nothing sent");
+        let mut w = RecordingWrapper::default();
+        client.process_msgs(&mut w);
+        assert!(w.events.iter().any(|e| e == &format!("error:1:10052:Invalid time in force:{tif}")), "{tif}: {:?}", w.events);
+    }
+}
+
 // ibx#469: the reference's other names for an order type give the same
 // request as ibx's name, and a modify under the other name is not a type
 // change.
 #[test]
 fn place_order_type_aliases() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     for (alias, name) in [("STOP LIMIT", "STP LMT"), ("stplmt", "STP LMT"), ("LIMIT", "LMT"), ("MKT TO LMT", "MTL"),
                           ("PEG PRIM", "REL"), ("TRAILING STOP", "TRAIL"), ("TRAILLMT", "TRAIL LIMIT")] {
         let order = |order_type: &str| Order {
@@ -1269,6 +1689,8 @@ fn place_order_type_aliases() {
         shared.market.set_instrument_count(1);
         client.place_order(1, &spy(), &order(alias)).unwrap();
         client.place_order(2, &spy(), &order(name)).unwrap();
+        acked(&client, 1);
+        acked(&client, 2);
         let a = format!("{:?}", rx.try_recv().unwrap()).replacen("order_id: 1", "order_id: 2", 1);
         let b = format!("{:?}", rx.try_recv().unwrap());
         assert_eq!(a, b, "{alias}");
@@ -1284,6 +1706,7 @@ fn place_order_type_aliases() {
 // each as an order of its own type.
 #[test]
 fn place_order_trail_mit_trail_lit_peg_best_rpi_and_passv_rel() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = |order_type: &str| Order {
@@ -1327,7 +1750,7 @@ fn place_order_trail_mit_trail_lit_peg_best_rpi_and_passv_rel() {
         client.place_order(id, &spy(), &no_trigger).unwrap();
         assert!(rx.try_iter().all(|c| !matches!(c, ControlCommand::Order(_))), "nothing sent");
         assert_eq!(shared.orders.drain_order_errors(),
-            [(id, 321, "Error validating request.-'bH' : cause - Please enter a stop price".to_string())]);
+            [(id, 321, "Error validating request.-'PlaceOrder(3)' : cause - Please enter a stop price".to_string())]);
     }
     client.place_order(15, &spy(), &Order { trail_stop_price: f64::MAX, ..order("TRAIL MIT") }).unwrap();
     assert!(rx.try_iter().any(|c| matches!(c, ControlCommand::Order(OrderRequest::SubmitEx {
@@ -1337,10 +1760,13 @@ fn place_order_trail_mit_trail_lit_peg_best_rpi_and_passv_rel() {
     assert!(client.place_order(11, &spy(), &Order { aux_price: 0.0, ..order("TRAIL LIT") }).is_err());
 }
 
-// ibx#467: a goodAfterTime that is not a date and time is refused with 337
-// and the reference's text; nothing is sent. A good one is sent.
+// ibx#688 (the reference 10.51, paper 15/10/2026): a goodAfterTime that
+// cannot be read is refused at once with 337, nothing sent (10.40 sent the
+// order without it, ibx#594); a time alone is today's (ibx#598). A good
+// one is sent.
 #[test]
-fn place_order_bad_good_after_time_is_refused() {
+fn place_order_unreadable_good_after_time_is_refused() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = |gat: &str| Order {
@@ -1349,26 +1775,36 @@ fn place_order_bad_good_after_time_is_refused() {
     };
     for (id, bad) in [(4, "tomorrow"), (5, "20261230"), (6, "20261230 25:00:00 US/Eastern"), (7, "20261230 09:30:00 Nowhere/Zone")] {
         client.place_order(id, &spy(), &order(bad)).unwrap();
+        assert!(rx.try_iter().all(|c| !matches!(c, ControlCommand::Order(_))), "{bad}: nothing sent");
     }
-    assert!(rx.try_iter().all(|c| !matches!(c, ControlCommand::Order(_))), "nothing sent");
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     for id in 4..=7 {
-        assert!(w.events.iter().any(|e| e.starts_with(&format!(
-            "error:{id}:337:Start Time: The date, time, or time-zone entered is invalid.\nThe correct format is yyyymmdd hh:mm:ss xx/xxxx\n"))),
-            "{id}: {:?}", w.events);
+        assert!(w.events.iter().any(|e| e.starts_with(&format!("error:{id}:337:Start Time: The date, time, or time-zone entered is invalid.\n"))), "{id}: {:?}", w.events);
     }
-
     client.place_order(8, &spy(), &order("20261230 09:30:00 US/Eastern")).unwrap();
     match rx.try_recv().unwrap() {
         ControlCommand::Order(OrderRequest::SubmitLimitEx { attrs, .. }) => assert_eq!(attrs.good_after, 1_798_641_000),
         other => panic!("expected SubmitLimitEx, got {:?}", other),
     }
+    // ibx#598: a time alone is sent as today's at that time, as the
+    // reference reads it (paper 12/10/2026).
+    client.place_order(10, &spy(), &order("09:30:00 US/Eastern")).unwrap();
+    match rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() {
+        ControlCommand::Order(OrderRequest::SubmitLimitEx { attrs, .. }) => {
+            let today = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::get("America/New_York").unwrap()).date();
+            let want = today.at(9, 30, 0, 0).in_tz("America/New_York").unwrap().timestamp().as_second();
+            assert_eq!(attrs.good_after, want);
+        }
+        other => panic!("expected SubmitLimitEx, got {:?}", other),
+    }
 }
 
-// ibx#335 (ib-agent#192 F6): a goodTillDate that does not parse, or whose
-// zone is not UTC, this machine's zone or the contract's zone, is refused
-// with 343; nothing is sent, the order does not go out without its expiry.
+// ibx#335 (ib-agent#192 F6): a goodTillDate whose zone is not UTC, this
+// machine's zone or the contract's zone is refused with 343; one that
+// does not parse, or whose zone does not exist, with 391 (ibx#548, paper
+// 11/10/2026). Nothing is sent, the order does not go out without its
+// expiry.
 #[test]
 fn place_order_bad_good_till_date_is_refused() {
     let (client, rx, shared) = test_client();
@@ -1398,8 +1834,10 @@ fn place_order_bad_good_till_date_is_refused() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     for (id, _) in &refused {
+        // 343 for what cannot be read too, on 10.51 (ibx#688).
+        let code = 343;
         assert!(w.events.iter().any(|e| e.starts_with(&format!(
-            "error:{id}:343:End Time: The date, time, or time-zone entered is invalid.\n"))),
+            "error:{id}:{code}:End Time: The date, time, or time-zone entered is invalid.\n"))),
             "{id}: {:?}", w.events);
     }
 
@@ -1418,6 +1856,7 @@ fn place_order_bad_good_till_date_is_refused() {
 
 #[test]
 fn place_order_trailing_stop_limit_without_stop_price_is_refused() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -1428,7 +1867,7 @@ fn place_order_trailing_stop_limit_without_stop_price_is_refused() {
     assert!(rx.try_iter().all(|c| !matches!(c, ControlCommand::Order(_))), "nothing sent");
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
-    assert!(w.events.iter().any(|e| e == "error:3:321:Error validating request.-'bH' : cause - Please enter a stop price"), "{:?}", w.events);
+    assert!(w.events.iter().any(|e| e == "error:3:321:Error validating request.-'PlaceOrder(3)' : cause - Please enter a trailing stop price"), "{:?}", w.events);
 }
 
 #[test]
@@ -1436,7 +1875,7 @@ fn place_order_moc() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "MOC".into(), ..Default::default()
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "MOC".into(), ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
 
@@ -1449,7 +1888,7 @@ fn place_order_loc() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "LOC".into(),
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "LOC".into(),
         lmt_price: 150.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -1463,7 +1902,7 @@ fn place_order_mit() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "MIT".into(),
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "MIT".into(),
         aux_price: 148.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -1477,7 +1916,7 @@ fn place_order_lit() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "LIT".into(),
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "LIT".into(),
         lmt_price: 150.0, aux_price: 148.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -1491,7 +1930,7 @@ fn place_order_mtl() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "MTL".into(), ..Default::default()
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "MTL".into(), ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
 
@@ -1504,7 +1943,7 @@ fn place_order_mkt_prt() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "MKT PRT".into(), ..Default::default()
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "MKT PRT".into(), ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
 
@@ -1517,7 +1956,7 @@ fn place_order_stp_prt() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "STP PRT".into(),
+        action: "SELL".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "STP PRT".into(),
         aux_price: 145.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -1531,7 +1970,7 @@ fn place_order_rel() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "REL".into(),
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "REL".into(),
         aux_price: 0.10, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -1545,7 +1984,7 @@ fn place_order_peg_mkt() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "PEG MKT".into(),
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "PEG MKT".into(),
         aux_price: 0.05, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -1559,7 +1998,7 @@ fn place_order_peg_mid() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "PEG MID".into(),
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "PEG MID".into(),
         aux_price: 0.02, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -1573,7 +2012,7 @@ fn place_order_midprice() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "MIDPRICE".into(),
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "MIDPRICE".into(),
         lmt_price: 150.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -1587,7 +2026,7 @@ fn place_order_snap_mkt() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "SNAP MKT".into(), ..Default::default()
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "SNAP MKT".into(), ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
 
@@ -1600,7 +2039,7 @@ fn place_order_snap_mid() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "SNAP MID".into(), ..Default::default()
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "SNAP MID".into(), ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
 
@@ -1613,7 +2052,7 @@ fn place_order_snap_pri() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "SNAP PRI".into(), ..Default::default()
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "SNAP PRIM".into(), ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
 
@@ -1621,12 +2060,29 @@ fn place_order_snap_pri() {
     assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitSnapPri { .. })));
 }
 
+// ibx#604: "SNAP PRI" is no order type of the reference 10.51: 321, nothing
+// sent (paper, 19/10/2026 pre-market; its name is SNAP PRIM).
+#[test]
+fn snap_pri_is_no_order_type() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "BUY".into(), total_quantity: 1.0, tif: "DAY".into(), order_type: "SNAP PRI".into(), ..Default::default()
+    };
+    client.place_order(1, &spy(), &order).unwrap();
+    assert!(rx.try_iter().all(|c| !matches!(c, ControlCommand::Order(_))), "nothing sent");
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    let want = "error:1:321:Error validating request.-'PlaceOrder(3)' : cause - Invalid order type was entered".to_string();
+    assert!(w.events.contains(&want), "{:?}", w.events);
+}
+
 #[test]
 fn place_order_box_top() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "BOX TOP".into(), ..Default::default()
+        action: "BUY".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "BOX TOP".into(), ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
 
@@ -1639,7 +2095,7 @@ fn place_order_sell_side() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 50.0, order_type: "MKT".into(), ..Default::default()
+        action: "SELL".into(), total_quantity: 50.0, tif: "DAY".into(), order_type: "MKT".into(), ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
 
@@ -1657,7 +2113,7 @@ fn place_order_short_sell_side() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SSHORT".into(), total_quantity: 50.0, order_type: "MKT".into(), ..Default::default()
+        action: "SSHORT".into(), total_quantity: 50.0, tif: "DAY".into(), order_type: "MKT".into(), ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
 
@@ -1672,6 +2128,7 @@ fn place_order_short_sell_side() {
 
 #[test]
 fn place_order_algo_vwap() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -1699,6 +2156,7 @@ fn place_order_algo_bracket_child_keeps_parent_oca_and_tif() {
         parent_id: 100, oca_group: "BR1".into(), tif: "GTC".into(),
         ..Default::default()
     };
+    known_parent(&client, 100);
     client.place_order(101, &spy(), &order).unwrap();
     match rx.try_recv().unwrap() {
         ControlCommand::Order(OrderRequest::SubmitLimitEx { tif, attrs, .. }) => {
@@ -1725,6 +2183,7 @@ fn place_order_algo_bracket_child_keeps_parent_oca_and_tif() {
 // was sent without them.
 #[test]
 fn place_order_with_only_conditions_keeps_them() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -1747,6 +2206,7 @@ fn place_order_with_only_conditions_keeps_them() {
 
 #[test]
 fn place_order_what_if() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -1819,7 +2279,7 @@ fn what_if_tracking_precedes_the_send_and_negative_ids_are_preserved() {
     shared.market.set_instrument_count(1);
     client.core.currency_sent.lock().unwrap().insert(756733, "USD".into());
     let (tx, rx) = crossbeam_channel::bounded(0);
-    client.control_tx = tx;
+    client.control_tx = tx.into();
     let client = Arc::new(client);
     let worker = client.clone();
     let task = std::thread::spawn(move || worker.place_order(-72, &spy(), &Order {
@@ -1948,6 +2408,7 @@ fn what_if_mixed_terminal_events_preserve_same_id_fifo_metadata() {
 // nothing is sent; the live order goes on.
 #[test]
 fn what_if_on_an_unanswered_order_id_is_a_duplicate() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let live = Order {
@@ -1958,12 +2419,12 @@ fn what_if_on_an_unanswered_order_id_is_a_duplicate() {
     client.place_order(79, &spy(), &Order { lmt_price: 168.46, what_if: true, ..live.clone() }).unwrap();
     assert!(rx.try_recv().is_err(), "nothing is sent");
     let errors = shared.orders.drain_order_errors();
-    assert_eq!(errors.iter().map(|e| (e.0, e.1, e.2.as_str())).collect::<Vec<_>>(), [(79, 103, "Duplicate order id")]);
+    assert_eq!(errors.iter().map(|e| (e.0, e.1, e.2.as_str())).collect::<Vec<_>>(), [(79, 103, "Duplicate order id: 79")]);
     assert_eq!(client.core.tracked_order(79).map(|o| o.what_if), Some(false));
     assert!(client.core.what_if_orders.lock().unwrap().is_empty());
 }
 
-// ibx#462 (`trader.order.bQ.a(gi, e3, fq)@263-321`; paper 02/10/2026 phase
+// ibx#462 (paper 02/10/2026 phase
 // 72): an order-message reply comes before the data reply. Each gives an
 // open_order, the first with no margins; the preview is kept until the
 // data reply, which carries the margins.
@@ -1991,6 +2452,7 @@ fn what_if_order_message_reply_then_data_reply() {
 // the reference's 321 and nothing is sent.
 #[test]
 fn what_if_with_transmit_off_is_refused() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let preview = Order {
@@ -2001,7 +2463,7 @@ fn what_if_with_transmit_off_is_refused() {
     assert!(rx.try_recv().is_err(), "nothing is sent");
     let errors = shared.orders.drain_order_errors();
     assert_eq!(errors.iter().map(|e| (e.0, e.1, e.2.as_str())).collect::<Vec<_>>(),
-        [(76, 321, "Error validating request.-'v' : cause - What-If order should have transmit flag set to TRUE.")]);
+        [(76, 321, "Error validating request.-'PlaceOrder(3)' : cause - What-If order should have transmit flag set to TRUE.")]);
 }
 
 // ibx#462, captured 02/10/2026: a refused what-if (a data reply with a
@@ -2028,6 +2490,7 @@ fn refused_what_if_gives_open_order_then_201() {
 // apart and answered with open_order only.
 #[test]
 fn what_if_on_a_working_order_id_is_a_preview_not_a_modify() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let working = Order {
@@ -2058,6 +2521,7 @@ fn what_if_on_a_working_order_id_is_a_preview_not_a_modify() {
 // real algo order.
 #[test]
 fn algo_what_if_is_a_preview() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     for algo in ["Adaptive", "Twap"] {
         let (client, rx, shared) = test_client();
         shared.market.set_instrument_count(1);
@@ -2073,33 +2537,49 @@ fn algo_what_if_is_a_preview() {
     }
 }
 
+// ibx#688: a name that is no order type is the reference's 321 callback,
+// nothing sent (observed on paper, 17/10/2026).
 #[test]
-fn place_order_unsupported_type_returns_error() {
-    let (client, _rx, shared) = test_client();
+fn place_order_unknown_type_is_refused_by_callback() {
+    let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
         action: "BUY".into(), total_quantity: 100.0, order_type: "FANTASY".into(), ..Default::default()
     };
-    let result = client.place_order(1, &spy(), &order);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("Unsupported order type"));
+    client.place_order(1, &spy(), &order).unwrap();
+    assert!(rx.try_recv().is_err(), "nothing sent");
+    assert_eq!(shared.orders.drain_order_errors(),
+        [(1, 321, "Error validating request.-'PlaceOrder(3)' : cause - Invalid order type was entered".to_string())]);
 }
 
 #[test]
-fn place_order_non_stk_contract_rejected() {
-    // A non-STK contract must be rejected, not silently sent as a stock order
-    // on the underlying. See: https://github.com/deepentropy/ibx/issues/202
+fn place_order_refusals_of_the_security_type() {
+    // ibx#666 (the reference 10.51, paper, 17/10/2026, market closed): a
+    // type the reference does not know, a news contract and a forward
+    // without local symbol or expiry are refused with 321 at once, nothing
+    // sent; a structured product goes on to the engine (its message is
+    // written), and a type is read without regard to case.
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
-    let opt = Contract { con_id: 999001, symbol: "AAPL".into(), sec_type: "OPT".into(), ..Default::default() };
-    let order = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "MKT".into(), ..Default::default() };
-    let result = client.place_order(1, &opt, &order);
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(err.contains("OPT"));
-    assert!(err.contains("STK"));
-    // No order must have been queued to the engine.
-    assert!(rx.try_recv().is_err());
+    let order = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 1.0, ..Default::default() };
+    let cases = [
+        ("XYZ", "AAPL", "SMART", "Please enter a valid security type"),
+        ("NEWS", "BRF:BRF_ALL", "BRF", "Missing order exchange."),
+        ("FWD", "EUR", "SMART", "Please enter a local symbol or an expiry"),
+    ];
+    for (i, (sec_type, symbol, exchange, cause)) in cases.into_iter().enumerate() {
+        let contract = Contract { symbol: symbol.into(), sec_type: sec_type.into(), exchange: exchange.into(), currency: "USD".into(), ..Default::default() };
+        client.place_order(i as i64 + 1, &contract, &order).unwrap();
+        assert!(rx.try_recv().is_err(), "nothing sent for {sec_type}");
+        assert_eq!(shared.orders.drain_order_errors(),
+            [(i as i64 + 1, 321, format!("Error validating request.-'PlaceOrder(3)' : cause - {cause}"))]);
+    }
+    let iopt = Contract { con_id: 411098772, symbol: "DAX".into(), sec_type: "IOPT".into(), exchange: "SBF".into(), ..Default::default() };
+    assert_eq!(ClientCore::order_contract_refusal(&iopt), None);
+    let lower = Contract { symbol: "AAPL".into(), sec_type: "stk".into(), exchange: "SMART".into(), ..Default::default() };
+    assert_eq!(ClientCore::order_contract_refusal(&lower), None);
+    let fwd = Contract { symbol: "EUR".into(), sec_type: "FWD".into(), exchange: "SMART".into(), local_symbol: "EUR.USD 1M".into(), ..Default::default() };
+    assert_eq!(ClientCore::order_contract_refusal(&fwd), None);
 }
 
 #[test]
@@ -2192,6 +2672,7 @@ fn guarded_combo_rejects_non_combo_and_what_if_before_authorization_or_queueing(
 
 #[test]
 fn place_order_explicit_stk_contract_accepted() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     // An explicit sec_type="STK" must still be accepted.
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
@@ -2214,14 +2695,15 @@ fn place_order_invalid_action_is_refused_with_321() {
     assert!(rx.try_recv().is_err(), "nothing sent");
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
-    assert!(w.events.contains(&"error:1:321:Error validating request.-'bH' : cause - Invalid side field was entered".to_string()),
+    assert!(w.events.contains(&"error:1:321:Error validating request.-'PlaceOrder(3)' : cause - Invalid side field was entered".to_string()),
         "{:?}", w.events);
 }
 
-// ibx#485: order id 0 is refused with 10149, as the reference
-// (`jextend.bH.W()@29-55`); ibx used to take the next id.
+// ibx#485: order id 0 is refused with 10149, as the reference does
+//; ibx used to take the next id.
 #[test]
 fn place_order_with_id_zero_is_refused_with_10149() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -2269,19 +2751,27 @@ fn req_global_cancel_without_contracts_still_goes() {
 //  Order validation — aux_price guards (issue #115)
 // ═══════════════════════════════════════════════════════════════════
 
-#[test]
-fn stp_order_with_zero_aux_price_is_rejected() {
-    let (client, _rx, shared) = test_client();
+/// An order of `order_type` with an auxPrice of 0 (and `lmt_price`): sent,
+/// no callback, as the reference 10.51 sends it and the server refuses it
+/// (ibx#688; paper, 18/10/2026, market closed). ibx used to fail the call
+/// (ibx#115).
+fn zero_offset_is_sent(order_type: &str, lmt_price: f64) {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "STP".into(),
-        lmt_price: 145.0, // common mistake: setting lmt_price instead of aux_price
-        aux_price: 0.0,
+        action: "SELL".into(), total_quantity: 100.0, order_type: order_type.into(), lmt_price, aux_price: 0.0,
         ..Default::default()
     };
-    let result = client.place_order(1, &spy(), &order);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("aux_price"));
+    client.place_order(1, &spy(), &order).unwrap();
+    assert!(rx.try_iter().any(|c| matches!(c, ControlCommand::Order(_))), "{order_type}: sent");
+    assert!(shared.orders.drain_order_errors().is_empty(), "{order_type}");
+}
+
+#[test]
+fn stp_order_with_zero_aux_price_is_sent() {
+    // A common mistake: the lmt_price set instead of the aux_price.
+    zero_offset_is_sent("STP", 145.0);
 }
 
 // The auxPrice left unset (the official API's default): the reference's
@@ -2289,11 +2779,12 @@ fn stp_order_with_zero_aux_price_is_rejected() {
 // their trigger price; nothing is sent.
 #[test]
 fn stop_types_with_unset_aux_price_get_the_reference_refusal() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let cases = [
         ("STP", "Please enter a stop price"), ("STP LMT", "Please enter a stop price"),
-        ("STP PRT", "Please enter a stop price"), ("MIT", "Invalid Trigger Price"), ("LIT", "Invalid Trigger Price"),
+        ("STP PRT", "Please enter a stop price"), ("MIT", "Please enter a trigger price"), ("LIT", "Please enter a trigger price"),
     ];
     for (i, (order_type, cause)) in cases.iter().enumerate() {
         let order = Order {
@@ -2305,7 +2796,7 @@ fn stop_types_with_unset_aux_price_get_the_reference_refusal() {
         assert!(rx.try_iter().all(|c| !matches!(c, ControlCommand::Order(_))), "{order_type}: nothing sent");
         let mut w = RecordingWrapper::default();
         client.process_msgs(&mut w);
-        let want = format!("error:{}:321:Error validating request.-'bH' : cause - {}", i + 1, cause);
+        let want = format!("error:{}:321:Error validating request.-'PlaceOrder(3)' : cause - {}", i + 1, cause);
         assert!(w.events.contains(&want), "{order_type}: {:?}", w.events);
     }
 }
@@ -2315,7 +2806,7 @@ fn stp_order_with_valid_aux_price_succeeds() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "STP".into(),
+        action: "SELL".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "STP".into(),
         aux_price: 145.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -2324,29 +2815,25 @@ fn stp_order_with_valid_aux_price_succeeds() {
 }
 
 #[test]
-fn stp_lmt_order_with_zero_aux_price_is_rejected() {
-    let (client, _rx, shared) = test_client();
-    shared.market.set_instrument_count(1);
-    let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "STP LMT".into(),
-        lmt_price: 144.0, aux_price: 0.0, ..Default::default()
-    };
-    let result = client.place_order(1, &spy(), &order);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("aux_price"));
+fn stp_lmt_order_with_zero_aux_price_is_sent() {
+    zero_offset_is_sent("STP LMT", 144.0);
 }
 
+// ibx#688: the reference's 321 callback, nothing sent (observed on paper,
+// 17/10/2026).
 #[test]
 fn trail_order_with_zero_amount_and_zero_percent_is_rejected() {
-    let (client, _rx, shared) = test_client();
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
         action: "SELL".into(), total_quantity: 100.0, order_type: "TRAIL".into(),
         ..Default::default() // neither trailing_percent nor aux_price
     };
-    let result = client.place_order(1, &spy(), &order);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("trailing_percent"));
+    client.place_order(1, &spy(), &order).unwrap();
+    assert!(rx.try_recv().is_err(), "nothing sent");
+    assert_eq!(shared.orders.drain_order_errors(), [(1, 321,
+        "Error validating request.-'PlaceOrder(3)' : cause - You must enter a Trailing Amount for TRAIL Order.".to_string())]);
 }
 
 #[test]
@@ -2354,7 +2841,7 @@ fn trail_order_with_trailing_percent_succeeds() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "TRAIL".into(),
+        action: "SELL".into(), total_quantity: 100.0, tif: "DAY".into(), order_type: "TRAIL".into(),
         trailing_percent: 5.0, ..Default::default()
     };
     client.place_order(1, &spy(), &order).unwrap();
@@ -2362,56 +2849,39 @@ fn trail_order_with_trailing_percent_succeeds() {
     assert!(matches!(cmd, ControlCommand::Order(OrderRequest::SubmitTrailingStopPct { .. })));
 }
 
+// ibx#688: without its trailing stop price, the reference asks for it
+// first (321 callback, observed on paper, 17/10/2026); with it, an order
+// without its trailing amount still fails in the call (not observed yet).
 #[test]
 fn trail_limit_order_with_zero_aux_price_is_rejected() {
-    let (client, _rx, shared) = test_client();
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
         action: "SELL".into(), total_quantity: 100.0, order_type: "TRAIL LIMIT".into(),
         lmt_price: 148.0, ..Default::default() // aux_price missing
     };
-    let result = client.place_order(1, &spy(), &order);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("aux_price"));
+    client.place_order(1, &spy(), &order).unwrap();
+    assert!(rx.try_recv().is_err(), "nothing sent");
+    assert_eq!(shared.orders.drain_order_errors(), [(1, 321,
+        "Error validating request.-'PlaceOrder(3)' : cause - Please enter a trailing stop price".to_string())]);
+    let with_stop = Order { trail_stop_price: 150.0, ..order };
+    assert!(client.place_order(2, &spy(), &with_stop).unwrap_err().contains("aux_price"));
 }
 
 #[test]
-fn mit_order_with_zero_aux_price_is_rejected() {
-    let (client, _rx, shared) = test_client();
-    shared.market.set_instrument_count(1);
-    let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "MIT".into(),
-        aux_price: 0.0, ..Default::default()
-    };
-    let result = client.place_order(1, &spy(), &order);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("aux_price"));
+fn mit_order_with_zero_aux_price_is_sent() {
+    zero_offset_is_sent("MIT", 0.0);
 }
 
 #[test]
-fn stp_prt_order_with_zero_aux_price_is_rejected() {
-    let (client, _rx, shared) = test_client();
-    shared.market.set_instrument_count(1);
-    let order = Order {
-        action: "SELL".into(), total_quantity: 100.0, order_type: "STP PRT".into(),
-        aux_price: 0.0, ..Default::default()
-    };
-    let result = client.place_order(1, &spy(), &order);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("aux_price"));
+fn stp_prt_order_with_zero_aux_price_is_sent() {
+    zero_offset_is_sent("STP PRT", 0.0);
 }
 
 #[test]
-fn lit_order_with_zero_aux_price_is_rejected() {
-    let (client, _rx, shared) = test_client();
-    shared.market.set_instrument_count(1);
-    let order = Order {
-        action: "BUY".into(), total_quantity: 100.0, order_type: "LIT".into(),
-        lmt_price: 150.0, aux_price: 0.0, ..Default::default()
-    };
-    let result = client.place_order(1, &spy(), &order);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("aux_price"));
+fn lit_order_with_zero_aux_price_is_sent() {
+    zero_offset_is_sent("LIT", 150.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2468,8 +2938,8 @@ fn req_historical_data_refuses_unknown_what_to_show_and_format_date() {
     client.req_historical_data(7, &spy(), "2026-01-02", "2 D", "1 min", "TRADES", true, 1, false).unwrap();
     assert!(rx.try_recv().is_err());
     let errors = shared.reference.drain_historical_errors();
-    assert_eq!(errors[0], (5, 321, "Error validating request.-'bM' : cause - What to show value of TRADE rejected.".to_string()));
-    assert_eq!(errors[1], (6, 321, "Error validating request.-'bM' : cause - Date formatting selection of 5 rejected.".to_string()));
+    assert_eq!(errors[0], (5, 321, "Error validating request.-'ReqHistoricalData(20)' : cause - What to show value of TRADE rejected.".to_string()));
+    assert_eq!(errors[1], (6, 321, "Error validating request.-'ReqHistoricalData(20)' : cause - Date formatting selection of 5 rejected.".to_string()));
     assert_eq!((errors[2].0, errors[2].1), (7, 10314));
 }
 
@@ -2477,7 +2947,9 @@ fn req_historical_data_refuses_unknown_what_to_show_and_format_date() {
 
 #[test]
 fn historical_requests_without_con_id_ask_for_the_contract_first() {
-    let (client, rx, _shared) = test_client();
+    let (client, rx, shared) = test_client();
+    // A logon that allows fundamentals (ibx#674).
+    shared.reference.set_logon_features("ALLOW_FNDT_SOMEAPI");
     let aapl = Contract { symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() };
     client.req_historical_data(1, &aapl, "", "1 D", "1 hour", "TRADES", true, 1, false).unwrap();
     client.req_head_time_stamp(2, &aapl, "TRADES", true, 1).unwrap();
@@ -2497,6 +2969,25 @@ fn historical_requests_without_con_id_ask_for_the_contract_first() {
     }
 }
 
+// ibx#643: a depth request by symbol is looked up first too, and the
+// lookup's conId reaches the depth request.
+#[test]
+fn depth_request_without_con_id_asks_for_the_contract_first() {
+    let (client, rx, _shared) = test_client();
+    let aapl = Contract { symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() };
+    client.req_mkt_depth(9, &aapl, 5, true).unwrap();
+    match rx.try_recv().unwrap() {
+        ControlCommand::ResolveContract { req_id: 9, request, .. } => {
+            let resolved = crate::engine::hot_loop::ccp::request_with_con_id(*request, 265598);
+            assert!(matches!(resolved, ControlCommand::SubscribeDepth { con_id: 265598, num_rows: 5, is_smart_depth: true, .. }));
+        }
+        other => panic!("expected ResolveContract, got {:?}", other),
+    }
+    let by_id = Contract { con_id: 265598, exchange: "SMART".into(), ..Default::default() };
+    client.req_mkt_depth(10, &by_id, 5, true).unwrap();
+    assert!(matches!(rx.try_recv().unwrap(), ControlCommand::SubscribeDepth { req_id: 10, con_id: 265598, .. }));
+}
+
 #[test]
 fn req_historical_data_sends_include_expired() {
     let (client, rx, _shared) = test_client();
@@ -2513,7 +3004,7 @@ fn req_historical_data_schedule_asks_for_the_trading_schedule() {
     client.req_historical_data(9, &spy(), "", "1 M", "1 hour", "SCHEDULE", true, 1, false).unwrap();
     assert!(rx.try_recv().is_err());
     assert_eq!(shared.reference.drain_historical_errors()[0].2,
-        "Error validating request.-'bM' : cause - Only daily resolution supported for Schedule requests");
+        "Error validating request.-'ReqHistoricalData(20)' : cause - Only daily resolution supported for Schedule requests");
 }
 
 #[test]
@@ -2530,9 +3021,9 @@ fn req_historical_data_streams_every_bar_size_and_refuses_as_the_reference() {
     assert!(rx.try_recv().is_err(), "no query");
     let errors: Vec<(i64, i32, String)> = shared.reference.drain_historical_errors();
     assert_eq!(errors, vec![
-        (6, 321, "Error validating request.-'bM' : cause - End date not supported with live updates".to_string()),
-        (7, 321, "Error validating request.-'bM' : cause - Source price not supported with live updates".to_string()),
-        (8, 321, "Error validating request.-'bM' : cause - Source price not supported with live updates".to_string()),
+        (6, 321, "Error validating request.-'ReqHistoricalData(20)' : cause - End date not supported with live updates".to_string()),
+        (7, 321, "Error validating request.-'ReqHistoricalData(20)' : cause - Source price not supported with live updates".to_string()),
+        (8, 321, "Error validating request.-'ReqHistoricalData(20)' : cause - Source price not supported with live updates".to_string()),
     ]);
 }
 
@@ -2704,9 +3195,9 @@ fn req_sec_def_opt_params_checks_then_sends() {
     client.process_msgs(&mut w);
     let errors: Vec<String> = w.events.iter().filter(|e| e.starts_with("error:")).cloned().collect();
     assert_eq!(errors, [
-        "error:2:321:Error validating request.-'cp' : cause - Invalid security type - OPT",
-        "error:3:321:Error validating request.-'cp' : cause - Missing exchange for security type FUT",
-        "error:4:321:Error validating request.-'cp' : cause - Invalid contract id",
+        "error:2:321:Error validating request.-'ReqSecDefOptParams(78)' : cause - Invalid security type - OPT",
+        "error:3:321:Error validating request.-'ReqSecDefOptParams(78)' : cause - Missing exchange for security type FUT",
+        "error:4:321:Error validating request.-'ReqSecDefOptParams(78)' : cause - Invalid contract id",
     ]);
 }
 
@@ -2747,11 +3238,11 @@ fn req_matching_symbols_checks_and_trims_the_pattern() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     let errors: Vec<String> = w.events.iter().filter(|e| e.starts_with("error:")).cloned().collect();
-    let empty = "error:2:321:Error validating request.-'ce' : cause - Pattern must not be empty";
+    let empty = "error:2:321:Error validating request.-'ReqMatchingSymbols(81)' : cause - Pattern must not be empty";
     assert_eq!(errors, [
         empty.to_string(), empty.to_string(), empty.to_string(),
-        "error:3:321:Error validating request.-'ce' : cause - Invalid pattern: 'MS\tFT'".to_string(),
-        "error:4:321:Error validating request.-'ce' : cause - Invalid pattern: 'Soci\u{e9}t\u{e9}'".to_string(),
+        "error:3:321:Error validating request.-'ReqMatchingSymbols(81)' : cause - Invalid pattern: 'MS\tFT'".to_string(),
+        "error:4:321:Error validating request.-'ReqMatchingSymbols(81)' : cause - Invalid pattern: 'Soci\u{e9}t\u{e9}'".to_string(),
     ]);
 }
 
@@ -2802,7 +3293,7 @@ fn option_identity_reaches_position_multi_and_portfolio_callbacks() {
     shared.reference.cache_contract(9, Contract { con_id: 9, ..Default::default() });
     shared.reference.cache_contract(9, contract.clone());
     shared.portfolio.set_position_info(PositionInfo {
-        con_id: 9, position_fixed: QTY_SCALE, avg_cost: 200 * PRICE_SCALE, ..Default::default()
+        con_id: 9, position_fixed: QTY_SCALE, avg_cost: 200.0, ..Default::default()
     });
     shared.portfolio.set_account_download_complete();
     seed_account_rows(&shared, true);
@@ -2820,10 +3311,13 @@ fn option_identity_reaches_position_multi_and_portfolio_callbacks() {
 fn req_positions_delivers_via_wrapper() {
     let (client, _rx, shared) = test_client();
     shared.portfolio.set_account_download_complete();
-    shared.portfolio.set_position_info(PositionInfo { con_id: 265598, position_fixed: (100) as i64 * crate::types::QTY_SCALE, avg_cost: 150 * PRICE_SCALE, ..Default::default() });
-    shared.portfolio.set_position_info(PositionInfo { con_id: 756733, position_fixed: (-50) as i64 * crate::types::QTY_SCALE, avg_cost: 400 * PRICE_SCALE, ..Default::default() });
+    // With their symbols, as the portfolio list gives them: a row known by
+    // its conId alone waits a little for its contract (ibx#742).
+    shared.portfolio.set_position_info(PositionInfo { con_id: 265598, position_fixed: (100) as i64 * crate::types::QTY_SCALE, avg_cost: 150.0, symbol: "AAPL".into(), ..Default::default() });
+    shared.portfolio.set_position_info(PositionInfo { con_id: 756733, position_fixed: (-50) as i64 * crate::types::QTY_SCALE, avg_cost: 400.0, symbol: "SPY".into(), ..Default::default() });
     let mut w = RecordingWrapper::default();
     client.req_positions(&mut w);
+    client.process_msgs(&mut w);
     let positions: Vec<_> = w.events.iter().filter(|e| e.starts_with("position:")).collect();
     assert_eq!(positions.len(), 2);
     assert!(w.events.last().unwrap() == "position_end");
@@ -2835,6 +3329,7 @@ fn req_positions_empty_still_calls_position_end() {
     shared.portfolio.set_account_download_complete();
     let mut w = RecordingWrapper::default();
     client.req_positions(&mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, vec!["position_end"]);
 }
 
@@ -2907,18 +3402,20 @@ fn req_scanner_subscription_refusals() {
     client.req_scanner_subscription(1, &sub, &[], &[tv("priceAbove", "")]).unwrap();
     client.req_scanner_subscription(2, &sub, &[tv("foo", "1")], &[]).unwrap();
     client.req_scanner_subscription(3, &sub, &[tv("manual", "2")], &[]).unwrap();
-    client.req_scanner_subscription(4, &sub, &[tv("manual", "1")], &[]).unwrap();
     assert!(rx.try_recv().is_err(), "nothing sent");
+    // 10.51 takes a valid manual option (ibx#591).
+    client.req_scanner_subscription(4, &sub, &[tv("manual", "1")], &[]).unwrap();
+    assert!(rx.try_recv().is_ok(), "the scan is asked");
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     for want in [
         "error:1:320:Error reading request:Not a key-value pair in generic options list: priceAbove=",
         "error:2:10337:Misc options key=foo is invalid in ReqScannerSubscription(22) request. Valid keys are: manual",
         "error:3:10338:Misc options value=2 is invalid for key=manual in ReqScannerSubscription(22) request. Valid values are: 0, 1",
-        "error:4:321:Error validating request.-'co' : cause - Historical data: 'manual' requires Verified API.",
     ] {
         assert!(w.events.iter().any(|e| e == want), "{want} not in {:?}", w.events);
     }
+    assert!(!w.events.iter().any(|e| e.starts_with("error:4:")), "{:?}", w.events);
 }
 
 #[test]
@@ -2984,11 +3481,11 @@ fn news_request_refusals() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     for want in [
-        "error:1:321:Error validating request.-'ca' : cause - Not subscribed for 'BZ' provider",
-        "error:2:321:Error validating request.-'ca' : cause - Not subscribed for '' provider",
-        "error:3:321:Error validating request.-'ca' : cause - Total results must be > 0",
-        "error:4:321:Error validating request.-'cg' : cause - Not subscribed for 'FLY' provider",
-        "error:5:321:Error validating request.-'cg' : cause - Article ID must not be empty",
+        "error:1:321:Error validating request.-'ReqHistoricalNews(86)' : cause - Not subscribed for 'BZ' provider",
+        "error:2:321:Error validating request.-'ReqHistoricalNews(86)' : cause - Not subscribed for '' provider",
+        "error:3:321:Error validating request.-'ReqHistoricalNews(86)' : cause - Total results must be > 0",
+        "error:4:321:Error validating request.-'ReqNewsArticle(84)' : cause - Not subscribed for 'FLY' provider",
+        "error:5:321:Error validating request.-'ReqNewsArticle(84)' : cause - Article ID must not be empty",
     ] {
         assert!(w.events.iter().any(|e| e == want), "{want} not in {:?}", w.events);
     }
@@ -3001,11 +3498,13 @@ fn news_request_refusals() {
 #[test]
 fn req_fundamental_data_sends_fetch() {
     let (client, rx, shared) = test_client();
+    // A logon that allows fundamentals (ibx#674).
+    shared.reference.set_logon_features("ALLOW_FNDT_SOMEAPI");
     // #434: only a stock may be asked; anything else is 321 at once.
     client.req_fundamental_data(5, &Contract { sec_type: String::new(), ..spy() }, "ReportSnapshot").unwrap();
     assert!(rx.try_recv().is_err());
     assert_eq!(shared.reference.drain_historical_errors(),
-        [(5, 321, "Error validating request.-'bL' : cause - Please enter a valid security type".to_string())]);
+        [(5, 321, "Error validating request.-'FundamentalsData(52)' : cause - Please enter a valid security type".to_string())]);
     let stock = Contract { sec_type: "STK".into(), ..spy() };
     client.req_fundamental_data(6, &stock, "ReportSnapshot").unwrap();
     let cmd = rx.try_recv().unwrap();
@@ -3364,6 +3863,7 @@ fn process_msgs_dispatches_partial_fill() {
 // PreSubmitted stays PreSubmitted (ib-agent#192 C8, pre-market fill).
 #[test]
 fn partial_fill_keeps_presubmitted() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, _rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -3425,7 +3925,7 @@ fn process_msgs_delivers_update_portfolio() {
     let (client, _rx, shared) = test_client();
     client.req_account_updates(true, "");
     shared.portfolio.set_position_info(crate::types::PositionInfo {
-        con_id: 756733, position_fixed: (18) as i64 * crate::types::QTY_SCALE, avg_cost: 723 * PRICE_SCALE, symbol: "SPY".into(),
+        con_id: 756733, position_fixed: (18) as i64 * crate::types::QTY_SCALE, avg_cost: 723.0, symbol: "SPY".into(),
         sec_type: "STK".into(), currency: "USD".into(),
         ..Default::default()
     });
@@ -3469,7 +3969,7 @@ fn process_msgs_reports_a_fractional_fill_in_shares() {
 
 // ibx#250, ibx#486: a server reject gives the Inactive status, then error
 // 201 with the reason, then the status once more, as the reference (every
-// 39=8 of the four-leg recordings of 26/09 to 02/10/2026).
+// rejected status report of the four-leg recordings of 26/09 to 02/10/2026).
 #[test]
 fn process_msgs_delivers_a_reject_error_after_the_status_and_the_status_again() {
     let (client, _rx, shared) = test_client();
@@ -3595,6 +4095,34 @@ fn process_msgs_dispatches_quotes_on_change() {
     assert!(w.events.iter().any(|e| e.starts_with("tick_price:1:1:149")));
 }
 
+// ibx#662: what is read from the state comes at its place among the
+// queued answers, as the reference gives the messages of its connection
+// in the order they came: a tick message written between two answers
+// comes between them, also when the client reads them in one pass.
+#[test]
+fn state_answers_come_at_their_place_among_the_queued_answers() {
+    let (client, _rx, shared) = test_client();
+    client.core.req_to_instrument.lock().unwrap().insert(1, 0);
+    client.core.instrument_to_req.lock().unwrap().insert(0, vec![1]);
+    let mut q = Quote::default();
+    shared.reference.push_contract_details_end(7);
+    shared.market.push_tick_req_params(crate::bridge::TickReqParams {
+        instrument: 0, min_tick: 0.01, bbo_exchange: "9c0001".into(), snapshot_permissions: 3,
+    });
+    shared.reference.push_contract_details_end(8);
+    q.bid = 150 * PRICE_SCALE;
+    shared.market.push_test_message(0, &q, &Default::default());
+    shared.reference.push_contract_details_end(9);
+    q.bid = 149 * PRICE_SCALE;
+    shared.market.push_test_message(0, &q, &Default::default());
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    let at = |prefix: &str| w.events.iter().position(|e| e.starts_with(prefix)).unwrap_or_else(|| panic!("{prefix}: {:?}", w.events));
+    let order = [at("contract_details_end:7"), at("tick_req_params:1"), at("contract_details_end:8"),
+        at("tick_price:1:1:150"), at("contract_details_end:9"), at("tick_price:1:1:149")];
+    assert!(order.windows(2).all(|p| p[0] < p[1]), "{:?}", w.events);
+}
+
 #[test]
 fn process_msgs_dispatches_all_quote_fields() {
     let (client, _rx, shared) = test_client();
@@ -3632,27 +4160,35 @@ fn process_msgs_dispatches_all_quote_fields() {
 }
 
 // ibx#287: a wire size of 1 reached the API as 0.0001, and a US stock's
-// sizes missed the round lot. AAPL, lot 40: bid 57 -> 2280, last 2 -> 80,
-// volume 1466 as on the wire.
+// sizes missed the round lot. AAPL, lot 40. The reference 10.51 has its
+// sizes in shares from the server: the wire sizes as they are. In the
+// 10.40 form (its replays) they came in round lots: bid 57 -> 2280,
+// last 2 -> 80; the volume as on the wire in both (ibx#663, ibx#604).
 #[test]
-fn api_sizes_are_wire_sizes_times_the_round_lot() {
+fn api_sizes_are_wire_sizes_and_times_the_round_lot_only_in_the_lot_form() {
     use crate::engine::market_state::MarketState;
     use crate::protocol::tick_decoder::{self as td, RawTick};
-    let (client, _rx, shared) = test_client();
-    let mut ms = MarketState::new();
-    let id = ms.register(265598);
-    ms.set_round_lot(id, 40);
-    for (tick_type, magnitude) in [(td::O_BID_SIZE, 57), (td::O_ASK_SIZE, 1), (td::O_LAST_SIZE, 2), (td::O_VOLUME, 1466)] {
-        ms.apply_tick(id, 0, false, &RawTick { server_tag: 1, tick_type, magnitude, stats_block: false, first: true });
-    }
-    shared.market.push_test_message(id, ms.quote(id), &Default::default());
-    client.core.req_to_instrument.lock().unwrap().insert(1, id);
-    client.core.instrument_to_req.lock().unwrap().insert(id, vec![1]);
+    for (lot_form, wants) in [
+        (false, ["tick_size:1:0:57", "tick_size:1:3:1", "tick_size:1:5:2", "tick_size:1:8:1466"]),
+        (true, ["tick_size:1:0:2280", "tick_size:1:3:40", "tick_size:1:5:80", "tick_size:1:8:1466"]),
+    ] {
+        let (client, _rx, shared) = test_client();
+        let mut ms = MarketState::new();
+        let id = ms.register(265598);
+        ms.set_round_lot(id, 40);
+        ms.set_lot_sizes(lot_form);
+        for (tick_type, magnitude) in [(td::O_BID_SIZE, 57), (td::O_ASK_SIZE, 1), (td::O_LAST_SIZE, 2), (td::O_VOLUME, 1466)] {
+            ms.apply_tick(id, 0, false, &RawTick { server_tag: 1, tick_type, magnitude, stats_block: false, first: true, scale: 0 });
+        }
+        shared.market.push_test_message(id, ms.quote(id), &Default::default());
+        client.core.req_to_instrument.lock().unwrap().insert(1, id);
+        client.core.instrument_to_req.lock().unwrap().insert(id, vec![1]);
 
-    let mut w = RecordingWrapper::default();
-    client.process_msgs(&mut w);
-    for want in ["tick_size:1:0:2280", "tick_size:1:3:40", "tick_size:1:5:80", "tick_size:1:8:1466"] {
-        assert!(w.events.iter().any(|e| e == want), "{want} missing in {:?}", w.events);
+        let mut w = RecordingWrapper::default();
+        client.process_msgs(&mut w);
+        for want in wants {
+            assert!(w.events.iter().any(|e| e == want), "lot form {lot_form}: {want} missing in {:?}", w.events);
+        }
     }
 }
 
@@ -3686,7 +4222,7 @@ fn process_msgs_dispatches_tbt_trade() {
     let (client, _rx, shared) = test_client();
     client.core.tbt_reqs.lock().unwrap().insert(10, (0, 756733, TbtType::Last));
     shared.market.push_tbt_trade(TbtTrade {
-        instrument: 0, req_id: 10, tbt_type: TbtType::Last, price: 150 * PRICE_SCALE, size: 100,
+        instrument: 0, req_id: 10, tbt_type: TbtType::Last, price: 150 * PRICE_SCALE, size: 100.0,
         timestamp: 1700000000, exchange: "ARCA".into(), conditions: "".into(), past_limit: false, unreported: false,
     });
     let mut w = RecordingWrapper::default();
@@ -3712,7 +4248,7 @@ fn process_msgs_tbt_goes_to_the_request_the_engine_names() {
     let (client, _rx, shared) = test_client();
     // No market data mapping: the tick names its request.
     shared.market.push_tbt_trade(TbtTrade {
-        instrument: 5, req_id: 42, tbt_type: TbtType::AllLast, price: 150 * PRICE_SCALE, size: 100,
+        instrument: 5, req_id: 42, tbt_type: TbtType::AllLast, price: 150 * PRICE_SCALE, size: 100.0,
         timestamp: 0, exchange: "".into(), conditions: "".into(), past_limit: false, unreported: false,
     });
     let mut w = RecordingWrapper::default();
@@ -3790,6 +4326,28 @@ fn process_msgs_dispatches_what_if() {
     // open_order only, as the reference answers a preview (ibx#462).
     assert!(w.events.iter().any(|e| e.starts_with("open_order:42:PreSubmitted")));
     assert!(!w.events.iter().any(|e| e.starts_with("order_status:42")));
+}
+
+// ibx#605 (the reference 10.51, paper, regular hours, 19/10/2026,
+// b1_462_whatif): the preview's openOrder shows the price management flag
+// the reply echoes, 1 or 0, and the compete values 100 and 0.02.
+#[test]
+fn a_what_if_shows_the_price_management_flag_of_its_reply() {
+    struct Flags(Vec<i32>);
+    impl Wrapper for Flags {
+        fn open_order(&mut self, _id: i64, _c: &Contract, order: &Order, _s: &crate::api::types::OrderState) {
+            self.0.push(order.use_price_mgmt_algo);
+            assert_eq!((order.min_compete_size, order.compete_against_best_offset), (100, 0.02));
+        }
+    }
+    let (client, _rx, shared) = test_client();
+    let mut with_flag = what_if_reply(42, [0.0; 3], [1.0; 3], 1.0);
+    with_flag.state.price_mgmt = true;
+    shared.orders.push_what_if(with_flag);
+    shared.orders.push_what_if(what_if_reply(43, [0.0; 3], [1.0; 3], 1.0));
+    let mut w = Flags(Vec::new());
+    client.process_msgs(&mut w);
+    assert_eq!(w.0, [1, 0]);
 }
 
 /// Regression: what-if dispatch must populate all 8 OrderState fields in
@@ -3943,13 +4501,33 @@ fn req_market_rule_answers_known_rules_and_refuses_others() {
     ]);
     let mut w = RecordingWrapper::default();
     client.req_market_rule(109, &mut w);
+    client.process_msgs(&mut w);
     client.req_market_rule(999999, &mut w);
+    client.process_msgs(&mut w);
     client.req_market_rule(5, &mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, vec![
         "market_rule:109:2".to_string(),
         "error:-1:322:Error processing request.-'cd' : cause - Market rule with id = 999999 is missing".to_string(),
         "error:-1:322:Error processing request.-'cd' : cause - Price increment rule for market rule with id = 5 is missing".to_string(),
     ]);
+}
+
+// ibx#498: an error the client answers itself (here the market rule
+// lookup) also goes to an attached event channel.
+#[test]
+fn an_error_answered_by_the_client_goes_to_the_event_channel() {
+    let (client, _rx, shared) = test_client();
+    let (tx, events) = crossbeam_channel::unbounded();
+    shared.attach_event_channel(&tx);
+    let mut w = RecordingWrapper::default();
+    client.req_market_rule(999999, &mut w);
+    client.process_msgs(&mut w);
+    assert_eq!(w.events.len(), 1);
+    match events.try_recv() {
+        Ok(crate::bridge::Event::Error { req_id: -1, code: 322, message }) => assert!(message.ends_with("999999 is missing")),
+        other => panic!("the 322 was expected on the channel: {other:?}"),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3959,10 +4537,114 @@ fn req_market_rule_answers_known_rules_and_refuses_others() {
 #[test]
 fn process_msgs_dispatches_scanner_params() {
     let (client, _rx, shared) = test_client();
-    shared.reference.push_scanner_params("<scanner>XML</scanner>".into());
+    shared.reference.push_scanner_params(scanner_parameters_with_vendors());
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     assert!(w.events.iter().any(|e| e == "scanner_parameters"));
+    // A text that cannot be rebuilt: no answer, as the reference (ibx#596).
+    shared.reference.push_scanner_params("<scanner>XML</scanner>".into());
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert!(!w.events.iter().any(|e| e == "scanner_parameters"));
+}
+
+/// Keeps the scanner parameters a client is given.
+#[derive(Default)]
+struct ScannerParameters(Vec<String>);
+
+impl Wrapper for ScannerParameters {
+    fn scanner_parameters(&mut self, xml: &str) {
+        self.0.push(xml.to_string());
+    }
+}
+
+/// A small document the rebuild accepts: three scan types, two of a
+/// vendor each.
+fn scanner_parameters_with_vendors() -> String {
+    let scan = |code: &str, vendor: &str| format!("<ScanType><scanCode>{code}</scanCode>{vendor}</ScanType>");
+    format!(
+        "<ScanParameterResponse><InstrumentList><Instrument><name>I</name></Instrument></InstrumentList>         <LocationTree><Location><locationCode>L</locationCode></Location></LocationTree>         <ScanTypeList>{}{}{}{}</ScanTypeList><FilterList varName=\"filterList\"/><SidecarScannerDefaults/></ScanParameterResponse>",
+        scan("S0", ""),
+        scan("S1", "<vendor>V1</vendor>"),
+        scan("S2", "<vendor>V2</vendor>"),
+        scan("S3", "<vendor>V3</vendor>"),
+    )
+}
+
+// ibx#571: the session of the scanner parameters is made of the names
+// of the logon feature list and of the news provider codes.
+#[test]
+fn scanner_session_is_made_of_the_logon_features_and_the_news_providers() {
+    use crate::control::scanner_params::Session;
+    let (_client, _rx, shared) = test_client();
+    assert_eq!(crate::client_core::scanner_session(&shared), Session::default());
+    shared.reference.set_logon_features("SECDEFTA,V1:2:x,,MOODY");
+    shared.reference.set_news_providers(vec![
+        NewsProvider { code: "V2".into(), name: "Two".into() },
+        NewsProvider { code: "BRFG".into(), name: "Briefing".into() },
+    ]);
+    let session = crate::client_core::scanner_session(&shared);
+    assert_eq!(session, Session::new("SECDEFTA,V1,MOODY", ["V2", "BRFG"]));
+    for name in ["SECDEFTA", "V1", "MOODY", "V2", "BRFG"] {
+        assert!(session.has(name), "{name}");
+    }
+    assert!(!session.has("V1:2:x") && !session.has("Two") && !session.no_research());
+    // The switch is a feature of the logon, not a news provider.
+    shared.reference.set_news_providers(vec![NewsProvider { code: "NORSRCH".into(), name: String::new() }]);
+    assert!(!crate::client_core::scanner_session(&shared).no_research());
+    shared.reference.set_logon_features("SECDEFTA,NORSRCH");
+    assert!(crate::client_core::scanner_session(&shared).no_research());
+}
+
+// ibx#571: the client gets the scanner parameters as the reference
+// hands them out, for what its session has; a text that cannot be
+// rebuilt gets no answer, as the reference (ibx#596).
+#[test]
+fn process_msgs_rebuilds_the_scanner_params_for_the_session() {
+    let (client, _rx, shared) = test_client();
+    shared.reference.set_logon_features("SECDEFTA,V1:2");
+    shared.reference.set_news_providers(vec![NewsProvider { code: "V2".into(), name: "Two".into() }]);
+    let server = scanner_parameters_with_vendors();
+    let (tx, events) = crossbeam_channel::unbounded();
+    shared.attach_event_channel(&tx);
+    shared.reference.push_scanner_params(server.clone());
+    shared.reference.push_scanner_params(server.clone());
+    shared.reference.push_scanner_params("<scanner>XML</scanner>".into());
+    shared.reference.push_scanner_params(server.clone());
+
+    let mut w = ScannerParameters::default();
+    client.process_msgs(&mut w);
+    let session = crate::control::scanner_params::Session::new("V1", ["V2"]);
+    let rebuilt = crate::control::scanner_params::for_client(&server, &session).expect("refused");
+    assert_eq!(w.0, [rebuilt.as_str(), rebuilt.as_str(), rebuilt.as_str()]);
+    assert!(rebuilt.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<ScanParameterResponse>
+	<InstrumentList varName=\"instrumentList\">
+"));
+    let codes: Vec<&str> = rebuilt.lines().filter_map(|l| l.trim().strip_prefix("<scanCode>")?.strip_suffix("</scanCode>")).collect();
+    assert_eq!(codes, ["S0", "S1", "S2"]);
+
+    // The event channel carries the callback's text (ibx#574), rebuilt on
+    // a thread of its own: the three answers of the text that rebuilds,
+    // none for the one refused.
+    let mut on_channel: Vec<String> = Vec::new();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while on_channel.len() < 3 && std::time::Instant::now() < until {
+        if let Ok(crate::bridge::Event::ScannerParameters(xml)) = events.recv_timeout(std::time::Duration::from_millis(50)) {
+            on_channel.push(xml);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    on_channel.extend(events.try_iter().filter_map(|e| match e {
+        crate::bridge::Event::ScannerParameters(xml) => Some(xml),
+        _ => None,
+    }));
+    assert_eq!(on_channel, [rebuilt.as_str(), rebuilt.as_str(), rebuilt.as_str()]);
+
+    // Nothing waits any more.
+    let mut w = ScannerParameters::default();
+    client.process_msgs(&mut w);
+    assert!(w.0.is_empty());
 }
 
 #[test]
@@ -4036,7 +4718,7 @@ fn process_msgs_dispatches_mkt_depth_exchanges() {
     let mut rows: Vec<crate::types::DepthMktDataDescription> = shared.reference.drain_depth_exchanges().unwrap();
     rows.sort_by(|a, b| (a.exchange.clone(), a.service_data_type.clone()).cmp(&(b.exchange.clone(), b.service_data_type.clone())));
     let got: Vec<String> = rows.iter().map(|d| format!("{}/{}/{}/{}/{}", d.exchange, d.sec_type, d.listing_exch, d.service_data_type, d.agg_group)).collect();
-    assert_eq!(got, ["NASDAQ/STK//Deep/-1", "NASDAQ/STK//Deep2/-1", "SMART/STK/OTCBB/AggDeep/1"]);
+    assert_eq!(got, ["NASDAQ/STK//Deep/2147483647", "NASDAQ/STK//Deep2/2147483647", "SMART/STK/OTCBB/AggDeep/1"]);
 
     let (client, _rx, shared) = test_client();
     shared.reference.set_depth_exchanges(rows);
@@ -4222,6 +4904,7 @@ fn process_msgs_live_fill_has_req_id_minus_one() {
 
 #[test]
 fn modify_limit_order_price_via_resubmit() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -4230,6 +4913,8 @@ fn modify_limit_order_price_via_resubmit() {
     };
     client.place_order(80, &spy(), &order).unwrap();
     while rx.try_recv().is_ok() {}
+    // The server answered it: a modify, no longer a new order (ibx#688).
+    acked(&client, 80);
 
     let modified = Order {
         action: "BUY".into(), total_quantity: 100.0,
@@ -4250,6 +4935,7 @@ fn modify_limit_order_price_via_resubmit() {
 
 #[test]
 fn modify_order_before_ack_no_panic() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     for price in 0..10 {
@@ -4262,7 +4948,11 @@ fn modify_order_before_ack_no_panic() {
     }
     let mut count = 0;
     while rx.try_recv().is_ok() { count += 1; }
-    assert!(count >= 10, "All modify attempts should send commands, got {}", count);
+    // Placed again before the server answered it: a modify each time, as
+    // the reference once the order went out (ibx#688, paper 18/10/2026);
+    // the engine answers 103 while it still holds the order.
+    assert_eq!(count, 10, "the order and nine modifies");
+    assert_eq!(shared.orders.drain_order_errors().iter().filter(|e| e.1 == 103).count(), 0);
 }
 
 #[test]
@@ -4316,6 +5006,7 @@ fn modify_reject_of_a_filled_order_gives_no_callback() {
 
 #[test]
 fn rapid_modify_multiple_prices_no_crash() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     for i in 0..50 {
@@ -4325,6 +5016,9 @@ fn rapid_modify_multiple_prices_no_crash() {
             ..Default::default()
         };
         let _ = client.place_order(77, &spy(), &order);
+        if i == 0 {
+            acked(&client, 77);
+        }
     }
     let mut order_count = 0;
     while let Ok(cmd) = rx.try_recv() {
@@ -4344,6 +5038,8 @@ fn modify_tif_day_to_gtc_via_resubmit() {
     };
     client.place_order(88, &spy(), &order).unwrap();
     while rx.try_recv().is_ok() {}
+    // The server answered it: a modify, no longer a new order (ibx#688).
+    acked(&client, 88);
 
     let modified = Order {
         action: "BUY".into(), total_quantity: 100.0,
@@ -4367,6 +5063,7 @@ fn modify_tif_day_to_gtc_via_resubmit() {
 
 #[test]
 fn modify_price_and_qty_simultaneously() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -4375,6 +5072,8 @@ fn modify_price_and_qty_simultaneously() {
     };
     client.place_order(55, &spy(), &order).unwrap();
     while rx.try_recv().is_ok() {}
+    // The server answered it: a modify, no longer a new order (ibx#688).
+    acked(&client, 55);
 
     let modified = Order {
         action: "BUY".into(), total_quantity: 200.0,
@@ -4395,9 +5094,10 @@ fn modify_price_and_qty_simultaneously() {
 
 // ibx#463: the reference refuses a modify that changes the side (105),
 // the OCA group (10326) or the OCA type (10327) before sending anything
-// (from the code read, ORDER-MODIFY.md 5). The order stays as placed.
+// (ORDER-MODIFY.md 5). The order stays as placed.
 #[test]
 fn modify_of_side_or_oca_is_refused_before_sending() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let placed = Order {
         action: "BUY".into(), total_quantity: 100.0, order_type: "LMT".into(), lmt_price: 150.0,
         oca_group: "G1".into(), oca_type: 2, ..Default::default()
@@ -4412,6 +5112,8 @@ fn modify_of_side_or_oca_is_refused_before_sending() {
         shared.market.set_instrument_count(1);
         client.place_order(70, &spy(), &placed).unwrap();
         while rx.try_recv().is_ok() {}
+        // The server answered it: a modify, no longer a new order (ibx#688).
+        acked(&client, 70);
         client.place_order(70, &spy(), &modified).unwrap();
         assert!(rx.try_recv().is_err(), "{code}: no replace is sent");
         assert_eq!(shared.orders.drain_order_errors(), [(70, code, text.to_string())]);
@@ -4429,6 +5131,7 @@ fn modify_of_side_or_oca_is_refused_before_sending() {
         shared.market.set_instrument_count(1);
         client.place_order(71, &spy(), &placed).unwrap();
         while rx.try_recv().is_ok() {}
+        acked(&client, 71);
         client.place_order(71, &spy(), &modified).unwrap();
         assert!(rx.try_iter().any(|c| matches!(c, ControlCommand::Order(OrderRequest::Modify { order_id: 71, .. }))));
         assert!(shared.orders.drain_order_errors().is_empty());
@@ -4439,8 +5142,11 @@ fn modify_of_side_or_oca_is_refused_before_sending() {
 // OVERNIGHT + DAY order as DAY and a DAY order with includeOvernight as
 // OVERNIGHT + DAY, reports that time in force, and refuses with 462 a
 // modify that restates another one. A modify with the held one goes out.
+// The rule of 10.40, kept for the replays of its recordings: 10.51
+// refuses the two overnight times in force at once (the test below,
+// ibx#660, ibx#604).
 #[test]
-fn modify_must_restate_the_held_overnight_time_in_force() {
+fn modify_must_restate_the_held_overnight_time_in_force_in_the_10_40_form() {
     let lmt = |tif: &str, include_overnight: bool, price: f64| Order {
         action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: price,
         tif: tif.into(), include_overnight, ..Default::default()
@@ -4452,9 +5158,13 @@ fn modify_must_restate_the_held_overnight_time_in_force() {
     ];
     for (tif, include_overnight, held, text) in cases {
         let (client, rx, shared) = test_client();
+        // The 10.40 form: 10.51 refuses these times in force (ibx#660).
+        shared.reference.set_form_10_40(true);
         shared.market.set_instrument_count(1);
         client.place_order(72, &spy(), &lmt(tif, include_overnight, 600.0)).unwrap();
         while rx.try_recv().is_ok() {}
+        // The server answered it: a modify, no longer a new order (ibx#688).
+        acked(&client, 72);
         assert_eq!(client.core.tracked_order(72).map(|o| o.tif).as_deref(), Some(held), "{tif}");
 
         // The placed time in force again: refused, nothing sent.
@@ -4469,12 +5179,63 @@ fn modify_must_restate_the_held_overnight_time_in_force() {
     }
 }
 
-// The reference checks the side before the order type (from the code
-// read: both side checks of a modify run before its order-type check): a
+// ibx#660 (the reference 10.51, paper, 13/10/2026, client at level 214):
+// the overnight times in force are refused with 10052 at once, nothing
+// sent; the cancel then gives 10147.
+#[test]
+fn overnight_times_in_force_are_refused() {
+    for tif in ["OVERNIGHT", "OVERNIGHT + DAY"] {
+        let (client, rx, shared) = test_client();
+        shared.market.set_instrument_count(1);
+        let order = Order {
+            action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 100.0,
+            tif: tif.into(), ..Default::default()
+        };
+        client.place_order(74, &spy(), &order).unwrap();
+        assert!(rx.try_recv().is_err(), "{tif}: nothing sent");
+        assert_eq!(shared.orders.drain_order_errors(), [(74, 10052, format!("Invalid time in force:{tif}"))]);
+    }
+}
+
+// ibx#674 (the reference 10.51, paper, 13/10/2026): without the
+// logon's permission, generic tick 258 is refused with 10358, also in a
+// snapshot, and so is reqFundamentalData; nothing sent.
+#[test]
+fn fundamentals_without_the_logon_permission_are_refused() {
+    let (client, rx, shared) = test_client();
+    let bmw = Contract { symbol: "BMW".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "EUR".into(), con_id: 14204, ..Default::default() };
+    client.req_mkt_data(1, &bmw, "233,236,258", false, false).unwrap();
+    client.req_mkt_data(2, &bmw, "258", true, false).unwrap();
+    client.req_fundamental_data(3, &bmw, "ReportSnapshot").unwrap();
+    assert!(rx.try_recv().is_err(), "nothing sent");
+    let text = "Fundamentals data is not allowed.".to_string();
+    assert_eq!(shared.orders.drain_order_errors(), [(1, 10358, text.clone()), (2, 10358, text.clone())]);
+    assert_eq!(shared.reference.drain_historical_errors(), [(3, 10358, text)]);
+}
+
+// ibx#660 (the reference 10.51, paper, 13/10/2026): a Minutes time in
+// force goes out with its own code, which the server judges (it rejected
+// it with 201 on a SMART stock); ibx refused it locally.
+#[test]
+fn minutes_time_in_force_goes_out() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order {
+        action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 100.0,
+        tif: "Minutes".into(), ..Default::default()
+    };
+    client.place_order(75, &spy(), &order).unwrap();
+    assert!(matches!(rx.try_recv().unwrap(), ControlCommand::Order(OrderRequest::SubmitLimitEx { tif: b'p', .. })));
+    assert!(shared.orders.drain_order_errors().is_empty());
+}
+
+// The reference checks the side before the order type (both side
+// checks of a modify run before its order-type check): a
 // BUY LMT modified into a BUY STP gets 329 (captured, ib-agent#192 A4b),
 // into a SELL STP gets 105. Nothing is sent either way.
 #[test]
 fn modify_type_change_gets_329_and_a_side_change_105_first() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     for (action, code) in [("BUY", 329), ("SELL", 105)] {
         let (client, rx, shared) = test_client();
         shared.market.set_instrument_count(1);
@@ -4483,6 +5244,8 @@ fn modify_type_change_gets_329_and_a_side_change_105_first() {
         };
         client.place_order(57, &spy(), &placed).unwrap();
         while rx.try_recv().is_ok() {}
+        // The server answered it: a modify, no longer a new order (ibx#688).
+        acked(&client, 57);
         let stp = Order {
             action: action.into(), total_quantity: 1.0, order_type: "STP".into(), aux_price: 195.0, ..Default::default()
         };
@@ -4496,6 +5259,7 @@ fn modify_type_change_gets_329_and_a_side_change_105_first() {
 
 #[test]
 fn modify_order_type_lmt_to_stp() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -4504,6 +5268,8 @@ fn modify_order_type_lmt_to_stp() {
     };
     client.place_order(66, &spy(), &order).unwrap();
     while rx.try_recv().is_ok() {}
+    // The server answered it: a modify, no longer a new order (ibx#688).
+    acked(&client, 66);
 
     let modified = Order {
         action: "BUY".into(), total_quantity: 100.0,
@@ -4545,6 +5311,8 @@ fn modify_of(first: Order, second: Order) -> (u32, OrderKind, u8, OrderAttrs) {
     shared.market.set_instrument_count(1);
     client.place_order(90, &spy(), &first).unwrap();
     while rx.try_recv().is_ok() {}
+    // The server answered it: a modify, no longer a new order (ibx#688).
+    acked(&client, 90);
     client.place_order(90, &spy(), &second).unwrap();
     match rx.try_recv().unwrap() {
         ControlCommand::Order(OrderRequest::Modify { order_id: 90, qty, kind, tif, attrs, .. }) => (qty, kind, tif, attrs),
@@ -4555,6 +5323,7 @@ fn modify_of(first: Order, second: Order) -> (u32, OrderKind, u8, OrderAttrs) {
 // ibx#324: a stop modify must carry the new trigger, not a limit price of 0.
 #[test]
 fn modify_stop_moves_the_trigger() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let stp = |aux: f64| Order {
         action: "SELL".into(), total_quantity: 1.0, order_type: "STP".into(), aux_price: aux, ..Default::default()
     };
@@ -4565,6 +5334,7 @@ fn modify_stop_moves_the_trigger() {
 // ibx#324: a stop-limit modify moves both prices.
 #[test]
 fn modify_stop_limit_moves_both_prices() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let stp_lmt = |lmt: f64, aux: f64| Order {
         action: "SELL".into(), total_quantity: 1.0, order_type: "STP LMT".into(),
         lmt_price: lmt, aux_price: aux, ..Default::default()
@@ -4577,6 +5347,7 @@ fn modify_stop_limit_moves_both_prices() {
 // ibx#334: a trailing modify keeps its trailing kind and amount / percent.
 #[test]
 fn modify_trailing_keeps_the_trail() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let trail = |aux: f64| Order {
         action: "SELL".into(), total_quantity: 1.0, order_type: "TRAIL".into(), aux_price: aux, ..Default::default()
     };
@@ -4597,7 +5368,7 @@ fn percent_trail_rounds_to_basis_points() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
-        action: "SELL".into(), total_quantity: 1.0, order_type: "TRAIL".into(),
+        action: "SELL".into(), total_quantity: 1.0, tif: "DAY".into(), order_type: "TRAIL".into(),
         trailing_percent: 1.15, ..Default::default()
     };
     client.place_order(91, &spy(), &order).unwrap();
@@ -4613,6 +5384,7 @@ fn percent_trail_rounds_to_basis_points() {
 // error 10243 (ib-agent#192 B3).
 #[test]
 fn fractional_quantity_is_refused_before_sending() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -4632,6 +5404,7 @@ fn fractional_quantity_is_refused_before_sending() {
 // the server sent.
 #[test]
 fn bad_algo_parameter_values_are_refused_before_sending() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let cases: [(&str, &str, &str, &str); 6] = [
         ("Twap", "strategyType", "Marketable", "443:Order processing failed. Unknown algo attribute:strategyType"),
         ("Adaptive", "adaptivePriority", "Bogus", "145:Error in validating entry fields -Bogus"),
@@ -4669,6 +5442,7 @@ fn bad_algo_parameter_values_are_refused_before_sending() {
 // nothing is sent, the definitions of that day loaded.
 #[test]
 fn algo_refusals_of_20261002_through_place_order() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     type Case = (&'static str, Vec<(&'static str, &'static str)>, f64, &'static str);
     let cases: [Case; 5] = [
         ("Foo", vec![], 165.16, "439:Order processing failed. Algorithm definition not found"),
@@ -4705,6 +5479,39 @@ fn algo_refusals_of_20261002_through_place_order() {
     client.place_order(85, &spy(), &order).unwrap();
     assert!(rx.try_recv().is_err());
     assert_eq!(shared.orders.drain_order_errors().iter().map(|e| e.1).collect::<Vec<_>>(), [110]);
+}
+
+// ibx#622 (paper 12/10/2026, .tmp/607 cases b and E): an AccuDistr order
+// is sent with its parameters; one with a parameter the definitions do
+// not have is refused with 443 and nothing is sent, as the reference.
+#[test]
+fn accu_distr_through_place_order() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let place = |id: i64, params: &[(&str, &str)]| {
+        let (client, rx, shared) = test_client();
+        shared.market.set_instrument_count(1);
+        shared.reference.add_algo_definitions(include_str!("../../../tests/fixtures/algo/IBALGO-AE-20261002.xml"));
+        shared.reference.add_algo_definitions(include_str!("../../../tests/fixtures/algo/IBALGO-AL-STK-20261002.xml"));
+        let order = Order {
+            action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 1.0,
+            algo_strategy: "AccuDistr".into(),
+            algo_params: params.iter().map(|(t, v)| TagValue { tag: t.to_string(), value: v.to_string() }).collect(),
+            ..Default::default()
+        };
+        client.place_order(id, &spy(), &order).unwrap();
+        let mut w = RecordingWrapper::default();
+        client.process_msgs(&mut w);
+        (rx.try_iter().collect::<Vec<_>>(), w.events)
+    };
+    let (sent, events) = place(90, &[("componentSize", "1"), ("timeBetweenOrders", "60"),
+        ("randomizeTime20", "0"), ("randomizeSize55", "0")]);
+    assert!(sent.iter().any(|cmd| matches!(cmd, ControlCommand::Order(OrderRequest::SubmitLimitEx {
+        attrs: crate::types::OrderAttrs { algo: Some(crate::types::OrderAlgo::Params(AlgoParams::Other { .. })), .. }, .. }))),
+        "{sent:?}");
+    assert!(!events.iter().any(|e| e.starts_with("error:90")), "{events:?}");
+    let (sent, events) = place(91, &[("componentSize", "1"), ("giveUp", "1")]);
+    assert!(!sent.iter().any(|cmd| matches!(cmd, ControlCommand::Order(_))), "{sent:?}");
+    assert!(events.contains(&"error:91:443:Order processing failed. Unknown algo attribute:giveUp".to_string()), "{events:?}");
 }
 
 // ibx#416, captured 02/10/2026 (b1_416_time_condition): a time condition
@@ -4752,6 +5559,7 @@ fn time_condition_through_place_order() {
 // Values the reference accepted in the same capture still go out.
 #[test]
 fn valid_algo_parameter_values_are_sent() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -4769,6 +5577,7 @@ fn valid_algo_parameter_values_are_sent() {
 
 #[test]
 fn fractional_quantity_on_a_modify_is_refused_and_keeps_the_order() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let whole = Order {
@@ -4788,6 +5597,7 @@ fn fractional_quantity_on_a_modify_is_refused_and_keeps_the_order() {
 // ibx#247: outside-RTH follows the order; it is not forced on.
 #[test]
 fn modify_carries_outside_rth_as_set() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let lmt = |rth: bool, px: f64| Order {
         action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: px,
         outside_rth: rth, ..Default::default()
@@ -5152,7 +5962,7 @@ fn an_untracked_execution_is_returned_by_req_executions_only() {
 }
 
 // ibx#487: a combo leg's execution shows the leg report's lastLiquidity
-// (851=2), not the combo report's (851=1); a filled order no longer tracked
+// (removed liquidity), not the combo report's (added liquidity); a filled order no longer tracked
 // shows the placing client of the report (captured 30/09/2026,
 // i105_combo_fill: openOrder and orderStatus with clientId 198).
 #[test]
@@ -5449,6 +6259,7 @@ fn captured_fill_exec() -> crate::bridge::FillExec {
         component: Default::default(),
         other_client: false,
         replayed: false,
+        position_after: None,
     }
 }
 
@@ -5540,6 +6351,7 @@ fn exec_details_carries_the_fill_report_fields() {
 // this client's id and the tracked order's orderRef.
 #[test]
 fn exec_details_of_an_own_order_takes_the_tracked_order_ref() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, _rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
@@ -5661,10 +6473,24 @@ fn placed_order(client: &EClient, shared: &Arc<SharedState>, id: i64) {
     client.place_order(id, &spy(), &order).unwrap();
 }
 
+/// The server answered order `id` (ibx#688): placed again, it is a modify.
+fn acked(client: &EClient, id: i64) {
+    client.core.update_order_status(id, "Submitted", 0.0, 1.0);
+}
+
+/// An order `id` this client placed and the server answered: a parent
+/// a child can name (ibx#688).
+fn known_parent(client: &EClient, id: i64) {
+    let parent = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 100.0, ..Default::default() };
+    client.core.track_order(id, spy(), parent, 0);
+    acked(client, id);
+}
+
 // Every report of a known order gives open_order then order_status, also
 // when the status is unchanged (a modify confirm).
 #[test]
 fn every_report_gives_open_order_then_order_status() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, _rx, shared) = test_client();
     placed_order(&client, &shared, 60);
     shared.orders.push_order_update(update(60, OrderStatus::Submitted, 0));
@@ -5675,6 +6501,51 @@ fn every_report_gives_open_order_then_order_status() {
         "open_order:60:Submitted:ref1", "order_status:60:Submitted:0:0:0",
         "open_order:60:Submitted:ref1", "order_status:60:Submitted:0:0:0",
     ]);
+}
+
+// ibx#682 (the reference 10.51, 13/10/2026): an order refused with 10043
+// and kept pending is listed by reqOpenOrders with its status only,
+// ApiPending.
+#[test]
+fn a_refused_pending_order_is_listed_with_its_status_only() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, _rx, shared) = test_client();
+    placed_order(&client, &shared, 62);
+    shared.orders.push_order_error(62, 10043, "Missing or invalid NonGuaranteed value.".into());
+    let mut w = StatusRecorder::default();
+    client.process_msgs(&mut w);
+    let mut w = StatusRecorder::default();
+    client.req_open_orders(&mut w);
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, ["order_status:62:ApiPending:0:0:0"]);
+}
+
+// ibx#660 (the reference 10.51 at level 214, 13/10/2026): an order placed
+// with no time in force holds the one of the account's order preset once
+// notice 10349 named it; a modify with no time in force restates it.
+#[test]
+fn the_preset_time_in_force_is_the_orders() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
+    placed_order(&client, &shared, 63);
+    acked(&client, 63);
+    shared.orders.push_order_error(63, 10349, "Order TIF was set to GTC based on order preset.".into());
+    let mut w = StatusRecorder::default();
+    client.process_msgs(&mut w);
+    let tif = || client.core.open_orders.lock().unwrap().get(&63).map(|o| o.order.tif.clone());
+    assert_eq!(tif().as_deref(), Some("GTC"));
+    while rx.try_recv().is_ok() {}
+    let modify = Order {
+        action: "BUY".into(), total_quantity: 100.0, order_type: "LMT".into(), lmt_price: 335.0,
+        order_ref: "ref1".into(), ..Default::default()
+    };
+    client.place_order(63, &spy(), &modify).unwrap();
+    let sent = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|cmd| match cmd {
+        ControlCommand::Order(OrderRequest::Modify { tif, .. }) => Some(tif),
+        _ => None,
+    });
+    assert_eq!(sent, Some(b'1'));
+    assert_eq!(tif().as_deref(), Some("GTC"));
 }
 
 #[test]
@@ -5690,6 +6561,7 @@ fn a_cancel_gives_order_status_only() {
 // A fill gives open_order too; a later report keeps the last fill price.
 #[test]
 fn a_later_report_carries_the_last_fill_price() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, _rx, shared) = test_client();
     placed_order(&client, &shared, 62);
     shared.orders.push_fill(Fill {
@@ -5975,13 +6847,16 @@ fn summary_event(rows: Vec<crate::bridge::AccountRow>, ledgers: Vec<crate::bridg
 
 #[test]
 fn account_summary_is_a_server_subscription() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
+    // Account updates asked earlier in the session: each frame twice (ibx#752).
+    let _ = client.core.subscribe_account_updates(true);
     client.req_account_summary(1, "All", "AccountType,NetLiquidation,$LEDGER:USD");
     assert_eq!(summary_sent(&rx), ["sub:SR.Socket.1:AccountType,NetLiquidation,$LEDGER:All"]);
 
     // Rows as sent; ledger rows of the chosen currency only, written as the
     // reference writes account values; the end. Each frame twice, as the
-    // reference (ibx#486: its listener is registered twice).
+    // reference after account updates (ibx#752).
     shared.portfolio.push_account_summary_event(summary_event(
         vec![summary_row("AccountType", "INDIVIDUAL", ""), summary_row("NetLiquidation", "953633.06", "USD")], vec![], false));
     shared.portfolio.push_account_summary_event(summary_event(vec![],
@@ -6018,6 +6893,38 @@ fn account_summary_is_a_server_subscription() {
     assert!(w.events.is_empty(), "{:?}", w.events);
 }
 
+// ibx#602 (the reference 10.51 at level 225, paper, 18/10/2026, two fresh
+// sessions): the cancel changes nothing. Nothing goes to the server, the
+// rows keep coming under the id, the request still counts in the limit,
+// and a new request with the same id replaces it.
+#[test]
+fn account_summary_cancel_changes_nothing_at_level_225() {
+    crate::client_core::set_session_level_for_test(Some(225));
+    let (client, rx, shared) = test_client();
+    client.req_account_summary(1, "All", "NetLiquidation");
+    assert_eq!(summary_sent(&rx), ["sub:SR.Socket.1:NetLiquidation:All"]);
+    client.cancel_account_summary(1);
+    assert!(summary_sent(&rx).is_empty());
+    shared.portfolio.push_account_summary_event(summary_event(vec![summary_row("NetLiquidation", "953642.02", "USD")], vec![], false));
+    let mut w = SummaryRec::default();
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, ["row:1:NetLiquidation:953642.02:USD"]);
+
+    client.req_account_summary(2, "All", "NetLiquidation");
+    client.req_account_summary(3, "All", "TotalCashValue");
+    client.req_account_summary(1, "All", "NetLiquidation");
+    let mut w = SummaryRec::default();
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, [
+        "error:3:322:Error processing request.-'ReqAccountSummary(62)' : cause - Maximum number of account summary requests exceeded; \
+         desubscribe to previous request first",
+    ]);
+    assert_eq!(summary_sent(&rx), [
+        "sub:SR.Socket.2:NetLiquidation:All", "cancel:SR.Socket.1", "sub:SR.Socket.3:NetLiquidation:All",
+    ]);
+    crate::client_core::set_session_level_for_test(None);
+}
+
 #[test]
 fn account_summary_refusals_and_limit() {
     let (client, rx, _shared) = test_client();
@@ -6032,10 +6939,10 @@ fn account_summary_refusals_and_limit() {
     let mut w = SummaryRec::default();
     client.process_msgs(&mut w);
     assert_eq!(w.events, [
-        "error:1:321:Error validating request.-'b2' : cause - Tags cannot be null",
-        "error:2:321:Error validating request.-'b2' : cause - Group name cannot be null",
-        "error:3:321:Error validating request.-'b2' : cause - Group name is invalid",
-        "error:6:322:Error processing request.-'b2' : cause - Maximum number of account summary requests exceeded; \
+        "error:1:321:Error validating request.-'ReqAccountSummary(62)' : cause - Tags cannot be null",
+        "error:2:321:Error validating request.-'ReqAccountSummary(62)' : cause - Group name cannot be null",
+        "error:3:321:Error validating request.-'ReqAccountSummary(62)' : cause - Unified group name is invalid",
+        "error:6:322:Error processing request.-'ReqAccountSummary(62)' : cause - Maximum number of account summary requests exceeded; \
          desubscribe to previous request first",
     ]);
     assert_eq!(summary_sent(&rx), [
@@ -6050,46 +6957,202 @@ fn account_summary_refusals_and_limit() {
 //  req_positions is a subscription (ibx#477)
 // ═══════════════════════════════════════════════════════════════════
 
-fn aapl_position(qty: i64, avg: i64) -> PositionInfo {
+fn aapl_position(qty: i64, avg: f64) -> PositionInfo {
     PositionInfo {
         con_id: 265598, position_fixed: qty * crate::types::QTY_SCALE, avg_cost: avg,
         symbol: "AAPL".into(), sec_type: "STK".into(), currency: "USD".into(), ..Default::default()
     }
 }
 
-// The capture of 25/09/2026: after a fill of BUY 100 AAPL for another
-// client, the observer got a position row, then a second one when the
-// average cost moved, with no new req_positions.
+// ibx#707: after the snapshot, a row for a quantity the server's position
+// feed moves; none when the feed only moves the average cost (the
+// reference 10.51, 15/10/2026: no row at the server's update after a
+// fill); none after cancel_positions.
 #[test]
-fn req_positions_sends_a_row_on_each_change() {
+fn req_positions_sends_a_row_when_the_feed_moves_a_quantity() {
     let (client, _rx, shared) = test_client();
     shared.portfolio.set_account_download_complete();
     let mut w = RecordingWrapper::default();
     client.req_positions(&mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, vec!["position_end"]);
 
-    shared.portfolio.set_position_info(aapl_position(100, 33625 * PRICE_SCALE / 100));
+    shared.portfolio.set_position_info(aapl_position(100, 336.25));
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
-    assert_eq!(w.events.iter().filter(|e| e.starts_with("position:")).count(), 1, "{:?}", w.events);
-    assert!(!w.events.iter().any(|e| e == "position_end"), "no end after the snapshot");
+    assert_eq!(w.events, ["position:DU123:265598:100:336.25"]);
 
-    // Average cost moves: another row. Same values again: nothing.
-    shared.portfolio.set_position_info(aapl_position(100, 336_260_003 * PRICE_SCALE / 1_000_000));
-    let mut w = RecordingWrapper::default();
-    client.process_msgs(&mut w);
-    assert_eq!(w.events.iter().filter(|e| e.starts_with("position:")).count(), 1);
-    shared.portfolio.set_position_info(aapl_position(100, 336_260_003 * PRICE_SCALE / 1_000_000));
+    // The average cost alone moves: no row. Same values again: nothing.
+    shared.portfolio.set_position_info(aapl_position(100, 336.260003));
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     assert!(w.events.is_empty(), "{:?}", w.events);
 
     // After cancel_positions: no row.
     client.cancel_positions();
-    shared.portfolio.set_position_info(aapl_position(200, 336 * PRICE_SCALE));
+    shared.portfolio.set_position_info(aapl_position(200, 336.0));
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     assert!(w.events.is_empty(), "{:?}", w.events);
+}
+
+// ibx#707: the average cost after a fill and after its commission, as the
+// reference 10.51 gave them (paper, 15/10/2026, regular hours, case D):
+// MSFT -10 at 397.54161, bought 1 at 539.87 (reduces: unchanged), sold 1
+// at 539.59 (adds: weighted), commission 1.011119 (into the cost); AAPL
+// flat, bought 1 at 343.39 (the fill price), commission 1.000003, sold 1
+// (closed: 0).
+#[test]
+fn the_average_cost_moves_as_the_reference_s() {
+    let shared = SharedState::new();
+    let px = |v: f64| v;
+    let q = |n: i64| n * crate::types::QTY_SCALE;
+    let cost = |con_id: i64| shared.portfolio.position_info(con_id).unwrap().avg_cost;
+    shared.portfolio.set_position_info(PositionInfo { con_id: 272093, position_fixed: q(-10), avg_cost: px(397.54161), ..Default::default() });
+    shared.portfolio.apply_fill_to_position(&Contract { con_id: 272093, sec_type: "STK".into(), ..Default::default() }, q(1), Some(px(539.87)));
+    assert_eq!(cost(272093), 397.54161);
+    shared.portfolio.apply_fill_to_position(&Contract { con_id: 272093, sec_type: "STK".into(), ..Default::default() }, q(-1), Some(px(539.59)));
+    assert_eq!(cost(272093), 411.746449);
+    shared.portfolio.apply_commission_to_position(272093, 1.011119);
+    assert_eq!(cost(272093), 411.6453371);
+    shared.portfolio.apply_fill_to_position(&Contract { con_id: 265598, sec_type: "STK".into(), ..Default::default() }, q(1), Some(px(343.39)));
+    assert_eq!(cost(265598), 343.39);
+    shared.portfolio.apply_commission_to_position(265598, 1.000003);
+    assert_eq!(cost(265598), 344.390003);
+    shared.portfolio.apply_fill_to_position(&Contract { con_id: 265598, sec_type: "STK".into(), ..Default::default() }, q(-1), Some(px(343.35)));
+    assert_eq!((shared.portfolio.position_info(265598).unwrap().position_fixed, cost(265598)), (0, 0.0));
+}
+
+// ibx#707: a fill of this session gives the reqPositions row before its
+// execution (the reference 10.51, 15/10/2026, six fills).
+#[test]
+fn a_fill_gives_its_position_row_before_its_execution() {
+    let (client, _rx, shared) = test_client();
+    shared.portfolio.set_account_download_complete();
+    let mut w = RecordingWrapper::default();
+    client.req_positions(&mut w);
+    client.process_msgs(&mut w);
+    let at = (265598, 100 * crate::types::QTY_SCALE, 336.0);
+    shared.portfolio.apply_fill_to_position(&Contract { con_id: 265598, sec_type: "STK".into(), ..Default::default() }, 100 * crate::types::QTY_SCALE, Some(336.0));
+    shared.orders.push_fill_with_exec(aapl_fill(7), crate::bridge::FillExec {
+        exec_id: "0000e0d5.6ab5f36f.01.01".into(), position_after: Some(at), ..Default::default()
+    });
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    let pos = w.events.iter().position(|e| e == "position:DU123:265598:100:336").expect("position row");
+    let exec = w.events.iter().position(|e| e.starts_with("exec_details:-1:")).expect("execution");
+    assert!(pos < exec, "{:?}", w.events);
+    assert_eq!(w.events.iter().filter(|e| e.starts_with("position:")).count(), 1, "{:?}", w.events);
+}
+
+// ibx#707: req_positions_multi gets a row at a fill (before its execution)
+// and after a commission report, each only when the values changed (the
+// reference 10.51, paper, 15/10/2026, regular hours: a MSFT buy that
+// reduced the position, its commission with no row; a sale that added to
+// it, its commission with a row).
+#[test]
+fn req_positions_multi_gets_the_rows_that_changed_at_a_fill() {
+    #[derive(Default)]
+    struct W(Vec<String>);
+    impl Wrapper for W {
+        fn position_multi(&mut self, req_id: i64, _a: &str, _m: &str, c: &Contract, pos: f64, avg: f64) {
+            self.0.push(format!("multi:{req_id}:{}:{pos}:{avg}", c.con_id));
+        }
+        fn position_multi_end(&mut self, req_id: i64) {
+            self.0.push(format!("end:{req_id}"));
+        }
+        fn exec_details(&mut self, _req_id: i64, _c: &Contract, _e: &crate::api::types::Execution) {
+            self.0.push("exec".into());
+        }
+        fn commission_and_fees_report(&mut self, _r: &crate::api::types::CommissionAndFeesReport) {
+            self.0.push("commission".into());
+        }
+    }
+    let (client, _rx, shared) = test_client();
+    shared.portfolio.set_account_download_complete();
+    let mut w = W::default();
+    client.req_positions_multi(7, "DU123", "", &mut w);
+    client.process_msgs(&mut w);
+    assert_eq!(w.0, ["end:7"]);
+    let contract = Contract { con_id: 265598, symbol: "AAPL".into(), ..Default::default() };
+    let fill = |id: &str, side: &str, after: (i64, f64)| -> (crate::api::types::Execution, crate::bridge::FillExec) {
+        (crate::api::types::Execution { exec_id: id.into(), side: side.into(), shares: 1.0, order_id: 15, ..Default::default() },
+         crate::bridge::FillExec { exec_id: id.into(), position_after: Some((265598, after.0, after.1)), ..Default::default() })
+    };
+    // A buy that opens the position: a row at the fill; its commission
+    // moves the cost: a row.
+    shared.portfolio.apply_fill_to_position(&Contract { con_id: 265598, sec_type: "STK".into(), ..Default::default() }, crate::types::QTY_SCALE, Some(336.0));
+    let (e, fe) = fill("0000e0d5.6ab5f36f.01.01", "BOT", (crate::types::QTY_SCALE, 336.0));
+    shared.orders.push_untracked_execution(contract.clone(), e, fe);
+    shared.portfolio.apply_commission_to_position(265598, 1.0);
+    shared.orders.push_commission_report(crate::api::types::CommissionAndFeesReport {
+        exec_id: "0000e0d5.6ab5f36f.01.01".into(), commission_and_fees: 1.0, currency: "USD".into(),
+        realized_pnl: f64::MAX, yield_amount: f64::MAX, yield_redemption_date: String::new(),
+    });
+    let mut w = W::default();
+    client.process_msgs(&mut w);
+    assert_eq!(w.0, ["multi:7:265598:1:336", "commission", "multi:7:265598:1:337"]);
+    // A sale that closes it: a row at the fill; its commission, with a
+    // realized P&L, changes nothing: no row.
+    shared.portfolio.apply_fill_to_position(&Contract { con_id: 265598, sec_type: "STK".into(), ..Default::default() }, -crate::types::QTY_SCALE, Some(338.0));
+    let (e, fe) = fill("0000e0d5.6ab5f370.01.01", "SLD", (0, 0.0));
+    shared.orders.push_untracked_execution(contract, e, fe);
+    shared.orders.push_commission_report(crate::api::types::CommissionAndFeesReport {
+        exec_id: "0000e0d5.6ab5f370.01.01".into(), commission_and_fees: 1.0, currency: "USD".into(),
+        realized_pnl: 1.0, yield_amount: f64::MAX, yield_redemption_date: String::new(),
+    });
+    let mut w = W::default();
+    client.process_msgs(&mut w);
+    assert_eq!(w.0, ["multi:7:265598:0:0", "commission"]);
+}
+
+// ibx#707 and the capture of 25/09/2026: a fill of another client's order
+// gives the observer a row at the fill and a row when its commission
+// moves the cost; a commission report with a realized P&L gives two.
+#[test]
+fn another_clients_fill_gives_rows_at_the_fill_and_the_commission() {
+    let (client, _rx, shared) = test_client();
+    shared.portfolio.set_account_download_complete();
+    let mut w = RecordingWrapper::default();
+    client.req_positions(&mut w);
+    client.process_msgs(&mut w);
+    let contract = Contract { con_id: 265598, symbol: "AAPL".into(), ..Default::default() };
+    let exec = crate::api::types::Execution {
+        exec_id: "0000e0d5.6ab5f36f.01.01".into(), side: "BOT".into(), shares: 100.0, order_id: 15, ..Default::default()
+    };
+    shared.portfolio.apply_fill_to_position(&Contract { con_id: 265598, sec_type: "STK".into(), ..Default::default() }, 100 * crate::types::QTY_SCALE, Some(336.25));
+    let fe = crate::bridge::FillExec {
+        exec_id: "0000e0d5.6ab5f36f.01.01".into(), client_id: 261, other_client: true,
+        position_after: Some((265598, 100 * crate::types::QTY_SCALE, 336.25)), ..Default::default()
+    };
+    shared.orders.push_untracked_execution(contract.clone(), exec, fe);
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, ["position:DU123:265598:100:336.25"]);
+
+    shared.portfolio.apply_commission_to_position(265598, 1.0003);
+    shared.orders.push_commission_report(captured_report());
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, ["position:DU123:265598:100:336.260003"]);
+
+    // A sale of it, with a realized P&L: the fill's row, then two.
+    let exec = crate::api::types::Execution {
+        exec_id: "0000e0d5.6ab5f370.01.01".into(), side: "SLD".into(), shares: 100.0, order_id: 16, ..Default::default()
+    };
+    shared.portfolio.apply_fill_to_position(&Contract { con_id: 265598, sec_type: "STK".into(), ..Default::default() }, -100 * crate::types::QTY_SCALE, Some(337.0));
+    let fe = crate::bridge::FillExec {
+        exec_id: "0000e0d5.6ab5f370.01.01".into(), client_id: 261, other_client: true,
+        position_after: Some((265598, 0, 0.0)), ..Default::default()
+    };
+    shared.orders.push_untracked_execution(contract, exec, fe);
+    shared.orders.push_commission_report(crate::api::types::CommissionAndFeesReport {
+        exec_id: "0000e0d5.6ab5f370.01.01".into(), commission_and_fees: 1.0, currency: "USD".into(),
+        realized_pnl: 72.0, yield_amount: f64::MAX, yield_redemption_date: String::new(),
+    });
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, ["position:DU123:265598:0:0"; 3]);
 }
 
 // Before the position data is in, req_positions returns at once; the
@@ -6097,7 +7160,7 @@ fn req_positions_sends_a_row_on_each_change() {
 #[test]
 fn req_positions_does_not_wait_in_the_caller() {
     let (client, _rx, shared) = test_client();
-    shared.portfolio.set_position_info(aapl_position(100, 336 * PRICE_SCALE));
+    shared.portfolio.set_position_info(aapl_position(100, 336.0));
     let started = std::time::Instant::now();
     let mut w = RecordingWrapper::default();
     client.req_positions(&mut w);
@@ -6146,7 +7209,7 @@ impl PositionReconnect {
                 .begin_execution_history("next-position-link");
             self.shared
                 .portfolio
-                .set_position_info(aapl_position(2, PRICE_SCALE));
+                .set_position_info(aapl_position(2, 1.0));
             self.shared.portfolio.set_account_download_complete();
         }
     }
@@ -6183,7 +7246,7 @@ fn position_snapshot_callback_reconnect_replays_without_stale_end() {
     let (client, _rx, shared) = test_client();
     shared
         .portfolio
-        .set_position_info(aapl_position(1, PRICE_SCALE));
+        .set_position_info(aapl_position(1, 1.0));
     shared.portfolio.set_position_info(PositionInfo {
         con_id: 756733,
         position_fixed: QTY_SCALE,
@@ -6215,7 +7278,7 @@ fn position_multi_callback_reconnect_replays_every_prepared_subscription() {
     let (client, _rx, shared) = test_client();
     shared
         .portfolio
-        .set_position_info(aapl_position(1, PRICE_SCALE));
+        .set_position_info(aapl_position(1, 1.0));
     shared.portfolio.set_account_download_complete();
     client.core.subscribe_positions_multi(1, "", "");
     client.core.subscribe_positions_multi(2, "", "");
@@ -6241,7 +7304,7 @@ fn position_subscriptions_wait_through_loss_and_replay_an_unchanged_image() {
     let (client, _rx, shared) = test_client();
     shared
         .portfolio
-        .set_position_info(aapl_position(1, PRICE_SCALE));
+        .set_position_info(aapl_position(1, 1.0));
     shared.portfolio.set_account_download_complete();
     let mut wrapper = RecordingWrapper::default();
     client.req_positions(&mut wrapper);
@@ -6355,6 +7418,7 @@ fn a_key_also_in_the_ledger_is_a_ledger_key() {
     });
     let mut w = MultiRec::default();
     client.req_account_updates_multi(9002, "", "", true, &mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, ["acct:9002::AccruedCash:1893.5:USD", "acct_end:9002"]);
 }
 
@@ -6364,8 +7428,10 @@ fn account_updates_multi_carries_its_request_id_and_model_code() {
     seed_multi_account(&shared);
     let mut w = MultiRec::default();
     client.req_account_updates_multi(9001, "", "Core", false, &mut w);
+    client.process_msgs(&mut w);
     client.req_account_updates_multi(9002, "", "", true, &mut w);
     client.req_account_updates_multi(9001, "", "", false, &mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, [
         "acct:9001:Core:NetLiquidation:953633.06:USD",
         "acct:9001:Core:CashBalance:899133.4993:BASE",
@@ -6393,102 +7459,53 @@ fn account_updates_multi_carries_its_request_id_and_model_code() {
 fn positions_multi_carries_its_request_id_and_updates() {
     let (client, _rx, shared) = test_client();
     shared.portfolio.set_account_download_complete();
-    shared.portfolio.set_position_info(aapl_position(100, 336 * PRICE_SCALE));
+    shared.portfolio.set_position_info(aapl_position(100, 336.0));
     let mut w = MultiRec::default();
     client.req_positions_multi(9003, "", "Core", &mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, ["pos:9003:Core:265598:100", "pos_end:9003"]);
 
-    shared.portfolio.set_position_info(aapl_position(101, 336 * PRICE_SCALE));
+    shared.portfolio.set_position_info(aapl_position(101, 336.0));
     let mut w = MultiRec::default();
     client.process_msgs(&mut w);
     assert_eq!(w.events, ["pos:9003:Core:265598:101"]);
 
     client.cancel_positions_multi(9003);
-    shared.portfolio.set_position_info(aapl_position(102, 336 * PRICE_SCALE));
+    shared.portfolio.set_position_info(aapl_position(102, 336.0));
     let mut w = MultiRec::default();
     client.process_msgs(&mut w);
     assert!(w.events.is_empty(), "{:?}", w.events);
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Quotes ibx subscribes to for the P&L
+//  The P&L quotes (ibx#511)
 // ═══════════════════════════════════════════════════════════════════
 
-/// Answer the engine side of the internal subscriptions sent so far with
-/// instrument `iid`; returns the conIds subscribed and unsubscribed.
-fn answer_pnl_quotes(rx: &crossbeam_channel::Receiver<ControlCommand>, iid: InstrumentId) -> (Vec<i64>, Vec<InstrumentId>) {
-    let (mut subs, mut unsubs) = (Vec::new(), Vec::new());
-    for cmd in rx.try_iter() {
-        match cmd {
-            ControlCommand::Subscribe { con_id, reply_tx: Some(tx), .. } => {
-                let _ = tx.send(Ok(iid));
-                subs.push(con_id);
-            }
-            ControlCommand::Unsubscribe { instrument } => unsubs.push(instrument),
-            _ => {}
-        }
-    }
-    (subs, unsubs)
+/// The P&L quote commands sent so far: (conIds, second price kind).
+fn pnl_quote_commands(rx: &crossbeam_channel::Receiver<ControlCommand>) -> Vec<(Vec<i64>, bool)> {
+    rx.try_iter().filter_map(|cmd| match cmd {
+        ControlCommand::PnlQuotes { con_ids, second_price } => Some((con_ids, second_price)),
+        _ => None,
+    }).collect()
 }
 
+// The reference asks its P&L quotes at the first P&L request and keeps
+// them (observed 15/10/2026, 10.51): nothing at the cancel, nothing at a
+// later request.
 #[test]
-fn a_pnl_request_subscribes_the_quotes_it_needs_and_cancels_them_after() {
+fn a_pnl_request_asks_the_pnl_quotes_once_and_keeps_them() {
     let (client, rx, shared) = test_client();
-    client.core.con_id_to_instrument.lock().unwrap().clear();
-    shared.portfolio.set_position_info(aapl_position(100, 336 * PRICE_SCALE));
+    shared.portfolio.set_position_info(aapl_position(100, 336.0));
     client.req_pnl(1, "DU123", "");
     client.process_msgs(&mut RecordingWrapper::default());
-    let (subs, _) = answer_pnl_quotes(&rx, 7);
-    assert_eq!(subs, [265598], "the held position's quote");
-
-    // The reply is read on the next pass; the quote feeds the P&L only.
-    client.process_msgs(&mut RecordingWrapper::default());
-    assert_eq!(client.core.con_id_to_instrument.lock().unwrap().get(&265598), Some(&7));
-    assert!(client.core.instrument_to_req.lock().unwrap().get(&7).is_none(), "no tick callbacks");
-
-    // No P&L request left: the quote is cancelled.
+    assert_eq!(pnl_quote_commands(&rx), [(vec![265598], true)]);
     client.cancel_pnl(1);
-    if let Some(q) = client.core.pnl_quotes.lock().unwrap().checked_at_mut() { *q -= std::time::Duration::from_secs(2); }
     client.process_msgs(&mut RecordingWrapper::default());
-    let (_, unsubs) = answer_pnl_quotes(&rx, 7);
-    assert_eq!(unsubs, [7]);
-    assert!(client.core.con_id_to_instrument.lock().unwrap().get(&265598).is_none());
-}
-
-#[test]
-fn a_pnl_quote_becomes_the_callers_subscription() {
-    let (client, rx, shared) = test_client();
-    client.core.con_id_to_instrument.lock().unwrap().clear();
-    shared.portfolio.set_position_info(aapl_position(100, 336 * PRICE_SCALE));
-    client.req_pnl(1, "DU123", "");
+    assert!(!rx.try_iter().any(|c| matches!(c, ControlCommand::Unsubscribe { .. } | ControlCommand::PnlQuotes { .. })),
+        "kept for the session");
+    client.req_pnl(2, "DU123", "");
     client.process_msgs(&mut RecordingWrapper::default());
-    answer_pnl_quotes(&rx, 7);
-    client.process_msgs(&mut RecordingWrapper::default());
-
-    let aapl = Contract { con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), ..Default::default() };
-    client.req_mkt_data(5, &aapl, "", false, false).unwrap();
-    let (subs, _) = answer_pnl_quotes(&rx, 7);
-    assert!(subs.is_empty(), "no second subscription to the server");
-    assert_eq!(client.core.instrument_to_req.lock().unwrap().get(&7), Some(&vec![5]));
-
-    // The P&L ends: the caller's subscription stays.
-    client.cancel_pnl(1);
-    if let Some(q) = client.core.pnl_quotes.lock().unwrap().checked_at_mut() { *q -= std::time::Duration::from_secs(2); }
-    client.process_msgs(&mut RecordingWrapper::default());
-    let (_, unsubs) = answer_pnl_quotes(&rx, 7);
-    assert!(unsubs.is_empty());
-}
-
-#[test]
-fn no_internal_quote_when_the_caller_has_one() {
-    let (client, rx, shared) = test_client();
-    shared.portfolio.set_position_info(aapl_position(100, 336 * PRICE_SCALE));
-    client.core.con_id_to_instrument.lock().unwrap().insert(265598, 3);
-    client.core.instrument_to_req.lock().unwrap().insert(3, vec![9]);
-    client.req_pnl(1, "DU123", "");
-    client.process_msgs(&mut RecordingWrapper::default());
-    let (subs, _) = answer_pnl_quotes(&rx, 3);
-    assert!(subs.is_empty());
+    assert!(pnl_quote_commands(&rx).is_empty(), "asked already");
 }
 
 // ibx#461: popup bulletins reach every client; a subscription gets every
@@ -6531,7 +7548,7 @@ fn news_bulletin_delivery_modes() {
 #[test]
 fn server_version_and_connection_time() {
     let (client, _rx, _shared) = test_client();
-    assert_eq!(client.server_version(), 214);
+    assert_eq!(client.server_version(), 225);
     let time = client.tws_connection_time();
     assert_eq!(time.split(' ').next().map(str::len), Some(8), "{}", time);
     assert_eq!(time, client.tws_connection_time(), "fixed at connect");
@@ -6616,6 +7633,7 @@ fn ids_outside_the_reference_range_drop_the_request() {
 // lost) leaves the client with no callback: no open order, no status.
 #[test]
 fn a_forgotten_order_leaves_without_callbacks() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, _rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 10.0, ..Default::default() };
@@ -6629,11 +7647,35 @@ fn a_forgotten_order_leaves_without_callbacks() {
     assert_eq!(w.events, vec!["open_order_end".to_string()]);
 }
 
+// ibx#738: an order refused with 200 at its contract's lookup is given the
+// error, then no open-order request lists it, as the reference 10.51
+// (paper, 17/10/2026, market closed); its id stays used: placed again, 103.
+#[test]
+fn an_order_refused_at_its_lookup_is_not_an_open_order() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 10.0, ..Default::default() };
+    client.place_order(1, &spy(), &order).unwrap();
+    shared.orders.push_order_error(1, 200, "No security definition has been found for the request".into());
+    shared.orders.push_forgotten_order(1);
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert_eq!(w.events.len(), 1, "{:?}", w.events);
+    assert!(w.events[0].starts_with("error:") && w.events[0].contains("200"), "{:?}", w.events);
+    w.events.clear();
+    client.req_open_orders(&mut w);
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, vec!["open_order_end".to_string()]);
+    assert_eq!(client.core.refusal_for_order_id(1, &order, &shared).map(|r| r.0), Some(103));
+}
+
 // ibx#251: an open-order request made while the auth link is lost gets no
 // answer until the order replay of the new logon has ended; then each kind
 // is answered once, after the replayed statuses, as in the reference.
 #[test]
 fn open_order_requests_wait_for_the_order_replay() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, _rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 10.0, ..Default::default() };
@@ -6642,8 +7684,11 @@ fn open_order_requests_wait_for_the_order_replay() {
     shared.orders.set_open_orders_held(true);
     let mut w = RecordingWrapper::default();
     client.req_open_orders(&mut w);
+    client.process_msgs(&mut w);
     client.req_open_orders(&mut w);
+    client.process_msgs(&mut w);
     client.req_all_open_orders(&mut w);
+    client.process_msgs(&mut w);
     client.process_msgs(&mut w);
     assert!(w.events.is_empty(), "no answer during the outage: {:?}", w.events);
 
@@ -6867,7 +7912,7 @@ fn login_end_does_not_escape_through_reentrant_explicit_snapshot_dispatch() {
 // reqAllOpenOrders lists every order of the book in its order (a hash
 // table keyed by permId, walked bucket by bucket; captured 01/10/2026),
 // with the order id and client id the reference shows; reqOpenOrders
-// only this client's (`jextend.cu.b(List)@149`).
+// only this client's.
 #[test]
 fn open_order_listings_go_in_the_books_order_by_client() {
     use crate::bridge::RichOrderInfo;
@@ -6912,7 +7957,7 @@ fn open_orders_show_the_reported_contract_and_trail_stop() {
 }
 
 // An execution of another client's order is kept for reqExecutions, with
-// no live callback and no commission report (`jextend.ba.a(dq, aQ)`).
+// no live callback and no commission report.
 #[test]
 fn an_execution_of_another_clients_order_gives_no_callback() {
     let (client, _rx, shared) = test_client();
@@ -7017,9 +8062,11 @@ fn set_exchange_map(shared: &SharedState, instrument: u32, map: Vec<crate::types
 fn regulatory_snapshot_delivers_one_batch_then_the_end() {
     let (client, rx, shared) = test_client();
     let engine = snapshot_engine(rx);
-    set_exchange_map(&shared, 5, vec![crate::types::SmartComponent {
-        bit_number: 0, exchange: "NYSE".into(), exchange_letter: "N".into(),
-    }]);
+    // The last trade's exchange is one exchange by its bit number (ibx#604).
+    set_exchange_map(&shared, 5, vec![
+        crate::types::SmartComponent { bit_number: 0, exchange: "NYSE".into(), exchange_letter: "N".into() },
+        crate::types::SmartComponent { bit_number: 1, exchange: "ARCA".into(), exchange_letter: "P".into() },
+    ]);
     client.req_mkt_data(1, &spy(), "", false, true).unwrap();
     // The same contract again: 10169; the same request id again: duplicate.
     client.req_mkt_data(2, &spy(), "", false, true).unwrap();
@@ -7042,7 +8089,7 @@ fn regulatory_snapshot_delivers_one_batch_then_the_end() {
     client.process_msgs(&mut w);
     assert_eq!(w.events, vec![
         "price:1:2:101", "size:1:3:3", "price:1:1:100", "size:1:0:2", "price:1:4:100", "size:1:5:1",
-        "string:1:33:N", "string:1:32:N", "string:1:84:N", "price:1:6:102", "price:1:7:99", "price:1:9:98",
+        "string:1:33:N", "string:1:32:N", "string:1:84:P", "price:1:6:102", "price:1:7:99", "price:1:9:98",
         "size:1:8:50", "end:1",
     ]);
     // Done: a cancel now is for an unknown request.
@@ -7054,13 +8101,14 @@ fn regulatory_snapshot_delivers_one_batch_then_the_end() {
     assert_eq!(seen, vec!["snapshot:756733", "drop:5"]);
 }
 
+/// A permission of 0 (ibx#645: 1 waits for the fields, as the reference 10.51).
 #[test]
 fn regulatory_snapshot_without_permission_and_cancel() {
     let (client, rx, shared) = test_client();
     let engine = snapshot_engine(rx);
     client.req_mkt_data(1, &spy(), "", false, true).unwrap();
     shared.market.push_snapshot_ack(crate::bridge::TickReqParams {
-        instrument: 5, min_tick: 0.01, bbo_exchange: "9c".into(), snapshot_permissions: 1,
+        instrument: 5, min_tick: 0.01, bbo_exchange: "9c".into(), snapshot_permissions: 0,
     });
     let mut w = SnapRec::default();
     client.process_msgs(&mut w);
@@ -7131,7 +8179,7 @@ fn plain_snapshot_sends_each_tick_type_once_then_the_end() {
     let mut w = SnapRec::default();
     client.process_msgs(&mut w);
     assert_eq!(w.events, vec![
-        "mdt:1:1", "price:1:1:100", "size:1:0:2", "price:1:2:101", "size:1:3:3", "string:1:32:N",
+        "mdt:1:1", "price:1:1:100", "size:1:0:2", "price:1:2:101", "size:1:3:3",
     ]);
     // The bid moves and the rest comes: the bid is not sent again; the end
     // comes with the daily figures, before the book update.
@@ -7201,6 +8249,39 @@ fn captured_eur_usd(shared: &SharedState, steps: &[crate::md_events::MdStep], ha
     message(shared, &captured_eur_usd_quote(), steps, halted);
 }
 
+// ibx#535 (the reference 10.51, paper, pre-market 13/10/2026, two runs
+// each): on a contract asked before, a request without top of book gets
+// its request parameters when its subscription starts and its market
+// data type alone at the acknowledgement; a top-of-book request gets both
+// at the acknowledgement, the type first.
+#[test]
+fn known_parameters_go_early_without_top_of_book_only() {
+    let params = || crate::bridge::TickReqParams {
+        instrument: 5, min_tick: 0.01, bbo_exchange: "9c0001".into(), snapshot_permissions: 3,
+    };
+    for (ticks, early) in [("mdoff,236", true), ("", false)] {
+        let (client, rx, shared) = test_client();
+        let engine = top_engine(rx);
+        client.req_mkt_data(1, &spy_stk(), ticks, false, false).unwrap();
+        // The subscription starts: the contract's parameters are known.
+        shared.market.push_early_tick_req_params(params(), false);
+        let mut w = SeqRec::default();
+        client.process_msgs(&mut w);
+        let at_start = w.events.clone();
+        // The acknowledgement.
+        shared.market.push_tick_req_params(params());
+        client.process_msgs(&mut w);
+        if early {
+            assert_eq!(at_start, ["params:1:0.01:9c0001:3"], "{ticks}");
+            assert_eq!(w.events, ["params:1:0.01:9c0001:3", "mdt:1:1"], "{ticks}");
+        } else {
+            assert!(at_start.is_empty(), "{at_start:?}");
+            assert_eq!(w.events, ["mdt:1:1", "params:1:0.01:9c0001:3"]);
+        }
+        drop(engine);
+    }
+}
+
 // ibx#446, captured 02/10/2026 (EUR.USD snapshots 9460-9462): the market
 // data type, then the request parameters; the trade's time and halted
 // state, the daily high, low and close, then the bid and the ask with
@@ -7210,6 +8291,7 @@ fn captured_eur_usd(shared: &SharedState, steps: &[crate::md_events::MdStep], ha
 fn eur_usd_snapshot_in_the_reference_order() {
     use crate::md_events::MdStep;
     let (client, rx, shared) = test_client();
+    shared.reference.set_form_10_40(true); // a capture of the reference 10.40 (its halted state of 0, ibx#494)
     let engine = top_engine(rx);
     client.req_mkt_data(1, &eur_usd(), "", true, false).unwrap();
     captured_eur_usd(&shared, &[MdStep::Time, MdStep::Last, MdStep::Daily, MdStep::Quote], Some(0));
@@ -7225,6 +8307,23 @@ fn eur_usd_snapshot_in_the_reference_order() {
     drop(engine);
 }
 
+// ibx#494 (the reference 10.51, paper, 19/10/2026 overnight, a fresh
+// process): a snapshot whose trade status is 0 gives no halted tick; the
+// rest as on 10.40.
+#[test]
+fn a_snapshot_without_a_halt_gives_no_halted_tick() {
+    use crate::md_events::MdStep;
+    let (client, rx, shared) = test_client();
+    let engine = top_engine(rx);
+    client.req_mkt_data(1, &eur_usd(), "", true, false).unwrap();
+    captured_eur_usd(&shared, &[MdStep::Time, MdStep::Last, MdStep::Daily, MdStep::Quote], Some(0));
+    let mut w = SeqRec::default();
+    client.process_msgs(&mut w);
+    assert!(!w.events.iter().any(|e| e.starts_with("generic:1:49")), "{:?}", w.events);
+    assert!(w.events.iter().any(|e| e.starts_with("string:1:45")) && w.events.last().map(String::as_str) == Some("end:1"), "{:?}", w.events);
+    drop(engine);
+}
+
 // ibx#446, captured 02/10/2026 (SPY snapshot 9463): the trade's time,
 // its price with its size, its halted state, the close, the open (an
 // update of its own), then the bid and ask, which execute automatically
@@ -7234,6 +8333,7 @@ fn eur_usd_snapshot_in_the_reference_order() {
 fn spy_snapshot_in_the_reference_order() {
     use crate::md_events::{field, MdEvent, MdStep};
     let (client, rx, shared) = test_client();
+    shared.reference.set_form_10_40(true); // a capture of the reference 10.40 (its halted state of 0, ibx#494)
     let engine = top_engine(rx);
     client.req_mkt_data(1, &spy_stk(), "", true, false).unwrap();
     let p = |raw: i64| raw * crate::types::PRICE_SCALE / 100;
@@ -7281,10 +8381,9 @@ fn spy_quote() -> crate::types::Quote {
     }
 }
 
-// ibx#446, from the reference's delayed sender (`jextend.dL.b(List, s,
-// int, pa, dy, o, SnapshotPreference, Set)`): a delayed snapshot sends the
-// trade's time as 88, never the exchanges nor a halted tick, and ends once
-// the delayed bid, ask, last, open, close and time came.
+// ibx#446, from the reference's delayed sender: a delayed
+// snapshot sends the trade's time as 88, never the exchanges nor a halted
+// tick, and ends once the delayed bid, ask, last, open, close and time came.
 #[test]
 fn delayed_snapshot_sends_its_own_time_and_no_exchanges() {
     let (client, rx, shared) = test_client();
@@ -7557,6 +8656,88 @@ fn stock_stream_joining_a_quote_in_the_reference_order() {
     }
 }
 
+// ibx#604, reference 10.51 (paper 19/10/2026, regular hours, two AAPL
+// requests on a kept quote): a request that joined a quote without writing
+// the last trade's exchange (no letter for it yet) gets it with the next
+// trade, also on the same exchange.
+#[test]
+fn a_joined_request_gets_the_last_trade_exchange_with_the_next_trade() {
+    use crate::md_events::{MdStep, TestMessage};
+    let (client, rx, shared) = test_client();
+    let engine = top_engine(rx);
+    let aapl = Contract { con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(),
+        ..Default::default() };
+    client.req_mkt_data(1, &aapl, "", false, false).unwrap();
+    let (mut q, _) = aapl_join_messages();
+    q.last_exch_mask = 1;
+    let whole = TestMessage { steps: Some(&[MdStep::CatchUp]), halted: Some(0), sizes_seen: true, ..Default::default() };
+    shared.market.push_test_message(5, &q, &whole);
+    client.core.join_stream(1, shared.market.md_events.head());
+    let mut w = SeqRec::default();
+    client.process_msgs(&mut w);
+    assert!(!w.events.iter().any(|e| e.starts_with("string:1:84:")), "no map yet: {:?}", w.events);
+    set_exchange_map(&shared, 5, ["K", "P", "Q", "V"].iter().enumerate().map(|(bit, letter)| {
+        crate::types::SmartComponent { bit_number: bit as i32, exchange: letter.to_string(), exchange_letter: letter.to_string() }
+    }).collect());
+    let trade = [MdStep::Time, MdStep::Exchange, MdStep::Last];
+    q.last = q.last + crate::types::PRICE_SCALE / 100;
+    q.timestamp_ns += 1_000_000_000;
+    shared.market.push_test_message(5, &q, &TestMessage { steps: Some(&trade), sizes_seen: true, ..Default::default() });
+    let mut w = SeqRec::default();
+    client.process_msgs(&mut w);
+    assert!(w.events.iter().any(|e| e == "string:1:84:P"), "{:?}", w.events);
+    drop(engine);
+}
+
+// ibx#638, reference 10.51 (paper 12/10/2026, regular hours): the last
+// trade's exchange (84) is in the picture a joining request gets, after the
+// quote's exchanges and before the time; in a trade, after its time and
+// before its price, and only when it changed.
+#[test]
+fn stock_stream_gives_the_last_trade_exchange_when_it_changes() {
+    use crate::md_events::{MdStep, TestMessage};
+    let (client, rx, shared) = test_client();
+    let engine = top_engine(rx);
+    set_exchange_map(&shared, 5, ["K", "P", "Q", "V"].iter().enumerate().map(|(bit, letter)| {
+        crate::types::SmartComponent { bit_number: bit as i32, exchange: letter.to_string(), exchange_letter: letter.to_string() }
+    }).collect());
+    let aapl = Contract { con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(),
+        ..Default::default() };
+    client.req_mkt_data(1, &aapl, "", false, false).unwrap();
+    let (mut q, _) = aapl_join_messages();
+    q.last_exch_mask = 1;
+    let whole = TestMessage { steps: Some(&[MdStep::CatchUp]), halted: Some(0), sizes_seen: true, ..Default::default() };
+    shared.market.push_test_message(5, &q, &whole);
+    client.core.join_stream(1, shared.market.md_events.head());
+    let mut w = SeqRec::default();
+    client.process_msgs(&mut w);
+    let at = |w: &SeqRec, e: &str| w.events.iter().position(|x| x == e);
+    let (ask_exch, last_exch, time) = (at(&w, "string:1:33:PQ"), at(&w, "string:1:84:P"), at(&w, "string:1:45:1790604766"));
+    assert!(ask_exch < last_exch && last_exch < time && ask_exch.is_some(), "{:?}", w.events);
+
+    // A trade on another exchange: time, exchange, then price.
+    let trade = [MdStep::Time, MdStep::Exchange, MdStep::Last];
+    q.last_exch_mask = 2;
+    q.last = q.last + crate::types::PRICE_SCALE / 100;
+    q.timestamp_ns += 1_000_000_000;
+    shared.market.push_test_message(5, &q, &TestMessage { steps: Some(&trade), sizes_seen: true, ..Default::default() });
+    let mut w = SeqRec::default();
+    client.process_msgs(&mut w);
+    let kinds: Vec<&str> = w.events.iter().filter(|e| e.starts_with("string:") || e.starts_with("price:1:4:"))
+        .map(|e| e.as_str()).collect();
+    assert_eq!(kinds, ["string:1:45:1790604767", "string:1:84:Q", "price:1:4:342.36:-"], "{:?}", w.events);
+
+    // A trade on the same exchange: no exchange.
+    q.last = q.last + crate::types::PRICE_SCALE / 100;
+    q.timestamp_ns += 1_000_000_000;
+    shared.market.push_test_message(5, &q, &TestMessage { steps: Some(&trade), sizes_seen: true, ..Default::default() });
+    let mut w = SeqRec::default();
+    client.process_msgs(&mut w);
+    assert!(!w.events.iter().any(|e| e.starts_with("string:1:84:")), "{:?}", w.events);
+    assert!(w.events.iter().any(|e| e.starts_with("price:1:4:")), "{:?}", w.events);
+    drop(engine);
+}
+
 // ibx#446: two messages read at once are not merged: each one's values go
 // out, in order (the old dispatch sent the last values only, and lost a
 // halted state repeated in a step with nothing else).
@@ -7613,7 +8794,134 @@ fn option_stream_auto_execution_comes_from_the_farm() {
     drop(engine);
 }
 
-// A snapshot that never completes ends 11 s after its acknowledgement.
+// ibx#671 (the reference 10.51, 13/10/2026): the bid and ask a contract
+// kept are given with their auto-execution to a stream, without it to a
+// snapshot.
+#[test]
+fn kept_bid_and_ask_auto_execution_stream_and_snapshot() {
+    for snapshot in [false, true] {
+        let (client, rx, shared) = test_client();
+        let engine = top_engine(rx);
+        let option = Contract { con_id: 900_000_001, symbol: "SPY".into(), sec_type: "OPT".into(),
+            exchange: "SMART".into(), ..Default::default() };
+        client.req_mkt_data(1, &option, "", snapshot, false).unwrap();
+        let s = crate::types::PRICE_SCALE;
+        let message = crate::md_events::TestMessage { steps: Some(&[crate::md_events::MdStep::KeptQuote]), auto_bits: Some(12), ..Default::default() };
+        shared.market.push_test_message(5, &crate::types::Quote { bid: 3 * s, ask: 4 * s, ..Default::default() }, &message);
+        let mut w = SeqRec::default();
+        client.process_msgs(&mut w);
+        let bid = w.events.iter().find(|e| e.starts_with("price:1:1:")).cloned().unwrap_or_default();
+        assert_eq!(bid, if snapshot { "price:1:1:3:-" } else { "price:1:1:3:auto" }, "snapshot {snapshot}: {:?}", w.events);
+        drop(engine);
+    }
+}
+
+// ibx#647 (the reference 10.51, paper: option streams 13/10/2026
+// pre-market, an option snapshot 12/10/2026 after hours): a kept bid and
+// ask of -1 come with an unset size and without auto-execution, to a
+// stream and to a snapshot.
+#[test]
+fn kept_minus_one_has_no_size_and_no_auto_execution() {
+    for snapshot in [false, true] {
+        let (client, rx, shared) = test_client();
+        let engine = top_engine(rx);
+        let option = Contract { con_id: 900_000_001, symbol: "SPY".into(), sec_type: "OPT".into(),
+            exchange: "SMART".into(), ..Default::default() };
+        client.req_mkt_data(1, &option, "", snapshot, false).unwrap();
+        let s = crate::types::PRICE_SCALE;
+        let message = crate::md_events::TestMessage { steps: Some(&[crate::md_events::MdStep::KeptQuote]), auto_bits: Some(12), ..Default::default() };
+        shared.market.push_test_message(5, &crate::types::Quote { bid: -s, ask: -s, ..Default::default() }, &message);
+        let mut w = SeqRec::default();
+        client.process_msgs(&mut w);
+        let quote: Vec<&String> = w.events.iter().filter(|e| e.starts_with("price:1:1:") || e.starts_with("price:1:2:")
+            || e.starts_with("size:1:0:") || e.starts_with("size:1:3:")).collect();
+        let unset = |tt: i32| format!("size:1:{tt}:{}", f64::MAX);
+        assert_eq!(quote, [&"price:1:1:-1:-".to_string(), &unset(0), &"price:1:2:-1:-".to_string(), &unset(3)],
+            "snapshot {snapshot}: {:?}", w.events);
+        drop(engine);
+    }
+}
+
+// ibx#749 (the reference 10.51 at level 225, paper, 18/10/2026 weekend,
+// AAPL streamed after a snapshot, three sessions): a stock's kept bid and
+// ask of -1 come with an unset size and with auto-execution.
+#[test]
+fn a_stocks_kept_minus_one_executes_automatically() {
+    let (client, rx, shared) = test_client();
+    let engine = top_engine(rx);
+    let stock = Contract { con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), ..Default::default() };
+    client.req_mkt_data(1, &stock, "", false, false).unwrap();
+    let s = crate::types::PRICE_SCALE;
+    let message = crate::md_events::TestMessage { steps: Some(&[crate::md_events::MdStep::KeptQuote]), ..Default::default() };
+    shared.market.push_test_message(5, &crate::types::Quote { bid: -s, ask: -s, ..Default::default() }, &message);
+    let mut w = SeqRec::default();
+    client.process_msgs(&mut w);
+    let quote: Vec<&String> = w.events.iter().filter(|e| e.starts_with("price:1:1:") || e.starts_with("price:1:2:")
+        || e.starts_with("size:1:0:") || e.starts_with("size:1:3:")).collect();
+    let unset = |tt: i32| format!("size:1:{tt}:{}", f64::MAX);
+    assert_eq!(quote, [&"price:1:1:-1:auto".to_string(), &unset(0), &"price:1:2:-1:auto".to_string(), &unset(3)], "{:?}", w.events);
+    drop(engine);
+}
+
+// ibx#647 (the reference 10.51, paper, 13/10/2026 after hours, the second
+// stream of an option with no bid or ask): after the kept -1 with an unset
+// size, the farm's own sizes of 0 come; its -1 prices, unchanged, do not.
+#[test]
+fn farm_sizes_of_zero_follow_a_kept_minus_one() {
+    let (client, rx, shared) = test_client();
+    let engine = top_engine(rx);
+    let option = Contract { con_id: 900_000_001, symbol: "SPY".into(), sec_type: "OPT".into(),
+        exchange: "SMART".into(), ..Default::default() };
+    client.req_mkt_data(1, &option, "", false, false).unwrap();
+    let s = crate::types::PRICE_SCALE;
+    let q = crate::types::Quote { bid: -s, ask: -s, ..Default::default() };
+    // The kept step carries its size fields, as the engine writes it.
+    let kept = crate::md_events::TestMessage { steps: Some(&[crate::md_events::MdStep::KeptQuote]), auto_bits: Some(12), sizes_seen: true, ..Default::default() };
+    shared.market.push_test_message(5, &q, &kept);
+    let farm = crate::md_events::TestMessage { steps: Some(&[crate::md_events::MdStep::Quote]), auto_bits: Some(12), sizes_seen: true, ..Default::default() };
+    shared.market.push_test_message(5, &q, &farm);
+    let mut w = SeqRec::default();
+    client.process_msgs(&mut w);
+    let quote: Vec<&String> = w.events.iter().filter(|e| e.starts_with("price:1:1:") || e.starts_with("price:1:2:")
+        || e.starts_with("size:1:0:") || e.starts_with("size:1:3:")).collect();
+    let unset = |tt: i32| format!("size:1:{tt}:{}", f64::MAX);
+    assert_eq!(quote, [&"price:1:1:-1:-".to_string(), &unset(0), &"price:1:2:-1:-".to_string(), &unset(3),
+        &"size:1:0:0".to_string(), &"size:1:3:0".to_string()], "{:?}", w.events);
+    drop(engine);
+}
+
+// ibx#674 (the reference 10.51, paper, 14/10/2026, RY on TSE in delayed
+// mode): a contract that needs a subscription for the API, delayed data
+// available: 10089, marketDataType 3, then 354 with the farm's text, and the
+// request ends (its cancel gives 300).
+#[test]
+fn a_delayed_fallback_gives_10089_then_type_3_then_354() {
+    let (client, rx, shared) = test_client();
+    let engine = top_engine(rx);
+    let ry = Contract { con_id: 4458964, symbol: "RY".into(), sec_type: "STK".into(), exchange: "TSE".into(),
+        currency: "CAD".into(), ..Default::default() };
+    client.req_market_data_type(3);
+    client.req_mkt_data(816, &ry, "", true, false).unwrap();
+    let mut w = SnapRec { events: Vec::new() };
+    client.process_msgs(&mut w);
+    let instrument = *client.core.req_to_instrument.lock().unwrap().get(&816).unwrap();
+    shared.market.push_md_reject(crate::bridge::MdReject::DelayedFallback {
+        instrument, description: "RY TSE".into(), farm_text: "Error&TSE/STK/Top&BEST/STK/Top".into(), kept_params: None,
+    });
+    let mut w = SnapRec { events: Vec::new() };
+    client.process_msgs(&mut w);
+    let base = "Requested market data requires additional subscription for API. See link in 'Market Data Connections' dialog for more details.";
+    assert_eq!(w.events, [
+        format!("error:816:10089:{base}RY TSE/TOP/ALL"),
+        "mdt:816:3".to_string(),
+        format!("error:816:354:{}Error&TSE/STK/Top&BEST/STK/Top", crate::client_core::MD_NOT_SUBSCRIBED),
+    ]);
+    assert!(client.core.req_to_instrument.lock().unwrap().get(&816).is_none(), "the request is gone");
+    drop(engine);
+}
+
+// A snapshot that never completes ends 11 s after its acknowledgement; a stream
+// never ends.
 #[test]
 fn plain_snapshot_ends_at_the_time_limit() {
     let start = std::time::Instant::now();
@@ -7622,6 +8930,8 @@ fn plain_snapshot_ends_at_the_time_limit() {
     client.req_mkt_data(1, &spy_stk(), "", true, false).unwrap();
     shared.market.push_top_ack(5, start);
     let s = crate::types::PRICE_SCALE;
+    // The time limit counts from the acknowledgement (ibx#494).
+    shared.market.push_top_ack(5, start);
     shared.market.push_test_message(5, &crate::types::Quote { bid: 100 * s, ..Default::default() }, &Default::default());
     let mut w = SnapRec::default();
     client.process_msgs(&mut w);
@@ -7675,7 +8985,7 @@ fn plain_snapshot_with_generic_ticks_is_refused() {
     client.req_mkt_data(2, &spy_stk(), "236", true, false).unwrap();
     let mut w = SnapRec::default();
     client.process_msgs(&mut w);
-    let refusal = "Error validating request.-'bQ' : cause - Snapshot market data subscription is not applicable to generic ticks";
+    let refusal = "Error validating request.-'ReqMktData(1)' : cause - Snapshot market data subscription is not applicable to generic ticks";
     assert_eq!(w.events.iter().filter(|e| e.starts_with("error:")).cloned().collect::<Vec<_>>(),
         vec![format!("error:1:321:{refusal}"), format!("error:2:321:{refusal}")]);
     assert_eq!(engine.join().unwrap(), vec!["subscribe:756733:true"]);
@@ -7695,7 +9005,7 @@ fn plain_snapshot_beyond_the_limit_is_refused() {
     }
     let mut w = SnapRec::default();
     client.process_msgs(&mut w);
-    let text = "Error validating request.-'bQ' : cause - Snapshot requests limitation exceeded:1 per 1 second(s)";
+    let text = "Error validating request.-'ReqMktData(1)' : cause - Snapshot requests limitation exceeded:1 per 1 second(s)";
     let refused = w.events.iter().filter(|e| e.ends_with(&format!(":321:{text}"))).count();
     // Five requests span at most two seconds: at most two go.
     assert!(refused >= 3, "{:?}", w.events);
@@ -7758,6 +9068,57 @@ fn news_tick_refusals_of_a_known_contract() {
         "error:9583:10094:API News error:Source code unchecked in API news Settings: XYZ",
     ], "{:?}", w.events);
     assert!(client.core.req_to_instrument.lock().unwrap().is_empty(), "the ids are free");
+}
+
+// ibx#662 (the reference 10.51, paper, regular hours 14/10/2026): a
+// request given without a conId, cancelled while its lookup is on its way,
+// gets nothing more; when the lookup answers: 354 for the request, then
+// 300 for the cancel, and the slot is let go. A lookup answered before the
+// engine read the cancel ends it silently.
+#[test]
+fn a_cancel_during_the_lookup_gives_354_then_300() {
+    let (client, rx, shared) = test_client();
+    let engine = std::thread::spawn(move || {
+        let mut got = Vec::new();
+        while let Ok(cmd) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            if let ControlCommand::SubscribeBySymbol { reply_tx: Some(r), .. } = &cmd { let _ = r.send(Ok(6)); }
+            got.push(cmd);
+        }
+        got
+    });
+    let f = Contract { symbol: "F".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() };
+    client.req_mkt_data(700, &f, "", false, false).unwrap();
+    client.cancel_mkt_data(700).unwrap();
+    assert!(client.core.req_to_instrument.lock().unwrap().is_empty(), "the id is free at once");
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert!(!w.events.iter().any(|e| e.starts_with("error:700:")), "nothing before the lookup answers: {:?}", w.events);
+    shared.market.push_md_reject(crate::bridge::MdReject::CancelledDuringLookup { instrument: 6 });
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    let got = engine.join().unwrap();
+    let cancels = got.iter().filter(|c| matches!(c, ControlCommand::Unsubscribe { instrument: 6 })).count();
+    assert_eq!(cancels, 2, "the cancel goes to the engine, then the slot is let go");
+    assert_eq!(w.events, [
+        format!("error:700:354:{}", crate::client_core::MD_NOT_SUBSCRIBED),
+        "error:700:300:Can't find EId with tickerId:700".to_string(),
+    ]);
+
+    // Answered before the engine read the cancel: nothing more.
+    let (client, rx, shared) = test_client();
+    let engine = std::thread::spawn(move || {
+        while let Ok(cmd) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            if let ControlCommand::SubscribeBySymbol { reply_tx: Some(r), .. } = &cmd { let _ = r.send(Ok(6)); }
+        }
+    });
+    client.req_mkt_data(701, &f, "", false, false).unwrap();
+    client.cancel_mkt_data(701).unwrap();
+    shared.market.push_md_resolved(6, 9599491);
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert!(!w.events.iter().any(|e| e.starts_with("error:701:")), "{:?}", w.events);
+    engine.join().unwrap();
+    assert!(client.core.md_cancelled_in_lookup.lock().unwrap().is_empty());
 }
 
 // ibx#458: an accepted news tick follows the request's subscription with
@@ -7830,9 +9191,202 @@ fn req_current_time_adds_the_logon_clock_offset() {
     shared.reference.clock().set(60_000);
     let mut w = Time::default();
     client.req_current_time(&mut w);
+    client.process_msgs(&mut w);
     let local = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     assert_eq!(w.0.len(), 1);
     assert!((w.0[0] - local - 60).abs() <= 1, "{} vs local {}", w.0[0], local);
+}
+
+// ibx#516: the time in milliseconds comes from the clock of the time in
+// seconds.
+#[test]
+fn req_current_time_in_millis_adds_the_logon_clock_offset() {
+    #[derive(Default)]
+    struct Time(Vec<i64>);
+    impl Wrapper for Time {
+        fn current_time_in_millis(&mut self, time_in_millis: i64) { self.0.push(time_in_millis); }
+    }
+    let (client, _rx, shared) = test_client();
+    shared.reference.clock().set(60_000);
+    let mut w = Time::default();
+    client.req_current_time_in_millis(&mut w);
+    client.process_msgs(&mut w);
+    let local = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    assert_eq!(w.0.len(), 1);
+    assert!((w.0[0] - local - 60_000).abs() <= 1_000, "{} vs local {}", w.0[0], local);
+}
+
+// ibx#516: the requests a session of the reference does not have give the
+// answers of the reference run of 10/10/2026, and send nothing.
+#[test]
+fn requests_the_reference_session_does_not_have() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
+    client.cancel_contract_data(7001);
+    client.cancel_historical_ticks(7003);
+    client.verify_request("app", "1.0");
+    client.verify_message("data");
+    client.verify_and_auth_request("app", "1.0", "key");
+    client.verify_and_auth_message("data", "response");
+    assert!(rx.try_recv().is_err(), "nothing goes to the engine");
+    assert_eq!(shared.orders.drain_order_errors(), [
+        (7001, 503, "The TWS is out of date and must be upgraded.  It does not support contract data cancels.".to_string()),
+        (7003, 503, "The TWS is out of date and must be upgraded.  It does not support historical ticks cancels.".to_string()),
+        (-1, 544, "Verify Request Sending Error -   Intent to authenticate needs to be expressed during initial connect request.".to_string()),
+        // No answer to verifyMessage on 10.51 (ibx#556).
+        (-1, 551, "Verify And Auth Request Sending Error -   Intent to authenticate needs to be expressed during initial connect request.".to_string()),
+    ]);
+}
+
+// ibx#556 (the reference 10.51, paper, pre-market 20/10/2026, an official
+// client at level 225): a plain verifyMessage, or a verifyRequest or
+// verifyAndAuthRequest with the intent to verify, leaves the session
+// answering no more request; without the intent, 544 and 551 and the
+// session goes on.
+#[test]
+fn a_verify_message_leaves_the_session_unanswered() {
+    let errors = |client: &EClient| {
+        let mut w = RecordingWrapper::default();
+        client.process_msgs(&mut w);
+        w.events.iter().filter_map(|e| e.strip_prefix("error:-1:")).map(|e| e[..3].parse::<i64>().unwrap()).collect::<Vec<_>>()
+    };
+    let order = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 1.0,
+        tif: "DAY".into(), ..Default::default() };
+    // Without the intent: refused, the session goes on.
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    client.verify_request("app", "1.0");
+    client.verify_and_auth_request("app", "1.0", "key");
+    assert_eq!(errors(&client), [544, 551]);
+    client.place_order(5, &spy(), &order).unwrap();
+    assert!(rx.try_iter().any(|c| matches!(c, ControlCommand::Order(_))), "the order goes");
+
+    for start in 0..4 {
+        let (client, rx, shared) = test_client();
+        shared.market.set_instrument_count(1);
+        match start {
+            0 => client.verify_message("data"),
+            1 => client.verify_and_auth_message("data", "response"),
+            _ => {
+                client.set_extra_auth(true);
+                if start == 2 { client.verify_request("app", "1.0") } else { client.verify_and_auth_request("app", "1.0", "key") }
+            }
+        }
+        let _ = client.place_order(5, &spy(), &order);
+        client.verify_request("app", "1.0");
+        let mut w = RecordingWrapper::default();
+        client.req_current_time(&mut w);
+        assert!(errors(&client).is_empty(), "case {start}: no answer");
+        assert!(rx.try_recv().is_err(), "case {start}: nothing sent");
+    }
+}
+
+// ibx#612: at session level 214 an update of the configuration is refused
+// with 503 for its id, or -1 without one, and nothing goes to the engine,
+// as the official client library at level 214 (reference 10.51, paper,
+// 17/10/2026).
+#[test]
+fn update_config_is_refused_below_level_221() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
+    let mut request = crate::api::config::UpdateConfigRequest { req_id: Some(7401), ..Default::default() };
+    client.update_config(&request);
+    request.req_id = None;
+    client.update_config(&request);
+    assert!(rx.try_recv().is_err(), "nothing goes to the engine");
+    let text = "The TWS is out of date and must be upgraded.  It does not support update config requests.".to_string();
+    assert_eq!(shared.orders.drain_order_errors(), [(7401, 503, text.clone()), (-1, 503, text)]);
+}
+
+// ibx#610: at session level 214 the configuration request is refused with
+// 503 for its id, or -1 without one, as the official client library does
+// below level 219, and nothing goes to the engine.
+#[test]
+fn req_config_is_refused_below_level_219() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
+    client.req_config(&crate::api::config::ConfigRequest { req_id: Some(7301) });
+    client.req_config(&crate::api::config::ConfigRequest::default());
+    assert!(rx.try_recv().is_err(), "nothing goes to the engine");
+    let text = "The TWS is out of date and must be upgraded.  It does not support config requests.".to_string();
+    assert_eq!(shared.orders.drain_order_errors(), [(7301, 503, text.clone()), (-1, 503, text)]);
+}
+
+// ibx#610, ibx#612 (decision of 18/10/2026): from levels 219 and 221 the
+// answers come from process_msgs, never inside the request; an update
+// that succeeds is kept and a later configuration request shows it; a
+// value ibx cannot follow is refused with the field named.
+#[test]
+fn config_answers_come_from_process_msgs_and_keep_an_update() {
+    use crate::api::config::*;
+    #[derive(Default)]
+    struct Config(Vec<String>);
+    impl Wrapper for Config {
+        fn config_response(&mut self, r: &ConfigResponse) {
+            let s = r.api.as_ref().unwrap().settings.as_ref().unwrap();
+            self.0.push(format!("config {:?} port {:?} messages {}", r.req_id, s.socket_port, r.messages.len()));
+        }
+        fn update_config_response(&mut self, r: &UpdateConfigResponse) {
+            self.0.push(format!("update {:?} {:?} {:?} {:?}", r.req_id, r.status, r.changed_fields, r.errors));
+        }
+    }
+    let (client, rx, _shared) = test_client();
+    let mut w = Config::default();
+    client.req_config_at(225, &ConfigRequest { req_id: Some(7301) });
+    let port = |id, port| UpdateConfigRequest {
+        req_id: Some(id),
+        api: Some(ApiConfig { settings: Some(ApiSettingsConfig { socket_port: Some(port), ..Default::default() }), precautions: None }),
+        ..Default::default()
+    };
+    client.update_config_at(225, &port(7302, 4003));
+    let mut read_only = port(7303, 4004);
+    read_only.api.as_mut().unwrap().settings.as_mut().unwrap().read_only_api = Some(true);
+    client.update_config_at(225, &read_only);
+    client.req_config_at(225, &ConfigRequest::default());
+    assert!(w.0.is_empty(), "nothing inside the requests");
+    assert!(rx.try_recv().is_err(), "nothing goes to the engine");
+    client.process_msgs(&mut w);
+    assert_eq!(w.0, [
+        "config Some(7301) port Some(4002) messages 22",
+        r#"update Some(7302) Some("success") ["configuration.api.settings.socketPort"] []"#,
+        r#"update Some(7303) Some("error") [] ["configuration.api.settings.readOnlyApi"]"#,
+        "config Some(0) port Some(4003) messages 22",
+    ]);
+}
+
+// ibx#561: on a paced session a market data request asks for its slot
+// first, which the engine tells at once, and sends its subscribe with no
+// reply to wait for.
+#[test]
+fn a_paced_market_data_request_does_not_wait_for_its_subscribe() {
+    let shared = Arc::new(SharedState::new());
+    let (raw_tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::engine::park::ControlSender::new(raw_tx, None, None);
+    let core = crate::client_core::ClientCore::new();
+    let engine = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        while let Ok(cmd) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            match cmd {
+                ControlCommand::MarketDataSlot { con_id, reply_tx, .. } => {
+                    seen.push(format!("slot {con_id}"));
+                    let _ = reply_tx.send(Ok(7));
+                }
+                // Never answered: the call must not wait for it.
+                ControlCommand::Subscribe { con_id, reply_tx, .. } => {
+                    seen.push(format!("subscribe {con_id} reply {}", reply_tx.is_some()));
+                }
+                other => seen.push(format!("{other:?}").chars().take(20).collect()),
+            }
+        }
+        seen
+    });
+    let started = std::time::Instant::now();
+    let slot = core.register_mkt_data(&shared, &tx, 1, 265598, "AAPL", "SMART", "STK", "USD", &Default::default(), false, "mdoff", 0)
+        .unwrap();
+    assert_eq!(slot, Some(7));
+    assert!(started.elapsed() < std::time::Duration::from_millis(200), "{:?}", started.elapsed());
+    drop(tx);
+    assert_eq!(engine.join().unwrap(), ["slot 265598", "subscribe 265598 reply false"]);
 }
 
 // Without SECDEFTA in the logon feature list, a matching symbols request
@@ -7847,7 +9401,7 @@ fn req_matching_symbols_refused_without_the_feature() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     let errors: Vec<String> = w.events.iter().filter(|e| e.starts_with("error:")).cloned().collect();
-    let refused = "Error validating request.-'ce' : cause - Failed to request matching symbols";
+    let refused = "Error validating request.-'ReqMatchingSymbols(81)' : cause - Failed to request matching symbols";
     assert_eq!(errors, [format!("error:8:321:{refused}"), format!("error:9:321:{refused}")]);
 
     shared.reference.set_api_features(crate::control::logon::ApiFeatures::parse("APIELOG,SECDEFTA"));
@@ -7863,7 +9417,7 @@ fn req_historical_data_years_above_the_logon_limit() {
     client.req_historical_data(5, &spy(), "", "2 Y", "1 day", "TRADES", true, 1, false).unwrap();
     assert!(rx.try_recv().is_err());
     assert_eq!(shared.reference.drain_historical_errors(), vec![(5, 321,
-        "Error validating request.-'bM' : cause - Historical data request for 2 year(s) rejected. Max API Backfill Years=1".to_string())]);
+        "Error validating request.-'ReqHistoricalData(20)' : cause - Historical data request for 2 year(s) rejected. Max API Backfill Years=1".to_string())]);
     client.req_historical_data(6, &spy(), "", "1 Y", "1 day", "TRADES", true, 1, false).unwrap();
     assert!(matches!(rx.try_recv().unwrap(), ControlCommand::FetchHistorical { req_id: 6, .. }));
     shared.reference.set_api_features(crate::control::logon::ApiFeatures::parse("NIGHTLY"));
@@ -7875,10 +9429,10 @@ fn req_historical_data_years_above_the_logon_limit() {
 #[test]
 fn version_cutoff_warning_reaches_the_client() {
     let (client, _rx, shared) = test_client();
-    crate::gateway::apply_first_logon(&Default::default(), Some("10411"), Some("20261201"), 199, &shared);
+    crate::gateway::apply_first_logon(&Default::default(), Some("10601"), Some("20271201"), 199, &shared);
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
-    assert!(w.events.iter().any(|e| e.starts_with("error:-1:2172:The version of the application you are running, 1040.1,")), "{:?}", w.events);
+    assert!(w.events.iter().any(|e| e.starts_with("error:-1:2172:The version of the application you are running, 1051.1,")), "{:?}", w.events);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -7959,6 +9513,10 @@ fn two_requests_on_one_contract_share_the_subscription() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     let math = "The New Math of AI: Are Those Trillion-Dollar Numbers for Real? -- Barrons.com";
+    // A joining request without top of book gets its market data type
+    // before its parameters, as in this recording (the reference 10.51,
+    // 13/10/2026, two runs; ibx#535); a top-of-book request joining gets
+    // the parameters first (12/10/2026, ibx#495).
     assert_eq!(w.events, [
         "market_data_type:9581:1".to_string(),
         "tick_req_params:9581:0.01:9c0001:3".to_string(),
@@ -7988,7 +9546,8 @@ fn two_requests_on_one_contract_share_the_subscription() {
 }
 
 // ibx#444: a request that joins a quote with data gets all of it at its
-// first poll; both requests then get each change.
+// first poll, and the running one gets it again (ibx#495); both requests
+// then get each change.
 #[test]
 fn a_joining_stream_gets_the_quote_at_once() {
     let (client, rx, shared) = test_client();
@@ -8006,7 +9565,11 @@ fn a_joining_stream_gets_the_quote_at_once() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     assert!(w.events.iter().any(|e| e == "tick_price:2:1:100") && w.events.iter().any(|e| e == "tick_price:2:2:101"), "{:?}", w.events);
-    assert!(!w.events.iter().any(|e| e.contains(":1:1:100")), "nothing new for the first: {:?}", w.events);
+    // The first gets the quote again, before the one that joins (the
+    // reference 10.51, paper 12/10/2026, ibx#495).
+    let first = w.events.iter().position(|e| e == "tick_price:1:1:100");
+    let second = w.events.iter().position(|e| e == "tick_price:2:1:100");
+    assert!(first.is_some() && first < second, "{:?}", w.events);
 
     quote.bid = 99 * s;
     shared.market.push_test_message(5, &quote, &Default::default());
@@ -8019,7 +9582,7 @@ fn a_joining_stream_gets_the_quote_at_once() {
 }
 
 // ibx#444, captured 02/10/2026: the second symbol-only AAPL request was
-// looked up (35=c) and then joined the first one's subscription. The engine
+// looked up and then joined the first one's subscription. The engine
 // says so once the lookup found the contract; the request moves to the
 // running subscription, gets what it has, and its own slot is freed.
 #[test]
@@ -8037,6 +9600,9 @@ fn a_symbol_only_request_joins_the_contract_it_finds() {
     shared.market.push_md_merge(6, 5);
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
+    // A joining request without top of book: the type before the
+    // parameters (the reference 10.51, 13/10/2026, two runs; ibx#535). A
+    // top-of-book request joining gets the parameters first (ibx#495).
     assert_eq!(w.events, ["market_data_type:9581:1", "tick_req_params:9581:0.01:9c0001:3"]);
     assert_eq!(client.core.instrument_to_req.lock().unwrap().get(&5), Some(&vec![9580, 9581]));
     assert!(!client.core.instrument_to_req.lock().unwrap().contains_key(&6));
@@ -8049,7 +9615,7 @@ fn a_symbol_only_request_joins_the_contract_it_finds() {
     ]);
 }
 
-// ibx#444 (`jextend.s.a(dy,ec,Set)@116-188`): a request joining a contract
+// ibx#444: a request joining a contract
 // that runs on delayed data gets 10168 when the client has not enabled
 // delayed data, and is not kept; with delayed data enabled it joins on
 // delayed data (marketDataType 3).
@@ -8082,7 +9648,7 @@ fn joining_a_delayed_subscription() {
     assert_eq!(seen, ["subscribe:265598"]);
 }
 
-// ibx#447 (`jextend.v.a(boolean)`, captured 07/10/2026): when the
+// ibx#447 (captured 07/10/2026): when the
 // contract's data is frozen its requests go on with the frozen slot,
 // marketDataType 2; a request that joins then is on the frozen slot too;
 // back on real-time data they return to the real-time slot, marketDataType
@@ -8118,7 +9684,7 @@ fn a_frozen_contract_moves_its_requests_to_the_frozen_slot_and_back() {
     assert_eq!(seen, ["subscribe:265598", "unsubscribe:9", "unsubscribe:5"]);
 }
 
-// ibx#444 (`jextend.s.b(boolean,boolean)`, `jextend.ba.a(...)@280`): when
+// ibx#444: when
 // the top of book is rejected, a request with the news tick keeps it, with
 // 2117; one without ends with 354, and the others' subscription stays.
 #[test]
@@ -8129,7 +9695,7 @@ fn a_top_reject_keeps_the_news_of_a_request() {
     client.req_mkt_data(1, &aapl_stk(), "mdoff,292", false, false).unwrap();
     client.req_mkt_data(2, &aapl_stk(), "", false, false).unwrap();
     shared.market.push_md_reject(crate::bridge::MdReject::NotSubscribed {
-        instrument: 5, delayed_available: true, needs_api_subscription: false, description: String::new(), kept_params: None,
+        instrument: 5, delayed_available: true, needs_api_subscription: false, description: String::new(), kept_params: None, part: None, farm_text: String::new(),
     });
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
@@ -8159,11 +9725,13 @@ fn an_invalid_generic_tick_list_is_refused() {
     assert!(rx.try_recv().is_err(), "nothing sent");
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
-    let legal = crate::control::generic_tick::legal_ones("STK");
+    // At session level 225 the list ends with the odd-lot entry (ibx#605).
+    let legal = crate::control::generic_tick::legal_ones_at("STK", true);
+    assert!(legal.ends_with(",623(EtfFrozenNavLast(fznavlast)),787(OddLotBidAskQuotesTickTag(mdbaodd))"));
     assert_eq!(w.events, [
-        format!("error:9570:321:Error validating request.-'bQ' : cause - Incorrect generic tick list of mdoff,292:.  Legal ones for (STK) are: {legal}"),
-        format!("error:7:321:Error validating request.-'bQ' : cause - Incorrect generic tick list of 999.  Legal ones for (CASH) are: {legal}"),
-        format!("error:8:321:Error validating request.-'bQ' : cause - Incorrect generic tick list of mdoff.  Legal ones for (STK) are: {legal}"),
+        format!("error:9570:321:Error validating request.-'ReqMktData(1)' : cause - Incorrect generic tick list of mdoff,292:.  Legal ones for (STK) are: {legal}"),
+        format!("error:7:321:Error validating request.-'ReqMktData(1)' : cause - Incorrect generic tick list of 999.  Legal ones for (CASH) are: {legal}"),
+        format!("error:8:321:Error validating request.-'ReqMktData(1)' : cause - Incorrect generic tick list of mdoff.  Legal ones for (STK) are: {legal}"),
     ]);
 }
 
@@ -8171,7 +9739,7 @@ fn an_invalid_generic_tick_list_is_refused() {
 // sent); a snapshot with an invalid list is not refused by this check.
 // ibx#444: `mdoff` (any case, anywhere in the list) turns the top of book
 // off for its request: the reference's sender skips the top pass of that
-// subscriber (`jextend.dL.a(s,int,pa,Map,Set)@136-220`). Another request
+// subscriber. Another request
 // of the same contract still gets it.
 #[test]
 fn mdoff_request_gets_no_top_of_book() {
@@ -8227,7 +9795,7 @@ fn line_engine(rx: crossbeam_channel::Receiver<ControlCommand>) -> std::thread::
     })
 }
 
-// ibx#444 (`jextend.s.a(dy,ec,Set)@104-191`): after a 354 with delayed data
+// ibx#444: after a 354 with delayed data
 // available, the contract's record keeps that state. A new request of a
 // client without delayed data gets 10168 at once, nothing sent; with
 // delayed data enabled it goes delayed at once: marketDataType 3, no
@@ -8239,7 +9807,7 @@ fn a_contract_known_delayed_available_gives_10168_or_goes_delayed() {
     let engine = line_engine(rx);
     client.req_mkt_data(1, &aapl_stk(), "", false, false).unwrap();
     shared.market.push_md_reject(crate::bridge::MdReject::NotSubscribed {
-        instrument: 10, delayed_available: true, needs_api_subscription: false, description: String::new(), kept_params: None,
+        instrument: 10, delayed_available: true, needs_api_subscription: false, description: String::new(), kept_params: None, part: None, farm_text: String::new(),
     });
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
@@ -8265,13 +9833,13 @@ fn a_contract_known_delayed_available_gives_10168_or_goes_delayed() {
     assert_eq!(seen, ["subscribe:265598:0", "unsubscribe:10", "subscribe:265598:1", "unsubscribe:11", "subscribe:265598:0"]);
 }
 
-// ibx#444 (`jclient.k_.a(boolean)`, `jextend.a4.a(jclient.record.dU)@136`):
-// with every API line taken, a stream on a new contract gets 101 and waits;
-// a snapshot and a stream joining a running contract take no line. When a
-// line is set free the waiting request is subscribed, with no second 101.
-// A waiting request is cancelled with nothing sent and no 300.
+// ibx#444:
+// with every API line taken, a stream on a new contract gets 101; a
+// snapshot and a stream joining a running contract take no line. Observed
+// 12/10/2026 (ibx#501): the refused request ends (its cancel gets 300) and
+// is not served when a line is set free.
 #[test]
-fn past_the_ticker_limit_a_stream_gets_101_and_waits_for_a_line() {
+fn past_the_ticker_limit_a_stream_gets_101_and_ends() {
     let (client, rx, shared) = test_client();
     shared.reference.set_snapshot_rate_limit(1);
     let engine = line_engine(rx);
@@ -8283,21 +9851,27 @@ fn past_the_ticker_limit_a_stream_gets_101_and_waits_for_a_line() {
     client.req_mkt_data(4, &eur_usd(), "", false, false).unwrap();
     client.process_msgs(&mut w);
     let errors: Vec<&String> = w.events.iter().filter(|e| e.starts_with("error:")).collect();
-    assert_eq!(errors, [
-        "error:2:101:Max number of tickers has been reached",
-        "error:4:101:Max number of tickers has been reached",
-        "error:4:322:Error processing request.-'bQ' : cause - Duplicate ticker id",
-    ]);
-
-    client.cancel_mkt_data(4).unwrap();
+    assert_eq!(errors, ["error:2:101:Max number of tickers has been reached"]);
+    client.cancel_mkt_data(2).unwrap();
     client.cancel_mkt_data(1).unwrap();
     client.cancel_mkt_data(3).unwrap();
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
-    assert!(!w.events.iter().any(|e| e.starts_with("error:")), "{:?}", w.events);
-    assert_eq!(client.core.md_lines_in_use(), 1);
+    let errors: Vec<&String> = w.events.iter().filter(|e| e.starts_with("error:")).collect();
+    let (mut held, others): (Vec<&String>, Vec<&String>) = errors.into_iter().partition(|e| e.contains(":101:"));
+    assert_eq!(others, ["error:2:300:Can't find EId with tickerId:2"]);
+    assert_eq!(client.core.md_lines_in_use(), 0);
     let seen = engine.join().unwrap();
-    assert_eq!(seen, ["subscribe:265598:0", "unsubscribe:10", "subscribe:756733:0"]);
+    assert_eq!(seen, ["subscribe:265598:0", "unsubscribe:10"]);
+    // ibx#649: the others of the pass get theirs at its end, together.
+    std::thread::sleep(crate::client_core::MD_LIMIT_PASS + std::time::Duration::from_millis(50));
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    held.extend(w.events.iter().filter(|e| e.starts_with("error:")));
+    assert_eq!(held, [
+        "error:4:101:Max number of tickers has been reached",
+        "error:4:101:Max number of tickers has been reached",
+    ]);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -8321,10 +9895,10 @@ fn requests_of_a_contract_with_no_exchange_are_refused() {
     client.process_msgs(&mut w);
     let errors: Vec<&String> = w.events.iter().filter(|e| e.starts_with("error:")).collect();
     assert_eq!(errors, [
-        "error:1:321:Error validating request.-'bH' : cause - Missing order exchange",
-        "error:2:321:Error validating request.-'bQ' : cause - Please enter exchange",
-        "error:3:321:Error validating request.-'bM' : cause - Please enter exchange",
-        "error:4:321:Error validating request.-'bN' : cause - Please enter exchange",
+        "error:1:321:Error validating request.-'PlaceOrder(3)' : cause - Missing order exchange.",
+        "error:2:321:Error validating request.-'ReqMktData(1)' : cause - Please enter exchange",
+        "error:3:321:Error validating request.-'ReqHistoricalData(20)' : cause - Please enter exchange",
+        "error:4:321:Error validating request.-'ReqHeadTimestamp(87)' : cause - Please enter exchange",
     ]);
 }
 
@@ -8339,8 +9913,8 @@ fn contract_details_of_an_unset_contract() {
     client.req_contract_details(2, &Contract { symbol: "AAPL".into(), ..Default::default() }).unwrap();
     assert!(rx.try_recv().is_err(), "nothing sent");
     assert_eq!(shared.reference.drain_historical_errors(), [
-        (1, 321, "Error validating request.-'bK' : cause - The symbol or the local-symbol or the security id must be entered".to_string()),
-        (2, 321, "Error validating request.-'bK' : cause - Please enter a valid security type".to_string()),
+        (1, 321, "Error validating request.-'ReqContractData(9)' : cause - The symbol or the local-symbol or the security id must be entered".to_string()),
+        (2, 321, "Error validating request.-'ReqContractData(9)' : cause - Please enter a valid security type".to_string()),
     ]);
     client.req_contract_details(3, &Contract { symbol: "AAPL".into(), sec_type: "STK".into(), ..Default::default() }).unwrap();
     match rx.try_recv().unwrap() {
@@ -8363,10 +9937,10 @@ fn contract_details_of_an_unset_contract() {
 fn an_order_with_unset_fields_goes_out_and_shows_as_the_reference() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
-    let order = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "MKT".into(), ..Default::default() };
+    let order = Order { action: "BUY".into(), total_quantity: 1.0, tif: "DAY".into(), order_type: "MKT".into(), ..Default::default() };
     client.place_order(5, &spy(), &order).unwrap();
     assert!(matches!(rx.try_recv().unwrap(), ControlCommand::Order(OrderRequest::SubmitMarket { order_id: 5, qty: 1, .. })));
-    let lmt = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 1.0, ..Default::default() };
+    let lmt = Order { action: "BUY".into(), total_quantity: 1.0, tif: "DAY".into(), order_type: "LMT".into(), lmt_price: 1.0, ..Default::default() };
     client.place_order(6, &spy(), &lmt).unwrap();
     match rx.try_recv().unwrap() {
         ControlCommand::Order(OrderRequest::SubmitLimit { order_id: 6, price, .. }) => assert_eq!(price, PRICE_SCALE),
@@ -8377,6 +9951,95 @@ fn an_order_with_unset_fields_goes_out_and_shows_as_the_reference() {
     assert_eq!((o.lmt_price, o.aux_price, o.tif.as_str()), (0.0, 0.0, "DAY"));
     assert_eq!((o.volatility_type, o.reference_price_type, o.dont_use_auto_price_for_hedge), (0, 0, true));
     assert_eq!((o.min_qty, o.trailing_percent, o.cash_qty, o.filled_quantity), (i32::MAX, f64::MAX, f64::MAX, 0.0));
+}
+
+// ibx#605 (the reference 10.51, paper, regular hours, 19/10/2026): the
+// openOrder of a filled order shows "Filled Size: <filled>"; a working one
+// shows no completed status, nor does any openOrder on 10.40.
+#[test]
+fn a_filled_order_shows_its_filled_size_on_10_51_only() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order { action: "BUY".into(), total_quantity: 3.0, tif: "DAY".into(), order_type: "MKT".into(), ..Default::default() };
+    client.place_order(5, &spy(), &order).unwrap();
+    let state = |status: &str| client.core.order_view(5, &client.shared, status).expect("tracked").state.completed_status;
+    assert_eq!(state("Submitted"), "");
+    let mut view = client.core.order_view(5, &client.shared, "Filled");
+    crate::client_core::ClientCore::report_filled(&mut view, 3.0);
+    assert_eq!(view.unwrap().state.completed_status, "Filled Size: 3");
+    shared.reference.set_form_10_40(true);
+    assert_eq!(state("Filled"), "");
+    shared.reference.set_form_10_40(false);
+}
+
+// ibx#605 (the reference 10.51, paper, regular hours, 19/10/2026,
+// i197_peg_best_ats): openOrder shows a pegged-to-best order as it goes
+// out, with the compete values 100 and 0.02 and without postToAts, which
+// is not sent.
+#[test]
+fn a_peg_best_order_shows_the_values_it_goes_out_with() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order { action: "BUY".into(), total_quantity: 1.0, tif: "DAY".into(), order_type: "PEG BEST".into(),
+        lmt_price: 700.0, post_to_ats: 1, ..Default::default() };
+    client.place_order(5, &spy(), &order).unwrap();
+    let o = client.core.order_view(5, &client.shared, "PreSubmitted").expect("tracked").order;
+    assert_eq!((o.min_compete_size, o.compete_against_best_offset, o.post_to_ats), (100, 0.02, i32::MAX));
+}
+
+// ibx#605 (the reference 10.51, paper, regular hours, 19/10/2026,
+// i105_combo_fill): a combo filled in full keeps its smart combo routing
+// parameters on its later openOrders (leg fills, commissions), which ibx
+// builds from the server's copy of the order.
+#[test]
+fn a_filled_combo_keeps_its_routing_parameters() {
+    let (client, _rx, shared) = test_client();
+    let params = vec![TagValue { tag: "NonGuaranteed".into(), value: "1".into() }];
+    let order = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 1.0,
+        smart_combo_routing_params: params.clone(), ..Default::default() };
+    client.core.track_order(9, spy(), order, 1);
+    let reported = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), ..Default::default() };
+    shared.orders.push_order_info(9, crate::bridge::RichOrderInfo { contract: spy(), order: reported,
+        order_state: Default::default(), last_exec: Default::default(),
+        parent_id_known: true, report_revision: None, report_time: None });
+    client.core.update_order_fill(9, "Filled", 1.0, 0.0);
+    let view = client.core.order_view(9, &client.shared, "Filled").expect("reported");
+    assert_eq!(view.order.smart_combo_routing_params, params);
+}
+
+// ibx#605 (the reference 10.51, paper, regular hours, 19/10/2026, b2_trail):
+// the open-orders answer shows a percent trail without auxPrice, as its
+// other openOrders, where the server's reports give 0.
+#[test]
+fn the_open_orders_answer_shows_a_percent_trail_without_aux_price() {
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = Order { action: "BUY".into(), total_quantity: 1.0, tif: "DAY".into(), order_type: "TRAIL".into(),
+        trailing_percent: 0.2, aux_price: 0.0, ..Default::default() };
+    client.core.track_order(5, spy(), order, 1);
+    let listed = client.core.open_orders_listing(&client.shared, crate::client_core::OpenOrdersRequest::All);
+    let (_, t, _) = listed.iter().find(|(id, ..)| *id == 5).expect("listed");
+    assert_eq!(t.order.aux_price, f64::MAX);
+}
+
+// ibx#622 (the reference 10.51, paper, pre-market 12/10 and 13/10/2026):
+// an AccuDistr order with post-only, which is not sent with it, shows
+// postOnly on its first openOrder and not on the next ones; another
+// post-only order keeps it.
+#[test]
+fn an_accu_distr_order_shows_post_only_on_its_first_open_order_only() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, _rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let base = Order { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 1.0,
+        post_only: true, outside_rth: true, ..Default::default() };
+    let accu = Order { algo_strategy: "AccuDistr".into(),
+        algo_params: vec![TagValue { tag: "componentSize".into(), value: "1".into() }], ..base.clone() };
+    client.place_order(5, &spy(), &accu).unwrap();
+    client.place_order(6, &spy(), &base).unwrap();
+    let post_only = |id| client.core.order_view(id, &client.shared, "Submitted").expect("tracked").order.post_only;
+    assert_eq!([post_only(5), post_only(5), post_only(5)], [true, false, false]);
+    assert_eq!([post_only(6), post_only(6)], [true, true]);
 }
 
 // ibx#420: reqManagedAccts answers every account of the logon's account
@@ -8393,10 +10056,13 @@ fn managed_accounts_are_the_logon_account_list() {
     let (client, _rx, shared) = test_client();
     let mut w = Accounts::default();
     client.req_managed_accts(&mut w);
+    client.process_msgs(&mut w);
     shared.reference.set_managed_accounts(crate::control::logon::managed_accounts("DUXXXXXX2/{alias},DUXXXXXX1/{alias}"));
     client.req_managed_accts(&mut w);
+    client.process_msgs(&mut w);
     shared.reference.set_managed_accounts(crate::control::logon::managed_accounts("DUXXXXXXX"));
     client.req_managed_accts(&mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.0, ["DU123", "DUXXXXXX2,DUXXXXXX1", "DUXXXXXXX"]);
 }
 
@@ -8408,6 +10074,7 @@ fn managed_accounts_are_the_logon_account_list() {
 // reqAccountUpdates gives the warning and goes on.
 #[test]
 fn pending_accounts_refuse_orders_and_positions() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     #[derive(Default)]
     struct Errors(Vec<(i64, i64, String)>);
     impl Wrapper for Errors {
@@ -8452,6 +10119,7 @@ fn pending_accounts_refuse_orders_and_positions() {
 // and the order goes out.
 #[test]
 fn algo_time_parameters_10314_and_2174() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     shared.reference.add_algo_definitions(include_str!("../../../tests/fixtures/algo/IBALGO-AE-20261002.xml"));
@@ -8485,20 +10153,25 @@ fn display_group_requests_as_the_reference() {
     let mut w = RecordingWrapper::default();
 
     client.query_display_groups(1, &mut w);
+    client.process_msgs(&mut w);
     client.subscribe_to_group_events(2, 1, &mut w);
+    client.process_msgs(&mut w);
     for group in [9, 0, 8, -1] {
         client.subscribe_to_group_events(3, group, &mut w);
+        client.process_msgs(&mut w);
     }
     client.subscribe_to_group_events(2, 1, &mut w);
+    client.process_msgs(&mut w);
     client.subscribe_to_group_events(7, 1, &mut w);
+    client.process_msgs(&mut w);
     assert_eq!(w.events, [
         "display_group_list:1:1|2|3|4|5|6|7".to_string(),
         "display_group_updated:2:none".to_string(),
-        refusal("bX", "Invalid window group ID=9"),
-        refusal("bX", "Invalid window group ID=0"),
-        refusal("bX", "Invalid window group ID=8"),
-        refusal("bX", "Invalid window group ID=-1"),
-        refusal("bX", "Request with ID=2 was already subscribed."),
+        refusal("DisplayToGroupEvents(68)", "Invalid window group ID=9"),
+        refusal("DisplayToGroupEvents(68)", "Invalid window group ID=0"),
+        refusal("DisplayToGroupEvents(68)", "Invalid window group ID=8"),
+        refusal("DisplayToGroupEvents(68)", "Invalid window group ID=-1"),
+        refusal("DisplayToGroupEvents(68)", "Request with ID=2 was already subscribed."),
         "display_group_updated:7:none".to_string(),
     ]);
 
@@ -8534,4 +10207,31 @@ fn display_group_requests_as_the_reference() {
         &refusal("bZ", "Request with ID=2 failed since request ID wasn't found."),
     ]);
     assert!(!w.events.iter().any(|e| e.starts_with("display_group")), "{:?}", w.events);
+}
+
+// ibx#532: the answers of different queues come in the order they were
+// written, and an answer the client makes itself after the answers
+// written before it, never inside the request.
+#[test]
+fn answers_come_in_the_order_written_across_queues_and_after_them_the_clients_own() {
+    #[derive(Default)]
+    struct Seen(Vec<String>);
+    impl Wrapper for Seen {
+        fn error(&mut self, req_id: i64, code: i64, _msg: &str, _json: &str) { self.0.push(format!("error {req_id} {code}")); }
+        fn contract_details_end(&mut self, req_id: i64) { self.0.push(format!("end {req_id}")); }
+        fn current_time(&mut self, _time: i64) { self.0.push("time".into()); }
+        fn news_providers(&mut self, _providers: &[crate::types::NewsProvider]) { self.0.push("providers".into()); }
+    }
+    let (client, _rx, shared) = test_client();
+    let mut w = Seen::default();
+    shared.reference.push_contract_details_end(1);
+    shared.reference.push_historical_error(2, 162, "x".into());
+    shared.orders.push_order_error(3, 200, "y".into());
+    shared.reference.push_contract_details_end(4);
+    client.req_current_time(&mut w);
+    assert!(w.0.is_empty(), "never inside the request: {:?}", w.0);
+    shared.push_connection_notice(1100, "z".into());
+    client.req_news_providers(&mut w);
+    client.process_msgs(&mut w);
+    assert_eq!(w.0, ["end 1", "error 2 162", "error 3 200", "end 4", "time", "error -1 1100", "providers"]);
 }

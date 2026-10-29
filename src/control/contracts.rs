@@ -23,7 +23,7 @@ pub const TAG_LONG_NAME: u32 = 306;
 pub const TAG_SECURITY_ID: u32 = 455;
 pub const TAG_SECURITY_ID_SOURCE: u32 = 456;
 
-// IB custom tags
+// Gateway-specific tags
 pub const TAG_IB_CON_ID: u32 = 6008;
 pub const TAG_IB_LOCAL_SYMBOL: u32 = 6035;
 pub const TAG_IB_VALID_EXCHANGES: u32 = 6046;
@@ -53,7 +53,7 @@ const MARKET_RULE_FIELDS: std::ops::RangeInclusive<u32> = 6020..=6031;
 /// Market type of the contract, for example USSTK.
 pub const TAG_IB_MARKET_TYPE: u32 = 6523;
 
-/// Security types (IB internal encoding).
+/// Security types (the broker's internal encoding).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityType {
     Stock,    // CS
@@ -188,11 +188,14 @@ pub struct ContractDefinition {
     pub liquid_hours: Option<String>,
     /// IANA timezone for session times (e.g. "US/Eastern").
     pub time_zone_id: Option<String>,
-    /// Exchange-path join key (tag 6256) used to pair secdef ↔ schedule replies.
+    /// Exchange-path join key used to pair secdef ↔ schedule replies.
     /// Internal — not exposed on the public API surface.
     pub join_key: String,
     /// conId of the underlying (the API underConId), 0 when absent.
     pub under_con_id: i64,
+    /// conId of the index a futures index names as its reference (an ES
+    /// index names the SPX index), 0 when absent (ibx#727).
+    pub index_con_id: i64,
     /// Exercise style of an option: 1 American, 2 European, 0 unknown.
     pub exercise_style: u8,
     /// Native payout method; absent or unrecognized values remain unknown.
@@ -211,17 +214,17 @@ pub struct ContractDefinition {
     /// `CONTFUT` (ibx#438).
     pub continuous: bool,
     // ── ibx#436: the other ContractDetails sources ──
-    /// Multiplier as received (tag 231), empty when absent.
+    /// Multiplier as received, empty when absent.
     pub multiplier_text: String,
-    /// Contract month: tag 200, else the month of tag 541.
+    /// Contract month: the contract month field, else the month of the maturity date.
     pub contract_month: String,
-    /// Real expiration date (tag 6614).
+    /// Real expiration date as received.
     pub real_expiration_date: String,
     /// Symbol of the underlying (detail 6855).
     pub under_symbol: String,
-    /// Aggregate group (tag 6178), None when absent.
+    /// Aggregate group, None when absent.
     pub agg_group: Option<i32>,
-    /// CUSIP of the alternative id group (455 with 456=1).
+    /// CUSIP of the alternative id group (the security id whose source is CUSIP).
     pub cusip: String,
     /// Second and third parts of the industry text.
     pub subcategory: String,
@@ -234,6 +237,10 @@ pub struct ContractDefinition {
     pub fractional: bool,
     /// Fractional size increment (detail 8175), None when absent.
     pub fraction_size: Option<f64>,
+    /// Precision of the last price and of the last size (details 8598 and
+    /// 8599), None when absent (ibx#605).
+    pub last_price_precision: Option<f64>,
+    pub last_size_precision: Option<f64>,
     /// Size set and price magnifier of the record's market rule.
     pub size_increments: Vec<PriceIncrement>,
     pub price_magnifier: i32,
@@ -242,8 +249,8 @@ pub struct ContractDefinition {
     pub ineligibility: Vec<(String, String)>,
     pub fund: FundFields,
     pub bond: BondFields,
-    /// Last trade date and time of the API row, from the schedule
-    /// (`jclient.dy.c(lh.D)`); None when no schedule was merged.
+    /// Last trade date and time of the API row, from the schedule, as the
+    /// reference gives them; None when no schedule was merged.
     pub schedule_expiry: Option<(String, String)>,
     /// Logon features BONDAPI and EVAPI when the row was made.
     pub bond_api: bool,
@@ -251,6 +258,17 @@ pub struct ContractDefinition {
     /// Symbol of the request when it reads as a CUSIP (the CUSIP of a bond
     /// row), else empty.
     pub lookup_cusip: String,
+    /// Market type as received (US stock, US warrant...), empty when
+    /// absent: with the wire type, whether its sizes count in round lots
+    /// (ibx#732).
+    pub market_type: String,
+    /// SMART component exchanges as received, empty when absent (ibx#732).
+    pub smart_components: Vec<String>,
+    /// Listing exchange as received, empty when absent (ibx#732).
+    pub listing_exchange: String,
+    /// The trading permission class the record names, empty when it names
+    /// none (ibx#734).
+    pub permission_key: String,
 }
 
 /// Fund fields of a definition (detail block, FUND only on the API).
@@ -325,6 +343,7 @@ impl Default for ContractDefinition {
             time_zone_id: None,
             join_key: String::new(),
             under_con_id: 0,
+            index_con_id: 0,
             exercise_style: 0,
             settlement_method: None,
             basket_composition: None,
@@ -344,6 +363,8 @@ impl Default for ContractDefinition {
             ev_rule: String::new(),
             fractional: false,
             fraction_size: None,
+            last_price_precision: None,
+            last_size_precision: None,
             size_increments: Vec::new(),
             price_magnifier: 1,
             ineligibility: Vec::new(),
@@ -353,11 +374,15 @@ impl Default for ContractDefinition {
             bond_api: false,
             ev_api: false,
             lookup_cusip: String::new(),
+            market_type: String::new(),
+            smart_components: Vec::new(),
+            listing_exchange: String::new(),
+            permission_key: String::new(),
         }
     }
 }
 
-/// A lookup symbol read as a CUSIP (`jfix.bh.b(String)`): 9 characters,
+/// A lookup symbol read as a CUSIP: 9 characters,
 /// or the internal id prefix `IBCID` followed by more.
 pub fn reads_as_cusip(symbol: &str) -> bool {
     let s = symbol.trim();
@@ -365,7 +390,7 @@ pub fn reads_as_cusip(symbol: &str) -> bool {
 }
 
 impl ContractDefinition {
-    /// API security type, as the reference names it (`jfix.eh.toString()`):
+    /// API security type, as the reference names it:
     /// `CONTFUT` for a continuous futures record, the stock code `CS` as
     /// `STK`, any other type as received (ibx#436).
     pub fn api_sec_type(&self) -> String {
@@ -385,7 +410,7 @@ impl ContractDefinition {
         }
     }
 
-    /// A bond, bill or fixed income record (`jfix.eh.N()`): its rows are
+    /// A bond, bill or fixed income record: its rows are
     /// bond contract details.
     pub fn is_bond(&self) -> bool {
         self.sec_type == SecurityType::Bond || matches!(self.wire_sec_type.as_str(), "BOND" | "BILL" | "FIXED")
@@ -568,8 +593,9 @@ pub fn parse_secdef_records(data: &[u8]) -> Option<Vec<ContractDefinition>> {
                 apply_secdef_fields(&mut def, &mut keys, block);
             }
         }
-        // Last trade date: 541, else 200; contract month: 200, else the
-        // month of 541 (`jclient.dy.aV()`, `dy.aU()`).
+        // Last trade date: the record's expiry, else its contract month;
+        // contract month: the record's month, else the month of its expiry
+        //.
         def.last_trade_date = if keys.expiry.is_empty() { keys.month } else { keys.expiry }.to_string();
         def.contract_month = if keys.month.is_empty() {
             keys.expiry.get(..6).unwrap_or(keys.expiry).to_string()
@@ -577,7 +603,7 @@ pub fn parse_secdef_records(data: &[u8]) -> Option<Vec<ContractDefinition>> {
             keys.month.to_string()
         };
         // The primary exchange carries its suffix when that full name is a
-        // valid exchange of the contract (`jclient.dy.y()`).
+        // valid exchange of the contract.
         if !def.primary_suffix.is_empty() {
             let full = format!("{}.{}", def.primary_exchange, def.primary_suffix);
             if def.valid_exchanges.contains(&full) {
@@ -595,7 +621,7 @@ pub fn parse_secdef_records(data: &[u8]) -> Option<Vec<ContractDefinition>> {
             def.order_types = list.split(',').map(|s| s.to_string()).collect();
         }
         // Industry, category and subcategory: the industry text of the
-        // record's key split on '|' (`jsecdef.l`, `jclient.b5.m/n/o()`).
+        // record's key split on '|'.
         if !keys.industry.is_empty()
             && let Some((_, text)) = industries.iter().find(|(key, _)| *key == keys.industry)
         {
@@ -638,8 +664,8 @@ pub fn parse_secdef_records(data: &[u8]) -> Option<Vec<ContractDefinition>> {
     }
     // Records of one underlying share its name, symbol and type: a
     // detail block that leaves them out gets those of another record of
-    // the same underlying (the underlying's data, `jclient.dy.bt()`,
-    // `dy.ba()`, `dy.aB()`).
+    // the same underlying (the reference reads them from the underlying's
+    // data).
     for i in 0..defs.len() {
         let under = defs[i].under_con_id;
         if under <= 0 {
@@ -672,12 +698,12 @@ struct RecordKeys<'a> {
 }
 
 /// A flag sent as text: true when its first character is `T` or `Y`
-/// (`jutils.dN.j(String)`).
+///.
 fn text_flag(v: &str) -> bool {
     matches!(v.as_bytes().first(), Some(b'T' | b'Y'))
 }
 
-/// A flag sent as a number: true when not 0 (`jfix.cN.e()`).
+/// A flag sent as a number: true when not 0.
 fn int_flag(v: &str) -> bool {
     v.trim().parse::<i64>().is_ok_and(|n| n != 0)
 }
@@ -699,7 +725,14 @@ fn apply_secdef_fields<'a>(def: &mut ContractDefinition, keys: &mut RecordKeys<'
                     def.exchange = exchange_from_fix(v).to_string();
                 }
             }
-            TAG_IB_PRIMARY_EXCHANGE => def.primary_exchange = exchange_from_fix(v).to_string(),
+            TAG_IB_PRIMARY_EXCHANGE => {
+                def.primary_exchange = exchange_from_fix(v).to_string();
+                def.listing_exchange = v.to_string();
+            }
+            TAG_IB_MARKET_TYPE => def.market_type = v.to_string(),
+            6177 => {
+                def.smart_components = v.split(',').map(str::trim).filter(|e| !e.is_empty()).map(String::from).collect();
+            }
             8224 => def.primary_suffix = v.to_string(),
             TAG_CURRENCY => def.currency = v.to_string(),
             TAG_IB_LOCAL_SYMBOL => def.local_symbol = v.to_string(),
@@ -724,7 +757,7 @@ fn apply_secdef_fields<'a>(def: &mut ContractDefinition, keys: &mut RecordKeys<'
             TAG_LAST_TRADE_DATE => keys.month = v,
             6614 => def.real_expiration_date = v.to_string(),
             TAG_STRIKE => def.strike = v.parse().unwrap_or(0.0),
-            // The wire right is 1 for a call and 0 for a put (`jfix.eg`);
+            // The wire right is 1 for a call and 0 for a put;
             // the letters are accepted too.
             TAG_RIGHT => {
                 def.right = match v {
@@ -734,7 +767,7 @@ fn apply_secdef_fields<'a>(def: &mut ContractDefinition, keys: &mut RecordKeys<'
                 };
             }
             // The API stock type is the text of 8273; 8077 fills an enum
-            // the API does not send (`jsecdef.i.a@5330`).
+            // the API does not send.
             TAG_IB_STOCK_TYPE_TEXT => def.stock_type = v.to_string(),
             6911 => def.country = v.to_string(), // Country
             58 => def.market_name = v.to_string(), // MarketName
@@ -747,6 +780,8 @@ fn apply_secdef_fields<'a>(def: &mut ContractDefinition, keys: &mut RecordKeys<'
                 _ => {}
             },
             6346 => def.under_con_id = v.parse().unwrap_or(0),
+            6411 => def.permission_key = v.to_string(),
+            6577 => def.index_con_id = v.parse().unwrap_or(0),
             6855 => def.under_symbol = v.to_string(),
             6178 => def.agg_group = v.trim().parse().ok(),
             6659 => def.exercise_style = v.parse().unwrap_or(0),
@@ -757,6 +792,8 @@ fn apply_secdef_fields<'a>(def: &mut ContractDefinition, keys: &mut RecordKeys<'
             6858 => def.ev_rule = v.to_string(),
             8193 => def.fractional = int_flag(v),
             8175 => def.fraction_size = v.trim().parse().ok(),
+            8598 => def.last_price_precision = v.trim().parse().ok(),
+            8599 => def.last_size_precision = v.trim().parse().ok(),
             // Fund
             6481 => def.fund.name = v.to_string(),
             6472 => def.fund.family = v.to_string(),
@@ -806,11 +843,23 @@ pub const SECDEF_BY_CONID_NAME: &str = "socket-reqContractDetailsReqByConid";
 pub const SECDEF_PREFERRED_NAME: &str = "PreferredReqByConid";
 /// Name of the lookup of a contract not seen yet, by conId (ibx#424).
 pub const SECDEF_MSG_NAME: &str = "SecDefReqMsgReqByConid";
+/// Name of the lookup by conId the engine makes for its own need, with no
+/// client source: the underlying of a client's option model when it is
+/// not known (ibx#731).
+pub const SECDEF_MSG_ND_NAME: &str = "SecDefReqMsgNDReqByConid";
+/// The name of the batch lookup of the portfolio's contracts (ibx#705).
+pub const SECDEF_SMALL_BATCH_NAME: &str = "SmallBatchReqByConid";
 /// Name of the lookup of a record's market rule on one of its valid
 /// exchanges, as the reference names it (ibx#435, ibx#436).
 pub const SECDEF_EXCHANGE_RULE_NAME: &str = "getECsForConidExchangePairsReqByConid";
 /// Name of the company lookup of an underlying (ibx#436).
 pub const SECDEF_UNDERLYING_NAME: &str = "UnderlyingECNoDupsNDReqByConid";
+/// Name of the lookup of a finished order's contract not known yet, on
+/// BEST (ibx#695; the reference's reqCompletedOrders of 07/10/2026).
+pub const SECDEF_LIVE_ORDER_NAME: &str = "LiveOrderNDReqByConid";
+/// Name of the lookup the reference makes before the first order of a
+/// contract in a session, on its primary exchange (ibx#706).
+pub const SECDEF_ORDER_TYPES_NAME: &str = "IBTypesNDReqByConid";
 
 /// Industry, category and subcategory of a company, set on a definition
 /// that has none (ibx#436).
@@ -830,6 +879,9 @@ pub fn secdef_request_number(req_id: &str) -> Option<crate::types::ReqId> {
         .or_else(|| req_id.strip_prefix(SECDEF_BY_CONID_NAME))
         .or_else(|| req_id.strip_prefix(SECDEF_PREFERRED_NAME))
         .or_else(|| req_id.strip_prefix(SECDEF_MSG_NAME))
+        .or_else(|| req_id.strip_prefix(SECDEF_SMALL_BATCH_NAME))
+        .or_else(|| req_id.strip_prefix(SECDEF_LIVE_ORDER_NAME))
+        .or_else(|| req_id.strip_prefix(SECDEF_ORDER_TYPES_NAME))
         .unwrap_or(req_id)
         .parse()
         .ok()
@@ -867,7 +919,7 @@ pub struct MarketRule {
     /// Size set of the rule (ibx#436): minimum size and size increments.
     pub size_increments: Vec<PriceIncrement>,
     /// Price magnifier: 10 to the power of the first tier set's exponent
-    /// (`jmarketrules.o.<init>@...`: `round(10^l.b())`, l from tag 6021).
+    /// of the rule, rounded.
     pub price_magnifier: i32,
 }
 
@@ -990,16 +1042,22 @@ pub fn parse_size_increments(data: &[u8]) -> Vec<PriceIncrement> {
     out
 }
 
+/// Whether a definition is the one of a US stock or US warrant: the
+/// contracts counted in round lots (ibx#287) and whose regulatory snapshot
+/// is marked for odd-lot quotes (ibx#648).
+pub fn is_us_stock_or_warrant(data: &[u8]) -> bool {
+    let tags = fix::fix_parse(data);
+    let sec_type = tags.get(&TAG_SECURITY_TYPE).map(String::as_str).unwrap_or("");
+    let market_type = tags.get(&TAG_IB_MARKET_TYPE).map(String::as_str).unwrap_or("");
+    matches!((sec_type, market_type), ("CS" | "STK", "USSTK") | ("WAR", "USWAR"))
+}
+
 /// Round lot of a contract's market data sizes (ibx#287), from its
 /// definition, as the reference: a US stock or US warrant counts in the
 /// integer part of its smallest size increment, 100 when that is missing
 /// or below 1; any other contract in 1.
 pub fn round_lot_from_secdef(data: &[u8]) -> i64 {
-    let tags = fix::fix_parse(data);
-    let sec_type = tags.get(&TAG_SECURITY_TYPE).map(String::as_str).unwrap_or("");
-    let market_type = tags.get(&TAG_IB_MARKET_TYPE).map(String::as_str).unwrap_or("");
-    let us = matches!((sec_type, market_type), ("CS" | "STK", "USSTK") | ("WAR", "USWAR"));
-    if !us {
+    if !is_us_stock_or_warrant(data) {
         return 1;
     }
     parse_size_increments(data)
@@ -1122,44 +1180,43 @@ pub fn parse_schedule_response(data: &[u8]) -> Option<ContractSchedule> {
         .unwrap_or_default();
 
     // Parse repeating session groups.
-    // Each session starts with tag 6841 (start) and includes 6842 (end), 75 (date),
-    // and either 6843 (trading) or 6844 (liquid).
+    // Each session has its start time, its end time and its trade date; the
+    // trading hours flag or the liquid hours flag (or both, on 24h venues
+    // such as FOREX) closes a group of one or more sessions and applies to
+    // all of them: a day with two trading sessions (an early session, then
+    // the regular one) gives both before one flag (ibx#605; an AAPL option,
+    // 18/10/2026). A session with no flag that has no length is a closed day.
     let mut trading_hours = Vec::new();
     let mut liquid_hours = Vec::new();
 
-    let mut start = String::new();
-    let mut end = String::new();
-    let mut trade_date = String::new();
+    let mut group: Vec<ScheduleSession> = Vec::new();
     let mut is_trading = false;
     let mut is_liquid = false;
-    let mut in_session = false;
 
-    // 24h venues (e.g. FOREX) emit sessions with both 6843=1 AND 6844=1 — append
-    // to both lists independently.
     for (tag, val) in &tags {
         match *tag {
             TAG_SESSION_START => {
-                if in_session {
-                    flush_session(&mut trading_hours, &mut liquid_hours,
-                        start.clone(), end.clone(), trade_date.clone(), is_trading, is_liquid);
+                let closed_day = group.last().is_some_and(|s| s.end.is_empty() || s.end == s.start);
+                if is_trading || is_liquid || closed_day {
+                    for s in group.drain(..) {
+                        flush_session(&mut trading_hours, &mut liquid_hours,
+                            s.start, s.end, s.trade_date, is_trading, is_liquid);
+                    }
+                    is_trading = false;
+                    is_liquid = false;
                 }
-                start = val.clone();
-                end.clear();
-                trade_date.clear();
-                is_trading = false;
-                is_liquid = false;
-                in_session = true;
+                group.push(ScheduleSession { start: val.clone(), end: String::new(), trade_date: String::new() });
             }
-            TAG_SESSION_END => end = val.clone(),
-            TAG_TRADE_DATE => trade_date = val.clone(),
-            TAG_IS_TRADING_HOURS => is_trading = val == "1",
-            TAG_IS_LIQUID_HOURS => is_liquid = val == "1",
+            TAG_SESSION_END => if let Some(s) = group.last_mut() { s.end = val.clone() },
+            TAG_TRADE_DATE => if let Some(s) = group.last_mut() { s.trade_date = val.clone() },
+            TAG_IS_TRADING_HOURS => is_trading |= val == "1",
+            TAG_IS_LIQUID_HOURS => is_liquid |= val == "1",
             _ => {}
         }
     }
-    if in_session {
+    for s in group {
         flush_session(&mut trading_hours, &mut liquid_hours,
-            start, end, trade_date, is_trading, is_liquid);
+            s.start, s.end, s.trade_date, is_trading, is_liquid);
     }
 
     Some(ContractSchedule { timezone, trading_hours, liquid_hours })
@@ -1197,7 +1254,7 @@ fn flush_session(
 type Session = (jiff::Timestamp, jiff::Timestamp);
 
 /// The days of a schedule from the current day on, as the reference builds
-/// them (`feature.lh.ag`, `feature.lh.D.<init>`): one day per trade date,
+/// them: one day per trade date,
 /// the days between two trade dates and the current day and the next one
 /// added closed; the days before the current day left out. A day's liquid
 /// sessions are its trading sessions when it has no liquid session, and
@@ -1267,7 +1324,7 @@ fn schedule_days(sched: &ContractSchedule, today: jiff::civil::Date) -> Schedule
     ScheduleDays { tz, trading, liquid }
 }
 
-/// One day of an hours text (`feature.lh.f.a(TimeZone)`): its sessions
+/// One day of an hours text, in the schedule's zone: its sessions
 /// `yyyyMMdd:HHmm-yyyyMMdd:HHmm` joined with `;`, or `yyyyMMdd:CLOSED`.
 fn day_text(date: jiff::civil::Date, sessions: &[Session], tz: &jiff::tz::TimeZone) -> String {
     if sessions.is_empty() {
@@ -1284,37 +1341,39 @@ fn day_text(date: jiff::civil::Date, sessions: &[Session], tz: &jiff::tz::TimeZo
 }
 
 /// A day with a session that starts or ends before its own date
-/// (`feature.lh.f.a(false)`).
+///.
 fn starts_before(date: jiff::civil::Date, sessions: &[Session], tz: &jiff::tz::TimeZone) -> bool {
     sessions.iter().any(|(start, end)| {
         start.to_zoned(tz.clone()).date() < date || end.to_zoned(tz.clone()).date() < date
     })
 }
 
-/// An hours text of the API row (`feature.lh.D.a(f[], boolean)`): the first
-/// day always; a later closed day is left out when the next day is open
-/// and starts on an earlier date (its session covers the closed day).
+/// An hours text of the API row, as the reference writes it: a closed day
+/// is left out when the next day is open and starts on an earlier date (its
+/// session covers the closed day); the first day keeps its place, empty
+/// (`;20261018:1700-...`: a future's trading hours on a Sunday, ibx#605;
+/// the reference 10.51, 18/10/2026, and the same form recorded on
+/// 26/04/2026 for a future and a currency pair).
 fn hours_text(days: &[(jiff::civil::Date, Vec<Session>)], tz: &jiff::tz::TimeZone) -> String {
     let mut out = String::new();
     for (i, (date, sessions)) in days.iter().enumerate() {
-        if i > 0
-            && sessions.is_empty()
-            && let Some((next_date, next)) = days.get(i + 1)
-            && !next.is_empty()
-            && starts_before(*next_date, next, tz)
-        {
+        let covered = sessions.is_empty()
+            && days.get(i + 1).is_some_and(|(next_date, next)| !next.is_empty() && starts_before(*next_date, next, tz));
+        if covered && i > 0 {
             continue;
         }
-        if !out.is_empty() {
+        if i > 0 {
             out.push(';');
         }
-        out.push_str(&day_text(*date, sessions, tz));
+        if !covered {
+            out.push_str(&day_text(*date, sessions, tz));
+        }
     }
     out
 }
 
-/// The last trading instant of a contract with a schedule
-/// (`jclient.dy.c(lh.D)`), and whether it has a time: with a last trading
+/// The last trading instant of a contract with a schedule, as the
+/// reference reads it, and whether it has a time: with a last trading
 /// time (6850) the date at that time in the zone; else, for a contract
 /// that is not a bond, the end of the last session of an open liquid day
 /// on that date; else the start of the date. None without a date.
@@ -1338,8 +1397,8 @@ fn last_trading(def: &ContractDefinition, days: &ScheduleDays) -> Option<(jiff::
     date.to_zoned(days.tz.clone()).ok().map(|z| (z, false))
 }
 
-/// The days of a schedule up to the last trading instant
-/// (`feature.lh.D.b(d1)`): a closed day is kept, an open day is kept when
+/// The days of a schedule up to the last trading instant, as the reference
+/// keeps them: a closed day is kept, an open day is kept when
 /// it starts before that instant, is its date, or holds it; the days after
 /// the first other one are left out. The session that holds the instant
 /// ends at it, the later sessions of that day are left out.
@@ -1376,7 +1435,7 @@ fn trim_days(days: &[(jiff::civil::Date, Vec<Session>)], end: jiff::Timestamp, t
 }
 
 /// Merge a schedule into a definition, as the reference fills the API row
-/// (ibx#436, `jextend.dz.a(dy, lh.D)`): a contract whose last trading
+/// (ibx#436): a contract whose last trading
 /// instant is past gets no schedule; else the zone, the trading and liquid
 /// hours up to that instant, and the last trade date and time.
 pub fn apply_schedule(def: &mut ContractDefinition, sched: &ContractSchedule, now: jiff::Timestamp) {
@@ -1403,7 +1462,7 @@ pub fn apply_schedule(def: &mut ContractDefinition, sched: &ContractSchedule, no
 }
 
 /// Market rule id of each valid exchange of a definition whose rule is
-/// known, comma-joined in valid-exchange order (ibx#435, `jclient.dy.fu()`).
+/// known, comma-joined in valid-exchange order (ibx#435).
 pub fn market_rule_ids(def: &ContractDefinition, known: &HashMap<(i64, String), u32>) -> String {
     let mut ids = String::new();
     for exch in &def.valid_exchanges {
@@ -1521,7 +1580,9 @@ pub const TAG_MATCH_ALT_SECURITY_TYPE: u32 = 310;
 /// A single matching symbol result (ibx#439).
 #[derive(Debug, Clone)]
 pub struct SymbolMatch {
-    /// -1 when the row has no conId, as the reference.
+    /// 0 when the row has no conId: the reference leaves the id out of its
+    /// answer for such a row, and the official client library then shows 0
+    /// (ibx#527; -1 is the value of the older text form of the answer).
     pub con_id: i64,
     pub symbol: String,
     /// The API text ("STK", "BOND", ...); a type the engine does not know
@@ -1559,6 +1620,20 @@ pub fn build_matching_symbols_request(pattern: &str, req_id: &str, seq: u32) -> 
 /// Parse a matching symbols response.
 ///
 /// Uses sequential tag parsing since matches are a repeating group.
+/// The derivative types of a matching symbol in the reference's order. The
+/// server lists them by name (BAG, CFD, IOPT, OPT, WAR); the reference
+/// keeps them in a set and gives them in that set's order, which is the same
+/// on every answer recorded (ibx#524, 140 answers with types of 02/10/2026
+/// and 08/10/2026, no pair seen in both orders): CFD, OPT, IOPT, WAR, FUT,
+/// BAG, and FOP before FUT. FOP was only seen with FUT and BAG: its place
+/// against the first four is not known. A type not in this list keeps the
+/// server's order, after the others.
+pub fn derivative_types_as_reference(mut types: Vec<String>) -> Vec<String> {
+    const ORDER: [&str; 7] = ["CFD", "OPT", "IOPT", "WAR", "FOP", "FUT", "BAG"];
+    types.sort_by_key(|t| ORDER.iter().position(|o| o == t).unwrap_or(ORDER.len()));
+    types
+}
+
 pub fn parse_matching_symbols_response(data: &[u8]) -> Option<Vec<SymbolMatch>> {
     use crate::protocol::fix::SOH;
 
@@ -1580,7 +1655,7 @@ pub fn parse_matching_symbols_response(data: &[u8]) -> Option<Vec<SymbolMatch>> 
     if sub_protocol != "186" { return None; }
 
     // Each row starts at its symbol, as the reference: rows without a
-    // conId are kept with -1, the security type is the first type field
+    // conId are kept with 0 (ibx#527), the security type is the first type field
     // else the alternative one (ibx#439). A row whose conId is not a number
     // is skipped, as the reference skips a row it cannot convert.
     struct Row<'a> {
@@ -1593,7 +1668,7 @@ pub fn parse_matching_symbols_response(data: &[u8]) -> Option<Vec<SymbolMatch>> 
         let mut m = row.m;
         m.sec_type = api_sec_type(row.sec_type.or(row.alt_sec_type).unwrap_or(""));
         m.con_id = match row.con_id {
-            None => -1,
+            None => 0,
             Some(v) => match v.parse() {
                 Ok(id) => id,
                 Err(_) => {
@@ -1614,7 +1689,7 @@ pub fn parse_matching_symbols_response(data: &[u8]) -> Option<Vec<SymbolMatch>> 
             }
             current = Some(Row {
                 m: SymbolMatch {
-                    con_id: -1,
+                    con_id: 0,
                     symbol: val.clone(),
                     sec_type: String::new(),
                     currency: String::new(),
@@ -1639,7 +1714,9 @@ pub fn parse_matching_symbols_response(data: &[u8]) -> Option<Vec<SymbolMatch>> 
             TAG_MATCH_DESCRIPTION => row.m.description = val.clone(),
             TAG_MATCH_ISSUER_ID => row.m.issuer_id = val.clone(),
             TAG_MATCH_DERIVATIVE_TYPES => {
-                row.m.derivative_types = val.split(',').map(|s| s.to_string()).collect();
+                // An empty value is no type, not one empty type.
+                row.m.derivative_types = derivative_types_as_reference(
+                    val.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect());
             }
             _ => {}
         }
@@ -2100,7 +2177,7 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_schedule_dual_flag_appends_to_both() {
-        // 24h venues (FOREX) emit sessions with both 6843=1 AND 6844=1.
+        // 24h venues (FOREX) emit sessions with both the trading and liquid hours flags set.
         let msg = fix::fix_build(
             &[
                 (TAG_MSG_TYPE, "U"),
@@ -2270,12 +2347,19 @@ pub(crate) mod tests {
         assert_eq!((m[0].con_id, m[0].symbol.as_str(), m[0].sec_type.as_str()), (272093, "MSFT", "STK"));
         assert_eq!((m[0].primary_exchange.as_str(), m[0].currency.as_str()), ("NASDAQ", "USD"));
         assert_eq!(m[0].description, "MICROSOFT CORP");
-        assert_eq!(m[0].derivative_types, ["BAG", "CFD", "IOPT", "OPT", "WAR"]);
+        // The server's BAG,CFD,IOPT,OPT,WAR in the reference's order (ibx#524).
+        assert_eq!(m[0].derivative_types, ["CFD", "OPT", "IOPT", "WAR", "BAG"]);
+        let order = |t: &[&str]| derivative_types_as_reference(t.iter().map(|s| s.to_string()).collect());
+        assert_eq!(order(&["BAG", "FOP", "FUT"]), ["FOP", "FUT", "BAG"]);
+        assert_eq!(order(&["BAG", "CFD", "FUT", "IOPT"]), ["CFD", "IOPT", "FUT", "BAG"]);
+        assert_eq!(order(&["BAG", "XYZ", "ABC", "OPT"]), ["OPT", "BAG", "XYZ", "ABC"]);
+        assert!(order(&[]).is_empty());
         assert_eq!(m[0].issuer_id, "");
         // A bond row: empty symbol, type from the alternative field, issuer id.
         assert_eq!((m[1].symbol.as_str(), m[1].sec_type.as_str(), m[1].issuer_id.as_str()), ("", "BOND", "e1393444"));
-        // No conId: kept with -1.
-        assert_eq!((m[2].con_id, m[2].sec_type.as_str()), (-1, "CASH"));
+        // No conId: 0, as a client of the reference reads it (ibx#527: the
+        // nine bond issuer rows of "IBM", recorded 02/10/2026, have no id).
+        assert_eq!((m[2].con_id, m[2].sec_type.as_str()), (0, "CASH"));
         // A type the engine does not know is kept as received.
         assert_eq!(m[3].sec_type, "FUND");
         // The wire stock code is given in its API form.
@@ -2704,6 +2788,45 @@ pub(crate) mod tests {
         let mut def = ContractDefinition::default();
         apply_schedule(&mut def, &empty, at("20261002-15:00:00"));
         assert_eq!(def.trading_hours.as_deref(), Some("20261002:CLOSED;20261003:CLOSED"));
+    }
+
+    // ibx#605 (the reference 10.51, paper, 18/10/2026, a Sunday): one flag
+    // closes a group of sessions, so a day with an early and a regular
+    // session gives both (an AAPL option); a future's Sunday, covered by
+    // the session of Monday that starts on it, keeps its place empty in
+    // the trading hours and is CLOSED in the liquid hours.
+    #[test]
+    fn a_flag_closes_a_group_of_sessions_and_a_covered_first_day_is_empty() {
+        // A session with no flag ("") belongs to the group of the next flag.
+        let sched = schedule("US/Eastern", &[
+            ("20261019-11:30:00", "20261019-13:25:00", "20261019", ""),
+            ("20261019-13:30:00", "20261019-20:15:00", "20261019", "T"),
+            ("20261020-11:30:00", "20261020-13:25:00", "20261020", ""),
+            ("20261020-13:30:00", "20261020-20:15:00", "20261020", "T"),
+            ("20261019-13:30:00", "20261019-20:00:00", "20261019", "L"),
+            ("20261020-13:30:00", "20261020-20:00:00", "20261020", "L"),
+        ]);
+        assert_eq!(sched.trading_hours.len(), 4);
+        assert_eq!(sched.liquid_hours.len(), 2);
+        let mut def = ContractDefinition { wire_sec_type: "OPT".into(), ..Default::default() };
+        apply_schedule(&mut def, &sched, at("20261018-16:44:00"));
+        assert_eq!(def.trading_hours.as_deref(), Some(
+            "20261018:CLOSED;20261019:0730-20261019:0925;20261019:0930-20261019:1615;20261020:0730-20261020:0925;20261020:0930-20261020:1615"));
+        assert_eq!(def.liquid_hours.as_deref(), Some(
+            "20261018:CLOSED;20261019:0930-20261019:1600;20261020:0930-20261020:1600"));
+
+        let sched = schedule("US/Central", &[
+            ("20261018-22:00:00", "20261019-21:00:00", "20261019", "T"),
+            ("20261019-22:00:00", "20261020-21:00:00", "20261020", "T"),
+            ("20261019-13:30:00", "20261019-21:00:00", "20261019", "L"),
+            ("20261020-13:30:00", "20261020-21:00:00", "20261020", "L"),
+        ]);
+        let mut def = ContractDefinition { wire_sec_type: "FUT".into(), ..Default::default() };
+        apply_schedule(&mut def, &sched, at("20261018-16:44:00"));
+        assert_eq!(def.trading_hours.as_deref(), Some(
+            ";20261018:1700-20261019:1600;20261019:1700-20261020:1600"));
+        assert_eq!(def.liquid_hours.as_deref(), Some(
+            "20261018:CLOSED;20261019:0830-20261019:1600;20261020:0830-20261020:1600"));
     }
 
     fn option_week() -> ContractSchedule {

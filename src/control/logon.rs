@@ -13,7 +13,7 @@ pub fn local_now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// A server time of tag 52 (`yyyyMMdd-HH:mm:ss`, UTC) in milliseconds
+/// A server time of the sending time field (`yyyyMMdd-HH:mm:ss`, UTC) in milliseconds
 /// since the epoch.
 pub fn server_time_ms(value: &str) -> Option<i64> {
     let dt = jiff::civil::DateTime::strptime("%Y%m%d-%H:%M:%S", value.trim()).ok()?;
@@ -31,9 +31,8 @@ const MESSAGE_UPDATE_INTERVAL_MS: i64 = 30_000;
 /// The offset of the local clock to the server clock, as the reference
 /// keeps it: set by the server time of every logon reply, then refreshed
 /// at most every 30 s by the server time of a test request or of an
-/// eligible `35=U` message (`twslaunch.jutils.aO.a(long, List, boolean)`,
-/// `jutils.d1.a(jfix.dk, long, String)`). The current time request
-/// answers the local clock plus this offset (`aO.r()`).
+/// eligible server update message. The
+/// current time request answers the local clock plus this offset.
 #[derive(Debug, Default)]
 pub struct ClockOffset {
     offset_ms: AtomicI64,
@@ -96,10 +95,9 @@ fn offset(server_ms: i64, received_ms: i64, now_ms: i64, logon: bool, zone: &jif
 }
 
 /// Whether a server message sets the clock offset after the logon: a test
-/// request, or a `35=U` message without an account (tag 1) whose
-/// message number `comm` (tag 6040) is not 60, 146 or 151
-/// (`jconnection.ai.a(jfix.dk, int)@160-177`, `@569-665`). The reference
-/// also uses a 6040=110 message in one session state ibx does not track;
+/// request, or a gateway-specific message without an account field whose
+/// message sub-type `comm` is not 60, 146 or 151. The reference
+/// also uses a message of sub-type 110 in one session state ibx does not track;
 /// such a message is not used here.
 pub fn message_sets_clock(msg_type: &str, comm: Option<&str>, has_account: bool) -> bool {
     match msg_type {
@@ -110,26 +108,26 @@ pub fn message_sets_clock(msg_type: &str, comm: Option<&str>, has_account: bool)
 }
 
 /// The version the client logs on with, build then sub-version
-/// (`10401c`), as the reference's `JtsVersion.a()`.
+/// (`10511b`), as the reference writes it.
 pub fn own_version() -> String {
     format!("{}{}", crate::config::IB_BUILD, crate::config::IB_VERSION)
 }
 
 /// The version the reference names in its warning: major, a dot, minor
-/// (`1040.1`, `JtsVersion.BUILDANDREV`).
+/// (`1051.1`).
 fn own_version_label() -> String {
     let build = crate::config::IB_BUILD;
     format!("{}.{}", &build[..4], &build[4..])
 }
 
-/// A version of the form `\d{5}[a-z]?` (`JtsVersion.VALID_FULL_VERSION_PATTERN`).
+/// A version of the form `\d{5}[a-z]?` (the reference's full version form).
 fn is_full_version(v: &str) -> bool {
     let b = v.as_bytes();
     (b.len() == 5 || (b.len() == 6 && b[5].is_ascii_lowercase())) && b[..5].iter().all(u8::is_ascii_digit)
 }
 
-/// Whether the cutoff version of the logon (tag 6243) is above `own`, as
-/// `jsetting.JtsVersion.b(String)`: the five digits compare as numbers;
+/// Whether the cutoff version of the logon is above `own`, as
+/// the reference compares them: the five digits compare as numbers;
 /// with the same digits, a version with a letter is above one without, and
 /// two letters compare as characters. False when either is not a full
 /// version.
@@ -151,9 +149,8 @@ pub fn cutoff_applies(own: &str, cutoff: &str) -> bool {
 pub const VERSION_CUTOFF_CODE: i64 = 2172;
 
 /// The warning 2172 the reference sends with id -1 at every API connect
-/// when the cutoff version of the logon (tag 6243) is above the client's
-/// own, with the cutoff date (tag 6244); None otherwise
-/// (`jextend.dL.bq()@1148-1297`). The text is the reference's
+/// when the cutoff version of the logon is above the client's
+/// own, with the cutoff date of the logon; None otherwise. The text is the reference's
 /// `Version_Cutoff` text with its markup removed (`<br>` becomes a space).
 pub fn version_cutoff_warning(cutoff: Option<&str>, date: Option<&str>) -> Option<String> {
     let cutoff = cutoff?;
@@ -172,28 +169,39 @@ pub fn has_feature(features: &str, feature: &str) -> bool {
     features.split(',').any(|f| f == feature)
 }
 
-/// Feature tokens of the logon feature list (tag 6542) that gate API
+/// Feature tokens of the logon feature list that gate API
 /// requests (ibx#421).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiFeatures {
-    /// DENYAPI: API connections are refused (`jfix.s.be()`).
+    /// DENYAPI: API connections are refused.
     pub deny_api: bool,
-    /// SECDEFTA: matching symbols requests are allowed (`jfix.s.d1()`).
+    /// SECDEFTA: matching symbols requests are allowed.
     pub matching_symbols: bool,
     /// NIGHTLY: the historical data years limit is not checked
-    /// (`jfix.s.x()`).
+    ///.
     pub nightly: bool,
     /// NOMAGNFIX: option chain strikes are not scaled by the price
-    /// magnifier (`jfix.s.e3()`, ibx#440).
+    /// magnifier (ibx#440).
     pub no_magnifier_fix: bool,
     /// ISLAND2NASDAQ: NASDAQ is not left out of the option chains
-    /// (`jfix.s.hy()`, ibx#440).
+    /// (ibx#440).
     pub island_to_nasdaq: bool,
-    /// BONDAPI: bond rows carry the bond fields (`jfix.s.aX()`, ibx#436).
+    /// BONDAPI: bond rows carry the bond fields (ibx#436).
     pub bond_api: bool,
-    /// EVAPI: contract rows carry the EV rule (`jfix.s.v()`, ibx#436).
+    /// EVAPI: contract rows carry the EV rule (ibx#436).
     pub ev_api: bool,
+    /// PRCEXTRAPREC: the last entry of a market data request is marked 2
+    /// (ibx#648).
+    pub extra_price_precision: bool,
+    /// ODDLOTBIDASK: the regulatory snapshot of a US stock or warrant is
+    /// marked 2 (ibx#648).
+    pub odd_lot_bid_ask: bool,
 }
+
+/// Bits of the market data entry marks (ibx#648): PRCEXTRAPREC.
+pub const ENTRY_EXTRA_PRECISION: u8 = 1;
+/// ODDLOTBIDASK.
+pub const ENTRY_ODD_LOT: u8 = 2;
 
 impl ApiFeatures {
     pub fn parse(features: &str) -> Self {
@@ -205,17 +213,25 @@ impl ApiFeatures {
             island_to_nasdaq: has_feature(features, "ISLAND2NASDAQ"),
             bond_api: has_feature(features, "BONDAPI"),
             ev_api: has_feature(features, "EVAPI"),
+            extra_price_precision: has_feature(features, "PRCEXTRAPREC"),
+            odd_lot_bid_ask: has_feature(features, "ODDLOTBIDASK"),
         }
+    }
+
+    /// The features that change the entries of a market data request, as
+    /// bits (ibx#648).
+    pub fn entry_marks(&self) -> u8 {
+        (if self.extra_price_precision { ENTRY_EXTRA_PRECISION } else { 0 }) | (if self.odd_lot_bid_ask { ENTRY_ODD_LOT } else { 0 })
     }
 }
 
 /// The reference's text when DENYAPI refuses an API connection
-/// (`jextend.ev`, API-SESSION 1.1).
+/// (API-SESSION 1.1).
 pub const API_NOT_ALLOWED: &str = "Disconnecting API request since regular API is not allowed.";
 
-/// The account ids of the logon's account list (tag 6095, ibx#420): a
+/// The account ids of the logon's account list (ibx#420): a
 /// comma list of `acct` or `acct/alias`, in logon order, the alias left
-/// out, empty items skipped (`jfix.ba.<init>(...)@285` → `jfix.m`).
+/// out, empty items skipped.
 pub fn managed_accounts(tag: &str) -> Vec<String> {
     tag.split(',')
         .map(|item| item.split('/').next().unwrap_or("").trim())
@@ -227,27 +243,26 @@ pub fn managed_accounts(tag: &str) -> Vec<String> {
 /// The managed accounts text of the API callback (ibx#420): every account
 /// of the list, in its order, with a comma between two accounts, as the
 /// reference writes MANAGED_ACCTS for a client at the server version ibx
-/// takes (the protobuf form, `jextend.dM.b(jfix.dr)@135-156`; captured
+/// takes (the protobuf form; captured
 /// 02/10/2026 as message 215 at server version 214). The older text form
-/// (`jextend.dL.a(jfix.dr)@131-205`) ends with a comma when there are
+/// ends with a comma when there are
 /// several accounts; it is not the one of this server version.
 pub fn managed_accounts_text(accounts: &[String]) -> String {
     accounts.join(",")
 }
 
-/// The pending accounts of a logon reply or update (tag 8092, ibx#421):
-/// the accounts whose application is not approved yet, a comma set
-/// (`jfix.dr.a(String)`).
+/// The pending accounts of a logon reply or update (ibx#421):
+/// the accounts whose application is not approved yet, a comma set.
 pub fn pending_accounts(tag: &str) -> Vec<String> {
     tag.split(',').map(str::trim).filter(|a| !a.is_empty()).map(String::from).collect()
 }
 
 /// Text of error 10136: an order or an exercise for an account whose
-/// application is not approved (`jextend.bH.S()@5127`, `jextend.bG.n()@470`).
+/// application is not approved.
 pub const PENDING_ACCOUNT: &str = "Cannot submit trades until the application is finished and approved";
 
 /// Text of error 10275 for the pending accounts `accounts`, comma joined
-/// (`jextend.cl.n()@162`, `jextend.bk.n()@29`, `jextend.bl.n()@141`).
+///.
 pub fn positions_not_available(accounts: &[&str]) -> String {
     format!("Positions info is not available for account(s): {} until the application is finished and approved.",
         accounts.join(","))
@@ -255,27 +270,25 @@ pub fn positions_not_available(accounts: &[&str]) -> String {
 
 /// Text of warning 2134, sent with id -1 to the API clients when the data
 /// permissions changed after a market data request was refused for an API
-/// subscription (`jextend.d9.F`, `jextend.dL.K()`).
+/// subscription.
 pub const MARKET_DATA_SUBSCRIPTION_CHANGED: &str = "Market Data subscription has been changed.";
 
 /// API error code of [`MARKET_DATA_SUBSCRIPTION_CHANGED`].
 pub const MARKET_DATA_SUBSCRIPTION_CHANGED_CODE: i64 = 2134;
 
 /// A change of the data permissions within this time of the last one is
-/// ignored (`jclient.ij.onPermissionsChanged()@28-38`).
+/// ignored.
 const PERMISSION_CHANGE_GUARD: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// Shortest time between two market data resubscriptions (the reference's
-/// task "ResubscribeMarketData", `jutils.thread.U.a(String, int,
-/// Runnable)` with 30000 ms).
+/// Shortest time between two market data resubscriptions (the reference
+/// resubscribes at most every 30000 ms).
 const RESUBSCRIBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The reference's timing of a data permission change (ibx#421,
-/// `jclient.ij`): a change within 1 s of the last one is ignored; else
+/// The reference's timing of a data permission change (ibx#421): a
+/// change within 1 s of the last one is ignored; else
 /// the market data resubscription is scheduled, at once when none ran in
 /// the last 30 s, else when 30 s have passed since the last one; a
-/// resubscription already scheduled is not scheduled again
-/// (`jutils.thread.A.a()`).
+/// resubscription already scheduled is not scheduled again.
 #[derive(Debug, Default)]
 pub struct PermissionChange {
     last_change: Option<std::time::Instant>,
@@ -314,14 +327,14 @@ impl PermissionChange {
     }
 }
 
-/// Most years of a historical data request: tag 6774 of the logon when
-/// above 0, else 1 (`jclient.gi.a(jfix.dk, jfix.bb, boolean, boolean, boolean)@573-594`).
+/// Most years of a historical data request: the backfill years field of the logon when
+/// above 0, else 1.
 pub fn max_backfill_years(tag: Option<&str>) -> i32 {
     tag.and_then(|v| v.trim().parse::<i32>().ok()).filter(|n| *n > 0).unwrap_or(1)
 }
 
 /// The cause of the refusal of a duration in years above `max_years`
-/// (`jextend.bM.n()@925-1046`); `duration` is the normalised duration
+///; `duration` is the normalised duration
 /// (`{n} y`).
 pub fn backfill_years_refusal(duration: &str, max_years: i32) -> Option<String> {
     let (n, unit) = duration.split_once(' ')?;
@@ -335,7 +348,7 @@ pub fn backfill_years_refusal(duration: &str, max_years: i32) -> Option<String> 
 mod tests {
     use super::*;
 
-    // ibx#421: tag 52 of the captured logon reply of 02/10/2026.
+    // ibx#421: the sending time of the captured logon reply of 02/10/2026.
     #[test]
     fn server_time_of_tag_52_is_utc() {
         assert_eq!(server_time_ms("20261002-06:15:59"), Some(1_790_921_759_000));
@@ -406,13 +419,15 @@ mod tests {
 
     #[test]
     fn version_cutoff_warning_text() {
-        assert_eq!(own_version(), "10401c");
+        // The version of the reference 10.51 (ibx#601).
+        assert_eq!(own_version(), "10511b");
         assert_eq!(
-            version_cutoff_warning(Some("10411"), Some("20261201")).unwrap(),
-            "The version of the application you are running, 1040.1, needs to be upgraded, as it will be \
-             desupported on 20261201. The minimum supported version at that time will be 1041.1. "
+            version_cutoff_warning(Some("10601"), Some("20271201")).unwrap(),
+            "The version of the application you are running, 1051.1, needs to be upgraded, as it will be desupported on 20271201. The minimum supported version at that time will be 1060.1. "
         );
-        assert_eq!(version_cutoff_warning(Some("10401c"), Some("20261201")), None);
+        assert_eq!(version_cutoff_warning(Some("10511b"), Some("20261201")), None);
+        // The cutoff announced to 10.40 sessions (10501 from 15/12/2026) does not apply.
+        assert_eq!(version_cutoff_warning(Some("10501"), Some("20261215")), None);
         assert_eq!(version_cutoff_warning(None, None), None);
     }
 
@@ -422,10 +437,14 @@ mod tests {
     fn api_features_of_the_feature_list() {
         let f = ApiFeatures::parse("1DAYSORDER,APIELOG,ISLAND2NASDAQ,SECDEFTA,SCALEUSLOT");
         assert_eq!(f, ApiFeatures { deny_api: false, matching_symbols: true, nightly: false,
-            no_magnifier_fix: false, island_to_nasdaq: true, bond_api: false, ev_api: false });
-        let f = ApiFeatures::parse("DENYAPI,NIGHTLY,SECDEFTA:x,NOMAGNFIX,BONDAPI,EVAPI");
+            no_magnifier_fix: false, island_to_nasdaq: true, bond_api: false, ev_api: false,
+            extra_price_precision: false, odd_lot_bid_ask: false });
+        assert_eq!(f.entry_marks(), 0);
+        let f = ApiFeatures::parse("DENYAPI,NIGHTLY,SECDEFTA:x,NOMAGNFIX,BONDAPI,EVAPI,ODDLOTBIDASK,PRCEXTRAPREC");
         assert_eq!(f, ApiFeatures { deny_api: true, matching_symbols: false, nightly: true,
-            no_magnifier_fix: true, island_to_nasdaq: false, bond_api: true, ev_api: true });
+            no_magnifier_fix: true, island_to_nasdaq: false, bond_api: true, ev_api: true,
+            extra_price_precision: true, odd_lot_bid_ask: true });
+        assert_eq!(f.entry_marks(), ENTRY_EXTRA_PRECISION | ENTRY_ODD_LOT);
     }
 
     #[test]

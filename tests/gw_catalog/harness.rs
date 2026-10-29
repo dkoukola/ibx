@@ -33,17 +33,27 @@ pub fn lmt(action: &str, qty: f64, price: f64) -> Order {
 pub struct Engine {
     pub client: EClient,
     pub shared: Arc<SharedState>,
-    control: Sender<ControlCommand>,
+    control: ibx::engine::park::ControlSender,
     ccp: Peer,
     /// The market data farm, open for the whole test: a closed one is a
     /// lost link (2103) among the errors.
     _farm: Peer,
     handle: Option<JoinHandle<()>>,
-    /// Every order message (35=D, 35=G, 35=F) the server got so far.
+    /// Every order message (new order, replace, cancel) the server got so far.
     orders: Vec<Fields>,
 }
 
 impl Engine {
+    /// Wait until a held order is known as a parent: the lookups of its
+    /// placeOrder answered (ibx#718). A hedge placed before is refused as
+    /// under no parent, as the reference does.
+    pub fn wait_held_known(&self, order_id: i64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.shared.orders.is_held_unknown(order_id.into()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     /// The engine with a signed auth link to a scripted server, and an API
     /// client of id 39 on it.
     pub fn start() -> Self {
@@ -81,11 +91,25 @@ impl Engine {
         self.control.send(ControlCommand::Order(req)).unwrap();
     }
 
+    /// Read what the engine sent and answer it as the server does (the
+    /// order preset), while a test waits for something else.
+    pub fn serve(&mut self) {
+        self.read();
+    }
+
     fn read(&mut self) {
         for m in self.ccp.messages() {
             let fields = parse_fields(&m);
             if fields.iter().any(|(t, v)| *t == 35 && matches!(v.as_str(), "D" | "G" | "F")) {
                 self.orders.push(fields);
+            }
+            // The order preset the engine asks at the first stock order of
+            // the session (ibx#728): answered as the server does, here with
+            // no time in force (`answer_preset` gives one).
+            else if field(&fields, 35) == Some("U") && field(&fields, 6040) == Some("193")
+                && let Some(kind) = field(&fields, 8168).map(str::to_string)
+            {
+                self.ccp.send_fix(&[(35, "U"), (6040, "194"), (8166, "G"), (8168, kind.as_str())]);
             }
         }
     }
@@ -99,6 +123,63 @@ impl Engine {
             if self.orders.len() >= n || Instant::now() >= deadline {
                 return self.orders.clone();
             }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Answer the engine's request of the order preset of `sec_type` once it
+    /// is sent (or after 5 s), as the server does: with the preset's time in
+    /// force, none when `tif` is empty (ibx#688).
+    pub fn answer_preset(&mut self, sec_type: &str, tif: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut asked = false;
+        while !asked && Instant::now() < deadline {
+            for m in self.ccp.messages() {
+                let fields = parse_fields(&m);
+                asked |= field(&fields, 35) == Some("U") && field(&fields, 6040) == Some("193");
+                if fields.iter().any(|(t, v)| *t == 35 && matches!(v.as_str(), "D" | "G" | "F")) {
+                    self.orders.push(fields);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(asked, "the preset of {sec_type} is asked");
+        let kind = format!("s={sec_type}");
+        let mut reply = vec![(35, "U"), (6040, "194"), (8166, "G"), (8168, kind.as_str())];
+        if !tif.is_empty() {
+            reply.push((4026, tif));
+        }
+        self.ccp.send_fix(&reply);
+    }
+
+    /// Answer the new order `id` as the server does once it took it (New),
+    /// and let the client read the answer: placed again, the order is then
+    /// a modify (ibx#688). An order this server does not get (a combo,
+    /// whose legs it does not answer) is marked answered in the client.
+    pub fn answer_order(&mut self, id: i64) {
+        let id_text = id.to_string();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let clord = loop {
+            self.read();
+            if let Some(c) = self.orders.iter().find(|f| field(f, 6121) == Some(id_text.as_str())).and_then(|f| field(f, 11)) {
+                break c.to_string();
+            }
+            if Instant::now() >= deadline {
+                self.client.order_answered_for_test(id);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        self.ccp.send_fix(&[
+            (35, "8"), (11, clord.as_str()), (17, "1.1.0"), (150, "0"), (20, "0"), (39, "0"),
+            (167, "CS"), (55, "AAPL"), (38, "1"), (44, "100"), (32, "0"), (31, "0.00"), (14, "0"),
+            (151, "1"), (6, "0"), (54, "1"), (37, "1"), (1, "DUXXXXXXX"), (40, "2"), (6121, id_text.as_str()),
+            (6119, "39"), (59, "0"), (6008, "265598"), (15, "USD"),
+        ]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.callbacks().iter().any(|c| c.contains(&format!(":{id}:")) || c.contains(&format!("({id}")))
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(2));
         }
     }

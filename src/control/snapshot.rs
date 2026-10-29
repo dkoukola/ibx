@@ -9,19 +9,21 @@
 use std::time::{Duration, Instant};
 
 /// A snapshot that is not complete ends this long after its top of book
-/// was acknowledged (ibx#494; upstream 0ed6407).
+/// was acknowledged. The reference 10.51 ends it 11.0 to 12.0 s after it
+/// sends the top of book (four snapshots, paper, 12/10, 13/10 and
+/// 14/10/2026, the option farm connecting or not); the acknowledgement
+/// comes 0.1 to 0.4 s after the send (ibx#494).
 pub const TIMEOUT: Duration = Duration::from_millis(11_000);
-/// A snapshot whose top of book is never acknowledged has this finite
-/// setup limit, as in upstream 0ed6407.
+/// ibx's own limit for a snapshot whose top of book is never acknowledged.
 pub const UNACKED_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The refusal of a snapshot with generic ticks.
 pub const GENERIC_TICKS_REFUSED: &str =
-    "Error validating request.-'bQ' : cause - Snapshot market data subscription is not applicable to generic ticks";
+    "Error validating request.-'ReqMktData(1)' : cause - Snapshot market data subscription is not applicable to generic ticks";
 
 /// The refusal of a snapshot beyond the limit, for `limit` per second.
 pub fn rate_refusal(limit: u32) -> String {
-    format!("Error validating request.-'bQ' : cause - Snapshot requests limitation exceeded:{} per 1 second(s)", limit)
+    format!("Error validating request.-'ReqMktData(1)' : cause - Snapshot requests limitation exceeded:{} per 1 second(s)", limit)
 }
 
 /// The bit of an API tick type in a snapshot; 0 for the types a snapshot
@@ -114,21 +116,43 @@ pub struct PlainSnapshot {
     /// The tick types sent (or never to be sent), as `tick_bit`s.
     pub sent: u64,
     option: bool,
-    acked: bool,
+    /// An index: the reference's snapshot has no last side (ibx#680).
+    pub index: bool,
+    /// Asked with no security type: typed once the engine knows the
+    /// definition's (ibx#676).
+    pub untyped: bool,
+    /// Its top of book was acknowledged (`started` is then that time), or
+    /// it joined a quote already there (ibx#494).
+    pub acked: bool,
 }
 
 impl PlainSnapshot {
     pub fn new(sec_type: &str, started: Instant) -> Self {
-        Self { started, sent: premarked(sec_type), option: is_option(sec_type), acked: false }
+        Self {
+            started, sent: premarked(sec_type), option: is_option(sec_type),
+            index: sec_type.eq_ignore_ascii_case("IND"), untyped: sec_type.is_empty(), acked: false,
+        }
     }
 
-    /// The first top-of-book acknowledgement starts the collection
-    /// window. A request joining an acknowledged quote starts now.
+    /// Its top of book was acknowledged at `at`: the time limit counts
+    /// from there, once.
     pub fn acked_at(&mut self, at: Instant) {
         if !self.acked {
             self.acked = true;
             self.started = at.max(self.started);
         }
+    }
+
+    /// The type of a snapshot asked with none, from the contract's
+    /// definition (ibx#676): what it waits for follows that type.
+    pub fn retype(&mut self, sec_type: &str) {
+        if !self.untyped || sec_type.is_empty() {
+            return;
+        }
+        self.untyped = false;
+        self.sent = (self.sent & !premarked("")) | premarked(sec_type);
+        self.option = is_option(sec_type);
+        self.index = sec_type.eq_ignore_ascii_case("IND");
     }
 
     /// Whether the tick type is to be sent now: the first time only, and
@@ -148,6 +172,12 @@ impl PlainSnapshot {
         let (done, delayed) = if self.option { (DONE_OPTION, DONE_DELAYED_OPTION) } else { (DONE, DONE_DELAYED) };
         self.sent & done == done || self.sent & delayed == delayed
     }
+
+    /// A snapshot of an option (its computations, its exchange strings).
+    pub fn is_option(&self) -> bool {
+        self.option
+    }
+
 
     pub fn timed_out(&self, now: Instant) -> bool {
         now.duration_since(self.started) >= if self.acked { TIMEOUT } else { UNACKED_TIMEOUT }
@@ -247,6 +277,8 @@ mod tests {
         assert!(opt.complete());
     }
 
+    // ibx#494: 11 s from the acknowledgement of its top of book; before
+    // it (a farm still connecting), only ibx's own longer limit.
     #[test]
     fn eleven_seconds_after_the_first_acknowledgement_end_it() {
         let start = Instant::now();
@@ -299,6 +331,6 @@ mod tests {
         assert!(r.allow(1_001, 2));
         assert!(!r.allow(1_001, 2));
         assert_eq!(rate_refusal(100),
-            "Error validating request.-'bQ' : cause - Snapshot requests limitation exceeded:100 per 1 second(s)");
+            "Error validating request.-'ReqMktData(1)' : cause - Snapshot requests limitation exceeded:100 per 1 second(s)");
     }
 }

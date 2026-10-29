@@ -1,7 +1,12 @@
-/// Client version identifiers.
-pub const IB_BUILD: &str = "10401";
-pub const IB_VERSION: &str = "c";
-pub const IB_ENCODED: &str = "17.0.10.0.101/W/en_US/G";
+/// Client version identifiers: those the reference 10.51 logs in with
+/// (build 1051.1b; its login of 12/10/2026, ibx#601).
+pub const IB_BUILD: &str = "10511";
+pub const IB_VERSION: &str = "b";
+/// The Java runtime the reference 10.51 runs on, as its login gives it.
+pub const IB_JAVA: &str = "25.0.2.0.101";
+pub const IB_ENCODED: &str = "25.0.2.0.101/W/en_US/G";
+/// The launcher version of the connect request.
+pub const LAUNCHER_VERSION: u32 = 28;
 
 /// Auth server endpoints.
 pub const CCP_HOSTS: &[&str] = &[
@@ -34,8 +39,8 @@ pub fn use_ssl_setting(value: Option<&str>) -> bool {
     !matches!(value.map(str::trim), Some(v) if v.eq_ignore_ascii_case("false") || v == "0")
 }
 
-/// The reference's setting `[Communication] TestSecureConnect` of its jts.ini
-/// (`jsetting.J.o()`, read once per process by `crypt.d.a(int, boolean)`):
+/// The reference's setting `[Communication] TestSecureConnect` of its
+/// settings file (read once per process):
 /// on, the key exchange also accepts the test certificates (ibx#276).
 /// `IBX_TEST_SECURE_CONNECT=true` (or `1`) turns it on; off by default, as
 /// the reference's.
@@ -45,12 +50,20 @@ pub fn test_secure_connect() -> bool {
 }
 
 /// The reference's API precaution "Bypass Redirect Order warning for Stock
-/// API Orders" (`ApiSettings.n()`, `m_bypassRedirectWarning`, false by
-/// default): off, a stock order directed to an exchange other than SMART
+/// API Orders" (false by default): off, a stock order directed to an exchange other than SMART
 /// is discarded with 10311 (10329 for OVERNIGHT and IBEOS), ibx#486.
 /// `IBX_BYPASS_REDIRECT_ORDER_WARNING=true` (or `1`) turns the bypass on.
 pub fn bypass_redirect_order_warning() -> bool {
     bypass_setting(std::env::var("IBX_BYPASS_REDIRECT_ORDER_WARNING").ok().as_deref())
+}
+
+/// The reference's API precaution "Bypass Route Marketable to BBO
+/// Warning" (off by default): off, an API order with
+/// routeMarketableToBbo is discarded with 10353 (ibx#608, paper
+/// 12/10/2026). `IBX_BYPASS_ROUTE_MARKETABLE_TO_BBO_WARNING=true` (or `1`)
+/// turns the bypass on.
+pub fn bypass_route_marketable_to_bbo_warning() -> bool {
+    bypass_setting(std::env::var("IBX_BYPASS_ROUTE_MARKETABLE_TO_BBO_WARNING").ok().as_deref())
 }
 
 /// An API precaution bypass of a setting value: on only for `true` (any
@@ -83,11 +96,12 @@ pub const FARM_LOGON_POLL_MS: u64 = 250;
 pub const TIMEOUT_SSL_AUTH: u64 = 20;
 pub const TIMEOUT_FARM_CONNECT: u64 = 8;
 
-/// Protocol version.
-pub const NS_VERSION: u32 = 50;
-pub const NS_VERSION_MIN: u32 = 38;
+/// Protocol versions of the reference 10.51 (the range `51..52` of its
+/// farm logins, 12/10/2026, ibx#601; 10.40 gave `38..50`).
+pub const NS_VERSION: u32 = 52;
+pub const NS_VERSION_MIN: u32 = 51;
 
-/// Stack-allocated FIX timestamp ("YYYYMMDD-HH:MM:SS"). Zero heap allocation.
+/// Stack-allocated wire-format timestamp ("YYYYMMDD-HH:MM:SS"). Zero heap allocation.
 pub struct TimestampBuf {
     buf: [u8; 17],
 }
@@ -107,7 +121,7 @@ impl std::fmt::Display for TimestampBuf {
     }
 }
 
-/// FIX-compliant UTC timestamp without chrono dependency. Zero heap allocation.
+/// Wire-format UTC timestamp without chrono dependency. Zero heap allocation.
 pub fn chrono_free_timestamp() -> TimestampBuf {
     use std::time::SystemTime;
     let dur = SystemTime::now()
@@ -142,7 +156,7 @@ fn write_u2(buf: &mut [u8], val: u8) {
     buf[1] = b'0' + val % 10;
 }
 
-/// Format unix timestamp (seconds) to IB's "YYYYMMDD HH:MM:SS" format (UTC).
+/// Format unix timestamp (seconds) to the API's "YYYYMMDD HH:MM:SS" format (UTC).
 pub fn unix_to_ib_datetime(secs: i64) -> String {
     let secs = secs as u64;
     let days = secs / 86400;
@@ -158,7 +172,8 @@ pub fn unix_to_ib_datetime(secs: i64) -> String {
 }
 
 /// Format unix timestamp (UTC seconds) to "YYYYMMDD-HH:MM:SS" — the dash-joined
-/// form the gateway requires for a time-precise good-till expiry (tag 126).
+/// form the gateway requires for a time-precise good-till expiry
+/// (the expire time field).
 /// Distinct from `unix_to_ib_datetime` (space-joined) which other callers use.
 pub fn unix_to_ib_utc_dash(secs: i64) -> String {
     let secs = secs.max(0) as u64;
@@ -173,7 +188,7 @@ pub fn unix_to_ib_utc_dash(secs: i64) -> String {
 
 /// A parsed good-till expiry: either a calendar date (no time) or a precise
 /// instant in UTC. The two are mutually exclusive on the wire — date-only is
-/// emitted as tag 432, time-precise as tag 126 (UTC).
+/// emitted as the expire date field, time-precise as the expire time field (UTC).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IbExpiry {
     /// Date with no time component. Packed `YYYYMMDD` (e.g. 20260620).
@@ -287,6 +302,50 @@ pub fn parse_ib_expiry_zoned(input: &str) -> Result<Option<(IbExpiry, Option<&st
     Ok(Some((IbExpiry::Instant(zoned.timestamp().as_second()), tz)))
 }
 
+/// A goodAfterTime as the reference reads it (ibx#598, paper 12/10/2026,
+/// the reference 10.51): a date and a time, or a time alone (today's date
+/// in its zone), in the zone given, else in the machine's zone `machine`
+/// ("16:00:00" and "20261012 16:00:00" on a Paris machine both start at
+/// 14:00 UTC). The `YYYYMMDD-HH:MM:SS` form is UTC. The text with its date
+/// and its zone written out, and whether the caller gave no zone; None
+/// for a text that is not such a time (left out, ibx#594).
+pub fn good_after_dated(input: &str, machine: &str) -> Option<(String, bool)> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let first = s.split_whitespace().next()?;
+    let time_alone = first.len() >= 3 && first.as_bytes()[2] == b':' && first.as_bytes()[..2].iter().all(u8::is_ascii_digit);
+    let (text, no_zone) = if time_alone {
+        // A time alone: today's date in its zone.
+        let zone = s[first.len()..].trim();
+        let (zone, no_zone) = if zone.is_empty() { (machine, true) } else { (zone, false) };
+        let tz = jiff::tz::TimeZone::get(canonical_zone(zone)).ok()?;
+        let today = jiff::Timestamp::now().to_zoned(tz).date();
+        (format!("{} {} {}", today.strftime("%Y%m%d"), first, zone), no_zone)
+    } else if s.len() > 8 && s.as_bytes()[8] == b'-' {
+        (s.to_string(), false)
+    } else if s.split_whitespace().count() == 2 {
+        (format!("{s} {machine}"), true)
+    } else {
+        (s.to_string(), false)
+    };
+    match parse_ib_expiry(&text) {
+        Ok(Some(IbExpiry::Instant(_))) => Some((text, no_zone)),
+        _ => None,
+    }
+}
+
+/// Unix seconds of a goodAfterTime as the reference reads it
+/// (`good_after_dated`), with the machine's zone; None when not a time.
+pub fn good_after_secs(input: &str) -> Option<i64> {
+    let (text, _) = good_after_dated(input, &crate::gateway::machine_time_zone())?;
+    match parse_ib_expiry(&text) {
+        Ok(Some(IbExpiry::Instant(secs))) => Some(secs),
+        _ => None,
+    }
+}
+
 /// Parse an API date-time (`YYYYMMDD HH:MM:SS [zone]` or
 /// `YYYYMMDD-HH:MM:SS`, the forms of `parse_ib_expiry`) to Unix seconds.
 /// `Ok(None)` for an empty string; a date with no time is an error.
@@ -360,7 +419,7 @@ mod expiry_tests {
 
     #[test]
     fn instant_round_trips_to_wire() {
-        // parse -> seconds -> tag 126 wire string must be the dash UTC form.
+        // parse -> seconds -> expire time wire string must be the dash UTC form.
         let secs = instant("20260620 18:00:00 US/Eastern");
         assert_eq!(unix_to_ib_utc_dash(secs), "20260620-22:00:00");
     }

@@ -41,6 +41,10 @@ impl Driver for PyDriver<'_> {
         }
     }
 
+    fn next_due(&self) -> Option<std::time::Instant> {
+        self.client.core.next_pnl_due()
+    }
+
     fn dispatch(&mut self) -> Vec<String> {
         let calls = match self.driver.call_method0("dispatch").and_then(|v| v.extract::<String>()) {
             Ok(text) => text,
@@ -62,16 +66,25 @@ impl EClient {
     /// (`20260926/lmt_cancel`) or, with `codec=True`, a codec fixture.
     /// Options: `until`, `skip_seqs`, `skip_orders`, `compare` (frame kinds),
     /// `farms` (other market data farms played on the farm link),
-    /// `hmds_farms` (farms played on the historical link).
+    /// `hmds_farms` (farms played on the historical link),
+    /// `positions_of_the_recording` (the account's positions of the
+    /// reference's first reqPositions answer, ibx#707), `replies_from` (a
+    /// scenario whose lookups also answer ibx's, ibx#604),
+    /// `after_account_updates` (the recording's process had served account
+    /// updates in an earlier session, ibx#752), `skip_frame` and
+    /// `frame_mask` (a filter of `test_support::scenario::filters` by its
+    /// name), `lookups_at_their_point`, `paced` (ibx#515).
     /// Returns a dict: `frame_error`, `frames_compared`, `ours`, `theirs`
     /// (callback lines), `unsent`, `not_made`.
     #[doc(hidden)]
-    #[pyo3(signature = (name, driver, codec=false, until=None, skip_seqs=Vec::new(), skip_orders=Vec::new(), compare=None, farms=Vec::new(), hmds_farms=Vec::new()))]
+    #[pyo3(signature = (name, driver, codec=false, until=None, skip_seqs=Vec::new(), skip_orders=Vec::new(), compare=None, farms=Vec::new(), hmds_farms=Vec::new(), positions_of_the_recording=false, replies_from=None, after_account_updates=false, skip_frame=None, frame_mask=None, lookups_at_their_point=false, paced=false))]
     #[allow(clippy::too_many_arguments)]
     fn _test_replay_scenario<'py>(
         &self, py: Python<'py>, name: &str, driver: Bound<'py, PyAny>, codec: bool, until: Option<u64>,
         skip_seqs: Vec<u64>, skip_orders: Vec<i64>, compare: Option<Vec<String>>, farms: Vec<String>,
-        hmds_farms: Vec<String>,
+        hmds_farms: Vec<String>, positions_of_the_recording: bool, replies_from: Option<String>,
+        after_account_updates: bool, skip_frame: Option<String>, frame_mask: Option<String>,
+        lookups_at_their_point: bool, paced: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         if self.connected.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("Already connected"));
@@ -90,6 +103,27 @@ impl EClient {
         if let Some(u) = until {
             opts = opts.until(u);
         }
+        if positions_of_the_recording {
+            opts = opts.positions_of_the_recording();
+        }
+        if let Some(first) = replies_from {
+            opts = opts.replies_from(&load_scenario(&first));
+        }
+        use crate::test_support::scenario::filters;
+        if let Some(f) = skip_frame {
+            opts = opts.skip_frame(filters::skip_frame_named(&f)
+                .ok_or_else(|| PyRuntimeError::new_err(format!("no frame filter {f}")))?);
+        }
+        if let Some(m) = frame_mask {
+            opts = opts.frame_mask(filters::frame_mask_named(&m)
+                .ok_or_else(|| PyRuntimeError::new_err(format!("no frame mask {m}")))?);
+        }
+        if lookups_at_their_point {
+            opts = opts.lookups_at_their_point();
+        }
+        if paced {
+            opts = opts.paced();
+        }
         if let Some(kinds) = compare {
             let known = [
                 crate::test_support::scenario::runner::ORDER, crate::test_support::scenario::runner::LOOKUP,
@@ -102,6 +136,7 @@ impl EClient {
         // The replay runs in the recording's machine zone (`run`); this
         // thread gets its own zone back after it.
         let zone_before = crate::gateway::machine_zone_for_test();
+        let level_before = crate::client_core::session_level_for_test();
         let mut links = Links::new();
         // Attached as a connected client of this engine.
         *self.shared.lock().unwrap() = Some(links.shared.clone());
@@ -109,9 +144,13 @@ impl EClient {
         *self.account_id.lock().unwrap() = Some(crate::test_support::scenario::session::ACCOUNT.to_string());
         *self.connection_time.lock().unwrap() = Some(crate::client_core::connection_time_now());
         self.connected.store(true, Ordering::Release);
+        if after_account_updates {
+            let _ = self.core.subscribe_account_updates(true);
+        }
         let mut d = PyDriver { client: self, driver, error: None };
         let outcome = run(&scenario, &opts, &mut links, &mut d);
         crate::gateway::set_machine_zone_for_test(zone_before.as_deref());
+        crate::client_core::set_session_level_for_test(level_before);
         if let Some(e) = d.error.take() {
             return Err(e);
         }

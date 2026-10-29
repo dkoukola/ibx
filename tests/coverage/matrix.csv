@@ -283,8 +283,8 @@ rule,FUNDAMENTALS-WSH-OPTCALC 3,"WSH: reqWshMetaData (100), reqWshEventData (102
 rule,FUNDAMENTALS-WSH-OPTCALC 3.1,Classes and manager,no test
 rule,FUNDAMENTALS-WSH-OPTCALC 3.2,Decode,no test
 rule,FUNDAMENTALS-WSH-OPTCALC 3.3,Local refusals,src/api/client/tests.rs::wsh_requests_get_the_permission_error
-rule,FUNDAMENTALS-WSH-OPTCALC 3.4,Wire request,no test
-rule,FUNDAMENTALS-WSH-OPTCALC 3.5,Response and API messages,no test
+rule,FUNDAMENTALS-WSH-OPTCALC 3.4,Wire request,src/control/wsh.rs::request_bodies_as_the_reference_writes_them ; src/engine/hot_loop/mod.rs::a_calendar_request_goes_to_the_contract_data_farm
+rule,FUNDAMENTALS-WSH-OPTCALC 3.5,Response and API messages,src/control/wsh.rs::meta_data_as_the_reference_rebuilds_it ; src/control/wsh.rs::events_as_the_reference_gives_them ; src/api/client/tests.rs::wsh_requests_get_the_permission_error
 rule,FUNDAMENTALS-WSH-OPTCALC 3.6,Cancels,src/api/client/tests.rs::wsh_requests_get_the_permission_error
 rule,FUNDAMENTALS-WSH-OPTCALC 4,exerciseOptions (21),no test
 rule,FUNDAMENTALS-WSH-OPTCALC 4.1,Decode,no test
@@ -526,7 +526,7 @@ rule,ORDER-COMBO 12,Differences in ibx main (87cfd98),no test
 rule,ORDER-LOCAL-VALIDATION 1,Where the checks run,no test
 rule,ORDER-LOCAL-VALIDATION 2,"Codes asked for, with the rule",no test
 rule,ORDER-LOCAL-VALIDATION 3,Other refusals on the submit path,no test
-rule,ORDER-LOCAL-VALIDATION 3.1,"Decode stage (error kept, thrown after the whole message; only the last one reaches the client)",no test
+rule,ORDER-LOCAL-VALIDATION 3.1,Reading stage (only the last error of a request reaches the client),no test
 rule,ORDER-LOCAL-VALIDATION 3.2,First checks and (hedge),no test
 rule,ORDER-LOCAL-VALIDATION 3.3,API order build and,no test
 rule,ORDER-LOCAL-VALIDATION 3.4,Order rules,no test
@@ -540,7 +540,7 @@ rule,ORDER-MODIFY 6107,on a new child (35=D only),no test
 rule,ORDER-MODIFY 5,Local modify refusals (no 35=G sent),src/api/client/tests.rs::modify_of_side_or_oca_is_refused_before_sending
 rule,ORDER-MODIFY 6,After the send,no test
 rule,ORDER-MODIFY 7,Summary for a client (IBX),no test
-rule,ORDER-OUTSIDERTH 0,Opaque flags (obfuscation),no test
+rule,ORDER-OUTSIDERTH 0,Opaque flags,no test
 rule,ORDER-OUTSIDERTH 1,Where 2109 is raised and where 6433 is written,no test
 rule,ORDER-OUTSIDERTH 2,The rule: (384 bytes),no test
 rule,ORDER-OUTSIDERTH 2.1,Market-type rule (A4),no test
@@ -559,8 +559,8 @@ rule,ORDER-PRICEMGMT 4.2,Order types: (71 bytes),src/engine/hot_loop/order_build
 rule,ORDER-PRICEMGMT 4.3,Logon rule: (60 bytes),no test
 rule,ORDER-PRICEMGMT 5,"Modify, report and openOrder",src/engine/hot_loop/ccp.rs::reports_give_the_price_management_flag_and_the_bracket_key
 rule,ORDER-PRICEMGMT 6,Capture check (28/09/2026),no test
-rule,ORDER-PRICEMGMT 7,"Server answer (observed, not in the gateway code)",no test
-rule,ORDER-PRICEMGMT 8,Captures of 01/10/2026 and the preset code read,no test
+rule,ORDER-PRICEMGMT 7,"Server answer (observed, not made by the gateway)",no test
+rule,ORDER-PRICEMGMT 8,Captures of 01/10/2026 and the presets,no test
 rule,ORDER-STATUS 1,Path of an inbound 35=8,src/golden/orders.rs::premarket_order_types
 rule,ORDER-STATUS 2,Tags read by,no test
 rule,ORDER-STATUS 3,Mapping to FixOrderState and the API status string,src/golden/orders.rs::cancel_gives_pending_cancel_then_cancelled_then_202
@@ -571,7 +571,7 @@ rule,ORDER-STATUS 7,API socket side (gateway to the reference API client),src/go
 rule,ORDER-STATUS 8,Parent and permId,no test
 rule,ORDER-SUBMIT 1,Entry path: API placeOrder to,src/golden/orders.rs::premarket_order_types
 rule,ORDER-SUBMIT 2,The 35=D body,src/golden/orders.rs::premarket_order_types
-rule,ORDER-SUBMIT 2.1,How to read the obfuscated code,no test
+rule,ORDER-SUBMIT 2.1,How to read the spec's names,no test
 rule,ORDER-SUBMIT 2.2,Emission order,src/golden/orders.rs::premarket_order_types
 rule,ORDER-SUBMIT 2.3,"Sub-block (price, account, GTD, short sale, attributes, algo)",src/golden/orders.rs::premarket_order_types
 rule,ORDER-SUBMIT 2.4,Attribute block,src/golden/orders.rs::premarket_order_types
@@ -655,7 +655,7 @@ rule,SCANNER 2.10,"Updates, cadence, disconnects",no test
 rule,SCANNER 3,cancelScannerSubscription (message 23),no test
 error,0,Warning: Approaching max rate of %s messages per second (%s),no test
 error,100,Max rate of messages per second has been exceeded,no test
-error,101,Max number of tickers has been reached,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/api/client/tests.rs::past_the_ticker_limit_a_stream_gets_101_and_waits_for_a_line
+error,101,Max number of tickers has been reached,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/api/client/tests.rs::past_the_ticker_limit_a_stream_gets_101_and_ends ; src/engine/hot_loop/mod.rs::a_request_without_con_id_over_the_limit_gets_101_unless_it_joins
 error,102,Duplicate ticker id,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/client_core.rs::pnl_request_checks ; src/engine/hot_loop/hmds.rs::historical_ticks_duplicate_and_zone_refusals
 error,103,Duplicate order id,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/api/client/tests.rs::what_if_on_an_unanswered_order_id_is_a_duplicate ; src/client_core.rs::what_if_on_an_order_not_answered_yet_and_known_ids ; src/golden/orders.rs::what_if_previews
 error,104,Can't modify a filled order,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/client_core.rs::place_on_a_cancelled_order_id_is_refused ; src/engine/hot_loop/order_builder.rs::modify_of_an_order_the_engine_no_longer_holds_is_refused ; src/golden/orders.rs::premarket_order_types
@@ -716,7 +716,7 @@ error,330,Only FA or STL customers can request managed accounts list.,no test
 error,331,Internal error. FA or STL does not have any managed accounts.,no test
 error,333,Invalid share allocation syntax.,no test
 error,336,The time entered is invalid. The correct format is hh:mm:ss E.g.: 15:59:00 Time zone associated with the financial instrument is assumed.,no test
-error,337,"%s: The date, time, or time-zone entered is invalid. The correct format is yyyymmdd hh:mm:ss xx/xxxx where yyyymmdd and xx/xxxx are optional",tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/api/client/tests.rs::place_order_bad_good_after_time_is_refused
+error,337,"%s: The date, time, or time-zone entered is invalid. The correct format is yyyymmdd hh:mm:ss xx/xxxx where yyyymmdd and xx/xxxx are optional",tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/api/client/tests.rs::place_order_unreadable_good_after_time_is_refused
 error,341,"The delta is invalid. Valid values are from 1 to 100. You can set the delta from the ""Pegged to Stock"" section of the Order Ticket Panel, or",no test
 error,343,"%s: The date, time, or time-zone entered is invalid. The correct format is yyyymmdd hh:mm:ss xx/xxxx where yyyymmdd and xx/xxxx are optional",tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/api/client/tests.rs::place_order_bad_good_till_date_is_refused ; src/client_core.rs::good_till_date_zone_rule
 error,346,"Not an institutional account, or an away clearing order",no test
@@ -806,7 +806,6 @@ error,445,The RFQ for this order is no longer valid,no test
 error,446,Missing scale order profit offset,no test
 error,447,Missing scale price adjustment amount or interval.,no test
 error,448,Invalid scale price adjustment interval.,no test
-error,449,Unexpected scale price adjustment amount or interval.,no test
 error,451,n/a,no test
 error,452,Missing order exchange,no test
 error,453,Not enough data to check underlying price conditions,no test
@@ -818,7 +817,7 @@ error,458,Auto-routed blotter order '%s' can't be modified or canceled.,no test
 error,459,No clearing rule selected,no test
 error,460,No trading permissions,no test
 error,461,Order size is not correct; it must be a multiple of the lot size.,no test
-error,462,Order modify failed. Cannot change to the new Time in Force,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/api/client/tests.rs::modify_must_restate_the_held_overnight_time_in_force ; src/golden/orders.rs::overnight_time_in_force_on_smart
+error,462,Order modify failed. Cannot change to the new Time in Force,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/api/client/tests.rs::modify_must_restate_the_held_overnight_time_in_force_in_the_10_40_form ; src/golden/orders.rs::overnight_time_in_force_on_smart
 error,463,You must enter a valid price.,no test
 error,464,Invalid exchange,no test
 error,465,Order not confirmed,no test
@@ -839,7 +838,6 @@ error,481,Order size was reduced.,no test
 error,482,Main and Hedging order accounts do not match,no test
 error,483,One-to-one combo order is not supported.,no test
 error,484,Your desk is not configured to create tickets for: %s. Please contact system administrator to upgrade your permissions.,no test
-error,485,Multiple account allocation scale order is currently not supported,no test
 error,486,"For non-guaranteed Combo Scale orders, the order type must be Market-if-Touched (MIT).",no test
 error,487,US Bond Ratings (Corporates and Municipals) service is required to place municipal bond order.,no test
 error,488,Only US STK/OPT legs are supported for smart guaranteed combo.,no test
@@ -939,6 +937,11 @@ error,2180,,no test
 error,2181,The 'OptOutFromSmartRouting' order attribute is not supported.,no test
 error,2182,Algorithm end time is in the past for order %s,no test
 error,2183,Algorithm end time precedes algorithm start time for %s,no test
+error,2184,This order will be distributed over multiple accounts.<br>We strongly suggest you familiarize yourself with our allocation<br> facilities at the link below before submitting orders.,no test
+error,2185,The confirmed MaxHedgeSize value of %s must be greater than or equals to %s,tests/gw_catalog/refusals.rs::beta_hedge_with_a_max_size_below_the_hedge ; src/engine/hot_loop/order_builder.rs::the_hedge_size_precaution_discards_the_parent_and_keeps_the_hedge
+error,2186,"Requested real-time market data requires additional subscription for API. You elected to receive delayed market data instead. To subscribe, see link in 'Market Data Connections' dialog for more details.",no test
+error,2187,Generic tick data is not available when using delayed market data fallback.,no test
+error,2188,Up-to-the-second historical data requires additional subscription for the API.,no test
 error,10000,Cross-currency combo order is not supported.,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/engine/combo.rs::non_guaranteed_needs_two_legs_and_one_currency
 error,10001,Cross-currency VOL order is not supported.,no test
 error,10002,Non-guaranteed order should only have two legs,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/engine/combo.rs::non_guaranteed_needs_two_legs_and_one_currency
@@ -1005,7 +1008,6 @@ error,10073,Reference price cannot be negative.,no test
 error,10074,Missing starting reference price,no test
 error,10075,Missing reference financial instrument,no test
 error,10076,Invalid price change of the reference financial instrument for peg-to-bench-order. Requires positive number.,no test
-error,10077,Scale order for a model is currently not supported,no test
 error,10078,This order conflicts with the order preset value(s),no test
 error,10079,%s is not accessible through API because product is trading on the basis of currency price with factor,no test
 error,10080,Custom Smart Strategy is not supported,no test
@@ -1014,7 +1016,6 @@ error,10082,Note that you are creating an order for a bond that has already been
 error,10083,Display size is smaller than the minimum requirement.,no test
 error,10084,Min. quantity is smaller than the minimum requirement.,no test
 error,10086,Option Exercise can only be cancelled,no test
-error,10087,Manual scale orders are not supported.,no test
 error,10089,Requested market data requires additional subscription for API. || Requested market data requires additional subscription for API. See link ,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/engine/hot_loop/mod.rs::requests_share_a_book
 error,10090,Part of requested market data is not subscribed. Subscription-independent ticks are still active.,no test
 error,10091,Part of requested market data requires additional subscription for API. || Part of requested market data requires additional subscription fo,no test
@@ -1264,6 +1265,30 @@ error,10345,You cannot trade a %s,no test
 error,10346,Market data for %s cannot be delivered because ticker for the same financial instrument is displayed on %s,no test
 error,10347,"<html>This security has limited liquidity. If you choose to trade this security,<br> there is a heightened risk that you may not be able to ",no test
 error,10348,The 'OptOutFromSmartRouting' order attribute is not supported.,no test
+error,10349,Order TIF was set to %s based on order preset,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/api/client/tests.rs::the_preset_time_in_force_is_the_orders ; src/engine/hot_loop/order_builder.rs::empty_tif_takes_the_order_preset
+error,10350,Connectivity with %SHORT_COMPNAME% is temporarily unavailable. Please retry in 1 minute,no test
+error,10351,What-If type %s is not supported for your account configuration.,no test
+error,10352,What-If type specified but What-If flag is not set. Orders with whatIfType must have whatIf=true.,no test
+error,10353,"Warning: setting ""Route marketable orders to exchanges at BBO only"" order attribute can result in higher total cost of the trade after exchange fees and commissions",tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/engine/hot_loop/order_builder.rs::route_marketable_to_bbo_is_discarded_unless_bypassed
+error,10354,"Attaching stop-loss or profit-taker is not allowed as part of a single placeOrder request, please submit such orders separately.",no test
+error,10355,Cannot auto-attach %s. Preset is not defined.,src/engine/hot_loop/order_builder.rs::attached_orders_from_an_undefined_preset_are_discarded ; live:tests/order_paths_paper.rs::order_paths_paper
+error,10356,Invalid value for %s order-id or order-type,no test
+error,10357,Configuration access via API is not available. Please refer to the application interface to view or update your settings.,src/client_core.rs::the_configuration_update_is_refused_below_level_221_and_without_configuration_access ; src/client_core.rs::the_configuration_request_is_refused_below_level_219_and_without_configuration_access
+error,10358,Fundamentals data is not allowed,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/api/client/tests.rs::fundamentals_without_the_logon_permission_are_refused
+error,10359,Scan code %s is not allowed,no test
+error,10360,Scan filter %s is not allowed,no test
+error,10361,Volatility value too small. %s Volatility Type requires a minimum value of %s. Please enter %s or higher.,no test
+error,10362,OVERNIGHT order is not supported,tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways
+error,10363,Non-ASCII symbol in field %s,no test
+error,10364,Max Hedging Size value must be defined for the hedge order.,tests/gw_catalog/refusals.rs::selling_beta_hedge_without_a_max_size
+error,10365,Max Hedging Size value is smaller than what has already filled: %s.,src/client_core.rs::the_hedge_size_precaution_of_a_transmitted_tree
+error,10366,Orders with Time in force in minutes cannot have a start time specified,no test
+error,10367,"Requesting ""Odd Lot Bid/Ask Quotes"" generic tick 787 is not allowed",tests/gw_catalog/errors.rs::every_error_ibx_raises_is_the_gateways ; src/client_core.rs::odd_lot_quotes_are_refused_below_level_225
+error,10368,Non-guaranteed combo order is only supported for 2-leg SMART combos.,no test
+error,10369,Limit price is required for combo orders with more than 2 legs.,no test
+error,10370,A security definition request with the same parameters is already in progress:,no test
+error,10371,Conditions include overnight is not supported for this instrument or is not enabled for this account.,no test
+error,10372,%s: The date entered is invalid. The correct format is yyyyMM for a contract month or yyyyMMdd for a date. E.g.: 202607 or 20260724.,no test
 error,2147483647,,no test
 writer,35=D 131,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 11,ClOrdID,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::a_bracket_child_without_an_oca_type_gets_the_default_one ; src/engine/hot_loop/order_builder.rs::what_if_is_the_real_order_plus_the_preview_flag ; src/engine/hot_loop/order_builder.rs::peg_bench_from_the_api_matches_the_reference
@@ -1271,7 +1296,6 @@ writer,35=D 8476,,tests/gw_catalog/writers.rs::every_order_request_variant_follo
 writer,35=D 44,Price,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::a_bracket_child_without_an_oca_type_gets_the_default_one ; src/engine/hot_loop/order_builder.rs::what_if_is_the_real_order_plus_the_preview_flag ; src/engine/hot_loop/order_builder.rs::overnight_orders_are_sent_like_the_reference
 writer,35=D 6879,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 8262,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
-writer,35=D 8019,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 99,StopPx,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::peg_bench_from_the_api_matches_the_reference ; src/engine/hot_loop/order_builder.rs::peg_bench_request_matches_the_reference_and_signs_a_decrease ; src/engine/hot_loop/order_builder.rs::new_orders_follow_the_captured_field_order
 writer,35=D 6700,ModelCode,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 8065,PTA allocation flag,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
@@ -1346,10 +1370,12 @@ writer,35=D 6081,,tests/gw_catalog/writers.rs::every_order_request_variant_follo
 writer,35=D 6082,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 6209,OcaType,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::a_bracket_child_without_an_oca_type_gets_the_default_one ; src/engine/hot_loop/order_builder.rs::new_orders_follow_the_captured_field_order ; src/golden/orders.rs::oca_group_orders_and_the_refused_second_cancel
 writer,35=D 6088,Source,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::a_bracket_child_without_an_oca_type_gets_the_default_one ; src/engine/hot_loop/order_builder.rs::what_if_is_the_real_order_plus_the_preview_flag ; src/engine/hot_loop/order_builder.rs::peg_bench_from_the_api_matches_the_reference
+writer,35=D 8572,NoIdealModelChange,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 6091,WhatIf,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::what_if_is_the_real_order_plus_the_preview_flag ; src/golden/orders.rs::what_if_previews
 writer,35=D 6406,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 6107,ParentId,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::a_bracket_child_without_an_oca_type_gets_the_default_one ; src/engine/hot_loop/order_builder.rs::new_orders_follow_the_captured_field_order
 writer,35=D 6128,CondIgnoreRTH,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::new_orders_follow_the_captured_field_order ; src/golden/orders.rs::time_conditions_near_dates
+writer,35=D 8612,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 6151,CondCancelOrder,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::new_orders_follow_the_captured_field_order ; src/golden/orders.rs::time_conditions_near_dates
 writer,35=D 6156,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 9823,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
@@ -1362,6 +1388,7 @@ writer,35=D 6899,,tests/gw_catalog/writers.rs::every_order_request_variant_follo
 writer,35=D 6239,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 6407,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 6958,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
+writer,35=D 6964,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 8441,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=D 8442,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 11,ClOrdID,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::replace_limit_without_outside_rth_matches_reference ; src/engine/hot_loop/order_builder.rs::replace_limit_with_outside_rth_matches_reference ; src/engine/hot_loop/order_builder.rs::replace_stop_moves_the_trigger_like_reference
@@ -1370,7 +1397,6 @@ writer,35=G 8476,,tests/gw_catalog/writers.rs::every_order_request_variant_follo
 writer,35=G 44,Price,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::replace_limit_without_outside_rth_matches_reference ; src/engine/hot_loop/order_builder.rs::replace_limit_with_outside_rth_matches_reference ; src/engine/hot_loop/order_builder.rs::replace_stop_limit_moves_both_prices_like_reference
 writer,35=G 6879,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 8262,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
-writer,35=G 8019,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 99,StopPx,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::replace_stop_moves_the_trigger_like_reference ; src/engine/hot_loop/order_builder.rs::replace_stop_limit_moves_both_prices_like_reference ; src/engine/hot_loop/order_builder.rs::replace_trailing_amount_matches_reference
 writer,35=G 6700,ModelCode,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 8065,PTA allocation flag,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
@@ -1409,8 +1435,6 @@ writer,35=G 9816,Volatility,tests/gw_catalog/writers.rs::every_order_request_var
 writer,35=G 6516,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 6858,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 8425,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
-writer,35=G 6121,OrderId,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
-writer,35=G 6119,ClientId,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 6981,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 6982,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 6989,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
@@ -1433,9 +1457,12 @@ writer,35=G 6079,,tests/gw_catalog/writers.rs::every_order_request_variant_follo
 writer,35=G 6080,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 6081,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 6082,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
+writer,35=G 8612,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 6088,Source,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::replace_limit_without_outside_rth_matches_reference ; src/engine/hot_loop/order_builder.rs::replace_limit_with_outside_rth_matches_reference ; src/engine/hot_loop/order_builder.rs::replace_stop_moves_the_trigger_like_reference
+writer,35=G 8572,NoIdealModelChange,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 6211,OrderRef,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::replace_limit_without_outside_rth_matches_reference ; src/engine/hot_loop/order_builder.rs::replace_limit_with_outside_rth_matches_reference ; src/engine/hot_loop/order_builder.rs::replace_stop_moves_the_trigger_like_reference
 writer,35=G 6238,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::replace_limit_without_outside_rth_matches_reference ; src/engine/hot_loop/order_builder.rs::replace_limit_with_outside_rth_matches_reference ; src/engine/hot_loop/order_builder.rs::replace_stop_moves_the_trigger_like_reference
+writer,35=G 6964,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 8441,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=G 8442,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 writer,35=F 11,ClOrdID,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/golden/orders.rs::algo_scenario_orders
@@ -1456,7 +1483,7 @@ writer,35=D 1,Account,tests/gw_catalog/writers.rs::every_order_request_variant_f
 writer,35=G 1,Account,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 order_request,SubmitLimit,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/api/client/tests.rs::place_order_limit ; src/engine/context.rs::submit_limit_drains_correctly ; src/engine/context.rs::submit_limit_uses_current_bid
 order_request,SubmitMarket,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/api/client/tests.rs::place_order_market ; src/api/client/tests.rs::place_order_sell_side ; src/api/client/tests.rs::place_order_short_sell_side
-order_request,SubmitStop,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/api/client/tests.rs::place_order_empty_tif_stays_plain ; src/api/client/tests.rs::place_order_stop ; src/api/client/tests.rs::stp_order_with_valid_aux_price_succeeds
+order_request,SubmitStop,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/api/client/tests.rs::place_order_empty_tif_takes_the_preset ; src/api/client/tests.rs::place_order_stop ; src/api/client/tests.rs::stp_order_with_valid_aux_price_succeeds
 order_request,SubmitStopLimit,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/api/client/tests.rs::place_order_stop_limit ; src/engine/hot_loop/order_builder.rs::stop_orders_carry_the_stop_trigger ; src/engine/hot_loop/order_builder.rs::both_encoders_write_one_order_like_the_reference
 order_request,SubmitLimitGtc,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::both_encoders_write_one_order_like_the_reference ; src/engine/hot_loop/order_builder.rs::option_orders_carry_the_option_terms
 order_request,SubmitStopGtc,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/hot_loop/order_builder.rs::both_encoders_write_one_order_like_the_reference
@@ -1497,174 +1524,224 @@ order_request,Cancel,,tests/gw_catalog/writers.rs::every_order_request_variant_f
 order_request,CancelAll,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/engine/context.rs::cancel_all_drains_correctly ; src/engine/hot_loop/ccp.rs::recovered_order_is_inside_the_global_cancel_range
 order_request,GlobalCancel,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/api/client/tests.rs::req_global_cancel_sends_one_global_cancel ; src/engine/hot_loop/order_builder.rs::global_cancel_reaches_every_order_of_the_book ; src/engine/hot_loop/order_builder.rs::global_cancel_goes_in_the_books_order ; tests/scenario_replay.rs::global_cancel_of_orders_of_earlier_sessions
 order_request,Modify,,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers ; src/api/client/tests.rs::place_order_type_aliases ; src/api/client/tests.rs::what_if_on_a_working_order_id_is_a_preview_not_a_modify ; src/api/client/tests.rs::modify_limit_order_price_via_resubmit
-local_rule,"110 dx.a(dy,boolean)@1961",110 build: the absolute price is off the tick of the contract's market rule (server data),src/api/client/tests.rs::algo_refusals_of_20261002_through_place_order ; src/engine/hot_loop/order_builder.rs::a_price_off_the_grid_is_refused_with_110
-local_rule,"145 algo.a.a(pe,OrderCreator)@212",145 build: an algo parameter value is not one of the legal strings of the algo definition (server data); text = the bad value,src/control/algo.rs::refusals_follow_the_definitions
-local_rule,343 bH.q@2674,"343 read: goodTillDate not empty and not a date and time, or its zone is not UTC, the machine's or the contract's trading-hours zone",tests/gw_catalog/refusals.rs::good_till_date_not_a_date
-local_rule,337 bH.q@2497,337 read: goodAfterTime not a date and time (same pattern as 343),tests/gw_catalog/refusals.rs::good_after_time_not_a_date
-local_rule,387 aN.a@5352,"387 rules: order type key not in the type list of the contract and exchange (server data); PEG MID needs PEGMID, PEG BEST needs REL2MID",src/engine/hot_loop/order_builder.rs::pegged_types_not_in_the_list_are_refused_with_387
-local_rule,"441 algo.a.a(AlgoExchanges,...)@649",441 build: algo parameter value refused by the definition (min / max of the server's algo definition),src/control/algo.rs::refusals_follow_the_definitions
-local_rule,"443 algo.a.a(AlgoExchanges,...)@376",443 build: algo parameter name not in the definition's parameter map,src/control/algo.rs::refusals_follow_the_definitions
-local_rule,460 aN.a@13933,460 rules: no trading permission for the account and contract (server data),open #485
-local_rule,2109 a0.c(pe)@190,"2109 rules: warning, order still sent: outsideRth does not apply to the order type and destination; the attribute is removed",src/engine/hot_loop/order_builder.rs::outside_rth_waits_for_the_definition_then_follows_the_rule ; src/engine/hot_loop/order_builder.rs::outside_rth_without_a_definition_uses_the_empty_list
-local_rule,"10243 dx.a(dy,boolean)@244","10243 build: account can trade fractions, STK or WAR, and the quantity is not whole",tests/gw_catalog/refusals.rs::fractional_quantity
-local_rule,10256 aN.a@12583,10256 rules: minQty set and the contract's type list has no PAON,open #485
-local_rule,152 aN.a@12443,152 rules: hidden set and the type list has no HID,open #485
-local_rule,10255 aN.a@12513,10255 rules: display size set and the type list has no ICE,open #485
-local_rule,10257 aN.a@12650,10257 rules: allOrNone set and the type list has no AON,open #485
-local_rule,10266 aN.a@12717,10266 rules: blockOrder set and the type list has no BLOCK,open #485
-local_rule,10267 aN.a@12784,10267 rules: sweepToFill set and the type list has no SWEEP,open #485
-local_rule,10342 aN.a@12851,10342 rules: imbalanceOnly set and the type list has no IMB,open #485
-local_rule,10274 aN.a@12921,10274 rules: postToAts set and the type list has no POSTATS,open #485
-local_rule,168 bH.q@2411,320 read: discretionaryAmt < 0,tests/gw_catalog/refusals.rs::negative_discretionary_amount
-local_rule,313 bH.q@2027,320 read: exception while reading combo leg i,open #485
-local_rule,409 bH.q@5988,320 read: message versions 22 to 25 only: old scaleNumComponents > 0,open #485
-local_rule,429 bH.q@8106,320 read: deltaNeutralContract given without combo legs,open #485
-local_rule,10027 bH.q@2254,320 read: smartComboRoutingParams tag not allowed,tests/gw_catalog/refusals.rs::unknown_combo_routing_tag
-local_rule,10057 bH.q@2126,320 read: numberOfPerLegPrices not 0 and not the number of legs,tests/gw_catalog/refusals.rs::per_leg_prices_not_one_per_leg
-local_rule,10060 bH.q@5607,320 read: trailingPercent and auxPrice both set (for trailing types auxPrice 0 counts as unset),tests/gw_catalog/refusals.rs::trailing_percent_with_a_trailing_amount
-local_rule,10105 bH.q@3586,320 read: side SELL LONG and shortSaleSlot not -100,open #485
-local_rule,10300 bH.q@10407,320 read: manualOrderTime not parseable,open #485
-local_rule,10314 am.a@103,10314 read: time condition string not parseable,tests/gw_catalog/refusals.rs::time_condition_not_a_time
-local_rule,10315 bH.q@6652,320 read: activeStartTime / activeStopTime format,open #485
-local_rule,10316 bH.q@1493,320 read: message version < 24 with the old outsideRth / trigger flag,open #485
-local_rule,10340 bH.q@10972,320 read: externalUserId / manualOrderIndicator from client versions 187 to 189,open #485
-local_rule,321 bH.S@1380,"321 check: side unknown, or SSHORT when the session has neither the institutional flag nor an away clearing",tests/gw_catalog/refusals.rs::short_side_without_the_logon_flags ; tests/gw_catalog/refusals.rs::unknown_action
-local_rule,452 bH.S@449,321 check: exchange empty,open #485
-local_rule,10272 bH.S@232,321 check: duration with TIF not GTD,open #485
-local_rule,10273 bH.S@335,321 check: GTD with both date and duration,open #485
-local_rule,391 bH.S@411,321 check: GTD with neither date nor duration,open #485
-local_rule,10244 bH.S@642,321 check: CRYPTO cash-quantity rule,open #485
-local_rule,10289 bH.S@746,321 check: CRYPTO cash-quantity rule,open #485
-local_rule,10052 bH.S@825,321 check: CRYPTO TIF rule,open #485
-local_rule,10040 bH.S@926,321 check: the broker's ATS exchange with an unknown secType and no conId,open #485
-local_rule,477 bH.S@1031,321 check: CASH pseudo-FX destination not allowed for the account,open #485
-local_rule,498 bH.S@1152,"321 check: side SSHORTX or a short combo leg, feature off",open #485
-local_rule,160 bH.S@1572,"321 check: size 0 (not QUOTE, no FA sizing, not hedge child, no cash quantity)",open #485
-local_rule,355 bH.S@1606,"321 check: quantity out of range (> 999,999,999 or < 0)",tests/gw_catalog/refusals.rs::quantity_out_of_range
-local_rule,321 bH.S@1750,"321 check: STP, STP LMT, STP PRT, TRAIL LIMIT with the stop price unset (TRAIL LIMIT: trailStopPrice)",tests/gw_catalog/refusals.rs::trail_limit_without_a_stop_price ; tests/gw_catalog/refusals.rs::stop_order_without_a_stop_price
-local_rule,146 bH.S@2257,"321 check: triggerMethod not in 0, 1, 2, 3, 4, 7, 8",tests/gw_catalog/refusals.rs::trigger_method_not_the_gateways
-local_rule,314 bH.S@2319,321 check: BAG without legs,tests/gw_catalog/refusals.rs::combo_without_legs
-local_rule,10011 bH.S@2410,321 check: BAG SMART without a smart-combo conId for the currency,tests/gw_catalog/refusals.rs::smart_combo_in_a_currency_without_its_conid
-local_rule,347 bH.S@2548,321 check: SSHORT without a short sale slot object,open #485
-local_rule,347 bH.S@3088,321 check: short side with a slot not 1 or 2,tests/gw_catalog/refusals.rs::short_sale_slot_not_1_or_2
-local_rule,346 bH.S@2702,321 check: short sale slot on a non-institutional account without away clearing,tests/gw_catalog/refusals.rs::short_sale_slot_on_a_non_institutional_session
-local_rule,393 bH.S@2793,321 check: short sale slot on an order that is not a delta hedge,open #485
-local_rule,348 bH.S@2857,321 check: short sale slot on an order that is not SSHORT,open #485
-local_rule,494 bH.S@2921,321 check: exempt code on an order that is not SSHORTX,tests/gw_catalog/refusals.rs::short_sale_exempt_code_on_a_short_sale
-local_rule,353 bH.S@3146,321 check: slot 1 with a location,tests/gw_catalog/refusals.rs::short_sale_slot_1_with_a_location
-local_rule,352 bH.S@3204,321 check: slot 2 without a location,tests/gw_catalog/refusals.rs::short_sale_slot_2_without_a_location
-local_rule,495 bH.S@3272,321 check: exempt code not valid,open #485
-local_rule,411 bH.S@3344,321 check: outsideRth flag not valid for the order,open #485
-local_rule,371 bH.S@3429,"321 check: VOL: volatility missing or negative, or set on a non-VOL order",open #485
-local_rule,367 bH.S@3638,321 check: VOL: volatility type not 1 or 2,open #485
-local_rule,368 bH.S@4394,321 check: VOL: reference price type not 1 or 2,open #485
-local_rule,380 bH.S@3760,321 check: delta hedge order type not allowed,open #485
-local_rule,379 bH.S@3894,321 check: delta hedge order type with an aux price,open #485
-local_rule,372 bH.S@4166,321 check: VOL attribute on a non-VOL order,open #485
-local_rule,373 bH.S@4267,321 check: stock range on an order that is not VOL or relative to stock,open #485
-local_rule,375 bH.S@4561,321 check: negative stock range,open #485
-local_rule,374 bH.S@4681,321 check: low stock range not below the high one,open #485
-local_rule,413 bH.S@4745,321 check: whatIf true and transmit false,tests/gw_catalog/refusals.rs::what_if_without_transmit
-local_rule,457 bH.S@5061,321 check: FA / account rule,open #481
-local_rule,10136 bH.S@5127,321 check: account application not approved (non-FA session),open #481
-local_rule,10132 bH.S@5340,321 check: read-only account,open #485
-local_rule,10226 bH.S@5474,321 check: invalid FA method,open #481
-local_rule,435 bH.S@5567,321 check: multi-account non-FA session and no account,open #481
-local_rule,10265 bH.S@7758,321 check: FA group without a method,open #481
-local_rule,10030 bH.S@5718,321 check: discretionary amount and percent both set,open #485
-local_rule,10061 bH.S@5907,321 check: trailing unit percent and the value < 0 or > 100,tests/gw_catalog/refusals.rs::trailing_percent_above_100
-local_rule,10081 bH.S@5949,321 check: custom SMART strategy invalid,open #485
-local_rule,10087 bH.S@6007,321 check: manual scale order,open #485
-local_rule,10100 bH.S@6174,"321 check: combo hedging strategy, non-cleared account",open #485
-local_rule,10099 bH.S@6287,321 check: parent hedged with a combination order,open #485
-local_rule,10131 bH.S@6352,321 check: RTH flag on BAG or PDC,open #485
-local_rule,10075 bH.S@6455,321 check: PEG BENCH with referenceContractId <= 0,open #485
-local_rule,362 bH.S@6556,321 check: adjusted stop price invalid,open #485
-local_rule,363 bH.S@6626,321 check: adjusted stop-limit price invalid,open #485
-local_rule,403 bH.S@6696,"321 check: STP, STP PRT, STP LMT, TRAIL LIMIT with auxPrice invalid",tests/gw_catalog/refusals.rs::stop_order_with_a_stop_price_not_a_number
-local_rule,361 bH.S@6766,"321 check: MIT, LIT, TRAIL LIT with auxPrice invalid",tests/gw_catalog/refusals.rs::touched_order_without_a_trigger_price
-local_rule,10028 bH.S@6870,"321 check: trailing type, unit amount, trailing amount negative or unset",open #485
-local_rule,321 bH.S@7210,"321 check: TRAIL LIMIT family: both lmtPrice and lmtPriceOffset set, or neither",tests/gw_catalog/refusals.rs::trail_limit_with_both_limit_fields
-local_rule,10210 bH.S@7521,321 check: MIDPRICE with outsideRth true,tests/gw_catalog/refusals.rs::midprice_outside_regular_hours
-local_rule,10274 bH.S@8292,321 check: postToAts out of range,open #485
-local_rule,10315 bH.S@8434,321 check: time algo parameter bad value,open #485
-local_rule,10341 bH.S@8592,321 check: orderId already live with another parentId,open #485
-local_rule,135 bH.S@8805,321 check: parent order id not found,open #485
-local_rule,417 bH.S@5803,321 check: scale initial component size vs total size,open #485
-local_rule,145 bH.S@8849,145 check: customerAccount set and the account config has no CUSTACCT,tests/gw_catalog/refusals.rs::customer_account_without_the_account_config
-local_rule,145 bH.S@8892,145 check: professionalCustomer true and the account config has no CUSTACCT,tests/gw_catalog/refusals.rs::professional_customer_without_the_account_config
-local_rule,10007 bH.r@85,"321 check: hedge type not D, B, F or P",open #485
-local_rule,10006 bH.r@212,321 check: hedge order without a parent,open #485
-local_rule,10010 bH.r@425,321 check: invalid delta hedge,open #485
-local_rule,10009 bH.r@523,321 check: invalid hedge ratio,open #485
-local_rule,10033 bH.r@630,321 check: invalid beta hedge,open #485
-local_rule,10008 bH.r@714,321 check: invalid beta value,open #485
-local_rule,10149 bH.W@44,10149 flow: orderId 0 or unset,tests/gw_catalog/refusals.rs::order_id_zero
-local_rule,103 bH.W@222,103 flow: orderId not in the order table and not above the highest used,tests/gw_catalog/refusals.rs::a_new_order_id_below_the_highest_used
-local_rule,10268 bH.o@67,10268 flow: eTradeOnly set with the feature on,open #485
-local_rule,10269 bH.o@121,10269 flow: firmQuoteOnly set with the feature on,open #485
-local_rule,10270 bH.o@178,10270 flow: nbboPriceCap set with the feature on,open #485
-local_rule,10348 bH.o@234,10348 flow: optOutSmartRouting set with the feature on,open #485
-local_rule,2168 bH.o@75,"2168 flow: warning, order sent: eTradeOnly set, feature off, attribute cleared",open #485
-local_rule,2169 bH.o@129,"2169 flow: warning, order sent: firmQuoteOnly set, feature off",open #485
-local_rule,2170 bH.o@186,"2170 flow: warning, order sent: nbboPriceCap set, feature off",open #485
-local_rule,2181 bH.o@242,"2181 flow: warning, order sent: optOutSmartRouting set, feature off",open #485
-local_rule,2102 bH.Y@65,"2102 flow: a new order whose id is still pending: warning code, order not sent",open #485
-local_rule,2139 bH.Z@21,"2139 flow: warning, order sent",open #485
-local_rule,2146 bH.Z@56,"2146 flow: warning, order sent: order id too high",open #485
-local_rule,"10318 dx.a(dy,boolean)@462",10318 build: fractional quantity not supported for the contract / order,open #485
-local_rule,"10208 dx.a(dy,boolean)@908",10208 build: stock size with more decimals than allowed,open #485
-local_rule,"10286 dx.a(dy,boolean)@1089",10286 build: TotalQuantity with too many decimals,open #485
-local_rule,"10292 dx.a(dy,boolean)@361",10292 build: order not allowed for this instrument,open #485
-local_rule,"464 dx.a(dy,boolean)@1223",464 build: invalid exchange,open #485
-local_rule,"10080 dx.a(dy,boolean)@1390",10080 build: custom SMART strategy not supported,open #485
-local_rule,"10031 dx.a(dy,boolean)@1764",10031 build: hedge child with a limit price,open #485
-local_rule,"10032 dx.a(dy,boolean)@1803",10032 build: hedge child with a size,open #485
-local_rule,"10063 dx.a(dy,boolean)@1871",10063 build: invalid FX hedge,open #485
-local_rule,"10195 dx.a(dy,boolean)@2111",10195 build: use-parent-price parameters invalid,open #485
-local_rule,"463 dx.a(dy,boolean)@2226",463 build: no valid price,open #485
-local_rule,"388 dx.a(dy,boolean)@2430",388 build: size below the minimum size,open #485
-local_rule,"10083 dx.a(dy,boolean)@2532",10083 build: display size below the minimum,open #485
-local_rule,"10084 dx.a(dy,boolean)@2595",10084 build: min quantity below the minimum,open #485
-local_rule,"10155 dx.a(dy,boolean)@2997",10155 build: invalid soft dollar tier,open #485
-local_rule,"10244 dx.a(dy,boolean)@3153",10244 build: cash quantity not usable for the order,open #485
-local_rule,"10203 dx.a(dy,boolean)@3466",10203 build: FUND buy rule,open #485
-local_rule,"10204 dx.a(dy,boolean)@3864",10204 build: FUND sell rule,open #485
-local_rule,"10206 dx.a(dy,boolean)@4216",10206 build: cash quantity with more than 2 decimals,open #485
-local_rule,"10207 dx.a(dy,boolean)@3956",10207 build: FUND size with more than 3 decimals,open #485
-local_rule,"10302 dx.a(OC,dy,...)@312",10302 build: min trade quantity not allowed,open #485
-local_rule,"10303 dx.a(OC,dy,...)@351",10303 build: min trade quantity not a positive integer,open #485
-local_rule,"439 algo.a.a(AlgoExchanges,...)@36",439 build: no algo definition with this name for the exchanges,src/control/algo.rs::refusals_follow_the_definitions
-local_rule,"442 algo.a.a(AlgoExchanges,...)@150",442 build: algo not allowed for the order,src/control/algo.rs::overnight_and_number_rules
-local_rule,"10314 algo.a.a(AlgoExchanges,...)@596",10314 build: algo time parameter not parseable,open #485
-local_rule,10235 aN.i(pe)@216,10235 rules: MiFID account and no Decision Maker,open #425
-local_rule,402 aN.a@10570,402 rules: conditions not allowed for the instrument,open #485
-local_rule,148 aN.a@10652,"148 rules: conditions on an order type other than LMT, MKT, MIDPRICE, REL, SNAP",open #485
-local_rule,148 aN.a@10734,148 rules: conditionsCancelOrder on an order type other than LMT or MIDPRICE,open #485
-local_rule,398 aN.a@10801,"398 rules: condition trigger error (time condition without time, ...)",open #485
-local_rule,10051 aN.a@2901,10051 rules: unknown order type,open #485
-local_rule,10052 aN.a@2961,10052 rules: TIF not valid,open #485
-local_rule,10070 aN.a@3067,10070 rules: order type not in the type list (server data),open #485
-local_rule,464 aN.a@3478,464 rules: invalid exchange,open #485
-local_rule,10166 aN.a@3468,10166 rules: no auto-routing destination,open #485
-local_rule,412 aN.a@4375,412 rules: contract not tradable,open #485
-local_rule,154 aN.a@9411,154 rules: halted security,open #485
-local_rule,107 aN.a@9434,107 rules: incomplete order,open #485
-local_rule,328 aN.a@9339,328 rules: trailing child on a parent that is not LMT or STP LMT,open #485
-local_rule,401 aN.a@12279,401 rules: OCA name over 64 characters,open #485
-local_rule,461 aN.a,461 rules: size not a multiple of the lot,open #485
-local_rule,10098 aN.p(pe)@115,10098 rules: SNAP order with a negative offset,open #485
-local_rule,2137 OrderChecker$16@186,"2137 rules: closing order larger than the position: warning code, order refused",open #485
-local_rule,10132 aN.a@2163,10132 rules: read-only account,open #485
-local_rule,104 bH.d(pe)@121,"104 modify: modify of an order that is filled, cancelled or with a cancel pending",src/client_core.rs::place_on_a_cancelled_order_id_is_refused ; src/engine/hot_loop/order_builder.rs::modify_of_an_order_the_engine_no_longer_holds_is_refused
-local_rule,105 bH.d(pe)@165,105 modify: modified order does not match the original,tests/gw_catalog/refusals.rs::modify_of_the_side
-local_rule,329 aj.e(pe)@52,329 modify: modify to another order type,tests/gw_catalog/refusals.rs::modify_to_another_order_type
-local_rule,462 aj.f(pe)@62,462 modify: modify to another time in force,src/api/client/tests.rs::modify_must_restate_the_held_overnight_time_in_force
-local_rule,10326 bH.d(pe)@836,10326 modify: OCA group changed,tests/gw_catalog/refusals.rs::modify_of_the_oca_group
-local_rule,10327 bH.d(pe)@905,10327 modify: OCA type changed,tests/gw_catalog/refusals.rs::modify_of_the_oca_type
-local_rule,"10059 bH.c(pe,dl)@1067",10059 modify: combo modify with a leg the working order does not have,tests/gw_catalog/refusals.rs::combo_modify_with_another_leg
-local_rule,10147 bw.a(pe)@179,10147 cancel: cancel of an order id that is not found,tests/gw_catalog/refusals.rs::cancel_of_an_unknown_order
-local_rule,10148 bw.a(pe)@543,10148 cancel: cancel of an order in a state that cannot be cancelled,tests/gw_catalog/refusals.rs::cancel_of_an_order_with_a_cancel_pending
+local_rule,110-1,110 build: the absolute price is off the tick of the contract's market rule (server data),src/api/client/tests.rs::algo_refusals_of_20261002_through_place_order ; src/engine/hot_loop/order_builder.rs::a_price_off_the_grid_is_refused_with_110
+local_rule,145-1,145 build: an algo parameter value is not one of the legal strings of the algo definition (server data); text = the bad value,src/control/algo.rs::refusals_follow_the_definitions
+local_rule,343-1,"343 read: goodTillDate not empty and not a date and time, or its zone is not UTC, the machine's zone or the contract's trading-hours zone",tests/gw_catalog/refusals.rs::good_till_date_not_a_date
+local_rule,337-1,337 read: goodAfterTime not a date and time (same pattern as 343),tests/gw_catalog/refusals.rs::good_after_time_not_a_date
+local_rule,387-1,387 rules: order type not in the contract's order type list for the exchange (server data); PEG MID and PEG BEST need their own entries in that list,src/engine/hot_loop/order_builder.rs::pegged_types_not_in_the_list_are_refused_with_387
+local_rule,441-1,441 build: algo parameter value refused by the definition (min / max of the server's algo definition),src/control/algo.rs::refusals_follow_the_definitions
+local_rule,443-1,443 build: algo parameter name not in the definition's parameter list,src/control/algo.rs::refusals_follow_the_definitions
+local_rule,460-1,460 rules: no trading permission for the account and contract (server data),src/engine/hot_loop/order_builder.rs::an_option_order_without_the_class_permission_is_refused_with_460
+local_rule,2109-1,"2109 rules: warning, order still sent: outsideRth does not apply to the order type and destination; the attribute is removed",src/engine/hot_loop/order_builder.rs::outside_rth_waits_for_the_definition_then_follows_the_rule ; src/engine/hot_loop/order_builder.rs::outside_rth_without_a_definition_uses_the_empty_list
+local_rule,10243-1,"10243 build: account can trade fractions, STK or WAR, and the quantity is not whole",tests/gw_catalog/refusals.rs::fractional_quantity
+local_rule,10256-1,10256 rules: minQty set and the server's attribute list for the contract and exchange does not allow minimum quantity,src/engine/hot_loop/order_builder.rs::minimum_quantity_and_display_size_follow_the_list
+local_rule,152-1,152 rules: hidden set and the attribute list does not allow hidden,tests/gw_catalog/refusals.rs::hidden_and_a_far_order_id
+local_rule,10255-1,10255 rules: display size set and the attribute list does not allow a display size,src/engine/hot_loop/order_builder.rs::minimum_quantity_and_display_size_follow_the_list
+local_rule,10257-1,10257 rules: allOrNone set and the attribute list does not allow all-or-none,src/engine/hot_loop/order_builder.rs::all_or_none_not_in_the_list_is_refused_with_10257
+local_rule,10266-1,10266 rules: blockOrder set and the attribute list does not allow block orders,src/engine/hot_loop/order_builder.rs::minimum_quantity_and_display_size_follow_the_list
+local_rule,10267-1,10267 rules: sweepToFill set and the attribute list does not allow sweep-to-fill,src/engine/hot_loop/order_builder.rs::minimum_quantity_and_display_size_follow_the_list
+local_rule,10342-1,10342 rules: imbalanceOnly set and the attribute list does not allow imbalance-only,src/engine/hot_loop/order_builder.rs::minimum_quantity_and_display_size_follow_the_list
+local_rule,10274-1,10274 rules: postToAts set and the attribute list does not allow it,tests/gw_catalog/refusals.rs::post_to_ats_out_of_range
+local_rule,168-1,168 read: discretionaryAmt < 0,tests/gw_catalog/refusals.rs::negative_discretionary_amount
+local_rule,313-1,313 read: a combo leg cannot be read,tests/gw_catalog/refusals.rs::combo_leg_not_read
+local_rule,409-1,409 read: message versions 22 to 25 only: old scale component count > 0,open #739
+local_rule,429-1,429 read: deltaNeutralContract given without combo legs,tests/gw_catalog/refusals.rs::delta_neutral_contract_without_combo_legs
+local_rule,10027-1,10027 check: a smartComboRoutingParams tag is not one of the allowed tags; the tag list is read with the request but refused at the first checks,tests/gw_catalog/refusals.rs::unknown_combo_routing_tag
+local_rule,10057-1,10057 read: number of per-leg prices not 0 and not the number of legs,tests/gw_catalog/refusals.rs::per_leg_prices_not_one_per_leg
+local_rule,10060-1,10060 read: trailingPercent and auxPrice both set (for trailing types auxPrice 0 counts as unset),tests/gw_catalog/refusals.rs::trailing_percent_with_a_trailing_amount
+local_rule,10105-1,10105 read: side SELL LONG and shortSaleSlot not -100,tests/gw_catalog/refusals.rs::sell_long_without_the_slot
+local_rule,10300-1,10300 read: manualOrderTime not a date and time,tests/gw_catalog/refusals.rs::manual_order_time_not_readable
+local_rule,10314-1,10314 read: the time of a time condition is not a date and time,tests/gw_catalog/refusals.rs::time_condition_not_a_time
+local_rule,10315-1,10315 read: activeStartTime / activeStopTime not in the hh:mm:ss form,tests/gw_catalog/refusals.rs::active_time_not_a_time
+local_rule,10316-1,10316 read: message version < 24 with the old outsideRth / trigger flag,open #739
+local_rule,10340-1,10340 read: externalUserId / manualOrderIndicator from client versions 187 to 189,open #739
+local_rule,10354-1,10354 read: new request form: attachedOrders given and the server feature that forbids attaching in one request is on,tests/gw_catalog/refusals.rs::attached_orders_not_in_one_request
+local_rule,10356-1,"10356 read: new request form: attachedOrders with a stop-loss order id but no stop-loss type PRESET, or the reverse",tests/gw_catalog/refusals.rs::attached_stop_loss_without_its_type
+local_rule,10356-2,"10356 read: new request form: attachedOrders with a profit-taker order id but no profit-taker type PRESET, or the reverse",tests/gw_catalog/refusals.rs::attached_profit_taker_without_its_id
+local_rule,10363-1,"10363 read: new request form: a text field of the request holds a non-ASCII character (every request of that form, placeOrder included)",open #602
+local_rule,321-1,"321 check: side unknown, or SSHORT when the session has neither the institutional flag nor an away clearing",tests/gw_catalog/refusals.rs::short_side_without_the_logon_flags ; tests/gw_catalog/refusals.rs::unknown_action
+local_rule,452-1,452 check: exchange empty,tests/gw_catalog/refusals.rs::order_without_an_exchange
+local_rule,10052-1,"10052 check: time in force OVERNIGHT or OVERNIGHT + DAY, or includeOvernight set with a time in force other than DAY, or a time in force text that is not known; the error is sent and the request goes on (classic request form)",tests/gw_catalog/refusals.rs::time_in_force_not_known_or_not_day_overnight
+local_rule,10052-2,"10052 check: new request form: time in force OVERNIGHT or OVERNIGHT + DAY, or includeOvernight set with a time in force other than DAY, or a time in force text that is not known; the request is refused",open #602
+local_rule,10052-3,"10052 check: new request form, client version 215 or above, server feature that requires a time in force on, and the time in force is empty",open #602
+local_rule,10272-1,10272 check: duration set with a time in force other than GTD,tests/gw_catalog/refusals.rs::duration_without_gtd
+local_rule,10273-1,10273 check: GTD with both an expiration date and time and a duration,tests/gw_catalog/refusals.rs::gtd_with_an_end_time_and_a_duration
+local_rule,391-1,"391 check: GTD with neither an expiration date and time nor a duration; the text is the date and time message with 'End Time' as the field name, not the message of 391",tests/gw_catalog/refusals.rs::gtd_without_an_end_time_or_a_duration
+local_rule,10244-1,"10244 check: crypto order with a cash quantity where none is allowed: a LMT order, or a MKT SELL order",open #666
+local_rule,10289-1,10289 check: crypto MKT BUY order without a cash quantity,open #666
+local_rule,10052-4,"10052 check: crypto BUY order whose time in force is not allowed for crypto (IOC or minutes, and with a server feature off also DAY, GTC, GTD); text = the time in force after a colon (the plain message when the time in force is empty)",open #666
+local_rule,10366-1,10366 check: time in force in minutes with goodAfterTime set,tests/gw_catalog/refusals.rs::minutes_with_a_start_time
+local_rule,10040-1,10040 check: the broker's own ATS destination with an unknown security type and no conId,src/client_core.rs::reading_rules_of_19_10_2026
+local_rule,10372-1,"10372 check: lastTradeDateOrContractMonth not empty and neither an expiry form, nor yyyyMM, nor yyyyMMdd",tests/gw_catalog/refusals.rs::contract_month_not_readable
+local_rule,477-1,477 check: CASH pseudo-FX destination not allowed for the account,src/client_core.rs::reading_rules_of_19_10_2026
+local_rule,498-1,"498 check: side SSHORTX or a short combo leg, feature off",tests/gw_catalog/refusals.rs::sshortx_not_supported
+local_rule,160-1,"160 check: size 0 (not QUOTE, no FA sizing, not hedge child, no cash quantity), and (new in 10.51) the destination is not AVGCOST",tests/gw_catalog/refusals.rs::size_zero
+local_rule,355-1,"355 check: quantity out of range (> 999,999,999 or < 0)",tests/gw_catalog/refusals.rs::quantity_out_of_range
+local_rule,321-2,"321 check: the order type needs a stop or trigger price and auxPrice is unset: STP, STP LMT, STP PRT ('stop price'), TRAIL LIMIT ('trailing stop price'), and (new in 10.51) LIT, MIT ('trigger price'), TRAIL LIT ('trailing trigger price')",tests/gw_catalog/refusals.rs::trail_limit_without_a_stop_price ; tests/gw_catalog/refusals.rs::stop_order_without_a_stop_price
+local_rule,146-1,"146 check: triggerMethod not in 0, 1, 2, 3, 4, 7, 8",tests/gw_catalog/refusals.rs::trigger_method_not_the_gateways
+local_rule,314-1,314 check: BAG without legs,tests/gw_catalog/refusals.rs::combo_without_legs
+local_rule,10011-1,10011 check: BAG SMART without a smart-combo contract for the currency,tests/gw_catalog/refusals.rs::smart_combo_in_a_currency_without_its_conid
+local_rule,347-1,347 check: SSHORT without a short sale slot,tests/gw_catalog/refusals.rs::short_sale_without_a_slot
+local_rule,347-2,347 check: short side with a slot not 1 or 2,tests/gw_catalog/refusals.rs::short_sale_slot_not_1_or_2
+local_rule,346-1,346 check: short sale slot on a non-institutional account without away clearing,tests/gw_catalog/refusals.rs::short_sale_slot_on_a_non_institutional_session
+local_rule,393-1,393 check: short sale slot on an order that is not a delta hedge,tests/gw_catalog/refusals.rs::short_sale_slot_on_a_buy
+local_rule,348-1,348 check: short sale slot on an order that is not SSHORT,tests/gw_catalog/refusals.rs::short_sale_slot_on_a_buy
+local_rule,494-1,494 check: exempt code on an order that is not SSHORTX,tests/gw_catalog/refusals.rs::short_sale_exempt_code_on_a_short_sale
+local_rule,353-1,353 check: slot 1 with a location,tests/gw_catalog/refusals.rs::short_sale_slot_1_with_a_location
+local_rule,352-1,352 check: slot 2 without a location,tests/gw_catalog/refusals.rs::short_sale_slot_2_without_a_location
+local_rule,495-1,495 check: exempt code not valid,tests/gw_catalog/refusals.rs::exempt_code_not_valid
+local_rule,10052-5,10052 check: VOL order with time in force GTC,open #673
+local_rule,411-1,411 check: VOL order with outsideRth set,open #673
+local_rule,371-1,"371 check: VOL: volatility missing or negative, or set on a non-VOL order",open #673
+local_rule,367-1,367 check: VOL: volatility type not 1 or 2,tests/gw_catalog/refusals.rs::volatility_order_without_its_type
+local_rule,368-1,368 check: VOL: reference price type not 1 or 2,open #673
+local_rule,380-1,380 check: delta hedge order type not allowed,open #673
+local_rule,379-1,379 check: delta hedge order type with an aux price,open #673
+local_rule,372-1,372 check: VOL attribute on a non-VOL order,open #673
+local_rule,373-1,373 check: stock range on an order that is not VOL or relative to stock,open #673
+local_rule,375-1,375 check: negative stock range,open #673
+local_rule,374-1,374 check: low stock range not below the high one,open #673
+local_rule,10352-1,10352 check: whatIf false and whatIfType above 0,tests/gw_catalog/refusals.rs::what_if_type_without_what_if
+local_rule,10351-1,10351 check: whatIfType below 0 or above the highest known type,tests/gw_catalog/refusals.rs::what_if_type_out_of_range
+local_rule,10351-2,"10351 check: whatIf true, whatIfType above 1, and the account does not allow what-if types (a settings flag and a server feature)",tests/gw_catalog/refusals.rs::what_if_type_above_a_preview
+local_rule,413-1,413 check: whatIf true and transmit false (10.51: checked with the what-if type rules),tests/gw_catalog/refusals.rs::what_if_without_transmit
+local_rule,457-1,457 check: FA / account rule,open #481
+local_rule,10136-1,10136 check: account application not approved (non-FA session),open #481
+local_rule,10132-1,10132 check: read-only account,open #634
+local_rule,10226-1,10226 check: invalid FA method,open #481
+local_rule,435-1,435 check: multi-account non-FA session and no account,open #481
+local_rule,10368-1,"10368 check: BAG with NonGuaranteed set, and not exactly 2 legs or not routed to SMART",tests/gw_catalog/refusals.rs::non_guaranteed_combo_not_smart
+local_rule,10369-1,"10369 check: BAG with more than 2 legs, an order type that carries a limit price (LMT, LOC, LIT, STP LMT, TRAIL LIMIT, TRAIL LIT, PEG MID, PEG BEST, PEG MKT and related types), and lmtPrice unset",tests/gw_catalog/refusals.rs::combo_of_three_legs_without_a_limit_price
+local_rule,10265-1,10265 check: FA group without a method,open #481
+local_rule,10030-1,10030 check: discretionary amount and percent both set,src/client_core.rs::sell_long_slot_discretionary_pair_and_trail_limit_under_a_stop
+local_rule,10061-1,10061 check: trailing unit percent and the value < 0 or > 100,tests/gw_catalog/refusals.rs::trailing_percent_above_100
+local_rule,10081-1,10081 check: custom SMART strategy invalid,open #635
+local_rule,10100-1,"10100 check: combo hedging strategy, non-cleared account",open #634
+local_rule,10099-1,10099 check: parent hedged with a combination order,src/client_core.rs::reading_rules_of_19_10_2026
+local_rule,10131-1,10131 check: RTH flag on BAG or PDC,src/engine/outside_rth.rs::a_combo_never_keeps_outside_rth
+local_rule,10075-1,10075 check: PEG BENCH with referenceContractId <= 0,tests/gw_catalog/refusals.rs::pegged_to_benchmark_without_its_reference
+local_rule,362-1,362 check: adjusted stop price invalid,tests/gw_catalog/refusals.rs::adjusted_stop_prices_not_valid
+local_rule,363-1,363 check: adjusted stop-limit price invalid,tests/gw_catalog/refusals.rs::adjusted_stop_prices_not_valid
+local_rule,403-1,"403 check: STP, STP PRT, STP LMT, TRAIL LIMIT with auxPrice invalid",tests/gw_catalog/refusals.rs::stop_order_with_a_stop_price_not_a_number
+local_rule,361-1,"361 check: MIT, LIT, TRAIL LIT with auxPrice invalid",tests/gw_catalog/refusals.rs::touched_order_without_a_trigger_price
+local_rule,10028-1,"10028 check: trailing type, unit amount, trailing amount negative or unset",tests/gw_catalog/refusals.rs::trail_without_a_trailing_amount
+local_rule,321-3,"321 check: TRAIL LIMIT family: both lmtPrice and lmtPriceOffset set, or neither",tests/gw_catalog/refusals.rs::trail_limit_with_both_limit_fields
+local_rule,10210-1,10210 check: MIDPRICE with outsideRth true,tests/gw_catalog/refusals.rs::midprice_outside_regular_hours
+local_rule,10274-2,10274 check: postToAts out of range,tests/gw_catalog/refusals.rs::post_to_ats_out_of_range
+local_rule,10315-2,10315 check: time algo parameter bad value,tests/gw_catalog/refusals.rs::own_algo_active_time_not_a_time
+local_rule,10341-1,10341 check: orderId already live with another parentId,src/client_core.rs::a_modify_keeps_its_own_parent
+local_rule,135-1,135 check: parent order id not found; text = the parent id after the message,tests/gw_catalog/refusals.rs::child_of_an_unknown_parent
+local_rule,417-1,417 check: scale initial component size vs total size,tests/gw_catalog/refusals.rs::scale_first_component_above_the_order
+local_rule,145-2,145 check: customerAccount set and the account configuration does not allow a customer account,tests/gw_catalog/refusals.rs::customer_account_without_the_account_config
+local_rule,145-3,145 check: professionalCustomer true and the account configuration does not allow it,tests/gw_catalog/refusals.rs::professional_customer_without_the_account_config
+local_rule,10051-1,10051 check: postOnly set and the order type does not support post-only,tests/gw_catalog/refusals.rs::post_only_on_a_market_order
+local_rule,464-1,464 check: postOnly set and the destination is the broker's own ATS,tests/gw_catalog/refusals.rs::post_only_on_the_own_trading_system
+local_rule,442-1,442 check: postOnly set on an algo order of a kind that excludes it,tests/gw_catalog/refusals.rs::post_only_on_the_own_algo
+local_rule,10052-6,10052 check: postOnly set with time in force OVERNIGHT + DAY,tests/gw_catalog/refusals.rs::post_only_overnight_and_day
+local_rule,464-2,464 check: allowPreOpen or ignoreOpenAuction set and the destination is an overnight venue (OVERNIGHT or its electronic overnight venue),tests/gw_catalog/refusals.rs::open_flags_on_an_overnight_venue
+local_rule,10052-7,10052 check: allowPreOpen or ignoreOpenAuction set with time in force OVERNIGHT + DAY,tests/gw_catalog/refusals.rs::open_flags_overnight_and_day
+local_rule,10340-2,"10340 check: ignoreOpenAuction set, destination SMART, and the pre-open reroute attribute set",open #635
+local_rule,10340-3,10340 check: ignoreOpenAuction set and the scale auto-reset attribute set,tests/gw_catalog/refusals.rs::ignore_open_auction_with_scale_auto_reset
+local_rule,321-4,321 check: goodTillDate not empty and a time in force other than GTD (the first of the first checks; a goodTillDate that cannot be read is refused at the reading before it),tests/gw_catalog/refusals.rs::good_till_date_without_gtd
+local_rule,321-5,"321 check: openClose given and its first character (case ignored) not O or C; empty, a leading space or ? is the default",tests/gw_catalog/refusals.rs::open_close_not_open_or_close
+local_rule,321-6,"321 check: a session that must give the open or close intent (institutional or omnibus logon, and some other account kinds) and openClose not O or C, empty included",tests/gw_catalog/refusals.rs::open_close_missing_on_an_institutional_session
+local_rule,321-7,"321 check: such a session, a short side (SSHORT or SSHORTX) and openClose C",tests/gw_catalog/refusals.rs::close_on_a_short_sale
+local_rule,321-8,"321 check: deltaNeutralOrderType given (the client sends the delta-neutral open or close only then) and deltaNeutralOpenClose given with a first character (case ignored) not O or C (empty, a leading space or ? is the default)",tests/gw_catalog/refusals.rs::delta_neutral_open_close_not_open_or_close
+local_rule,378-1,"378 check: a delta-neutral order type allowed as one (REL, RPI, LMT, MKT, PASSV REL) that needs an aux price, and deltaNeutralAuxPrice unset; none of the allowed types needs one, so the rule does not fire",open #739
+local_rule,10115-1,"10115 check: auxPrice 0 on an order type that is not trailing, takes an aux price and does not take 0: STP, STP LMT, STP PRT, MIT, LIT, PEG MKT, PEG BENCH, PEG STK, RPI, PEG MKT VOL",tests/gw_catalog/refusals.rs::zero_offset_on_a_type_without_one
+local_rule,10115-2,10115 check: auxPrice below 0 on PEG PRM VOL or PEG MKT VOL (PEG MID VOL and PEG SURF VOL take it),open #673
+local_rule,321-9,"321 check: order type QUOTE (a request for quote) and already 2 of them in the same second on the client's connection; text = 2, then 1",tests/gw_catalog/refusals.rs::requests_for_quote_beyond_two_a_second
+local_rule,10136-2,10136 check: FA session: the order is allocated to one account whose application is not approved (after 'Invalid account specified' for an account not known and 10132 for a read-only one),open #507
+local_rule,10226-2,"10226 check: FA session with the allocation checks on: an FA method, and a group that exists whose own method is set and is another; an exemption of some orders not identified",open #507
+local_rule,10226-3,"10226 check: FA session with the allocation checks on: an FA method, no group that exists, and an allocation profile that exists; an exemption of some orders not identified",open #507
+local_rule,10226-4,"10226 check: FA session with the allocation checks on: no FA method, and a group that exists",open #507
+local_rule,10007-1,"10007 read: hedge type not D, B, F or P",tests/gw_catalog/refusals.rs::hedge_of_an_unknown_kind
+local_rule,10006-1,"10006 read: hedge order (hedge type set) whose parent order is not found, for a new order (a known order id is only logged); text = the message, then client id, order id, parent id and hedge type",tests/gw_catalog/refusals.rs::hedge_without_its_parent
+local_rule,10010-1,"10010 read: delta hedge whose parent or hedge contract does not fit (parent an option; hedge stock, CFD, or futures for an index option); text = the message, then client id, order id, parent id and hedge type",tests/gw_catalog/refusals.rs::delta_hedge_not_on_an_option
+local_rule,10009-1,"10009 read: invalid hedge ratio (delta hedge without a ratio, or pair hedge ratio missing or 0)",tests/gw_catalog/refusals.rs::pair_hedge_without_a_ratio
+local_rule,10033-1,10033 read: beta hedge whose parent or hedge is not a stock order,tests/gw_catalog/refusals.rs::beta_hedge_not_on_a_stock
+local_rule,10008-1,10008 read: beta hedge with a beta value that is not a number,tests/gw_catalog/refusals.rs::beta_hedge_with_a_beta_not_a_number
+local_rule,10149-1,10149 flow: orderId 0 or unset,tests/gw_catalog/refusals.rs::order_id_zero
+local_rule,103-1,103 flow: orderId not in the order table and not above the highest used,tests/gw_catalog/refusals.rs::a_new_order_id_below_the_highest_used
+local_rule,10149-2,10149 flow: new request form: the order id or an attached order id is not a known order and not a valid id,tests/gw_catalog/refusals.rs::attached_order_id_zero
+local_rule,103-2,103 flow: new request form: the order id or an attached order id is not a known order and not above the highest used,tests/gw_catalog/refusals.rs::attached_order_id_below_the_highest_used
+local_rule,103-3,103 flow: new request form: the order id and the attached order ids are not all different,tests/gw_catalog/refusals.rs::attached_order_ids_not_all_different
+local_rule,10268-1,10268 flow: eTradeOnly set with the feature on,open #739
+local_rule,10269-1,10269 flow: firmQuoteOnly set with the feature on,open #739
+local_rule,10270-1,10270 flow: nbboPriceCap set with the feature on,open #739
+local_rule,10348-1,10348 flow: optOutSmartRouting set with the feature on,open #634
+local_rule,2168-1,"2168 flow: warning, order sent: eTradeOnly set, feature off, attribute cleared",open #739
+local_rule,2169-1,"2169 flow: warning, order sent: firmQuoteOnly set, feature off",open #739
+local_rule,2170-1,"2170 flow: warning, order sent: nbboPriceCap set, feature off",open #739
+local_rule,2181-1,"2181 flow: warning, order sent: optOutSmartRouting set, feature off",tests/gw_catalog/refusals.rs::opt_out_of_smart_routing_is_a_warning
+local_rule,2184-1,"2184 flow: warning, order sent: FA session, the order has an allocation group, and the allocation warning was not acknowledged before (shown once, then remembered in the settings); text ends with a link",open #507
+local_rule,2102-1,"2102 flow: a new order whose id is still pending: warning code, order not sent",src/engine/hot_loop/order_builder.rs::a_re_place_of_an_order_not_sent_yet_is_a_duplicate
+local_rule,2139-1,"2139 flow: warning, order sent",open #739
+local_rule,2146-1,"2146 flow: warning, order sent: order id too high",tests/gw_catalog/refusals.rs::hidden_and_a_far_order_id
+local_rule,10318-1,10318 build: fractional quantity not supported for the contract / order,tests/gw_catalog/refusals.rs::quantity_decimals_and_fractions
+local_rule,10208-1,10208 build: stock size with more decimals than allowed,tests/gw_catalog/refusals.rs::quantity_decimals_and_fractions
+local_rule,10286-1,10286 build: total quantity with too many decimals,tests/gw_catalog/refusals.rs::quantity_decimals_and_fractions
+local_rule,10292-1,10292 build: order not allowed for this instrument,src/engine/hot_loop/order_builder.rs::an_index_order_is_refused_with_10345
+local_rule,464-3,464 build: invalid exchange,src/engine/hot_loop/order_builder.rs::an_order_on_an_exchange_without_a_definition_gets_200
+local_rule,10080-1,10080 build: custom SMART strategy not supported,open #635
+local_rule,10031-1,10031 build: hedge child with a limit price,tests/gw_catalog/refusals.rs::hedge_with_a_limit_price
+local_rule,10032-1,10032 build: hedge child with a size,tests/gw_catalog/refusals.rs::hedge_with_a_size
+local_rule,10063-1,10063 build: invalid FX hedge,tests/gw_catalog/refusals.rs::fx_hedge_not_on_a_currency_pair
+local_rule,10195-1,10195 build: use-parent-price parameters invalid,open #635
+local_rule,463-1,463 build: no valid price,tests/gw_catalog/refusals.rs::limit_order_at_zero
+local_rule,388-1,388 build: size below the minimum size,src/engine/hot_loop/order_builder.rs::an_order_below_the_minimum_size_is_388
+local_rule,10083-1,10083 build: display size below the minimum,src/engine/hot_loop/order_builder.rs::an_order_below_the_minimum_size_is_388
+local_rule,10084-1,10084 build: min quantity below the minimum,src/engine/hot_loop/order_builder.rs::an_order_below_the_minimum_size_is_388
+local_rule,10155-1,10155 build: invalid soft dollar tier,open #506
+local_rule,10244-2,10244 build: cash quantity not usable for the order,open #666
+local_rule,10203-1,10203 build: FUND buy rule,src/engine/hot_loop/order_builder.rs::a_fund_and_an_unwritten_type_given_by_con_id_are_refused
+local_rule,10204-1,10204 build: FUND sell rule,open #666
+local_rule,10206-1,10206 build: cash quantity with more than 2 decimals,open #666
+local_rule,10207-1,10207 build: FUND size with more than 3 decimals,open #666
+local_rule,10302-1,10302 build: min trade quantity not allowed,tests/gw_catalog/refusals.rs::min_trade_quantity_below_zero
+local_rule,10303-1,10303 build: min trade quantity not a positive integer,tests/gw_catalog/refusals.rs::min_trade_quantity_below_zero
+local_rule,10362-1,"10362 build: destination OVERNIGHT or its electronic overnight venue, or includeOvernight set, and the contract has no overnight venue among its valid exchanges",src/engine/hot_loop/order_builder.rs::include_overnight_needs_an_overnight_exchange
+local_rule,10371-1,"10371 build: conditionsIncludeOvernight set, and the contract has no overnight venue among its valid exchanges, or is of an excluded kind, or the account lacks the server feature for overnight conditions",open #602
+local_rule,439-1,439 build: no algo definition with this name for the exchanges,src/control/algo.rs::refusals_follow_the_definitions
+local_rule,442-2,442 build: algo not allowed for the order,src/control/algo.rs::overnight_and_number_rules
+local_rule,10314-2,10314 build: a time algo parameter is not a date and time,src/control/algo.rs::time_parameters_are_read_as_dates
+local_rule,10235-1,10235 rules: MiFID account and no Decision Maker,open #425
+local_rule,402-1,402 rules: conditions not allowed for the instrument,open #635
+local_rule,148-1,"148 rules: conditions on an order type other than LMT, MKT, MIDPRICE, REL, SNAP",tests/gw_catalog/refusals.rs::conditions_on_an_order_type_without_them
+local_rule,148-2,148 rules: conditionsCancelOrder on an order type other than LMT or MIDPRICE,tests/gw_catalog/refusals.rs::conditions_on_an_order_type_without_them
+local_rule,398-1,"398 rules: condition trigger error (time condition without time, ...)",tests/gw_catalog/refusals.rs::time_condition_not_a_time
+local_rule,10051-2,10051 rules: unknown order type,tests/gw_catalog/refusals.rs::order_type_not_known
+local_rule,10052-8,10052 rules: TIF not valid,tests/gw_catalog/refusals.rs::time_in_force_not_valid_on_the_destination
+local_rule,10070-1,10070 rules: order type not in the type list (server data),src/engine/hot_loop/order_builder.rs::market_on_close_follows_the_list
+local_rule,464-4,464 rules: destination not valid for the contract and the order does not use auto-routing (several exemptions; new in 10.51: the AVGCOST destination is exempt),src/engine/hot_loop/order_builder.rs::a_directed_order_to_an_exchange_the_contract_does_not_list_gets_464
+local_rule,10166-1,"10166 rules: destination not valid for the contract and the order uses auto-routing (same exemptions as 464, AVGCOST exempt in 10.51)",src/engine/hot_loop/order_builder.rs::an_order_on_an_exchange_without_a_definition_gets_200
+local_rule,412-1,412 rules: contract not tradable,open #635
+local_rule,154-1,154 rules: halted security,open #739
+local_rule,107-1,107 rules: incomplete order,open #635
+local_rule,328-1,328 rules: trailing child on a parent that is not LMT or STP LMT,tests/gw_catalog/refusals.rs::trailing_stop_under_a_stop_parent
+local_rule,401-1,401 rules: OCA name over 64 characters,tests/gw_catalog/refusals.rs::oca_group_name_too_long
+local_rule,461-1,461 rules: size not a multiple of the lot,open #634
+local_rule,10098-1,10098 rules: SNAP order with a negative offset,tests/gw_catalog/refusals.rs::snap_order_with_a_negative_offset
+local_rule,2137-1,"2137 rules: closing order larger than the position: warning code, order refused",tests/gw_catalog/refusals.rs::closing_order_larger_than_the_position
+local_rule,10132-2,10132 rules: read-only account,open #634
+local_rule,10361-1,10361 rules: VOL order whose volatility is below the minimum of its volatility type,open #673
+local_rule,10364-1,10364 rules: an attached hedge child of the kind that takes a maximum hedge size has none,tests/gw_catalog/refusals.rs::selling_beta_hedge_without_a_max_size
+local_rule,10365-1,10365 rules: the maximum hedge size of such a hedge child is below its filled quantity,src/client_core.rs::the_hedge_size_precaution_of_a_transmitted_tree
+local_rule,10355-1,10355 rules: new request form: attachedOrders asks for a profit taker and the order preset has none; order dropped,tests/gw_catalog/refusals.rs::attached_from_a_preset_without_them
+local_rule,10355-2,10355 rules: new request form: attachedOrders asks for a stop loss and the order preset has none; order dropped,tests/gw_catalog/refusals.rs::attached_from_a_preset_without_them
+local_rule,10349-1,"10349 rules: notice, order still sent: API order whose time in force was taken from the order preset",tests/gw_catalog/refusals.rs::time_in_force_from_the_order_preset
+local_rule,10353-1,"10353 rules: API order with routeMarketableToBbo set and the API precaution 'Bypass Route Marketable to BBO Warning' off: warning code, order discarded",tests/gw_catalog/refusals.rs::route_marketable_to_bbo_without_the_bypass
+local_rule,2185-1,"2185 rules: a hedge child of the kind that takes a maximum hedge size, with a maximum below the computed hedge size, hedge-size precaution on: warning code, order refused",tests/gw_catalog/refusals.rs::beta_hedge_with_a_max_size_below_the_hedge
+local_rule,104-1,"104 modify: modify of an order that is filled, cancelled or with a cancel pending",src/client_core.rs::place_on_a_cancelled_order_id_is_refused ; src/engine/hot_loop/order_builder.rs::modify_of_an_order_the_engine_no_longer_holds_is_refused
+local_rule,105-1,105 modify: modified order does not match the original,tests/gw_catalog/refusals.rs::modify_of_the_side
+local_rule,329-1,329 modify: modify to another order type,tests/gw_catalog/refusals.rs::modify_to_another_order_type
+local_rule,462-1,462 modify: modify to another time in force,src/api/client/tests.rs::modify_must_restate_the_held_overnight_time_in_force_in_the_10_40_form
+local_rule,10326-1,10326 modify: OCA group changed,tests/gw_catalog/refusals.rs::modify_of_the_oca_group
+local_rule,10327-1,10327 modify: OCA type changed,tests/gw_catalog/refusals.rs::modify_of_the_oca_type
+local_rule,10273-2,10273 modify: modify of a GTD order where the new or the working order has an expiration date and time and the new or the working order has a duration,tests/gw_catalog/refusals.rs::modify_adding_a_duration_to_gtd
+local_rule,10059-1,10059 modify: combo modify with a leg the working order does not have,tests/gw_catalog/refusals.rs::combo_modify_with_another_leg
+local_rule,10147-1,10147 cancel: cancel of an order id that is not found,tests/gw_catalog/refusals.rs::cancel_of_an_unknown_order
+local_rule,10148-1,10148 cancel: cancel of an order in a state that cannot be cancelled,tests/gw_catalog/refusals.rs::cancel_of_an_order_with_a_cancel_pending
 attribute,1 AccountHolder,holder,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 attribute,12 ClientCommissionAmt,decimal,no test
 attribute,13 ClientCommissionType,enum,no test
@@ -1884,7 +1961,6 @@ attribute,6938 PeggedChangeAmount,custom,tests/gw_catalog/writers.rs::every_orde
 attribute,6939 ReferenceChangeAmount,double,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 attribute,6941 ReferenceContractId,custom,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 attribute,6942 ReferenceContractExchange,custom,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
-attribute,6952 OrderSubmissionMidPrc,double,no test
 attribute,6965 AutoCancelParent,boolean,no test
 attribute,6975 CommissionType,enum,no test
 attribute,6979 OptionPrice,double,no test
@@ -1987,21 +2063,30 @@ attribute,8571 EUIlliqSecUserSelection,custom,no test
 attribute,8572 NoIdealModelChange,boolean,no test
 attribute,8582 JpMFundProspectusAck,boolean,no test
 attribute,8585 JpMFundProspectusData,string,no test
+attribute,8589 RampAndDumpAck,custom,no test
+attribute,8594 FundingComponentAck,custom,no test
+attribute,8596 RejectIfUncoveredCall,boolean,no test
+attribute,8604 ScaleDayNoLevels,custom,no test
+attribute,8605 ScaleDayFillPrice,custom,no test
+attribute,8606 ScaleDayFillCumQty,custom,no test
+attribute,8607 ScaleDeepestPrice,double,no test
+attribute,8615 ExternalInstructionID,string,no test
 attribute,9801 BlockOrder,custom,no test
 attribute,9813 DiscretionaryAmt,double,tests/gw_catalog/writers.rs::every_order_request_variant_follows_the_gateway_writers
 attribute,9816 Volatility,custom,no test
 attribute,9822 PercentOffset,double,no test
 attribute,99994 PostToAtsDurationUnit,custom,no test
 attribute,99995 DurationUnit,custom,no test
+attribute,2147483647 ScaleComponentDisplaySize,integer,no test
 eclient,req_positions,,tests/scenario_replay.rs::combo_fill_executions_and_commissions ; src/api/client/tests.rs::req_positions_delivers_via_wrapper ; src/api/client/tests.rs::req_positions_empty_still_calls_position_end
-eclient,req_pnl,,src/api/client/tests.rs::a_pnl_request_subscribes_the_quotes_it_needs_and_cancels_them_after ; src/api/client/tests.rs::a_pnl_quote_becomes_the_callers_subscription ; src/api/client/tests.rs::no_internal_quote_when_the_caller_has_one
-eclient,cancel_pnl,,src/api/client/tests.rs::a_pnl_request_subscribes_the_quotes_it_needs_and_cancels_them_after ; src/api/client/tests.rs::a_pnl_quote_becomes_the_callers_subscription ; tests/scenarios.rs::cancel_pnl_stops_dispatch
+eclient,req_pnl,,src/api/client/tests.rs::a_pnl_request_asks_the_pnl_quotes_once_and_keeps_them ; tests/scenario_replay.rs::pnl_first_request_of_the_session
+eclient,cancel_pnl,,src/api/client/tests.rs::a_pnl_request_asks_the_pnl_quotes_once_and_keeps_them ; tests/scenarios.rs::cancel_pnl_stops_dispatch
 eclient,req_pnl_single,,tests/scenarios.rs::pnl_single_dispatches_position_info
 eclient,cancel_pnl_single,,tests/scenarios.rs::pnl_single_dispatches_position_info
 eclient,req_account_summary,,tests/scenario_replay.rs::account_summary_subscription_and_tag_rows ; src/api/client/tests.rs::account_summary_is_a_server_subscription ; src/api/client/tests.rs::account_summary_refusals_and_limit
 eclient,cancel_account_summary,,tests/scenario_replay.rs::account_summary_subscription_and_tag_rows ; src/api/client/tests.rs::account_summary_is_a_server_subscription ; tests/scenarios.rs::cancel_account_summary_prevents_delivery
 eclient,req_account_updates,,src/api/client/tests.rs::process_msgs_delivers_update_portfolio ; src/api/client/tests.rs::account_updates_send_the_image_then_the_end_once ; src/api/client/tests.rs::a_second_subscribe_sends_nothing
-eclient,cancel_positions,,tests/scenario_replay.rs::combo_fill_executions_and_commissions ; src/api/client/tests.rs::req_positions_sends_a_row_on_each_change
+eclient,cancel_positions,,tests/scenario_replay.rs::combo_fill_executions_and_commissions ; src/api/client/tests.rs::req_positions_sends_a_row_when_the_feed_moves_a_quantity
 eclient,req_managed_accts,,no test
 eclient,req_account_updates_multi,,src/api/client/tests.rs::a_key_also_in_the_ledger_is_a_ledger_key ; src/api/client/tests.rs::account_updates_multi_carries_its_request_id_and_model_code
 eclient,cancel_account_updates_multi,,src/api/client/tests.rs::account_updates_multi_carries_its_request_id_and_model_code
@@ -2046,6 +2131,7 @@ eclient,next_order_id,,src/api/client/tests.rs::next_order_id_monotonic ; tests/
 eclient,req_open_orders,,src/api/client/tests.rs::a_forgotten_order_leaves_without_callbacks ; src/api/client/tests.rs::open_order_requests_wait_for_the_order_replay
 eclient,req_all_open_orders,,src/api/client/tests.rs::open_order_requests_wait_for_the_order_replay
 eclient,req_completed_orders,,tests/scenarios.rs::req_completed_orders_drains_and_dispatches ; tests/scenarios.rs::req_completed_orders_empty_still_fires_end
+eclient,req_completed_orders_only,reqCompletedOrders with its apiOnly flag (ibx#695),tests/scenario_replay.rs::session_start_with_completed_orders
 eclient,req_auto_open_orders,,no test
 eclient,req_executions,,src/api/client/tests.rs::commission_report_comes_from_the_commission_frame ; src/api/client/tests.rs::an_untracked_execution_is_returned_by_req_executions_only ; src/api/client/tests.rs::req_executions_without_a_commission_report_sends_the_execution_only
 eclient,parse_algo_params,,no test
@@ -2074,6 +2160,16 @@ eclient,req_historical_schedule,,src/api/client/tests.rs::historical_requests_wi
 eclient,req_smart_components,,live:tests/rust_api_gt.rs::api_gt_suite ; src/golden/l1.rs::aapl_and_spy_before_the_open
 eclient,req_news_providers,,live:tests/rust_api_gt.rs::api_gt_suite
 eclient,req_current_time,,src/api/client/tests.rs::req_current_time_adds_the_logon_clock_offset
+eclient,req_current_time_in_millis,,src/api/client/tests.rs::req_current_time_in_millis_adds_the_logon_clock_offset
+eclient,cancel_contract_data,,src/api/client/tests.rs::requests_the_reference_session_does_not_have ; src/client_core.rs::the_lookup_cancels_are_refused_below_level_215_and_answer_nothing_from_it
+eclient,cancel_historical_ticks,,src/api/client/tests.rs::requests_the_reference_session_does_not_have ; src/client_core.rs::the_lookup_cancels_are_refused_below_level_215_and_answer_nothing_from_it
+eclient,set_extra_auth,,src/api/client/tests.rs::a_verify_message_leaves_the_session_unanswered
+eclient,verify_request,,src/api/client/tests.rs::requests_the_reference_session_does_not_have
+eclient,verify_message,,src/api/client/tests.rs::requests_the_reference_session_does_not_have
+eclient,verify_and_auth_request,,src/api/client/tests.rs::requests_the_reference_session_does_not_have
+eclient,verify_and_auth_message,,src/api/client/tests.rs::requests_the_reference_session_does_not_have
+eclient,req_config,,src/api/client/tests.rs::req_config_is_refused_below_level_219 ; src/api/client/tests.rs::config_answers_come_from_process_msgs_and_keep_an_update ; src/client_core/session_config.rs::the_configuration_is_the_paper_installations
+eclient,update_config,,src/api/client/tests.rs::update_config_is_refused_below_level_221 ; src/client_core.rs::the_configuration_update_is_refused_below_level_221_and_without_configuration_access ; src/client_core/update_config.rs::invalid_values_are_listed_in_the_reference_order ; src/client_core/session_config.rs::a_value_ibx_cannot_follow_is_refused_with_the_field_named ; src/client_core/session_config.rs::a_new_value_of_a_setting_ibx_does_not_act_on_is_kept
 eclient,request_fa,,src/api/client/tests.rs::fa_requests_on_a_non_fa_session_are_refused
 eclient,replace_fa,,src/api/client/tests.rs::fa_requests_on_a_non_fa_session_are_refused
 eclient,query_display_groups,,src/api/client/tests.rs::display_group_requests_as_the_reference
@@ -2094,7 +2190,14 @@ decoder,protocol::ns::parse_test_request_timestamp,NS test request,src/robustnes
 decoder,protocol::ns::is_ns_text,NS text or XYZ binary,src/robustness/decoders.rs::ns_frames ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
 decoder,protocol::xyz::xyz_parse_response,XYZ login message,src/robustness/decoders.rs::xyz_messages ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
 decoder,protocol::xyz::parse_swcr_token_challenge,XYZ second factor challenge,src/robustness/decoders.rs::xyz_messages ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
+decoder,protocol::xyz::XyzItems::new,XYZ typed-code second factor items (the start),src/robustness/decoders.rs::xyz_messages ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
+decoder,protocol::xyz::XyzItems::version,XYZ typed-code second factor items (the version),src/robustness/decoders.rs::xyz_messages ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
+decoder,protocol::xyz::XyzItems::int,XYZ typed-code second factor items (an integer),src/robustness/decoders.rs::xyz_messages ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
+decoder,protocol::xyz::XyzItems::bytes,XYZ typed-code second factor items (raw bytes),src/robustness/decoders.rs::xyz_messages ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
+decoder,protocol::xyz::XyzItems::string,XYZ typed-code second factor items (a string),src/robustness/decoders.rs::xyz_messages ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
 decoder,protocol::fix::fix_parse,FIX tags,src/robustness/decoders.rs::fix_frames ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
+decoder,protocol::fix::fix_parse_borrowed,fields borrowed from the message (ibx#701),src/robustness/decoders.rs::fix_frames ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
+decoder,protocol::fix::fix_fields,fields borrowed or copied when not UTF-8 (ibx#701),src/robustness/decoders.rs::fix_frames ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
 decoder,protocol::fix::is_signed,FIX signature trailer,src/robustness/decoders.rs::fix_frames ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
 decoder,protocol::fix::fix_unsign,FIX signature check,src/robustness/decoders.rs::fix_frames ; src/robustness/decoders.rs::connection_framing ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders
 decoder,protocol::fix::fix_read,FIX frame read,src/robustness/decoders.rs::fix_frames ; src/robustness/mutation.rs::recorded_frames_mutated_through_the_decoders

@@ -8,7 +8,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crossbeam_channel::Sender;
+use crate::engine::park::ControlSender;
 
 use crate::api::client::EClient;
 use crate::api::types::{
@@ -18,7 +18,6 @@ use crate::api::wrapper::Wrapper;
 use crate::bridge::SharedState;
 use crate::engine::hot_loop::HotLoop;
 use crate::test_support::{parse_fields, Fields, Peer};
-use crate::types::ControlCommand;
 
 use super::record::{attr_mask, n, order_price, perm, OPEN_ORDER_FIELDS};
 use super::runner::Link;
@@ -28,6 +27,9 @@ pub const ACCOUNT: &str = "DUXXXXXXX";
 /// The zone of the machine the recordings were made on, when a fixture
 /// header does not name it (`machine_zone`): every capture so far.
 pub const RECORDING_ZONE: &str = "Europe/Paris";
+
+/// The session level of the recordings: the client was at 214 (ibx#602).
+pub const RECORDING_LEVEL: i32 = 214;
 
 /// The machine zone a recording names (`machine_zone` in its header), else
 /// [`RECORDING_ZONE`]: a replay runs in it, whatever the zone of the
@@ -55,7 +57,7 @@ pub struct Links {
     pub engine: HotLoop,
     pub shared: Arc<SharedState>,
     /// The engine's command channel, for an API client to take.
-    pub control_tx: Sender<ControlCommand>,
+    pub control_tx: ControlSender,
     pub farm: Peer,
     pub ccp: Peer,
     pub hmds: Peer,
@@ -63,14 +65,28 @@ pub struct Links {
     pub farm_out: Vec<Fields>,
     pub ccp_out: Vec<Fields>,
     pub hmds_out: Vec<Fields>,
+    /// The requests are paced and the market data sent in passes, by the
+    /// clock of `at` (ibx#563); the time `at(0)` stands for.
+    paced: Option<std::time::Instant>,
 }
+
+/// How long a call may run before it is taken as waiting for its turn.
+const CALL_WAITS: std::time::Duration = std::time::Duration::from_millis(30);
 
 impl Links {
     pub fn new() -> Self {
         // The engine runs on this thread in the recording machine's zone; a
         // replay of another zone sets its own (`in_zone`).
         crate::gateway::set_machine_zone_for_test(Some(RECORDING_ZONE));
+        // The recordings were made with the client at level 214 (the
+        // reference 10.40, and 10.51 with a capped client); a replay of a
+        // recording at another level sets its own (`runner::run`).
+        crate::client_core::set_session_level_for_test(Some(RECORDING_LEVEL));
         let shared = Arc::new(SharedState::new());
+        shared.reference.set_user_name("user");
+        // The client has no clock of the recording: its own copied waits
+        // are not replayed (ibx#723).
+        shared.portfolio.set_pnl_first_wait_off();
         // Reads return at once: the test steps the engine itself.
         let pair = || {
             let (conn, mut peer) = Peer::pair();
@@ -86,6 +102,9 @@ impl Links {
         // The paper logon of the recordings (captures/0928, 28/09/2026):
         // features PRICEMGMT and SCALEUSLOT, 6247=demo, 8146 exclusions.
         engine.set_scale_us_lots(true);
+        // Recorded on the 10.40 gateway (tests/fixtures/gw1040), whose
+        // entries had no mark: sizes in round lots (ibx#663).
+        engine.set_lot_sizes(true);
         engine.set_user_book(true);
         engine.set_price_mgmt(true, Some("*/CMDTY;*/CRYPTO;*/FUND;*/IOPT;*/SLB"));
         // Its smart combo conIds (6611).
@@ -94,9 +113,62 @@ impl Links {
             "GBP:58666494,HKD:61227072,INR:136000444,JPY:61227069,KRW:136000424,MXN:136000449,NOK:136000452,",
             "NZD:136000435,SEK:136000429,USD:28812380",
         ));
+        // Its subscribed news sources (ibx#514, ibx#460).
+        shared.reference.set_news_sources(
+            "BRFG,BRFUPDN,DJ-N,DJ-RTA,DJ-RTE,DJ-RTG,DJ-RTPRO,DJNL".split(',').map(String::from).collect());
         Self {
             engine, shared, control_tx, farm, ccp, hmds,
             farm_out: Vec::new(), ccp_out: Vec::new(), hmds_out: Vec::new(),
+            paced: None,
+        }
+    }
+
+    /// Pace the requests and send the market data in passes, as a session
+    /// opened by a logon (ibx#555, ibx#560), by a clock the test sets with
+    /// `at`. The answers the client gives itself take their turn too.
+    pub fn pace(&mut self) {
+        let start = std::time::Instant::now();
+        self.engine.pace_as_reference();
+        self.engine.set_pace_clock(start);
+        // The client's own clocks follow the same time (ibx#515).
+        self.shared.set_test_clock(Some(start));
+        let clock = self.shared.command_clock();
+        clock.set_paced(None);
+        // The engine is stepped by the thread of the test.
+        clock.set_running(true);
+        self.paced = Some(start);
+    }
+
+    pub fn is_paced(&self) -> bool {
+        self.paced.is_some()
+    }
+
+    /// The nanoseconds after the start of the pacing of a time (none
+    /// before the start, or when not paced).
+    pub fn nanos_of(&self, t: std::time::Instant) -> Option<u64> {
+        self.paced.and_then(|start| t.checked_duration_since(start)).map(|d| d.as_nanos() as u64)
+    }
+
+    /// Set the clock of the pacing `nanos` after its start; it never goes
+    /// back. Nothing when the links are not paced.
+    pub fn at(&mut self, nanos: u64) {
+        if let Some(start) = self.paced {
+            self.engine.set_pace_clock(start + std::time::Duration::from_nanos(nanos));
+            self.shared.set_test_clock(self.engine.pace_clock());
+        }
+    }
+
+    /// Move the clock to the time at which what waits is due (the next
+    /// step of the pacing, the next market data pass); false when nothing
+    /// waits.
+    pub fn to_next_due(&mut self) -> bool {
+        match self.engine.next_pace_time().filter(|_| self.paced.is_some()) {
+            Some(due) => {
+                self.engine.set_pace_clock(due);
+                self.shared.set_test_clock(self.engine.pace_clock());
+                true
+            }
+            None => false,
         }
     }
 
@@ -159,17 +231,41 @@ impl Links {
     /// The engine's thread reads the machine zone of this one.
     pub fn during<R>(&mut self, f: impl FnOnce() -> R) -> R {
         let stop = AtomicBool::new(false);
+        let paced = self.paced.is_some();
+        let clock = self.shared.command_clock().clone();
         let engine = &mut self.engine;
         let zone = crate::gateway::machine_zone_for_test();
+        let level = crate::client_core::session_level_for_test();
         let out = std::thread::scope(|s| {
             s.spawn(|| {
                 crate::gateway::set_machine_zone_for_test(zone.as_deref());
+                crate::client_core::set_session_level_for_test(level);
+                if paced {
+                    clock.set_engine_thread(true);
+                }
+                let mut waited = std::time::Instant::now();
                 while !stop.load(Ordering::Acquire) {
                     engine.step_for_test();
+                    // A call that waits for its turn: the time of the
+                    // pacing goes to that turn (ibx#563).
+                    if paced && waited.elapsed() >= CALL_WAITS {
+                        if let Some(due) = engine.next_pace_time() {
+                            engine.set_pace_clock(due);
+                        }
+                        waited = std::time::Instant::now();
+                    }
                     std::thread::yield_now();
                 }
             });
+            // The caller is not the engine while it calls: what it answers
+            // itself takes its turn.
+            if paced {
+                self.shared.command_clock().set_engine_thread(false);
+            }
             let out = f();
+            if paced {
+                self.shared.command_clock().set_engine_thread(true);
+            }
             stop.store(true, Ordering::Release);
             out
         });
@@ -222,6 +318,22 @@ impl Session {
         self
     }
 
+    /// Run as the fixture's recording ran: its machine zone, and for a
+    /// recording of 10.51 its client's level, the 10.51 forms and its
+    /// logon features (`runner::as_recorded`, ibx#604). A codec fixture of
+    /// 10.40 keeps the session the codec replays always had.
+    pub fn as_recorded(mut self, header: &serde_json::Value) -> Self {
+        self = self.in_zone(header);
+        let version = header.get("gateway_version")
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|t| t.parse().ok())));
+        if version.is_some_and(|v| v >= 10500) {
+            let level = header.get("client_level").and_then(|v| v.as_i64()).map_or(RECORDING_LEVEL, |l| l as i32)
+                .min(crate::client_core::SERVER_VERSION);
+            super::runner::as_recorded(header, level, &mut self.links);
+        }
+        self
+    }
+
     /// Call the API client; the engine runs on this thread meanwhile (a
     /// call may wait for the engine's answer). Then the engine settles and
     /// the callbacks are taken.
@@ -230,9 +342,11 @@ impl Session {
         let client = &*client;
         // The client's thread reads the machine zone of this one.
         let zone = crate::gateway::machine_zone_for_test();
+        let level = crate::client_core::session_level_for_test();
         let out = std::thread::scope(|s| {
             let h = s.spawn(move || {
                 crate::gateway::set_machine_zone_for_test(zone.as_deref());
+                crate::client_core::set_session_level_for_test(level);
                 f(client)
             });
             while !h.is_finished() {
@@ -323,6 +437,15 @@ impl Wrapper for Recorder {
     }
     fn tick_string(&mut self, req_id: i64, tick_type: i32, value: &str) {
         self.lines.push(format!("tickString|{req_id}|{tick_type}|{value}"));
+    }
+    fn tick_option_computation(
+        &mut self, req_id: i64, tick_type: i32, tick_attrib: i32, implied_vol: f64, delta: f64, opt_price: f64,
+        pv_dividend: f64, gamma: f64, vega: f64, theta: f64, und_price: f64,
+    ) {
+        // A value not computed is "-", as the official client's None (ibx#646).
+        let v = |x: f64| if x == f64::MAX || !x.is_finite() { "-".to_string() } else { n(x) };
+        self.lines.push(format!("tickOptionComputation|{req_id}|{tick_type}|{tick_attrib}|{}|{}|{}|{}|{}|{}|{}|{}",
+            v(implied_vol), v(delta), v(opt_price), v(pv_dividend), v(gamma), v(vega), v(theta), v(und_price)));
     }
     fn tick_generic(&mut self, req_id: i64, tick_type: i32, value: f64) {
         self.lines.push(format!("tickGeneric|{req_id}|{tick_type}|{}", n(value)));
@@ -426,17 +549,36 @@ impl Wrapper for Recorder {
                 "whatIf" => o.what_if.to_string(),
                 "permId" => perm(o.perm_id).to_string(),
                 "clientId" => o.client_id.to_string(),
+                "ocaType" => o.oca_type.to_string(),
+                "clearingIntent" => o.clearing_intent.clone(),
+                "shareholder" => o.shareholder.clone(),
+                "deltaNeutralOrderType" => o.delta_neutral_order_type.clone(),
+                "adjustedOrderType" => o.adjusted_order_type.clone(),
+                "submitter" => super::record::submitter(&o.submitter).to_string(),
                 _ => unreachable!("{k}"),
             }
         };
-        let fields: Vec<String> = OPEN_ORDER_FIELDS.iter().filter(|k| super::record::compared_field(k, &o.order_type))
+        let mut fields: Vec<String> = OPEN_ORDER_FIELDS.iter()
+            .filter(|k| super::record::compared_field(k, &o.order_type, &c.sec_type))
             .map(|k| format!("{k}={}", field(k))).collect();
+        fields.push(format!("exchange={}", c.exchange));
+        fields.push(format!("primaryExchange={}", c.primary_exchange));
         self.lines.push(format!(
             "openOrder|{order_id}|{}|{}|{}|{}|{}", c.con_id, c.symbol, c.sec_type, fields.join(","), state.status,
         ));
     }
     fn open_order_end(&mut self) {
         self.lines.push("openOrderEnd".into());
+    }
+    fn completed_order(&mut self, c: &Contract, o: &Order, state: &OrderState) {
+        self.lines.push(format!(
+            "completedOrder|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            c.con_id, c.symbol, o.action, n(o.total_quantity), o.order_type, order_price(o.lmt_price),
+            order_price(o.aux_price), o.tif, o.order_ref, perm(o.perm_id), n(o.filled_quantity), state.status,
+        ));
+    }
+    fn completed_orders_end(&mut self) {
+        self.lines.push("completedOrdersEnd".into());
     }
     fn exec_details(&mut self, req_id: i64, c: &Contract, e: &Execution) {
         self.lines.push(format!(

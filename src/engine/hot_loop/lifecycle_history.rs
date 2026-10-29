@@ -1,9 +1,11 @@
 //! Explicit lifecycle projections, isolated from ordinary fill accounting.
+#[cfg(test)]
 use std::collections::HashMap;
 
 use crate::api::types::{ExecutionFilter, OptionLifecycleReport, OptionLifecycleReportKind};
 use crate::bridge::SharedState;
 use crate::client_core::{ClientCore, StoredExecution, format_exec_time};
+use crate::protocol::fix::FieldMap;
 use crate::types::{OptionLifecycleClassification, OrderStatus};
 
 use super::ccp::{
@@ -12,7 +14,7 @@ use super::ccp::{
 use super::report::{ReportProjection, project_report};
 
 pub(super) fn project(
-    fields: &HashMap<u32, String>,
+    fields: &FieldMap<'_>,
     shared: &SharedState,
     account: &str,
 ) -> Result<OptionLifecycleReport, String> {
@@ -20,7 +22,7 @@ pub(super) fn project(
     let value = |tag| {
         fields
             .get(&tag)
-            .map(String::as_str)
+            .copied()
             .ok_or("Missing lifecycle field")
     };
     let number = |tag| {
@@ -176,8 +178,8 @@ pub(super) fn project(
         exec_transaction_type: transaction.into(),
         exec_type: exec_type.into(),
         order_status: status.into(),
-        native_order_id: fields.get(&37).cloned(),
-        native_report_time: fields.get(&60).cloned(),
+        native_order_id: fields.get(&37).map(|value| (*value).to_owned()),
+        native_report_time: fields.get(&60).map(|value| (*value).to_owned()),
         native_side: value(54)?.into(),
         commission_and_fees: None,
     })
@@ -387,6 +389,7 @@ pub(super) fn captured_automatic_rows() -> Vec<HashMap<u32, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::fix::field_view;
 
     #[test]
     fn captured_manual_execution_and_instruction_shapes_keep_distinct_economics() {
@@ -397,7 +400,7 @@ mod tests {
             .zip([11.0, 0.0, 12.0, 0.0])
             .map(|((a, b), c)| (a, b, c))
         {
-            let row = project(&fields, &shared, "DU123456").unwrap();
+            let row = project(&field_view(&fields), &shared, "DU123456").unwrap();
             assert_eq!(row.kind, OptionLifecycleReportKind::EconomicExecution);
             assert_eq!(row.execution.shares, quantity);
             assert_eq!(row.execution.cum_qty, quantity);
@@ -412,7 +415,7 @@ mod tests {
             assert!(row.commission_and_fees.is_none());
         }
         for pending in [false, true] {
-            let row = project(&captured_instruction(pending), &shared, "DU123456").unwrap();
+            let row = project(&field_view(&captured_instruction(pending)), &shared, "DU123456").unwrap();
             assert_eq!(row.kind, OptionLifecycleReportKind::InstructionStatus);
             assert_eq!(row.execution.shares, 0.0);
             assert_eq!(row.execution.cum_qty, if pending { 0.0 } else { 1.0 });
@@ -424,8 +427,8 @@ mod tests {
     fn captured_lapse_is_an_option_disposal_not_its_completed_instruction() {
         let shared = SharedState::new();
         let [economic, instruction] = captured_lapse_rows();
-        let economic = project(&economic, &shared, "DU123456").unwrap();
-        let instruction = project(&instruction, &shared, "DU123456").unwrap();
+        let economic = project(&field_view(&economic), &shared, "DU123456").unwrap();
+        let instruction = project(&field_view(&instruction), &shared, "DU123456").unwrap();
         assert_eq!(economic.kind, OptionLifecycleReportKind::EconomicExecution);
         assert_eq!(
             economic.observation.classification,
@@ -494,7 +497,7 @@ mod tests {
             let mut fields = original.clone();
             fields.insert(tag, value.into());
             assert!(
-                project(&fields, &shared, "DU123456").is_err(),
+                project(&field_view(&fields), &shared, "DU123456").is_err(),
                 "{tag}={value}"
             );
         }
@@ -502,7 +505,7 @@ mod tests {
         for tag in [32, 14, 38] {
             fractional.insert(tag, "0.5".into());
         }
-        assert!(project(&fractional, &shared, "DU123456").is_err());
+        assert!(project(&field_view(&fractional), &shared, "DU123456").is_err());
     }
 
     #[test]
@@ -542,7 +545,7 @@ mod tests {
                 },
             )
         {
-            let row = project(&fields, &shared, "DU123456").unwrap();
+            let row = project(&field_view(&fields), &shared, "DU123456").unwrap();
             assert_eq!(row.kind, OptionLifecycleReportKind::EconomicExecution);
             assert_eq!(row.observation.classification, class);
             assert_eq!(row.observation.raw_value, fields[&6809]);
@@ -588,7 +591,7 @@ mod tests {
                 let mut fields = original.clone();
                 fields.insert(tag, value.into());
                 assert!(
-                    project(&fields, &shared, "DU123456").is_err(),
+                    project(&field_view(&fields), &shared, "DU123456").is_err(),
                     "{tag}={value}"
                 );
             }
@@ -596,19 +599,19 @@ mod tests {
             for tag in [32, 14, 38] {
                 fractional.insert(tag, "0.5".into());
             }
-            assert!(project(&fractional, &shared, "DU123456").is_err());
+            assert!(project(&field_view(&fractional), &shared, "DU123456").is_err());
             for status in ["0", "2", "4", "8"] {
                 let mut instruction = original.clone();
                 for (tag, value) in [(20, "3"), (32, "0"), (150, status), (39, status)] {
                     instruction.insert(tag, value.into());
                 }
-                assert!(project(&instruction, &shared, "DU123456").is_err());
+                assert!(project(&field_view(&instruction), &shared, "DU123456").is_err());
             }
             for tag in [1, 11, 17, 20, 150, 39, 6008, 32, 14, 38, 31, 6, 54, 60, 15] {
                 let mut missing = original.clone();
                 missing.remove(&tag);
                 assert!(
-                    project(&missing, &shared, "DU123456").is_err(),
+                    project(&field_view(&missing), &shared, "DU123456").is_err(),
                     "missing {tag}"
                 );
             }
@@ -618,7 +621,7 @@ mod tests {
                 let mut fields = original.clone();
                 fields.insert(tag, value.into());
                 assert!(
-                    project(&fields, &shared, "DU123456").is_err(),
+                    project(&field_view(&fields), &shared, "DU123456").is_err(),
                     "{tag}={value}"
                 );
             }
@@ -626,7 +629,7 @@ mod tests {
         let mut stock = captured_automatic_rows().remove(0);
         stock.insert(31, "0".into());
         stock.insert(6, "0".into());
-        assert!(project(&stock, &shared, "DU123456").is_err());
+        assert!(project(&field_view(&stock), &shared, "DU123456").is_err());
     }
 
     #[test]
@@ -637,7 +640,7 @@ mod tests {
             let mut fields = original.clone();
             fields.remove(&tag);
             assert!(
-                project(&fields, &shared, "DU123456").is_err(),
+                project(&field_view(&fields), &shared, "DU123456").is_err(),
                 "missing {tag}"
             );
         }
@@ -656,7 +659,7 @@ mod tests {
             let mut fields = original.clone();
             fields.insert(tag, value.into());
             assert!(
-                project(&fields, &shared, "DU123456").is_err(),
+                project(&field_view(&fields), &shared, "DU123456").is_err(),
                 "{tag}={value}"
             );
         }
@@ -682,7 +685,7 @@ mod tests {
             if let Some(currency) = currency {
                 row.insert(15, currency.into());
             }
-            assert!(project(&row, &shared, "DU123456").is_err());
+            assert!(project(&field_view(&row), &shared, "DU123456").is_err());
         }
     }
 
@@ -692,9 +695,9 @@ mod tests {
         let mut fields = captured_manual_rows().remove(0);
         fields.remove(&60);
         fields.insert(52, "20261003-13:00:00".into());
-        assert!(project(&fields, &shared, "DU123456").is_err());
+        assert!(project(&field_view(&fields), &shared, "DU123456").is_err());
         fields.insert(6699, "20261003-12:00:00".into());
-        let row = project(&fields, &shared, "DU123456").unwrap();
+        let row = project(&field_view(&fields), &shared, "DU123456").unwrap();
         assert_eq!(row.execution.time_unix_seconds, Some(row.time_secs));
         assert_eq!(
             row.time_secs,

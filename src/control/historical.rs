@@ -298,7 +298,7 @@ impl BarSize {
 /// Text of a local refusal of a bar request, as the reference sends it
 /// with error 321 (ibx#430).
 pub fn bar_request_refusal(cause: &str) -> String {
-    format!("Error validating request.-'bM' : cause - {}", cause)
+    format!("Error validating request.-'ReqHistoricalData(20)' : cause - {}", cause)
 }
 
 /// Text of error 10314 for an end date the reference cannot read.
@@ -499,10 +499,10 @@ pub fn duration_start(end: i64, duration: &str, machine_zone: &str) -> i64 {
     span.ok().and_then(|sp| at.checked_sub(sp).ok()).map_or(end, |z| z.timestamp().as_second())
 }
 
-/// A time as the reference's `jutils.d1.T()` writes it (ibx#421):
+/// A time as the reference writes it (ibx#421):
 /// `yyyyMMdd HH:mm:ss` and the zone's abbreviation, in `zone`. The
 /// reference writes the short name of its Java zone when it reads back as
-/// the same zone, else the long name (`jutils.d1.aa()`); the zone
+/// the same zone, else the long name; the zone
 /// database abbreviation is taken here, which was not compared with the
 /// reference's names.
 fn calendar_text(secs: i64, zone: &jiff::tz::TimeZone) -> String {
@@ -511,8 +511,7 @@ fn calendar_text(secs: i64, zone: &jiff::tz::TimeZone) -> String {
         .unwrap_or_default()
 }
 
-/// The reference's second years rule of a bar request (ibx#421,
-/// `jextend.bM.n()@1578-1601` → `jextend.bM.b(jutils.d1)`), for a
+/// The reference's second years rule of a bar request (ibx#421), for a
 /// contract without includeExpired and a session without NIGHTLY (the
 /// caller's): the limit is now moved back by `max_years` years, then by
 /// one day, on the calendar of the machine zone; a request whose start
@@ -762,9 +761,9 @@ pub fn build_query_xml(req: &HistoricalRequest) -> String {
     // symbol, API exchange and type label (ibx#429; a one-shot query too,
     // ibx#486: `cf76;;AAPL@SMART Trades;;1;;true;;0;;I`).
     let query_id = format!("{};;{};;1;;true;;0;;I", req.query_id, chart_name(&req.symbol, &req.exchange, &req.data_type.label()));
-    // Whole days for daily and longer bars (`hmdscore.xml.Query.a(settings.b,
-    // boolean, boolean)@119-167`, `settings.b.l()` = shorter than a day;
-    // captured: 1 day bars true, 1 hour false, ibx#486).
+    // Whole days for daily and longer bars, not for a bar shorter than a
+    // day (captured: 1 day bars true, 1 hour
+    // false, ibx#486).
     let whole_days = !req.bar_size.is_intraday();
 
     let (end_time_tag, refresh_tag) = if req.keep_up_to_date {
@@ -1008,7 +1007,10 @@ pub fn parse_series(xml: &str) -> (Vec<SeriesBar>, Vec<(i64, i64)>) {
 /// from the 5-second bar. A 5-second bar already inside its bar changes
 /// nothing. Merging raises the high, lowers the low, sets the close, and
 /// for trades adds the volume and the count and weighs the WAP by the
-/// volume; other data keep volume, WAP and count unset (-1). Bars of a
+/// volume; other data keep volume, WAP and count unset (-1). A trades bar
+/// with no volume yet (made from a 5-second bar with no trade, at the last
+/// price) takes the first 5-second bar with trades as it is: its open,
+/// high, low and WAP (the reference 10.51, 19/10/2026, ibx#604). Bars of a
 /// day or longer take the 5-second bars into their last bar.
 pub fn merge_five_seconds(
     series: &mut Vec<SeriesBar>, sessions: &[(i64, i64)], bar_size: BarSize, trades: bool,
@@ -1049,15 +1051,26 @@ pub fn merge_five_seconds(
     if end <= b.end {
         return Some(i);
     }
-    b.high = b.high.max(bar.high);
-    b.low = b.low.min(bar.low);
+    let added = if trades { bar.volume as i64 } else { 0 };
+    if trades && b.volume <= 0 && added > 0 {
+        b.open = bar.open;
+        b.high = bar.high;
+        b.low = bar.low;
+    } else {
+        b.high = b.high.max(bar.high);
+        b.low = b.low.min(bar.low);
+    }
     b.close = bar.close;
     b.end = end;
     if trades {
-        let added = bar.volume as i64;
         let total = b.volume.max(0) + added;
-        if total > 0 && added > 0 {
-            b.wap = (b.wap * b.volume.max(0) as f64 + bar.wap * added as f64) / total as f64;
+        if b.volume <= 0 && added > 0 {
+            b.wap = bar.wap;
+        } else if total > 0 && added > 0 {
+            // In 16-digit decimals, as the reference (ibx#604).
+            let sum = Dec16::from_f64(b.wap).mul(Dec16::int(b.volume.max(0) as i128))
+                .add(Dec16::from_f64(bar.wap).mul(Dec16::int(added as i128)));
+            b.wap = sum.div(Dec16::int(total as i128)).to_f64();
         }
         b.volume = total;
         b.count = b.count.max(0) + bar.count.max(0);
@@ -1219,6 +1232,8 @@ pub enum TickSource {
     Trades,
     Midpoint,
     BidAsk,
+    /// The aggregated trades of a crypto pair (ibx#719).
+    AggTrades,
 }
 
 impl TickSource {
@@ -1228,6 +1243,7 @@ impl TickSource {
             Self::Trades => "AllLast",
             Self::Midpoint => "MidPoint",
             Self::BidAsk => "BidAsk",
+            Self::AggTrades => "AggLast",
         }
     }
 
@@ -1237,13 +1253,14 @@ impl TickSource {
             Self::Trades => "Trades",
             Self::Midpoint => "Midpoint",
             Self::BidAsk => "Bid_ask",
+            Self::AggTrades => "Aggregated_Trades",
         }
     }
 }
 
 /// Text of the local refusals of a historical ticks request (321).
 pub fn ticks_refusal(cause: &str) -> String {
-    format!("Error validating request.-'bP' : cause - {}", cause)
+    format!("Error validating request.-'ReqHistoricalTicks(96)' : cause - {}", cause)
 }
 
 /// A historical ticks request that passed the reference checks (ibx#432).
@@ -1307,18 +1324,26 @@ fn check_ticks(
     }
     let what = what_to_show.to_ascii_uppercase();
     let midpoint_default = sec_type == "CASH";
+    let crypto = sec_type == "CRYPTO";
     let source = match what.as_str() {
         "TRADES" | "AGGTRADES" if midpoint_default => TickSource::Midpoint,
+        // A crypto pair's trades are its aggregated trades (ibx#719; the
+        // reference 10.51, paper, 16/10/2026, BTC on PAXOS).
+        "TRADES" | "AGGTRADES" if crypto => TickSource::AggTrades,
         "TRADES" | "AGGTRADES" => TickSource::Trades,
         "MIDPOINT" => TickSource::Midpoint,
         "BID_ASK" => TickSource::BidAsk,
         _ => return refuse("Invalid source price"),
     };
-    if what == "AGGTRADES" && sec_type != "CRYPTO" {
+    if what == "AGGTRADES" && !crypto {
         warnings.push((10299, "Expected what to show is TRADES, please use that instead of AGGTRADES.".to_string()));
+    }
+    if what == "TRADES" && crypto {
+        warnings.push((10299, "Expected what to show is AGGTRADES, please use that instead of TRADES.".to_string()));
     }
     let asked_as_other = match source {
         TickSource::Trades => what != "TRADES",
+        TickSource::AggTrades => what != "AGGTRADES",
         TickSource::Midpoint => true,
         TickSource::BidAsk => ignore_size,
     };
@@ -1428,10 +1453,12 @@ pub fn parse_server_time(s: &str) -> Option<i64> {
 /// Parse a ResultSetTick reply frame as the reference reads it (ibx#432):
 /// the kind of ticks comes from the reply's `<data>` (`AllLast` and `Last`
 /// are trades, `BidAsk`, `MidPoint`); each tick time is Unix seconds; each
-/// size is multiplied by the reply's `<sizeMinTick>`; `<exch>` is the
-/// exchange and `<cond>` the special conditions; the `<flags>` tokens, `;`
-/// separated, give past limit (`H`), unreported (`U`), ask past high (`AH`)
-/// and bid past low (`BH`). A price `nan` is the maximum double.
+/// size is multiplied by the reply's `<sizeMinTick>`, or by its
+/// `<fracSizeMinTick>` for a trade flagged fractional (`F`, ibx#604);
+/// `<exch>` is the exchange and `<cond>` the special conditions; the
+/// `<flags>` tokens, `;` separated, give past limit (`H`), unreported (`U`),
+/// ask past high (`AH`) and bid past low (`BH`). A price `nan` is the
+/// maximum double.
 pub fn parse_tick_response(xml: &str) -> Option<TickFrame> {
     // The reply's data name comes before its events.
     let head = &xml[..xml.find("<Events>").unwrap_or(xml.len())];
@@ -1455,7 +1482,11 @@ fn parse_tick_frame(xml: &str, data_name: &str) -> Option<TickFrame> {
     let query_id = extract_xml_tag(xml, "id").unwrap_or("").to_string();
     let done = extract_xml_tag(xml, "eoq").unwrap_or("false").trim() == "true";
     let size_step: Option<f64> = extract_xml_tag(xml, "sizeMinTick").and_then(|s| s.trim().parse().ok());
+    let frac_step: Option<f64> = extract_xml_tag(xml, "fracSizeMinTick").and_then(|s| s.trim().parse().ok());
     let data_name = data_name.strip_prefix("All").unwrap_or(data_name);
+    // Aggregated trades are read as trades (ibx#719; not observed: the
+    // paper account has no crypto data).
+    let data_name = if data_name == "AggLast" { "Last" } else { data_name };
 
     let mut ticks: Vec<&str> = Vec::new();
     let mut search_start = 0;
@@ -1485,6 +1516,12 @@ fn parse_tick_frame(xml: &str, data_name: &str) -> Option<TickFrame> {
     let data = match data_name {
         "Last" => Some(HistoricalTickData::Last(ticks.iter().map(|t| {
             let f = flags(t);
+            // A trade flagged fractional is counted in the reply's
+            // fractional step (ibx#604, seen on 10.51 from 14/10/2026).
+            let size = match frac_step.filter(|_| f.iter().any(|x| x == "F")) {
+                Some(step) => fractional_size(extract_xml_tag(t, "size").and_then(|s| s.trim().parse().ok()).unwrap_or(0), step),
+                None => size(t, "size"),
+            };
             HistoricalTickLast {
                 time: time(t),
                 tick_attrib_last: TickAttribLast {
@@ -1492,7 +1529,7 @@ fn parse_tick_frame(xml: &str, data_name: &str) -> Option<TickFrame> {
                     unreported: f.iter().any(|x| x == "U"),
                 },
                 price: price(t, "price"),
-                size: size(t, "size"),
+                size: whole_below_fractional_level(crate::client_core::session_level(), size),
                 exchange: text(t, "exch"),
                 special_conditions: text(t, "cond"),
             }
@@ -1524,6 +1561,25 @@ fn parse_tick_frame(xml: &str, data_name: &str) -> Option<TickFrame> {
     Some(TickFrame { query_id, data, done })
 }
 
+/// `raw` steps of a fractional step, as the decimal the step gives
+/// (0.10853, not the binary product).
+fn fractional_size(raw: u64, step: f64) -> f64 {
+    crate::md_events::Increment::from_step(step).map_or(raw as f64 * step, |inc| inc.times(raw))
+}
+
+/// A trade's size as a client at session level `level` gets it: with its
+/// fraction from level 222; below it its whole part, at least 1 (the
+/// reference 10.51 at level 214 gives 1 for trades of 0.002 to 1.302122
+/// shares, historical and live, 105 trades, 14 to 19/10/2026, ibx#604;
+/// ibx#613).
+pub(crate) fn whole_below_fractional_level(level: i32, size: f64) -> f64 {
+    if level >= crate::client_core::LEVEL_FRACTIONAL_LAST_SIZE || (size - size.round()).abs() < 1e-9 {
+        size
+    } else {
+        size.floor().max(1.0)
+    }
+}
+
 /// Server data name of a real-time bar whatToShow, with the reference
 /// table (ibx#454): exact API names only. None is refused with 321.
 pub fn realtime_bar_data(what_to_show: &str) -> Option<&'static str> {
@@ -1538,7 +1594,7 @@ pub fn realtime_bar_data(what_to_show: &str) -> Option<&'static str> {
 }
 
 /// The id of a real-time bar query, as the reference writes it
-/// (`jextend.eG.a(Query)`, `hmdscore.xml.j.toString()`; captured
+/// (captured
 /// 05/10/2026): `realTime{n};;{symbol}@{exchange} {data};;1;;true;;0;;U`,
 /// the data named as the reference's bar types (Trades, Midpoint, Bid,
 /// Ask); an empty exchange is SMART.
@@ -1689,19 +1745,113 @@ pub fn decode_bar_payload(payload: &[u8], min_tick: f64) -> Option<crate::types:
         return None;
     }
 
+    // The prices as the reference sends them: a whole number of ticks
+    // (captured 05/10/2026: 333.79, not 333.78999999999996). The WAP is
+    // built on that low (343.4397755102041, not 343.43977551020413 from
+    // 343.40000000000003, captured 19/10/2026, ibx#604).
+    let price = crate::control::generic_values::java_price;
     let wap = if count > 1 && volume > 0.0 {
-        low + wap_sum * min_tick / volume
+        // In 16-digit decimals, as the reference: (low x volume + sum x
+        // tick) / volume, the low as the binary product of its ticks
+        // (333.65000000000003: 333.6882176287052, ibx#604).
+        let v = Dec16::int(volume as i128);
+        let total = Dec16::from_f64(low).mul(v).add(Dec16::int(wap_sum as i128).mul(Dec16::from_f64(min_tick)));
+        total.div(v).to_f64()
     } else {
-        low
+        price(low)
     };
 
-    // The prices as the reference sends them: a whole number of ticks
-    // (captured 05/10/2026: 333.79, not 333.78999999999996).
-    let price = crate::control::generic_values::java_price;
     Some(crate::types::RealTimeBar {
         timestamp: 0, // filled by caller from message header
         open: price(open), high: price(high), low: price(low), close: price(close), volume, wap, count,
     })
+}
+
+/// A decimal of at most 16 significant digits: each operation rounds its
+/// exact result to 16 digits, half even, as the reference's decimal
+/// arithmetic does for the average price of the live bars (ibx#604:
+/// 84.90555555555557 for 76541 / 900 hundredths, where the binary
+/// arithmetic gives 84.90555555555555). Value: `c` x 10^`e`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Dec16 {
+    c: i128,
+    e: i32,
+}
+
+impl Dec16 {
+    const DIGITS: u32 = 16;
+
+    pub(crate) fn int(v: i128) -> Self {
+        Self { c: v, e: 0 }.round(false)
+    }
+
+    /// The shortest decimal that reads back as `v`, all its digits (up to
+    /// 17), not rounded (0 for a value that is not finite).
+    pub(crate) fn from_f64(v: f64) -> Self {
+        if !v.is_finite() {
+            return Self { c: 0, e: 0 };
+        }
+        let text = format!("{v:e}");
+        let (mantissa, exp) = text.split_once('e').unwrap_or((&text, "0"));
+        let exp: i32 = exp.parse().unwrap_or(0);
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let c: i128 = format!("{int}{frac}").parse().unwrap_or(0);
+        Self { c, e: exp - frac.len() as i32 }
+    }
+
+    pub(crate) fn to_f64(self) -> f64 {
+        format!("{}e{}", self.c, self.e).parse().unwrap_or(0.0)
+    }
+
+    fn digits(c: i128) -> u32 {
+        let mut n = c.unsigned_abs();
+        let mut d = 1;
+        while n >= 10 {
+            n /= 10;
+            d += 1;
+        }
+        d
+    }
+
+    /// Rounded to 16 digits, half even; `sticky` is a non-zero part
+    /// already dropped below the last digit.
+    fn round(self, sticky: bool) -> Self {
+        let d = Self::digits(self.c);
+        if d <= Self::DIGITS {
+            return self;
+        }
+        let k = d - Self::DIGITS;
+        let p = 10i128.pow(k);
+        let (q, r) = (self.c / p, (self.c % p).abs());
+        let half = p / 2;
+        let up = r > half || (r == half && (sticky || q % 2 != 0));
+        let q = if up { q + self.c.signum() } else { q };
+        Self { c: q, e: self.e + k as i32 }.round(false)
+    }
+
+    pub(crate) fn mul(self, o: Self) -> Self {
+        Self { c: self.c * o.c, e: self.e + o.e }.round(false)
+    }
+
+    pub(crate) fn add(self, o: Self) -> Self {
+        let (hi, lo) = if self.e >= o.e { (self, o) } else { (o, self) };
+        // Past 20 places the smaller term is below the last digit.
+        let shift = (hi.e - lo.e).min(20) as u32;
+        let lo_c = if hi.e - lo.e > 20 { lo.c.signum() } else { lo.c };
+        Self { c: hi.c * 10i128.pow(shift) + lo_c, e: hi.e - shift as i32 }.round(false)
+    }
+
+    pub(crate) fn div(self, o: Self) -> Self {
+        if o.c == 0 {
+            return Self { c: 0, e: 0 };
+        }
+        // The dividend widened to 37 digits gives at least 21 digits of
+        // quotient, then rounded with the rest as sticky.
+        let shift = 37 - Self::digits(self.c);
+        let n = self.c * 10i128.pow(shift);
+        let (q, r) = (n / o.c, n % o.c);
+        Self { c: q, e: self.e - shift as i32 - o.e }.round(r != 0)
+    }
 }
 
 /// Build the XML query for a historical schedule request.
@@ -1923,19 +2073,19 @@ mod tests {
         let code = |r: Result<CheckedBarRequest, (i32, String)>| r.unwrap_err();
         assert_eq!(code(check_bar_request("garbage", "1 D", "1 day", "TRADES", None, false, "", None, false)).0, 10314);
         assert_eq!(code(check_bar_request("", "400 D", "1 day", "TRADES", None, false, "", None, false)),
-            (321, "Error validating request.-'bM' : cause - Historical data requests for durations longer than 365 days must be made in years.".to_string()));
+            (321, "Error validating request.-'ReqHistoricalData(20)' : cause - Historical data requests for durations longer than 365 days must be made in years.".to_string()));
         assert_eq!(code(check_bar_request("20260102 10:00:00", "1 D", "1 hour", "ADJUSTED_LAST", None, false, "", None, false)).1,
-            "Error validating request.-'bM' : cause - End date not supported with adjusted last");
+            "Error validating request.-'ReqHistoricalData(20)' : cause - End date not supported with adjusted last");
         assert_eq!(code(check_bar_request("", "1 Y", "1 week", "ADJUSTED_LAST", None, false, "", None, false)).1,
-            "Error validating request.-'bM' : cause - Multi day bar size not supported with adjusted last");
+            "Error validating request.-'ReqHistoricalData(20)' : cause - Multi day bar size not supported with adjusted last");
         assert!(check_bar_request("", "1 Y", "1 day", "ADJUSTED_LAST", None, false, "", None, false).is_ok());
         assert_eq!(code(check_bar_request("", "1 D", "1 sec", "TRADES", None, false, "", None, false)).0, 321);
         assert_eq!(code(check_bar_request("", "1 D", "1 day", "YIELD", None, false, "", None, false)).1,
-            "Error validating request.-'bM' : cause - What to show value of YIELD rejected.");
+            "Error validating request.-'ReqHistoricalData(20)' : cause - What to show value of YIELD rejected.");
         assert_eq!(code(check_bar_request("", "1 D", "1 day", "TRADES", Some(4), false, "", None, false)).1,
-            "Error validating request.-'bM' : cause - Date formatting selection of 4 rejected.");
+            "Error validating request.-'ReqHistoricalData(20)' : cause - Date formatting selection of 4 rejected.");
         assert_eq!(code(check_bar_request("", "1 M", "1 hour", "SCHEDULE", None, false, "", None, false)).1,
-            "Error validating request.-'bM' : cause - Only daily resolution supported for Schedule requests");
+            "Error validating request.-'ReqHistoricalData(20)' : cause - Only daily resolution supported for Schedule requests");
         assert!(check_bar_request("", "1 M", "1 day", "SCHEDULE", None, false, "", None, false).is_ok());
         // The issue's checks: 1 year and 3 months bars over 5 Y.
         assert!(check_bar_request("", "5 Y", "1 year", "TRADES", None, false, "", None, false).is_ok());
@@ -1946,27 +2096,27 @@ mod tests {
             assert!(check_bar_request("", "1 D", size, "TRADES", Some(1), true, "STK", None, false).is_ok(), "{}", size);
         }
         assert_eq!(code(check_bar_request("20261001 10:00:00 US/Eastern", "1 D", "1 hour", "TRADES", Some(1), true, "STK", None, false)),
-            (321, "Error validating request.-'bM' : cause - End date not supported with live updates".to_string()));
+            (321, "Error validating request.-'ReqHistoricalData(20)' : cause - End date not supported with live updates".to_string()));
         for what in ["BID_ASK", "ADJUSTED_LAST", "HISTORICAL_VOLATILITY"] {
             assert_eq!(code(check_bar_request("", "1 D", "1 hour", what, Some(1), true, "STK", None, false)).1,
-                "Error validating request.-'bM' : cause - Source price not supported with live updates", "{}", what);
+                "Error validating request.-'ReqHistoricalData(20)' : cause - Source price not supported with live updates", "{}", what);
         }
         for what in ["TRADES", "MIDPOINT", "BID", "ASK"] {
             assert!(check_bar_request("", "1 D", "1 hour", what, Some(1), true, "STK", None, false).is_ok(), "{}", what);
         }
         assert_eq!(code(check_bar_request("", "1 D", "1 hour", "TRADES", Some(1), true, "BAG", None, false)).1,
-            "Error validating request.-'bM' : cause - Live updates for combos are not supported");
+            "Error validating request.-'ReqHistoricalData(20)' : cause - Live updates for combos are not supported");
         // ibx#421: years above the logon limit, after the duration checks.
         assert_eq!(code(check_bar_request("", "2 Y", "1 day", "TRADES", None, false, "", Some(1), false)).1,
-            "Error validating request.-'bM' : cause - Historical data request for 2 year(s) rejected. Max API Backfill Years=1");
+            "Error validating request.-'ReqHistoricalData(20)' : cause - Historical data request for 2 year(s) rejected. Max API Backfill Years=1");
         assert!(check_bar_request("", "199 Y", "1 month", "TRADES", None, false, "", Some(199), false).is_ok());
         assert_eq!(code(check_bar_request("", "400 D", "1 day", "TRADES", None, false, "", Some(1), false)).1,
-            "Error validating request.-'bM' : cause - Historical data requests for durations longer than 365 days must be made in years.");
+            "Error validating request.-'ReqHistoricalData(20)' : cause - Historical data requests for durations longer than 365 days must be made in years.");
         assert_eq!(code(check_bar_request("", "2 Y", "1 day", "YIELD", None, false, "", Some(1), false)).1,
-            "Error validating request.-'bM' : cause - Historical data request for 2 year(s) rejected. Max API Backfill Years=1");
+            "Error validating request.-'ReqHistoricalData(20)' : cause - Historical data request for 2 year(s) rejected. Max API Backfill Years=1");
     }
 
-    // ibx#421: the second years rule (`jextend.bM.b(jutils.d1)`): with
+    // ibx#421: the second years rule: with
     // includeExpired off, a request that starts before now moved back by
     // M years and one day (machine calendar) is refused, with the start
     // and end written in the zone of the end date.
@@ -1985,7 +2135,7 @@ mod tests {
 
         let code = |r: Result<CheckedBarRequest, (i32, String)>| r.unwrap_err();
         let refused = check_bar_request("19900101 00:00:00", "1 D", "1 day", "TRADES", None, false, "", Some(1), false);
-        assert!(code(refused).1.starts_with("Error validating request.-'bM' : cause - Historical data queries on this contract requesting any data earlier than 1 year(s) back from now which is "));
+        assert!(code(refused).1.starts_with("Error validating request.-'ReqHistoricalData(20)' : cause - Historical data queries on this contract requesting any data earlier than 1 year(s) back from now which is "));
         assert!(check_bar_request("19900101 00:00:00", "1 D", "1 day", "TRADES", None, false, "", Some(1), true).is_ok(),
             "includeExpired");
         assert!(check_bar_request("19900101 00:00:00", "1 D", "1 day", "TRADES", None, false, "", None, false).is_ok(),
@@ -2533,6 +2683,28 @@ mod tests {
         check_ticks_request(start, end, n, what, ignore, sec_type, "SMART", "Europe/Paris", ET_15H)
     }
 
+    // ibx#719 (the reference 10.51, paper, 16/10/2026, BTC on PAXOS): a
+    // crypto pair's trades are asked as aggregated trades, TRADES with
+    // warning 10299 and the size filter, AGGTRADES without either; the
+    // query is named by the local symbol, its replies read as trades.
+    #[test]
+    fn crypto_trades_are_aggregated_trades() {
+        let t15 = "20261001 15:00:00 UTC";
+        let (w, ok) = ticks(t15, "", 50, "TRADES", false, "CRYPTO");
+        assert_eq!(w, vec![(10299, "Expected what to show is AGGTRADES, please use that instead of TRADES.".to_string())]);
+        let ok = ok.unwrap();
+        assert_eq!((ok.source, ok.ignore_size_filter), (TickSource::AggTrades, true));
+        let (w, ok) = ticks(t15, "", 50, "AGGTRADES", false, "CRYPTO");
+        assert!(w.is_empty());
+        assert_eq!((ok.as_ref().unwrap().source, ok.unwrap().ignore_size_filter), (TickSource::AggTrades, false));
+        let q = TickQuery { symbol: "BTC.USD".into(), con_id: 479624278, sec_type: "CRYPTO".into(), exchange: "PAXOS".into(),
+            ..tick_query(TickSource::AggTrades, None, Some(ET_15H), false) };
+        assert!(q.query_id().contains(";;BTC.USD@PAXOS Aggregated_Trades;;0;;true;;0;;U"), "{}", q.query_id());
+        assert!(build_tick_query_xml(&q, ET_15H + 60).contains("<data>AggLast</data>"));
+        let reply = "<ResultSetTick><id>cf4;;BTC.USD@PAXOS Aggregated_Trades;;0;;true;;0;;U</id><eoq>true</eoq><data>AggLast</data>            <Events><Tick><time>20261016-11:00:00</time><price>67000</price><size>1</size></Tick></Events></ResultSetTick>";
+        assert!(matches!(parse_tick_response(reply).unwrap().data, Some(crate::types::HistoricalTickData::Last(ref t)) if t.len() == 1));
+    }
+
     #[test]
     fn tick_request_checks_as_captured() {
         let t15 = "20261001 15:00:00 US/Eastern";
@@ -2541,9 +2713,9 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!((ok.source, ok.ignore_size_filter, ok.start.unwrap().secs), (TickSource::Trades, false, ET_15H));
         let refusal = |n: i32, what: &str| ticks(t15, "", n, what, false, "STK").1.unwrap_err();
-        assert_eq!(refusal(0, "TRADES"), (321, "Error validating request.-'bP' : cause - Number of ticks must be > 0".into()));
-        assert_eq!(refusal(10, "FOO"), (321, "Error validating request.-'bP' : cause - Invalid source price".into()));
-        assert_eq!(refusal(10, ""), (321, "Error validating request.-'bP' : cause - Source price must not be empty".into()));
+        assert_eq!(refusal(0, "TRADES"), (321, "Error validating request.-'ReqHistoricalTicks(96)' : cause - Number of ticks must be > 0".into()));
+        assert_eq!(refusal(10, "FOO"), (321, "Error validating request.-'ReqHistoricalTicks(96)' : cause - Invalid source price".into()));
+        assert_eq!(refusal(10, ""), (321, "Error validating request.-'ReqHistoricalTicks(96)' : cause - Source price must not be empty".into()));
         let (w, err) = ticks("not a date", "", 10, "TRADES", false, "STK");
         assert!(w.is_empty());
         let err = err.unwrap_err();
@@ -2567,9 +2739,9 @@ mod tests {
         assert!(ticks(t15, "", 100, "BID_ASK", true, "STK").1.unwrap().ignore_size_filter);
         assert!(!ticks(t15, "", 100, "TRADES", true, "STK").1.unwrap().ignore_size_filter);
         assert_eq!(check_ticks_request(t15, "", 10, "TRADES", false, "STK", "", "UTC", ET_15H).1.unwrap_err().1,
-            "Error validating request.-'bP' : cause - Exchange must not be empty");
+            "Error validating request.-'ReqHistoricalTicks(96)' : cause - Exchange must not be empty");
         assert_eq!(ticks(t15, "", 10, "TRADES", false, "BAG").1.unwrap_err().1,
-            "Error validating request.-'bP' : cause - Combo types are not supported");
+            "Error validating request.-'ReqHistoricalTicks(96)' : cause - Combo types are not supported");
     }
 
     fn tick_query(source: TickSource, start: Option<i64>, end: Option<i64>, filter: bool) -> TickQuery {
@@ -2629,6 +2801,34 @@ mod tests {
         let xml = build_tick_query_xml(&q, now);
         assert!(xml.contains("<id>tk_1;;EUR.USD@IDEALPRO Midpoint;;0;;true;;0;;U</id>"), "{}", xml);
         assert!(xml.contains("<exchange>FXSUBPIP</exchange><secType>CASH</secType>"), "{}", xml);
+    }
+
+    // ibx#613, ibx#604: below session level 222 a trade's fractional size
+    // is given as its whole part, at least 1 (observed on stock trades of
+    // 0.002 to 1.302122 shares at level 214, 19/10/2026; this crypto
+    // step not observed).
+    #[test]
+    fn a_fractional_trade_size_is_whole_below_level_222() {
+        crate::client_core::set_session_level_for_test(Some(214));
+        let xml = "<ResultSetTick><id>cf4;;BTC.USD@PAXOS Trades;;0;;true;;0;;U</id><eoq>true</eoq><data>AllLast</data>            <sizeMinTick>0.00000001</sizeMinTick><Events>            <Tick><time>20261016-11:00:00</time><price>67000</price><size>40000000</size></Tick>            <Tick><time>20261016-11:00:01</time><price>67000</price><size>160000000</size></Tick>            <Tick><time>20261016-11:00:02</time><price>67000</price><size>2600000</size></Tick></Events></ResultSetTick>";
+        let frame = parse_tick_response(xml).unwrap();
+        let Some(crate::types::HistoricalTickData::Last(ticks)) = frame.data else { panic!("{:?}", frame.data) };
+        assert_eq!(ticks.iter().map(|t| t.size).collect::<Vec<_>>(), [1.0, 1.0, 1.0]);
+    }
+
+    // ibx#604: a trade the reply flags fractional (`F`) is counted in the
+    // reply's fractional step: its decimal from session level 222, the next
+    // whole share below (the reference 10.51 at levels 225 and 214, AAPL,
+    // 14 to 19/10/2026); the other trades in the whole-share step.
+    #[test]
+    fn a_trade_flagged_fractional_takes_the_fractional_step() {
+        let xml = "<ResultSetTick><id>cf20;;AAPL@SMART Trades;;0;;true;;0;;U</id><eoq>true</eoq><data>AllLast</data>            <minTick>0.00001</minTick><sizeMinTick>1</sizeMinTick><fracSizeMinTick>0.000001</fracSizeMinTick><Events>            <Tick><time>20261001-19:00:00</time><price>329.809</price><size>17340</size><exch>FINRA</exch><cond>   I</cond><flags>U;F</flags></Tick>            <Tick><time>20261001-19:00:00</time><price>329.82</price><size>23</size><exch>FINRA</exch><cond>   I</cond><flags>U</flags></Tick>            <Tick><time>20261001-19:00:03</time><price>329.825</price><size>1136966</size><exch>FINRA</exch><cond>   I</cond><flags>U;F</flags></Tick>            </Events></ResultSetTick>";
+        for (level, sizes) in [(225, [0.01734, 23.0, 1.136966]), (214, [1.0, 23.0, 1.0])] {
+            crate::client_core::set_session_level_for_test(Some(level));
+            let frame = parse_tick_response(xml).unwrap();
+            let Some(crate::types::HistoricalTickData::Last(ticks)) = frame.data else { panic!("{:?}", frame.data) };
+            assert_eq!(ticks.iter().map(|t| t.size).collect::<Vec<_>>(), sizes, "level {level}");
+        }
     }
 
     #[test]
@@ -2717,6 +2917,52 @@ mod tests {
         let mut series = Vec::new();
         merge_five_seconds(&mut series, &rth, BarSize::Hour1, true, parse_server_time("20261001-13:30:05").unwrap(), &empty);
         assert_eq!(server_time(series[0].start), "20261001-13:30:00");
+    }
+
+    // ibx#604: the average prices of the reference's live bars, in
+    // 16-digit decimals (b2_rtbars of 05/10/2026, b1_429_keep_up_to_date
+    // of 19/10/2026).
+    #[test]
+    fn live_bar_averages_in_sixteen_digits() {
+        let wap = |low_ticks: i128, volume: i128, sum: i128| {
+            let v = Dec16::int(volume);
+            Dec16::from_f64(low_ticks as f64 * 0.01).mul(v).add(Dec16::int(sum).mul(Dec16::from_f64(0.01))).div(v).to_f64()
+        };
+        assert_eq!(wap(8489, 900, 1400), 84.90555555555557);
+        assert_eq!(wap(8488, 200, 400), 84.9);
+        assert_eq!(wap(33366, 6933, 30986), 333.7046934948796);
+        assert_eq!(wap(34340, 490, 1949), 343.4397755102041);
+        assert_eq!(wap(34357, 231, 210), 343.5790909090909);
+        assert_eq!(wap(33365, 2564, 9799), 333.6882176287052);
+        // The merges into the 1 hour bar of 04:00 New York time.
+        let merge = |w: f64, v: i128, w2: f64, v2: i128| Dec16::from_f64(w).mul(Dec16::int(v))
+            .add(Dec16::from_f64(w2).mul(Dec16::int(v2))).div(Dec16::int(v + v2)).to_f64();
+        let first = merge(343.928, 51439, 343.4397755102041, 490);
+        assert_eq!(first, 343.9233931329315);
+        assert_eq!(merge(first, 51929, 343.5790909090909, 231), 343.9218683282209);
+        assert_eq!(Dec16::int(2).div(Dec16::int(3)).to_f64(), 0.6666666666666667);
+        assert_eq!(Dec16::from_f64(-1.25).mul(Dec16::int(3)).to_f64(), -3.75);
+    }
+
+    // ibx#604, the reference 10.51 (b1_429_keep_up_to_date, 19/10/2026,
+    // pre-market): a 1 min bar made from a 5-second bar with no trade is
+    // at the last price (343.18); the first 5-second bar with trades gives
+    // its open, high, low and WAP as they are, not merged with that price.
+    #[test]
+    fn an_empty_trades_bar_takes_its_first_trades() {
+        let t0 = parse_server_time("20261019-08:10:00").unwrap();
+        let sessions = vec![(parse_server_time("20261019-08:00:00").unwrap(), parse_server_time("20261020-00:00:00").unwrap())];
+        let mut minute = Vec::new();
+        merge_five_seconds(&mut minute, &sessions, BarSize::Min1, true, t0, &five(343.18, 343.18, 343.18, 343.18, 0.0, 0));
+        assert_eq!((minute[0].open, minute[0].low, minute[0].volume), (343.18, 343.18, 0));
+        let trades = crate::types::RealTimeBar { wap: 343.4397755102041, ..five(343.4, 343.46, 343.4, 343.46, 490.0, 5) };
+        assert_eq!(merge_five_seconds(&mut minute, &sessions, BarSize::Min1, true, t0 + 5, &trades), Some(0));
+        let b = &minute[0];
+        assert_eq!((b.open, b.high, b.low, b.close, b.volume, b.wap, b.count), (343.4, 343.46, 343.4, 343.46, 490, 343.4397755102041, 5));
+        // The next trades merge as before.
+        let more = crate::types::RealTimeBar { wap: 343.3, ..five(343.3, 343.3, 343.3, 343.3, 10.0, 1) };
+        merge_five_seconds(&mut minute, &sessions, BarSize::Min1, true, t0 + 10, &more);
+        assert_eq!((minute[0].open, minute[0].low, minute[0].volume, minute[0].count), (343.4, 343.3, 500, 6));
     }
 
     // The real-time bar query ids and the bars of 05/10/2026 (b2_rtbars):

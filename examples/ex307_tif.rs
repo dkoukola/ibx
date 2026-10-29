@@ -1,6 +1,6 @@
 //! ibx#307 probe. Paper account only.
 //!
-//! GTX and NMIN go out as GTC (59=1) and read back as GTC, as the
+//! GTX and NMIN go out as GTC on the wire and read back as GTC, as the
 //! reference. Limit orders far from the market, cancelled at the end.
 //!
 //! Env: IB_USERNAME, IB_PASSWORD.
@@ -44,6 +44,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         username: env::var("IB_USERNAME")?, password: env::var("IB_PASSWORD")?,
         host: env::var("IB_HOST").unwrap_or_else(|_| "cdc1.ibllc.com".into()),
         paper: true, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     })?;
     if !client.account_id.starts_with("DU") { client.disconnect(); return Err("not a paper account".into()); }
     let aapl = Contract { con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() };

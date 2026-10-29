@@ -24,6 +24,9 @@ const HISTORICAL_TICKS_ERROR: &str = "Failed to request historical ticks";
 const HISTOGRAM_ERROR: &str = "Failed to request histogram data";
 
 pub(crate) struct HmdsState {
+    /// The 10.40 forms (replays of its recordings): a bar of quotes gives
+    /// -1 for its volume and average price (ibx#679).
+    pub(crate) form_10_40: bool,
     pub(crate) next_tbt_req_id: u32,
     /// Tick-by-tick streams (ibx#404), one per contract, type and size
     /// filter, in the order they were made (ibx#455).
@@ -36,12 +39,15 @@ pub(crate) struct HmdsState {
     /// before the start, 3 days long, as the reference (ibx#404).
     pub(crate) tbt_guess_window: (i64, i64),
     pub(crate) next_hmds_query_id: u32,
+    /// The session series of the bar and historical tick queries' names,
+    /// as the reference's: cf4, cf8, cf12 ... (ibx#721; paper, 16/10/2026).
+    pub(crate) next_chart_query: u32,
     /// The counter of the real-time bar query ids (`realTime{n}`, the
-    /// reference's `jextend.eG`), from 1.
+    /// reference's counter), from 1.
     pub(crate) next_rtbar_id: u32,
     pub(crate) disconnected: bool,
     /// In-flight historical bar queries: (query_id, req_id). No deadline,
-    /// as in the reference: its bar query (`jextend.j`, `hmdscore`) waits
+    /// as in the reference: its bar query waits
     /// for the server's answer, an error or a cancel; only a head timestamp
     /// query times out (ibx#485; ibx#231 failed a bar request after 60 s
     /// with a text of ibx's own).
@@ -55,15 +61,43 @@ pub(crate) struct HmdsState {
     pub(crate) next_fundamental_window: u32,
     /// A scanner parameters request is on the wire.
     pub(crate) pending_scanner_params: bool,
+    /// When the scanner parameters request leaves: the reference asks for
+    /// them about 1 s after the first need (ibx#553).
+    pub(crate) scanner_params_due: Option<Instant>,
+    /// The delay applies: a session opened by a logon. An engine built by
+    /// hand asks at once.
+    pub(crate) scanner_params_delayed: bool,
     /// Scanner parameters of this connection: one request, then every
     /// client request is answered from here (ibx#457).
     pub(crate) scanner_params: Option<String>,
+    /// When the next request that waited for the parameters is taken, in
+    /// a session opened by a logon (ibx#572).
+    scanner_release_due: Option<Instant>,
+    /// When each later parameters request, answered from the kept text,
+    /// gets its answer (ibx#572).
+    scanner_params_answers_due: Vec<Instant>,
+    /// The time of the last sweep: the clock of the delays (the pacing's
+    /// clock in a replay).
+    scanner_now: Option<Instant>,
     /// Client parameters requests waiting for the answer (ibx#457).
     pub(crate) scanner_params_waiting: u32,
+    /// The parameters follow the link (ibx#554): a request for them was
+    /// sent and a scanner session is left; dropped at a loss and asked
+    /// again after the return.
+    pub(crate) scanner_params_followed: bool,
+    /// A parameters request sent and not answered was told of the loss:
+    /// told of the return too (ibx#554).
+    scanner_params_told: bool,
     /// Row limit of each scan type, from the scanner parameters (ibx#456).
     pub(crate) scan_size_limits: std::collections::HashMap<String, u32>,
+    /// The scan codes and filter codes of the parameters (ibx#657).
+    pub(crate) scan_codes: std::collections::HashSet<String>,
+    pub(crate) filter_codes: std::collections::HashSet<String>,
     /// Live scanner subscriptions, matched to results by their id (ibx#457).
     pub(crate) pending_scanner: Vec<ScannerSub>,
+    /// The ids of `pending_scanner` in the order the waiting subscriptions
+    /// go out when the scanner parameters arrive (ibx#513).
+    pub(crate) scanner_table: crate::control::scanner::ScannerTable,
     /// News queries in flight, matched to replies by query id (ibx#459).
     pub(crate) pending_news: Vec<NewsQuery>,
     pub(crate) pending_articles: Vec<NewsQuery>,
@@ -90,13 +124,15 @@ pub(crate) struct HmdsState {
     head_ts_keys: std::collections::HashMap<ReqId, HeadTsKey>,
     /// Head timestamps the farm gave, Unix seconds, by contract, route,
     /// data and RTH flag: a later request is answered from here with no
-    /// query, as the reference's store (`hmdscore.store.b`, ibx#486).
+    /// query, as the reference's store does (ibx#486).
     head_ts_cache: std::collections::HashMap<HeadTsKey, i64>,
     /// How the bars of each bar request are written (ibx#431), until its
     /// answer ended (keepUpToDate: until its cancel).
     pub(crate) bar_requests: Vec<BarRequestInfo>,
     /// keepUpToDate requests and their bar series (ibx#429).
     pub(crate) live_bars: Vec<LiveBars>,
+    /// Last place given to a keepUpToDate request on its stream (ibx#512).
+    pub(crate) live_joins: u64,
     /// The last 5-second bar of each farm and ticker id: a keepUpToDate
     /// request whose history ends after it takes it then (ibx#429).
     pub(crate) router_bars: Vec<(super::pool::FarmId, u32, u32, crate::types::RealTimeBar)>,
@@ -151,6 +187,11 @@ pub(crate) struct TbtSub {
     pub(crate) clients: Vec<ReqId>,
     pub(crate) min_tick: f64,
     pub(crate) size_min_tick: Option<f64>,
+    /// The size step as an exact decimal, for the fractional trade sizes
+    /// of session level 222 (ibx#613).
+    pub(crate) size_increment: Option<crate::md_events::Increment>,
+    /// The step of a trade the server marks fractional (ibx#604).
+    pub(crate) frac_size_min_tick: Option<f64>,
     pub(crate) last: i64,
     pub(crate) bid: i64,
     pub(crate) ask: i64,
@@ -173,7 +214,7 @@ pub(crate) struct TbtSub {
 /// of the stream (ibx#455).
 #[derive(Debug, Clone)]
 pub(crate) enum TbtTick {
-    Trade { price: i64, size: i64, time: u64, exchange: String, conditions: String, past_limit: bool, unreported: bool },
+    Trade { price: i64, size: f64, time: u64, exchange: String, conditions: String, past_limit: bool, unreported: bool },
     Quote { bid: i64, ask: i64, bid_size: i64, ask_size: i64, time: u64, bid_past_low: bool, ask_past_high: bool },
     MidPoint { mid_point: i64, time: u64 },
 }
@@ -212,7 +253,66 @@ impl TbtSub {
             None => raw as i64,
         }
     }
+
+    /// A trade's size in size increments as the client gets it at this
+    /// session's level (ibx#613).
+    fn trade_size(&self, raw: u64) -> f64 {
+        trade_size_at(crate::client_core::session_level(), raw, self.size_min_tick, self.size_increment)
+    }
+
+    /// A trade's size the server marks fractional (attribute bit 0x20): in
+    /// the acknowledgement's fractional step (the reference 10.51 at level
+    /// 225, AAPL, 19/10/2026 pre-market: 987479 steps of 0.000001 give
+    /// 0.987479, ibx#604).
+    fn fractional_trade_size(&self, raw: u64) -> f64 {
+        match self.frac_size_min_tick {
+            Some(step) => trade_size_at(crate::client_core::session_level(), raw, Some(step),
+                crate::md_events::Increment::from_step(step)),
+            None => self.trade_size(raw),
+        }
+    }
 }
+
+/// A tick-by-tick trade's size at session level `level` (ibx#613,
+/// ibx#604; the reference 10.51, AAPL, 19/10/2026 pre-market): the size
+/// increments times the increment, below level 222 its whole part, at
+/// least 1, with its fractional part from 222, as the historical trade
+/// ticks. From 222 the size is the decimal the step gives (0.026, not the
+/// binary product 0.026000000000000002) when the step is a decimal.
+pub(crate) fn trade_size_at(level: i32, raw: u64, size_min_tick: Option<f64>, increment: Option<crate::md_events::Increment>) -> f64 {
+    if level < crate::client_core::LEVEL_FRACTIONAL_LAST_SIZE {
+        let size = size_min_tick.map_or(raw as f64, |step| raw as f64 * step);
+        return crate::control::historical::whole_below_fractional_level(level, size);
+    }
+    match (increment, size_min_tick) {
+        (Some(inc), _) => inc.times(raw),
+        (None, Some(step)) => raw as f64 * step,
+        (None, None) => raw as f64,
+    }
+}
+
+/// The bars of one frame in the order the reference gives them: the first
+/// bar of each stream, then the second ones, and so on (the reference
+/// 10.51, 19/10/2026 regular hours, b2_rtbars: a frame with an AAPL TRADES
+/// bar of :50 and :55 and a MIDPOINT bar of :55 gave the :50 TRADES bar,
+/// the MIDPOINT bar, then the :55 TRADES bar, ibx#604). Within a rank the
+/// frame's order is kept.
+fn by_rank<T>(entries: Vec<(u32, u32, T)>) -> Vec<(u32, u32, T)> {
+    let mut seen: Vec<(u32, usize)> = Vec::new();
+    let mut ranked: Vec<(usize, usize, (u32, u32, T))> = entries.into_iter().enumerate().map(|(i, e)| {
+        let rank = match seen.iter_mut().find(|(t, _)| *t == e.0) {
+            Some((_, n)) => { *n += 1; *n }
+            None => { seen.push((e.0, 0)); 0 }
+        };
+        (rank, i, e)
+    }).collect();
+    ranked.sort_by_key(|(rank, i, _)| (*rank, *i));
+    ranked.into_iter().map(|(_, _, e)| e).collect()
+}
+
+/// The attribute bit of a tick-by-tick trade whose size is in the
+/// fractional step (ibx#604).
+const TBT_FRACTIONAL_SIZE: u64 = 0x20;
 
 /// How long a tick-by-tick stream with no client left waits before its
 /// cancel, as in the reference (ibx#404).
@@ -305,6 +405,10 @@ pub(crate) struct RtBarSub {
 /// How the bars of a bar request are written (ibx#431): formatDate, bars
 /// shorter than a day or not, the instrument zone (the contract's trading
 /// hours zone when known, else the reply's zone), and the start and end
+/// Warning 2188, given before the end of an answer of delayed data
+/// (ibx#703).
+const DELAYED_HISTORY: &str = "Up-to-the-second historical data requires additional subscription for the API.";
+
 /// of the request in Unix seconds for historicalDataEnd.
 #[derive(Debug, Clone)]
 pub(crate) struct BarRequestInfo {
@@ -314,6 +418,18 @@ pub(crate) struct BarRequestInfo {
     pub(crate) zone: Option<String>,
     pub(crate) start: i64,
     pub(crate) end: i64,
+    /// The answer said its data are delayed: warning 2188 before the end
+    /// (ibx#703).
+    pub(crate) delayed: bool,
+    /// The contract, whose market rule rounds the prices below session
+    /// level 224 (ibx#615); 0 when not known.
+    pub(crate) con_id: i64,
+    /// The zone the answer's first part named: the later parts do not name
+    /// it again (ibx#615; paper, 16/10/2026, 5-second bars of EUR.USD).
+    pub(crate) reply_zone: String,
+    /// The bars of the answer's earlier parts, given with its last part in
+    /// time order (ibx#615).
+    pub(crate) held: Vec<crate::control::historical::HistoricalBar>,
 }
 
 /// A keepUpToDate bar request (ibx#429): its query, the 5-second router
@@ -337,6 +453,12 @@ pub(crate) struct LiveBars {
     pub(crate) history_done: bool,
     /// Zone of the reply, for the dates of bars of a day or longer.
     pub(crate) reply_zone: String,
+    /// What names the 5-second stream the request shares: the contract,
+    /// the data and the regular-hours choice (ibx#512).
+    pub(crate) stream: (i64, crate::control::historical::BarDataType, bool),
+    /// Its place among the requests of its stream, 0 while it has none
+    /// (ibx#512): the updates of a 5-second bar are given in this order.
+    pub(crate) joined: u64,
 }
 
 /// Most real-time bar requests when the logon gives no limit, as the
@@ -381,11 +503,43 @@ pub(crate) struct NewsQuery {
 
 /// Scanner notices of the historical data link, as the reference words
 /// them (ibx#457): the text of 165 with the notice after its colon
-/// (`jextend.dt.e(String)` gives `d7.I.c(text)`, joined by
-/// `jextend.ac.a(String,String)`; ibx#485).
+/// (ibx#485).
+/// The scanner parameters are asked this long after their first need
+/// (ibx#553).
+pub(crate) const SCANNER_PARAMS_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The reference's time from the parameters answer to the first request
+/// that waited for it, and from one to the next (ibx#572; 274 to 400 ms
+/// and 35 to 100 ms on 10/10/2026, its own reading of the text for each
+/// request, not a timer: copied with fixed values, the project manager's
+/// decision of 16/10/2026).
+pub(crate) const SCANNER_FIRST_RELEASE: std::time::Duration = std::time::Duration::from_millis(300);
+pub(crate) const SCANNER_NEXT_RELEASE: std::time::Duration = std::time::Duration::from_millis(60);
+/// The reference's time to answer a parameters request from the kept text
+/// (ibx#572; 285 ms on 10/10/2026).
+pub(crate) const SCANNER_PARAMS_ANSWER: std::time::Duration = std::time::Duration::from_millis(285);
+
 const SCANNER_LINK_LOST: &str =
     "Historical Market Data Service query message:HMDS server disconnect occurred.  Attempting reconnection...";
+/// `v` at the nearest multiple of `step`, written with the step's decimals
+/// (ibx#615).
+fn round_to_step(v: f64, step: f64) -> f64 {
+    if !v.is_finite() || v == f64::MAX {
+        return v;
+    }
+    let decimals = format!("{}", step).split('.').nth(1).map_or(0, str::len);
+    // By the steps in one unit, in binary, as the reference: 1.125025
+    // gave 1.12505 and 1.125325 gave 1.1253 (paper, 16/10/2026; every
+    // settled bar of two runs).
+    let per_unit = (1.0 / step).round();
+    let n = (v * per_unit + 0.5).floor();
+    format!("{:.*}", decimals, n / per_unit).parse().unwrap_or(v)
+}
+
 const SCANNER_LINK_RESTORED: &str = "Historical Market Data Service query message:HMDS server connection was successful.";
+/// The request id of a client's scanner parameters request in the
+/// reference's notices of the link (ibx#554): the largest int.
+const SCANNER_PARAMS_REQ_ID: ReqId = i32::MAX as ReqId;
 const SCANNER_CONNECT_FAILED: &str =
     "Historical Market Data Service query message:HMDS connection attempt failed.  Connection will be re-attempted...";
 
@@ -403,6 +557,14 @@ pub(crate) struct BarLeg {
     pub(crate) query_id: String,
     pub(crate) data_type: crate::control::historical::BarDataType,
     pub(crate) state: LegState,
+}
+
+/// Whether a reply's whole query id is this leg's: its window and its chart
+/// name's data label (ibx#721: the legs of one request share the window).
+fn leg_of(leg: &BarLeg, query_id: &str) -> bool {
+    let mut parts = query_id.split(";;");
+    parts.next() == Some(leg.query_id.as_str())
+        && parts.next().is_some_and(|chart| chart.ends_with(&format!(" {}", leg.data_type.label())))
 }
 
 /// A bar request answered from several server queries (BID_ASK, ibx#408).
@@ -447,6 +609,7 @@ impl BarRequestInfo {
 impl HmdsState {
     pub(crate) fn new() -> Self {
         Self {
+            form_10_40: false,
             next_tbt_req_id: 1,
             tbt_subscriptions: Vec::new(),
             tbt_ended: Vec::new(),
@@ -455,6 +618,7 @@ impl HmdsState {
                 (now - 5, now - 5 + 259_200)
             },
             next_hmds_query_id: 1000,
+            next_chart_query: 4,
             next_rtbar_id: 0,
             disconnected: false,
             pending_historical: Vec::new(),
@@ -463,10 +627,20 @@ impl HmdsState {
             next_histogram_window: 0,
             next_fundamental_window: 1,
             pending_scanner_params: false,
+            scanner_params_due: None,
+            scanner_params_delayed: false,
             scanner_params: None,
             scanner_params_waiting: 0,
+            scanner_params_followed: false,
+            scanner_params_told: false,
+            scanner_release_due: None,
+            scanner_params_answers_due: Vec::new(),
+            scanner_now: None,
             scan_size_limits: std::collections::HashMap::new(),
+            scan_codes: std::collections::HashSet::new(),
+            filter_codes: std::collections::HashSet::new(),
             pending_scanner: Vec::new(),
+            scanner_table: Default::default(),
             pending_news: Vec::new(),
             pending_articles: Vec::new(),
             next_news_query: 0,
@@ -481,6 +655,7 @@ impl HmdsState {
             head_ts_cache: std::collections::HashMap::new(),
             bar_requests: Vec::new(),
             live_bars: Vec::new(),
+            live_joins: 0,
             router_bars: Vec::new(),
             rtbar_subs: Vec::new(),
             max_real_time_requests: DEFAULT_MAX_REAL_TIME_REQUESTS,
@@ -524,7 +699,7 @@ impl HmdsState {
                         return;
                     }
                     Ok(n) => {
-                        log::info!("HMDS recv: {} bytes", n);
+                        log::trace!("HMDS recv: {} bytes", n);
                         hb.last_hmds_recv = Instant::now();
                         hb.pending_hmds_test = None;
                     }
@@ -532,10 +707,11 @@ impl HmdsState {
                 let frames = conn.extract_frames();
                 // ibx#183 follow-up: frame-extraction tracer. If a recv produces
                 // 0 frames AND buffered_after > 0, the bytes are stuck waiting for
-                // more (incomplete FIXCOMP frame — declared tag-9 length exceeds
+                // more (incomplete compressed frame — declared body length exceeds
                 // received bytes). If buffered_after == 0, the bytes were dropped
-                // outright (no recognized header — buf.clear() path).
-                log::warn!(
+                // outright (no recognized header — buf.clear() path). At trace
+                // level: it fired on every read (ibx#701).
+                log::trace!(
                     "HMDS poll: extracted={} frames, buffered_after={}B",
                     frames.len(),
                     conn.buffered(),
@@ -581,7 +757,7 @@ impl HmdsState {
                             msgs.push(unsigned);
                         }
                         Frame::Control(_) => {
-                            // 8=1 / 8=X control state — not consumed on the data path (ibx#185).
+                            // Token-auth / encrypted control state — not consumed on the data path (ibx#185).
                         }
                     }
                 }
@@ -611,6 +787,15 @@ impl HmdsState {
         event_tx: &Option<Sender<Event>>,
         hb: &mut HeartbeatState,
     ) {
+        // The data messages and the heartbeat are dispatched on their type
+        // alone, read from the raw bytes; the map of the fields is built for
+        // the others only (ibx#701: 0.6 us a tick message).
+        match super::fast_extract_msg_type(msg) {
+            Some(b"E") => return self.handle_tbt_data(msg, shared, event_tx),
+            Some(b"G") => return self.handle_rtbar_data(msg, shared, hmds_conn, hb),
+            Some(b"0") => return,
+            _ => {}
+        }
         let parsed = fix::fix_parse(msg);
         let msg_type = match parsed.get(&fix::TAG_MSG_TYPE) {
             Some(t) => t.as_str(),
@@ -618,6 +803,7 @@ impl HmdsState {
         };
         match msg_type {
             "E" => self.handle_tbt_data(msg, shared, event_tx),
+            "G" => self.handle_rtbar_data(msg, shared, hmds_conn, hb),
             "0" => {}
             "1" => {
                 let test_id = parsed.get(&fix::TAG_TEST_REQ_ID).cloned().unwrap_or_default();
@@ -652,7 +838,8 @@ impl HmdsState {
                                 if is_complete {
                                     self.pending_historical.remove(pos);
                                 }
-                                self.on_leg_bars(req_id, &leg_qid, &resp, xml_tag, shared, event_tx);
+                                let _ = leg_qid;
+                                self.on_leg_bars(req_id, &resp.query_id, &resp, xml_tag, shared, event_tx);
                                 return;
                             }
                             // Bar completion rides <eoq>true> in the final segmented
@@ -666,13 +853,44 @@ impl HmdsState {
                             if let Some(live) = self.live_bars.iter_mut().find(|l| l.req_id == req_id) {
                                 let (bars, sessions) = crate::control::historical::parse_series(xml_tag);
                                 live.series.extend(bars);
+                                live.series.sort_by_key(|b| b.start);
                                 live.sessions.extend(sessions);
                                 live.history_done |= is_complete;
                                 if live.reply_zone.is_empty() {
                                     live.reply_zone = resp.timezone.clone();
                                 }
                             }
+                            // An answer of delayed data (its first part says how
+                            // late): warning 2188 just before the end, as the
+                            // reference 10.51 (paper 15/10/2026, daily bars of
+                            // Japanese, Canadian and Australian stocks; ibx#703).
+                            if let Some(info) = self.bar_requests.iter_mut().find(|r| r.req_id == req_id) {
+                                info.delayed |= xml_tag.contains("<delay>");
+                                if is_complete && info.delayed {
+                                    shared.reference.push_historical_error(req_id, 2188, DELAYED_HISTORY.to_string());
+                                }
+                            }
+                            // The parts of an answer are not in time order (the
+                            // later bars first, paper, 16/10/2026, 5-second bars
+                            // of EUR.USD): the bars are given once the last part
+                            // came, in time order, as the reference.
+                            if let Some(info) = self.bar_requests.iter_mut().find(|r| r.req_id == req_id) {
+                                if !is_complete {
+                                    if !resp.timezone.is_empty() {
+                                        info.reply_zone = resp.timezone.clone();
+                                    }
+                                    info.held.append(&mut resp.bars);
+                                    return;
+                                }
+                                if !info.held.is_empty() {
+                                    let mut bars = std::mem::take(&mut info.held);
+                                    bars.append(&mut resp.bars);
+                                    bars.sort_by_key(|b| crate::control::historical::parse_server_time(&b.time).unwrap_or(i64::MIN));
+                                    resp.bars = bars;
+                                }
+                            }
                             self.write_bar_times(req_id, &mut resp, is_complete);
+                            self.round_bar_prices(req_id, &mut resp.bars, shared);
                             // Clone only when someone is listening on the event
                             // channel — a bar batch is a deep copy (ibx#242).
                             let for_event = clone_for_event(event_tx, &resp);
@@ -707,7 +925,7 @@ impl HmdsState {
                             if let Some(secs) = crate::control::historical::parse_server_time(&resp.head_timestamp) {
                                 resp.head_timestamp = crate::control::historical::head_timestamp_text(secs, format_date);
                                 // Kept for the next request; the later of two
-                                // values stays (`store.b.a(a, long)@19-66`).
+                                // values stays.
                                 if let Some(key) = key {
                                     let kept = self.head_ts_cache.entry(key).or_insert(secs);
                                     *kept = (*kept).max(secs);
@@ -808,6 +1026,12 @@ impl HmdsState {
                                 live.ticker_id = Some(ticker_id);
                                 live.min_tick = min_tick;
                                 live.farm = farm;
+                                // Its place on the stream, unless it took
+                                // one when its query was built (ibx#512).
+                                if live.joined == 0 {
+                                    self.live_joins += 1;
+                                    live.joined = self.live_joins;
+                                }
                                 matched = true;
                             }
                         }
@@ -836,7 +1060,8 @@ impl HmdsState {
                                 self.keep_up_to_date_reqs.remove(&req_id);
                                 self.live_bars.retain(|l| l.req_id != req_id);
                                 self.bar_requests.retain(|b| b.req_id != req_id);
-                                self.on_leg_failed(req_id, &leg_qid);
+                                let _ = leg_qid;
+                                self.on_leg_failed(req_id, qid);
                                 released = Some((req_id, 162, historical_service_error(&error_msg)));
                             } else if let Some(pos) = self.pending_head_ts.iter().position(|(q, _, _)| q == wid) {
                                 let (_, req_id, _) = self.pending_head_ts.remove(pos);
@@ -858,7 +1083,7 @@ impl HmdsState {
                                 let req_id = self.rtbar_subs.remove(pos).req_id;
                                 released = Some((req_id, 420, crate::control::historical::join_error_text(INVALID_REAL_TIME_QUERY, &error_msg)));
                             } else if let Some(pos) = self.pending_scanner.iter().position(|s| s.scan_id == *qid) {
-                                let req_id = self.pending_scanner.remove(pos).req_id;
+                                let req_id = self.drop_scanner(pos).req_id;
                                 released = Some((req_id, 162, error_msg.clone()));
                             } else if let Some(pos) = self.tbt_subscriptions.iter().position(|s| s.window_id == wid && s.query_pending) {
                                 // A refused tick-by-tick query ends its
@@ -937,7 +1162,6 @@ impl HmdsState {
                     }
                 }
             }
-            "G" => self.handle_rtbar_data(msg, shared, hmds_conn, hb),
             "T" => {
                 // The routing table, when it came after the logon (#445).
                 if let Some(text) = crate::engine::routing::table_text(msg) {
@@ -980,6 +1204,8 @@ impl HmdsState {
         sub.farm = farm;
         sub.min_tick = extract_xml_tag(xml, "minTick").and_then(|v| v.trim().parse().ok()).unwrap_or(0.01);
         sub.size_min_tick = extract_xml_tag(xml, "sizeMinTick").and_then(|v| v.trim().parse().ok());
+        sub.size_increment = sub.size_min_tick.and_then(crate::md_events::Increment::from_step);
+        sub.frac_size_min_tick = extract_xml_tag(xml, "fracSizeMinTick").and_then(|v| v.trim().parse().ok());
         (sub.last, sub.bid, sub.ask, sub.mid) = (0, 0, 0, 0);
         (sub.last_size, sub.bid_size, sub.ask_size) = (0, 0, 0);
         sub.holding = sub.history_wanted;
@@ -1075,8 +1301,9 @@ impl HmdsState {
                         continue;
                     };
                     (sub.last, sub.last_size) = (last, size);
+                    let size = if attribs & TBT_FRACTIONAL_SIZE != 0 { sub.fractional_trade_size(size) } else { sub.trade_size(size) };
                     TbtTick::Trade {
-                        price: sub.price(last), size: sub.size(size), time: entry.time, exchange, conditions,
+                        price: sub.price(last), size, time: entry.time, exchange, conditions,
                         past_limit: attribs & 1 != 0, unreported: attribs & 2 != 0,
                     }
                 }
@@ -1133,13 +1360,15 @@ impl HmdsState {
         let body = if let Some(pos) = sig_pos { &body[..pos] } else { body };
         let farm = self.rx_farm;
         let mut unknown: Vec<u32> = Vec::new();
-        for (ticker_id, timestamp, payload) in rtbar_entries(body) {
+        for (ticker_id, timestamp, payload) in by_rank(rtbar_entries(body)) {
             // Every request on the router gets the bar (ibx#454).
             let subs: Vec<(ReqId, f64)> = self.rtbar_subs.iter()
                 .filter(|s| farm == super::pool::PRIMARY_HMDS && s.ticker_id == Some(ticker_id))
                 .map(|s| (s.req_id, s.min_tick)).collect();
-            // A bar of quotes has no volume, average price or trade count:
-            // -1 each (captured 05/10/2026, MIDPOINT).
+            // A bar of quotes has no volume or average price, unset, and a
+            // trade count of -1 (the reference 10.51 to a client at level
+            // 214, 13/10/2026, MIDPOINT; the reference 10.40 gave -1 each,
+            // 05/10/2026; ibx#679).
             let trades = self.rtbar_subs.iter().find(|s| s.ticker_id == Some(ticker_id))
                 .is_none_or(|s| matches!(s.data, "Last" | "AggLast"));
             let live_tick = self.live_bars.iter()
@@ -1155,7 +1384,8 @@ impl HmdsState {
                 if let Some(mut bar) = crate::control::historical::decode_bar_payload(payload, min_tick) {
                     bar.timestamp = timestamp;
                     if !trades {
-                        (bar.volume, bar.wap, bar.count) = (-1.0, -1.0, -1);
+                        let none = if self.form_10_40 { -1.0 } else { f64::MAX };
+                        (bar.volume, bar.wap, bar.count) = (none, none, -1);
                     }
                     for &(req_id, _) in &subs {
                         shared.market.push_real_time_bar(req_id, bar);
@@ -1167,10 +1397,12 @@ impl HmdsState {
                     bar.timestamp = timestamp;
                     self.router_bars.retain(|(f, t, _, _)| !(*f == farm && *t == ticker_id));
                     self.router_bars.push((farm, ticker_id, timestamp, bar));
-                    let reqs: Vec<ReqId> = self.live_bars.iter()
+                    // In the order the requests joined the stream (ibx#512).
+                    let mut reqs: Vec<(u64, ReqId)> = self.live_bars.iter()
                         .filter(|l| l.farm == farm && l.ticker_id == Some(ticker_id) && l.history_done)
-                        .map(|l| l.req_id).collect();
-                    for req_id in reqs {
+                        .map(|l| (l.joined, l.req_id)).collect();
+                    reqs.sort_unstable();
+                    for (_, req_id) in reqs {
                         self.update_live_bar(req_id, timestamp, &bar, shared);
                     }
                 }
@@ -1199,7 +1431,28 @@ impl HmdsState {
         if let Some(info) = self.bar_requests.iter().find(|r| r.req_id == req_id) {
             out.time = info.bar_time(b.start, &reply_zone);
         }
+        self.round_bar_prices(req_id, std::slice::from_mut(&mut out), shared);
         shared.reference.push_historical_update(req_id, out);
+    }
+
+    /// The prices of a request's bars in the steps of the contract's
+    /// market rule, as the reference gives them to a client below session
+    /// level 224 (ibx#615; paper, 16/10/2026: EUR.USD bars of 1.125465 and
+    /// 1.125675 given as 1.12545 and 1.1257 at level 214, as they are at
+    /// level 225): the nearest step, in binary. Nothing when the rule is
+    /// not known, or from level 224.
+    fn round_bar_prices(&self, req_id: ReqId, bars: &mut [crate::control::historical::HistoricalBar], shared: &SharedState) {
+        if crate::client_core::session_level() >= crate::client_core::LEVEL_PRICE_FROM_DEFINITION {
+            return;
+        }
+        let Some(con_id) = self.bar_requests.iter().find(|r| r.req_id == req_id).map(|r| r.con_id).filter(|c| *c != 0) else { return };
+        for bar in bars {
+            for p in [&mut bar.open, &mut bar.high, &mut bar.low, &mut bar.close] {
+                if let Some(step) = shared.reference.price_step(con_id, *p) {
+                    *p = round_to_step(*p, step);
+                }
+            }
+        }
     }
 
     /// A keepUpToDate request whose history just ended takes the last
@@ -1213,8 +1466,13 @@ impl HmdsState {
 
     /// Write the bar times of an answer as the reference writes them, and,
     /// at its end, the start and end of the request (ibx#431).
-    fn write_bar_times(&self, req_id: ReqId, resp: &mut crate::control::historical::HistoricalResponse, is_complete: bool) {
-        let Some(info) = self.bar_requests.iter().find(|r| r.req_id == req_id) else { return };
+    fn write_bar_times(&mut self, req_id: ReqId, resp: &mut crate::control::historical::HistoricalResponse, is_complete: bool) {
+        let Some(info) = self.bar_requests.iter_mut().find(|r| r.req_id == req_id) else { return };
+        if resp.timezone.is_empty() {
+            resp.timezone = info.reply_zone.clone();
+        } else {
+            info.reply_zone = resp.timezone.clone();
+        }
         for bar in &mut resp.bars {
             if let Some(secs) = crate::control::historical::parse_server_time(&bar.time) {
                 bar.time = info.bar_time(secs, &resp.timezone);
@@ -1350,7 +1608,7 @@ impl HmdsState {
         self.tbt_subscriptions.push(TbtSub {
             instrument, con_id, window_id, query_id, tbt_type, ignore_size, farm, rt_ticker_id: None,
             query_pending: true, owner: Some(req_id), clients,
-            min_tick: 0.01, size_min_tick: None, last: 0, bid: 0, ask: 0, mid: 0,
+            min_tick: 0.01, size_min_tick: None, size_increment: None, frac_size_min_tick: None, last: 0, bid: 0, ask: 0, mid: 0,
             last_size: 0, bid_size: 0, ask_size: 0,
             history_wanted: number_of_ticks > 0, holding: false, held: Vec::new(), cancel_at: None,
         });
@@ -1458,24 +1716,23 @@ impl HmdsState {
             zone,
             start: crate::control::historical::duration_start(end, duration, &machine_zone),
             end,
+            delayed: false,
+            con_id,
+            reply_zone: String::new(), held: Vec::new(),
         });
         let end_date_time = crate::control::historical::server_time(end);
-        let qid = self.next_hmds_query_id;
-        self.next_hmds_query_id += 1;
+        // The query's name in the session series; the legs of one request
+        // share it, told apart by their chart names (the reference 10.51:
+        // "cf8;;EUR.USD@IDEALPRO Bid" and "cf8;;EUR.USD@IDEALPRO Ask").
+        let window = format!("cf{}", self.next_chart_query);
+        self.next_chart_query += 4;
 
         // One server query per leg: BID_ASK is a Bid query plus an Ask
         // query answered as one request (ibx#408).
         let legs = data_type.legs();
         let mut leg_states = Vec::with_capacity(legs.len());
-        for (i, &leg_type) in legs.iter().enumerate() {
-            let qid = if i == 0 {
-                qid
-            } else {
-                let q = self.next_hmds_query_id;
-                self.next_hmds_query_id += 1;
-                q
-            };
-            let query_id = format!("hist_{}", qid);
+        for &leg_type in legs.iter() {
+            let query_id = window.clone();
             let req = crate::control::historical::HistoricalRequest {
                 query_id: query_id.clone(),
                 con_id,
@@ -1512,6 +1769,24 @@ impl HmdsState {
             if keep_up_to_date {
                 self.keep_up_to_date_reqs.insert(req_id);
                 self.live_bars.retain(|l| l.req_id != req_id);
+                // The reference keeps the requests of one 5-second stream
+                // in the order they joined it, and gives each bar's updates
+                // in that order. A request joins when its query is built if
+                // the stream is already there, else when the stream's
+                // number comes for its own query: a later request can so
+                // pass an earlier one that still waits for its number
+                // (ibx#512; recording of 02/10/2026, requests of 1 hour,
+                // 1 min and 2 hours updated in the order first, third,
+                // second).
+                let stream = (con_id, leg_type, use_rth);
+                let running = self.live_bars.iter()
+                    .any(|l| l.farm == farm && l.ticker_id.is_some() && l.stream == stream);
+                let joined = if running {
+                    self.live_joins += 1;
+                    self.live_joins
+                } else {
+                    0
+                };
                 self.live_bars.push(LiveBars {
                     req_id,
                     window_id: query_id.clone(),
@@ -1525,6 +1800,8 @@ impl HmdsState {
                     sessions: Vec::new(),
                     history_done: false,
                     reply_zone: String::new(),
+                    stream,
+                    joined,
                 });
             }
             self.pending_historical.push((query_id, req_id));
@@ -1557,7 +1834,7 @@ impl HmdsState {
     ) {
         let Some(pos) = self.multi_leg.iter().position(|m| m.req_id == req_id) else { return };
         let m = &mut self.multi_leg[pos];
-        if let Some(leg) = m.legs.iter_mut().find(|l| l.query_id == leg_qid) {
+        if let Some(leg) = m.legs.iter_mut().find(|l| leg_of(l, leg_qid)) {
             let bars = crate::control::historical::parse_leg_bars(xml);
             if !bars.is_empty() {
                 m.frames.push((leg.data_type, bars));
@@ -1577,7 +1854,7 @@ impl HmdsState {
     fn on_leg_failed(&mut self, req_id: ReqId, leg_qid: &str) {
         let Some(pos) = self.multi_leg.iter().position(|m| m.req_id == req_id) else { return };
         let m = &mut self.multi_leg[pos];
-        if let Some(leg) = m.legs.iter_mut().find(|l| l.query_id == leg_qid) {
+        if let Some(leg) = m.legs.iter_mut().find(|l| leg_of(l, leg_qid)) {
             leg.state = LegState::Failed;
         }
         if m.legs.iter().all(|l| l.state != LegState::Pending) {
@@ -1615,6 +1892,7 @@ impl HmdsState {
             ..Default::default()
         };
         self.write_bar_times(m.req_id, &mut resp, true);
+        self.round_bar_prices(m.req_id, &mut resp.bars, shared);
         self.bar_requests.retain(|b| b.req_id != m.req_id);
         let for_event = clone_for_event(event_tx, &resp);
         shared.reference.push_historical_data(m.req_id, resp);
@@ -1649,7 +1927,10 @@ impl HmdsState {
         let mut waiting = Vec::new();
         self.pending_historical.retain(|(qid, rid)| {
             if *rid == req_id {
-                waiting.push(qid.clone());
+                // The legs of a request share their window: one cancel.
+                if !waiting.contains(qid) {
+                    waiting.push(qid.clone());
+                }
                 false
             } else {
                 true
@@ -1694,9 +1975,9 @@ impl HmdsState {
 
     /// A head timestamp request the store answers (ibx#486): the reference
     /// answers a contract, route, data and RTH flag it was given before
-    /// with the stored value and sends no query (`headtime.k.a(store.a,
-    /// long)@0-86`; captured 02/10/2026, b1_431_hist_format: the second
-    /// TRADES head timestamp of AAPL after the contract lookup, no 35=W).
+    /// with the stored value and sends no query (captured 02/10/2026,
+    /// b1_431_hist_format: the second
+    /// TRADES head timestamp of AAPL after the contract lookup, no historical query).
     /// False when the store has no value for it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn head_timestamp_from_cache(&self, req_id: ReqId, con_id: i64, sec_type: &str, exchange: &str, what_to_show: &str,
@@ -1728,7 +2009,7 @@ impl HmdsState {
                 // 321 with the text of the reference (ibx#430).
                 log::error!("head timestamp req_id={}: {}", req_id, e);
                 shared.reference.push_historical_error(
-                    req_id, 321, format!("Error validating request.-'bN' : cause - {}", e),
+                    req_id, 321, format!("Error validating request.-'ReqHeadTimestamp(87)' : cause - {}", e),
                 );
                 return;
             }
@@ -1768,58 +2049,176 @@ impl HmdsState {
                 (crate::control::scanner::TAG_SUB_PROTOCOL, "10001"),
             ]);
             self.pending_scanner_params = true;
+            self.scanner_params_followed = true;
             hb.last_hmds_sent = Instant::now();
             log::info!("Sent scanner params request");
         }
     }
 
-    /// A client asks for the scanner parameters (ibx#457): answered from
-    /// the cache of this connection, else one request goes out and every
-    /// waiting client gets its answer.
-    pub(crate) fn req_scanner_params(&mut self, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
-        if let Some(xml) = &self.scanner_params {
-            shared.reference.push_scanner_params(xml.clone());
+    /// The scanner parameters are needed and not known: their request
+    /// leaves `SCANNER_PARAMS_DELAY` after the first need, as the
+    /// reference's (ibx#553; recording of 26/09/2026: first subscription
+    /// at 0 ms, parameters asked at +1,039 ms). A later need before it
+    /// leaves does not move it.
+    fn need_scanner_params(&mut self, now: Instant, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+        if self.pending_scanner_params || self.scanner_params_due.is_some() {
             return;
         }
-        self.scanner_params_waiting += 1;
-        if !self.pending_scanner_params {
+        if self.scanner_params_delayed {
+            self.scanner_params_due = Some(now + SCANNER_PARAMS_DELAY);
+        } else {
             self.send_scanner_params_request(hmds_conn, hb);
         }
     }
 
-    fn on_scanner_params(&mut self, xml: &str, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
-        self.pending_scanner_params = false;
-        for _ in 0..std::mem::take(&mut self.scanner_params_waiting) {
-            shared.reference.push_scanner_params(xml.to_string());
+    /// Send the scanner parameters request once its delay has passed
+    /// (ibx#553). With the link down it is left to the link's return.
+    pub(crate) fn sweep_scanner_params(&mut self, now: Instant, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
+        self.scanner_now = Some(now);
+        if self.scanner_params_due.is_some_and(|due| now >= due) {
+            self.scanner_params_due = None;
+            if !self.pending_scanner_params && self.scanner_params.is_none() {
+                self.send_scanner_params_request(hmds_conn, hb);
+            }
         }
-        self.scan_size_limits = crate::control::scanner::scan_size_limits(xml);
-        self.scanner_params = Some(xml.to_string());
-        self.send_waiting_scanners(hmds_conn, hb);
+        // The requests that waited for the parameters, one at a time
+        // (ibx#572).
+        while self.scanner_release_due.is_some_and(|due| now >= due) {
+            self.scanner_release_due = None;
+            if self.release_next_scanner(hmds_conn, hb, shared) {
+                self.scanner_release_due = Some(now + SCANNER_NEXT_RELEASE);
+            }
+        }
+        // Later parameters requests answered from the kept text.
+        if let Some(xml) = &self.scanner_params {
+            let before = self.scanner_params_answers_due.len();
+            self.scanner_params_answers_due.retain(|due| now < *due);
+            for _ in self.scanner_params_answers_due.len()..before {
+                shared.reference.push_scanner_params(xml.clone());
+            }
+        }
     }
 
-    /// Send the subscriptions that are not on the wire yet. A subscription
-    /// goes out only once the scanner parameters are known, as the
-    /// reference does: its row count depends on the scan type's limit
-    /// there (ibx#456).
-    fn send_waiting_scanners(&mut self, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
-        if self.scanner_params.is_none() {
+    /// The next time a scanner delay ends (ibx#553, ibx#572), for the
+    /// clock of a replay.
+    pub(crate) fn next_scanner_due(&self) -> Option<Instant> {
+        [self.scanner_params_due, self.scanner_release_due].into_iter().flatten()
+            .chain(self.scanner_params_answers_due.iter().copied())
+            .min()
+    }
+
+    /// A client asks for the scanner parameters (ibx#457): answered from
+    /// the cache of this connection, else one request goes out and every
+    /// waiting client gets its answer.
+    pub(crate) fn req_scanner_params(&mut self, now: Instant, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
+        if let Some(xml) = &self.scanner_params {
+            // In a session opened by a logon, after the reference's time to
+            // read the text again (ibx#572).
+            if self.scanner_params_delayed {
+                self.scanner_params_answers_due.push(now + SCANNER_PARAMS_ANSWER);
+            } else {
+                shared.reference.push_scanner_params(xml.clone());
+            }
             return;
         }
-        for i in 0..self.pending_scanner.len() {
-            if self.pending_scanner[i].sent {
-                continue;
-            }
-            let sub = &mut self.pending_scanner[i];
-            let xml = sub.xml.get_or_insert_with(|| {
-                let limit = self.scan_size_limits.get(&sub.request.scan_code).copied();
-                let max_items = crate::control::scanner::scanner_max_items(sub.request.number_of_rows, limit);
-                crate::control::scanner::build_scanner_subscribe_xml(&sub.request, &sub.scan_id, max_items)
-            });
-            sub.sent = Self::send_scanner_xml(xml, hmds_conn, hb);
-            if sub.sent {
-                log::info!("Sent scanner subscribe: req_id={} scan_code={}", sub.req_id, sub.request.scan_code);
-            }
+        self.scanner_params_waiting += 1;
+        // It has its place among the scanner sessions until it is
+        // answered (ibx#552).
+        self.scanner_table.insert(crate::control::scanner::ScannerTable::PARAMS_REQUEST);
+        self.need_scanner_params(now, hmds_conn, hb);
+    }
+
+    /// The parameters answer: the requests that waited for it are taken in
+    /// the reference's walk (ibx#513), each a subscription sent or refused
+    /// or the parameters requests answered. In a session opened by a logon
+    /// the first is taken `SCANNER_FIRST_RELEASE` after the answer and each
+    /// next one `SCANNER_NEXT_RELEASE` later, the reference's times
+    /// (ibx#572); else all at once.
+    fn on_scanner_params(&mut self, xml: &str, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
+        self.pending_scanner_params = false;
+        self.scan_size_limits = crate::control::scanner::scan_size_limits(xml);
+        (self.scan_codes, self.filter_codes) = crate::control::scanner::parameter_codes(xml);
+        self.scanner_params = Some(xml.to_string());
+        if self.scanner_params_delayed {
+            let now = self.scanner_now.unwrap_or_else(Instant::now);
+            self.scanner_release_due = Some(now + SCANNER_FIRST_RELEASE);
+        } else {
+            self.send_waiting_scanners(hmds_conn, hb, shared);
         }
+    }
+
+    /// Take the next request that waited for the parameters, in the
+    /// reference's walk (ibx#513): a subscription is refused (162) or
+    /// sent; the parameters requests get their answer. True when another
+    /// one waits.
+    fn release_next_scanner(&mut self, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) -> bool {
+        use crate::control::scanner::ScannerTable;
+        let Some(xml) = self.scanner_params.clone() else { return false };
+        let params_waiting = self.scanner_params_waiting > 0;
+        let waits = |s: &Self, id: &str| (id == ScannerTable::PARAMS_REQUEST && params_waiting)
+            || s.pending_scanner.iter().any(|p| !p.sent && p.scan_id == id);
+        let Some(next) = self.scanner_table.ids().find(|id| waits(self, id)).map(str::to_string) else { return false };
+        if next == ScannerTable::PARAMS_REQUEST {
+            for _ in 0..std::mem::take(&mut self.scanner_params_waiting) {
+                shared.reference.push_scanner_params(xml.clone());
+            }
+            self.scanner_table.remove(ScannerTable::PARAMS_REQUEST);
+            self.unfollow_scanner_params_when_idle();
+        } else if let Some(pos) = self.pending_scanner.iter().position(|p| p.scan_id == next) {
+            self.release_scanner(pos, hmds_conn, hb, shared);
+        }
+        self.scanner_table.ids().any(|id| waits(self, id))
+    }
+
+    /// A subscription that waited for the parameters: refused when its
+    /// scan code or a filter is named nowhere in them (162 and the
+    /// subscription is gone, nothing sent; ibx#657, the reference 10.51,
+    /// paper, 14/10/2026: "Scanner type with code NOT_A_SCAN_CODE is
+    /// disabled.", "Scanner filter notAFilter is disabled."; a code of
+    /// another instrument, named in the parameters, is sent), else sent
+    /// with the row count of its scan type's limit there (ibx#456).
+    fn release_scanner(&mut self, pos: usize, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
+        let s = &self.pending_scanner[pos];
+        let refusal = if !self.scan_codes.is_empty() && !self.scan_codes.contains(&s.request.scan_code) {
+            Some(format!("Scanner type with code {} is disabled.", s.request.scan_code))
+        } else {
+            s.request.filters.iter().find(|(code, _)| !self.filter_codes.is_empty() && !self.filter_codes.contains(code))
+                .map(|bad| format!("Scanner filter {} is disabled.", bad.0))
+        };
+        if let Some(text) = refusal {
+            let sub = self.drop_scanner(pos);
+            log::warn!("Scanner subscription {} refused: {}", sub.req_id, text);
+            shared.reference.push_historical_error(sub.req_id, 162, historical_service_error(&text));
+            return;
+        }
+        let sub = &mut self.pending_scanner[pos];
+        let xml = sub.xml.get_or_insert_with(|| {
+            let limit = self.scan_size_limits.get(&sub.request.scan_code).copied();
+            let max_items = crate::control::scanner::scanner_max_items(sub.request.number_of_rows, limit);
+            crate::control::scanner::build_scanner_subscribe_xml(&sub.request, &sub.scan_id, max_items, shared.reference.form_10_40())
+        });
+        sub.sent = Self::send_scanner_xml(xml, hmds_conn, hb);
+        if sub.sent {
+            log::info!("Sent scanner subscribe: req_id={} scan_code={}", sub.req_id, sub.request.scan_code);
+        }
+    }
+
+    /// The parameters stop following the link when no scanner session is
+    /// left (ibx#554): kept across a loss from then on, until a request
+    /// for them is sent again.
+    fn unfollow_scanner_params_when_idle(&mut self) {
+        if self.scanner_table.ids().next().is_none() {
+            self.scanner_params_followed = false;
+        }
+    }
+
+    /// Take every request that waits for the parameters at once, in the
+    /// reference's walk (ibx#513): an engine built by hand, and a
+    /// subscription made once the parameters are known. A subscription
+    /// goes out only once the parameters are known, as the reference does:
+    /// its row count depends on the scan type's limit there (ibx#456).
+    fn send_waiting_scanners(&mut self, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
+        while self.release_next_scanner(hmds_conn, hb, shared) {}
     }
 
     /// Running scanner sessions for the concurrent limit: the
@@ -1837,7 +2236,7 @@ impl HmdsState {
         };
         let req_id = self.pending_scanner[pos].req_id;
         if !result.error_text.is_empty() {
-            self.pending_scanner.remove(pos);
+            self.drop_scanner(pos);
             shared.reference.push_historical_error(req_id, 162, historical_service_error(&result.error_text));
             return;
         }
@@ -1883,14 +2282,26 @@ impl HmdsState {
 
     /// Start a scanner subscription (ibx#456): sent at once when the
     /// scanner parameters are known, else after they arrive.
-    pub(crate) fn send_scanner_subscribe(&mut self, req_id: ReqId, client_id: i64, request: crate::control::scanner::ScannerSubscription, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_scanner_subscribe(&mut self, req_id: ReqId, client_id: i64, request: crate::control::scanner::ScannerSubscription, now: Instant, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
         let scan_id = crate::control::scanner::scanner_subscription_id(client_id, req_id);
+        self.scanner_table.insert(&scan_id);
         self.pending_scanner.push(ScannerSub { scan_id, req_id, request, xml: None, sent: false });
-        if self.scanner_params.is_some() {
-            self.send_waiting_scanners(hmds_conn, hb);
-        } else if !self.pending_scanner_params {
-            self.send_scanner_params_request(hmds_conn, hb);
+        if self.scanner_params.is_none() {
+            self.need_scanner_params(now, hmds_conn, hb);
+        } else if self.scanner_release_due.is_none() {
+            // While the requests that waited for the parameters are taken
+            // one at a time, a new one joins them (ibx#572).
+            self.send_waiting_scanners(hmds_conn, hb, shared);
         }
+    }
+
+    /// End the subscription at `pos`.
+    fn drop_scanner(&mut self, pos: usize) -> ScannerSub {
+        let sub = self.pending_scanner.remove(pos);
+        self.scanner_table.remove(&sub.scan_id);
+        self.unfollow_scanner_params_when_idle();
+        sub
     }
 
     pub(crate) fn send_scanner_cancel(&mut self, scan_id: &str, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
@@ -1918,7 +2329,7 @@ impl HmdsState {
                 format!("No scanner subscription found for ticker id:{}", req_id));
             return false;
         };
-        let sub = self.pending_scanner.remove(pos);
+        let sub = self.drop_scanner(pos);
         shared.reference.push_historical_error(req_id, 162,
             historical_service_error(&format!("API scanner subscription cancelled: {}", req_id)));
         if sub.sent {
@@ -1930,13 +2341,27 @@ impl HmdsState {
     }
 
     /// The historical data link is down (ibx#457): every live scanner is
-    /// told, and the parameters are asked again on the next connection.
+    /// told. The parameters are dropped when they follow the link (a
+    /// request for them was sent and a scanner session is left, ibx#554):
+    /// they are asked again after the return. A parameters request sent
+    /// and not answered is told too, under the reference's id of such a
+    /// request. The order of the notices is the reference's walk of its
+    /// listeners, which changes from one process to the next: ibx keeps
+    /// the order of the requests.
     pub(crate) fn scanner_link_lost(&mut self, shared: &SharedState) {
-        self.scanner_params = None;
+        self.scanner_params_told = self.scanner_params_waiting > 0 && self.pending_scanner_params;
+        if self.scanner_params_followed {
+            self.scanner_params = None;
+        }
         self.pending_scanner_params = false;
+        self.scanner_params_due = None;
+        self.scanner_release_due = None;
         for sub in &mut self.pending_scanner {
             sub.sent = false;
             shared.reference.push_historical_error(sub.req_id, 165, SCANNER_LINK_LOST.to_string());
+        }
+        if self.scanner_params_told {
+            shared.reference.push_historical_error(SCANNER_PARAMS_REQ_ID, 165, SCANNER_LINK_LOST.to_string());
         }
     }
 
@@ -1945,22 +2370,37 @@ impl HmdsState {
         for sub in &self.pending_scanner {
             shared.reference.push_historical_error(sub.req_id, 165, SCANNER_CONNECT_FAILED.to_string());
         }
+        if self.scanner_params_told {
+            shared.reference.push_historical_error(SCANNER_PARAMS_REQ_ID, 165, SCANNER_CONNECT_FAILED.to_string());
+        }
     }
 
-    /// The historical data link is back (ibx#457): every live scanner is
-    /// told and subscribed again; waiting parameters requests go out.
-    pub(crate) fn scanner_link_restored(&mut self, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
+    /// The historical data link is back (ibx#457, ibx#554): every live
+    /// scanner is told, and one that was on the wire is cancelled and
+    /// subscribed again at once, under its id; one that waited for the
+    /// parameters waits for them again. The parameters that follow the link
+    /// are asked again after the delay of a first need (ibx#553); when they
+    /// do not, a scanner that waits asks them as usual.
+    pub(crate) fn scanner_link_restored(&mut self, now: Instant, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
         for i in 0..self.pending_scanner.len() {
             let req_id = self.pending_scanner[i].req_id;
             shared.reference.push_historical_error(req_id, 165, SCANNER_LINK_RESTORED.to_string());
-            if let Some(xml) = &self.pending_scanner[i].xml {
-                let sent = Self::send_scanner_xml(xml, hmds_conn, hb);
-                self.pending_scanner[i].sent = sent;
+            if let Some(xml) = self.pending_scanner[i].xml.clone() {
+                let scan_id = self.pending_scanner[i].scan_id.clone();
+                self.send_scanner_cancel(&scan_id, hmds_conn, hb);
+                self.pending_scanner[i].sent = Self::send_scanner_xml(&xml, hmds_conn, hb);
             }
         }
+        if std::mem::take(&mut self.scanner_params_told) {
+            shared.reference.push_historical_error(SCANNER_PARAMS_REQ_ID, 165, SCANNER_LINK_RESTORED.to_string());
+        }
+        if self.scanner_params.is_some() || self.pending_scanner_params {
+            return;
+        }
         let waiting = self.scanner_params_waiting > 0 || self.pending_scanner.iter().any(|s| !s.sent);
-        if waiting && self.scanner_params.is_none() && !self.pending_scanner_params {
-            self.send_scanner_params_request(hmds_conn, hb);
+        if self.scanner_params_followed || waiting {
+            self.scanner_params_due = None;
+            self.need_scanner_params(now, hmds_conn, hb);
         }
     }
 
@@ -2174,7 +2614,7 @@ impl HmdsState {
             log::error!("histogram req_id={}: invalid time period {:?}", req_id, period);
             shared.reference.push_historical_error(
                 req_id, 321,
-                "Error validating request.-'bO' : cause - Invalid time period".to_string(),
+                "Error validating request.-'ReqHistogramData(88)' : cause - Invalid time period".to_string(),
             );
             return;
         }
@@ -2246,10 +2686,11 @@ impl HmdsState {
             shared.reference.push_historical_error(req_id, 10314, h::INVALID_END_DATE.to_string());
             return;
         }
-        let qid = self.next_hmds_query_id;
-        self.next_hmds_query_id += 1;
+        // In the session series of the bar queries (ibx#721).
+        let window = format!("cf{}", self.next_chart_query);
+        self.next_chart_query += 4;
         let query = h::TickQuery {
-            window_id: format!("tk_{}", qid),
+            window_id: window,
             symbol: symbol.to_string(),
             con_id,
             sec_type: sec_type.to_string(),
@@ -2283,7 +2724,7 @@ impl HmdsState {
         if crate::control::historical::realtime_bar_data(what_to_show).is_none() {
             log::error!("rtbar req_id={}: whatToShow {:?} refused", req_id, what_to_show);
             shared.reference.push_historical_error(req_id, 321,
-                "Error validating request.-'bS' : cause - What to show field is missing or incorrect.".to_string());
+                "Error validating request.-'ReqRealTimeBars(50)' : cause - What to show field is missing or incorrect.".to_string());
             return;
         }
         if self.rtbar_subs.iter().any(|s| s.req_id == req_id) {
@@ -2416,8 +2857,8 @@ fn reply_window_id(xml: &str) -> &str {
 }
 
 /// The key of a stored head timestamp: contract, route, data (as the
-/// API names it, upper case) and the RTH flag (`hmdscore.store.a(dy, flag,
-/// ...)`; the flag is useRTH for the contracts ibx asks).
+/// API names it, upper case) and the RTH flag, as the reference's store
+/// keys it (the flag is useRTH for the contracts ibx asks).
 type HeadTsKey = (i64, String, String, bool);
 
 fn head_ts_key(con_id: i64, sec_type: &str, exchange: &str, what_to_show: &str, use_rth: bool) -> HeadTsKey {
@@ -2428,6 +2869,26 @@ fn head_ts_key(con_id: i64, sec_type: &str, exchange: &str, what_to_show: &str, 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // ibx#613, ibx#604 (the reference 10.51, stock trades of 0.002 to
+    // 1.302122 shares, 19/10/2026): a tick-by-tick trade's fractional size
+    // is its whole part, at least 1, below session level 222 and kept from
+    // 222.
+    #[test]
+    fn a_fractional_tick_by_tick_size_is_whole_below_level_222_and_kept_from_it() {
+        let step = Some(0.00000001);
+        let inc = step.and_then(crate::md_events::Increment::from_step);
+        assert_eq!(trade_size_at(214, 40_000_000, step, inc), 1.0);
+        assert_eq!(trade_size_at(214, 160_000_000, step, inc), 1.0);
+        assert_eq!(trade_size_at(222, 40_000_000, step, inc), 0.4);
+        assert_eq!(trade_size_at(222, 160_000_000, step, inc), 1.6);
+        // The decimal the step gives, not the binary product of the two.
+        assert_ne!(2_600_000.0 * 0.00000001, 0.026);
+        assert_eq!(trade_size_at(225, 2_600_000, step, inc), 0.026);
+        // A whole size, or no increment: the same at both levels.
+        assert_eq!(trade_size_at(214, 300, None, None), 300.0);
+        assert_eq!(trade_size_at(222, 300, None, None), 300.0);
+    }
 
     fn make_query_error_msg(query_id: &str, error: &str) -> Vec<u8> {
         let xml = format!(
@@ -2481,7 +2942,7 @@ pub(crate) mod tests {
 
     #[test]
     fn conadj_response_frame_is_skipped_without_disturbing_pending() {
-        // ibx#183 / ib-agent#169: the 6040=10022 ConAdjResponse (corporate
+        // ibx#183 / ib-agent#169: the ConAdjResponse message (corporate
         // actions) is pushed once per contract on the first historical request.
         // It must be recognized and skipped, not treated as bar or completion.
         let mut hmds = HmdsState::new();
@@ -2536,7 +2997,11 @@ pub(crate) mod tests {
         let legs: Vec<&(String, ReqId)> =
             hmds.pending_historical.iter().filter(|(_, r)| *r == req_id).collect();
         assert_eq!(legs.len(), 2, "BID_ASK must go out as two queries");
-        (legs[0].0.clone(), legs[1].0.clone())
+        // One window for both legs, told apart by their chart names
+        // (ibx#721); the replies' whole ids.
+        assert_eq!(legs[0].0, legs[1].0);
+        let w = &legs[0].0;
+        (format!("{w};;SPX@CBOE Bid;;1;;true;;0;;I"), format!("{w};;SPX@CBOE Ask;;1;;true;;0;;I"))
     }
 
     #[test]
@@ -2545,6 +3010,7 @@ pub(crate) mod tests {
         let shared = SharedState::new();
         let (bid, ask) = send_bid_ask(&mut hmds, &shared, 5);
         assert_ne!(bid, ask);
+        assert!(bid.starts_with("cf4;;"), "{bid}");
         assert_eq!(hmds.multi_leg.len(), 1);
         let m = &hmds.multi_leg[0];
         assert_eq!(m.req_id, 5);
@@ -2686,8 +3152,8 @@ pub(crate) mod tests {
         let mut conn: Option<Connection> = None;
         send_bid_ask(&mut hmds, &shared, 9);
         let cancels = hmds.cancel_bar_request(9, &shared);
-        assert_eq!(cancels.len(), 2, "each waiting leg is cancelled by its id: {cancels:?}");
-        assert!(cancels[0].1.contains("<CancelQuery><id>hist_1000</id></CancelQuery>"), "{:?}", cancels);
+        assert_eq!(cancels.len(), 1, "the legs' window is cancelled once: {cancels:?}");
+        assert!(cancels[0].1.contains("<CancelQuery><id>cf4</id></CancelQuery>"), "{:?}", cancels);
         assert!(hmds.pending_historical.is_empty());
         assert!(hmds.multi_leg.is_empty());
         let _ = (&mut hb, &mut conn);
@@ -2705,7 +3171,7 @@ pub(crate) mod tests {
         assert!(hmds.pending_historical.is_empty() && hmds.live_bars.is_empty());
         // ibx#429: the reference's refusal.
         assert_eq!(shared.reference.drain_historical_errors(), vec![(12, 321,
-            "Error validating request.-'bM' : cause - Source price not supported with live updates".to_string())]);
+            "Error validating request.-'ReqHistoricalData(20)' : cause - Source price not supported with live updates".to_string())]);
     }
 
     #[test]
@@ -3014,7 +3480,7 @@ pub(crate) mod tests {
         hmds.send_histogram_request(8, 265598, "STK", "SMART", true, "abc", &mut conn, &mut hb, &shared);
         assert!(hmds.pending_histogram.is_empty(), "no query");
         assert_eq!(shared.reference.drain_historical_errors(), vec![(
-            8, 321, "Error validating request.-'bO' : cause - Invalid time period".to_string(),
+            8, 321, "Error validating request.-'ReqHistogramData(88)' : cause - Invalid time period".to_string(),
         )]);
     }
 
@@ -3038,6 +3504,13 @@ pub(crate) mod tests {
 
     fn rt_sub(query_id: &str, req_id: ReqId, ticker_id: Option<u32>) -> RtBarSub {
         RtBarSub { query_id: query_id.to_string(), req_id, con_id: 265598, data: "Last", use_rth: true, ticker_id, min_tick: 0.01 }
+    }
+
+    #[test]
+    fn bars_of_a_frame_by_rank() {
+        let e = vec![(1u32, 350u32, 'a'), (1, 355, 'b'), (2, 355, 'c'), (1, 360, 'd'), (3, 355, 'e')];
+        let order: Vec<char> = by_rank(e).into_iter().map(|(_, _, x)| x).collect();
+        assert_eq!(order, ['a', 'c', 'e', 'b', 'd']);
     }
 
     #[test]
@@ -3075,6 +3548,25 @@ pub(crate) mod tests {
         let got: Vec<(ReqId, u32)> = bars.iter().map(|(r, b)| (*r, b.timestamp)).collect();
         assert_eq!(got, vec![(11, 100), (12, 105)]);
         assert!((bars[0].1.close - 150.0).abs() < 1e-9, "{:?}", bars[0].1);
+    }
+
+    // ibx#679: a bar of quotes (MIDPOINT) has its volume and average price
+    // unset and a count of -1, as the reference 10.51 gives it to a client
+    // at level 214 (13/10/2026); -1 each in the 10.40 form.
+    #[test]
+    fn a_bar_of_quotes_has_no_volume_or_average() {
+        for (form_10_40, none) in [(false, f64::MAX), (true, -1.0)] {
+            let mut hmds = HmdsState::new();
+            hmds.form_10_40 = form_10_40;
+            let shared = SharedState::new();
+            let mut hb = HeartbeatState::new();
+            let mut conn: Option<Connection> = None;
+            hmds.rtbar_subs.push(RtBarSub { data: "Midpoint", ..rt_sub("rt_1", 11, Some(5)) });
+            let payload = single_price_payload(15000, 100);
+            hmds.process_hmds_message(&rtbar_frame(&[(5, 100, &payload)]), &mut conn, &shared, &None, &mut hb);
+            let bars = shared.market.drain_real_time_bars();
+            assert_eq!((bars[0].1.volume, bars[0].1.wap, bars[0].1.count), (none, none, -1));
+        }
     }
 
     /// Payload of a bar with one trade, at `low_ticks` price increments
@@ -3147,7 +3639,7 @@ pub(crate) mod tests {
         // A request on an existing router does not add one.
         hmds.send_realtime_bar_subscribe(5, 265598, "STK", "SMART", "AAPL", "TRADES", true, &mut conn, &mut hb, &shared);
         assert_eq!(shared.reference.drain_historical_errors(), vec![
-            (1, 321, "Error validating request.-'bS' : cause - What to show field is missing or incorrect.".to_string()),
+            (1, 321, "Error validating request.-'ReqRealTimeBars(50)' : cause - What to show field is missing or incorrect.".to_string()),
             (2, 102, "Duplicate ticker id".to_string()),
             (4, 456, "Max number of real time requests has been reached".to_string()),
         ]);
@@ -3227,7 +3719,7 @@ pub(crate) mod tests {
         let errors = shared.reference.drain_historical_errors();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].1, 321);
-        assert!(errors[0].2.starts_with("Error validating request.-'bM' : cause - Historical data bar size setting is invalid."),
+        assert!(errors[0].2.starts_with("Error validating request.-'ReqHistoricalData(20)' : cause - Historical data bar size setting is invalid."),
             "got: {}", errors[0].2);
         assert!(shared.reference.drain_historical_data().is_empty(), "a refusal has no end");
     }
@@ -3264,7 +3756,7 @@ pub(crate) mod tests {
         hmds.send_head_timestamp_request(4, 265598, "STK", "SMART", "TRADE", true, 1, &mut conn, &mut hb, &shared);
         assert!(hmds.pending_head_ts.is_empty());
         assert_eq!(shared.reference.drain_historical_errors(), vec![(
-            4, 321, "Error validating request.-'bN' : cause - What to show value of TRADE rejected.".to_string(),
+            4, 321, "Error validating request.-'ReqHeadTimestamp(87)' : cause - What to show value of TRADE rejected.".to_string(),
         )]);
     }
 
@@ -3316,12 +3808,41 @@ pub(crate) mod tests {
         hmds.keep_up_to_date_reqs.insert(req_id);
         hmds.bar_requests.push(BarRequestInfo {
             req_id, format_date: 1, intraday: bar_size.is_intraday(), zone: Some("US/Eastern".into()), start: 0, end: 0,
+            delayed: false, con_id: 0, reply_zone: String::new(), held: Vec::new(),
         });
         hmds.live_bars.push(LiveBars {
             req_id, window_id: window_id.to_string(), query_id: format!("{window_id};;AAPL@SMART {label};;1;;true;;0;;I"),
             farm: super::super::pool::PRIMARY_HMDS, ticker_id: None, min_tick: 0.01, bar_size, trades,
             series: Vec::new(), sessions: Vec::new(), history_done: false, reply_zone: String::new(),
+            stream: (265598, if trades { crate::control::historical::BarDataType::Trades }
+                else { crate::control::historical::BarDataType::Midpoint }, true),
+            joined: 0,
         });
+    }
+
+    // ibx#615 (the reference 10.51, paper, 16/10/2026, EUR.USD 1 min
+    // MIDPOINT bars): at level 214 the prices in the market rule's steps
+    // of 0.00005, the nearest one in binary; level 225 gave 1.125465,
+    // 1.125675, 1.125435, 1.12562 for 1.12545, 1.1257, 1.12545, 1.1256.
+    #[test]
+    fn bar_prices_in_the_market_rule_steps_below_level_224() {
+        crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+        for (v, want) in [(1.125465, 1.12545), (1.125675, 1.1257), (1.125435, 1.12545), (1.12562, 1.1256), (773.38, 773.38),
+                          (1.125325, 1.1253), (1.124875, 1.1249), (1.125525, 1.12555), (1.125025, 1.12505)] {
+            let step = if v > 100.0 { 0.01 } else { 0.00005 };
+            assert_eq!(round_to_step(v, step), want, "{v}");
+        }
+        let shared = SharedState::new();
+        shared.reference.push_market_rules(vec![crate::control::contracts::MarketRule {
+            rule_id: 239, price_increments: vec![crate::control::contracts::PriceIncrement { low_edge: 0.0, increment: 0.00005 }],
+            ..Default::default()
+        }]);
+        shared.reference.note_contract_rule(12087792, 239);
+        let mut hmds = HmdsState::new();
+        hmds.bar_requests.push(BarRequestInfo { req_id: 7, format_date: 1, intraday: true, zone: None, start: 0, end: 0, delayed: false, con_id: 12087792, reply_zone: String::new(), held: Vec::new() });
+        let mut bars = vec![crate::control::historical::HistoricalBar { time: String::new(), open: 1.125465, high: 1.125675, low: 1.125435, close: 1.12562, volume: -1, wap: -1.0, count: -1 }];
+        hmds.round_bar_prices(7, &mut bars, &shared);
+        assert_eq!((bars[0].open, bars[0].high, bars[0].low, bars[0].close), (1.12545, 1.1257, 1.12545, 1.1256));
     }
 
     // ibx#429 (scenario b1_429_keep_up_to_date): four keepUpToDate
@@ -3333,6 +3854,8 @@ pub(crate) mod tests {
         use crate::control::historical::BarSize;
         let mut hmds = HmdsState::new();
         let shared = SharedState::new();
+        let (tx, events) = crossbeam_channel::unbounded();
+        shared.attach_event_channel(&tx);
         let mut hb = HeartbeatState::new();
         let mut conn: Option<Connection> = None;
         recorded_live(&mut hmds, 9530, "cf60", "Trades", BarSize::Hour1, true);
@@ -3390,6 +3913,20 @@ pub(crate) mod tests {
             }
         }
         assert!(shared.reference.drain_historical_updates().is_empty());
+        // The event channel (ibx#576): each request's updates come before
+        // its 162, none after it. An update written between a client's
+        // cancel call and the engine's handling of it is on the channel
+        // before the 162, as the reference's socket gives what it wrote
+        // before it took the cancel.
+        let mut cancelled_at = std::collections::HashMap::new();
+        for (i, e) in events.try_iter().enumerate() {
+            match e {
+                Event::Error { req_id, code: 162, .. } => { cancelled_at.insert(req_id, i); }
+                Event::HistoricalUpdate { req_id, .. } => assert!(!cancelled_at.contains_key(&req_id), "update of {req_id} after its 162"),
+                _ => {}
+            }
+        }
+        assert_eq!(cancelled_at.len(), 4);
     }
 
     // ibx#432 (scenario b1_432_hist_ticks): every reply frame of a tick
@@ -3445,7 +3982,9 @@ pub(crate) mod tests {
             hmds.pending_historical.push((w.to_string(), req));
             let duration = if intraday { "1 d" } else { "1 m" };
             hmds.bar_requests.push(BarRequestInfo { req_id: req, format_date, intraday, zone: Some("US/Eastern".into()),
-                start: crate::control::historical::duration_start(end, duration, "Europe/Paris"), end });
+                start: crate::control::historical::duration_start(end, duration, "Europe/Paris"), end,
+            delayed: false, con_id: 0, reply_zone: String::new(), held: Vec::new(),
+        });
         }
         hmds.pending_head_ts.push(("TickHeadClient1".to_string(), 9544, Instant::now() + HEAD_TIMESTAMP_TIMEOUT));
         hmds.head_ts_format.insert(9544, 2);
@@ -3474,6 +4013,64 @@ pub(crate) mod tests {
         assert_eq!(shared.reference.drain_historical_errors()[0].1, 366);
     }
 
+    // ibx#703 (the reference 10.51, paper 15/10/2026, daily bars of 7203 on
+    // TSEJ): an answer whose first part says its data are delayed gets
+    // warning 2188 just before its end; an answer without it gets none.
+    #[test]
+    fn delayed_bars_get_2188_before_their_end() {
+        let mut hmds = HmdsState::new();
+        let shared = SharedState::new();
+        let mut hb = HeartbeatState::new();
+        let mut conn: Option<Connection> = None;
+        let part = |id: &str, eoq: bool, head: &str, bar: bool| {
+            let bars = if bar {
+                "<Bar><time>20261014-00:00:00</time><open>1</open><close>1</close><high>1</high><low>1</low><weightedAvg>1</weightedAvg><volume>-1</volume><count>-1</count></Bar>"
+            } else { "" };
+            let xml = format!("<ResultSetBar><id>{id};;7203.T@SMART Midpoint;;1;;true;;0;;I</id><eoq>{eoq}</eoq>{head}<Events>{bars}</Events></ResultSetBar>");
+            crate::protocol::fix::fix_build(&[(35, "W"), (6118, xml.as_str())], 1)
+        };
+        for (w, req) in [("cf16", 7303), ("cf20", 7304)] {
+            hmds.pending_historical.push((w.to_string(), req));
+            hmds.bar_requests.push(BarRequestInfo { req_id: req, format_date: 1, intraday: false, zone: None, start: 0, end: 0, delayed: false, con_id: 0, reply_zone: String::new(), held: Vec::new() });
+        }
+        for msg in [part("cf16", false, "<tz>Japan</tz><delay>1200</delay>", false), part("cf16", true, "", true),
+            part("cf20", false, "<tz>MET</tz>", false), part("cf20", true, "", true)]
+        {
+            hmds.process_hmds_message(&msg, &mut conn, &shared, &None, &mut hb);
+        }
+        assert_eq!(shared.reference.drain_historical_errors(), [(7303, 2188,
+            "Up-to-the-second historical data requires additional subscription for the API.".to_string())]);
+        let ends: Vec<ReqId> = shared.reference.drain_historical_data().iter().filter(|(_, d)| d.is_complete).map(|(r, _)| *r).collect();
+        assert_eq!(ends, [7303, 7304]);
+    }
+
+    // ibx#615 (paper, 16/10/2026, 5-second midpoint bars of EUR.USD): the
+    // zone is named by the answer's first part only, and the first part has
+    // the later bars. The reference gives every bar once the last part
+    // came, in time order and in that zone, not in the machine's zone.
+    #[test]
+    fn bars_of_the_parts_in_time_order_and_the_first_parts_zone() {
+        let mut hmds = HmdsState::new();
+        let shared = SharedState::new();
+        let mut hb = HeartbeatState::new();
+        let mut conn: Option<Connection> = None;
+        let part = |eoq: bool, head: &str, time: &str| {
+            let bars = format!("<Bar><time>{time}</time><open>1</open><close>1</close><high>1</high><low>1</low><weightedAvg>1</weightedAvg><volume>-1</volume><count>-1</count></Bar>");
+            let xml = format!("<ResultSetBar><id>cf16;;@IDEALPRO Midpoint;;1;;true;;0;;I</id><eoq>{eoq}</eoq>{head}<Events>{bars}</Events></ResultSetBar>");
+            crate::protocol::fix::fix_build(&[(35, "W"), (6118, xml.as_str())], 1)
+        };
+        hmds.pending_historical.push(("cf16".to_string(), 7305));
+        hmds.bar_requests.push(BarRequestInfo { req_id: 7305, format_date: 1, intraday: true, zone: None, start: 0, end: 0,
+            delayed: false, con_id: 0, reply_zone: String::new(), held: Vec::new() });
+        for msg in [part(false, "<tz>US/Eastern</tz>", "20261016-10:56:05"), part(true, "", "20261016-10:56:00")] {
+            hmds.process_hmds_message(&msg, &mut conn, &shared, &None, &mut hb);
+        }
+        let data = shared.reference.drain_historical_data();
+        assert_eq!(data.len(), 1, "one answer, at its last part");
+        let times: Vec<&str> = data[0].1.bars.iter().map(|b| b.time.as_str()).collect();
+        assert_eq!(times, ["20261016 06:56:00 US/Eastern", "20261016 06:56:05 US/Eastern"]);
+    }
+
     #[test]
     fn a_waiting_one_shot_request_is_cancelled_by_its_query_id() {
         let mut hmds = HmdsState::new();
@@ -3484,7 +4081,7 @@ pub(crate) mod tests {
             true, false, "AAPL", &mut conn, &mut hb, &shared, false, 1, None, super::super::pool::PRIMARY_HMDS);
         let cancels = hmds.cancel_bar_request(5, &shared);
         assert_eq!(cancels.len(), 1);
-        assert!(cancels[0].1.ends_with("<ListOfCancelQueries><CancelQuery><id>hist_1000</id></CancelQuery></ListOfCancelQueries>"), "{:?}", cancels);
+        assert!(cancels[0].1.ends_with("<ListOfCancelQueries><CancelQuery><id>cf4</id></CancelQuery></ListOfCancelQueries>"), "{:?}", cancels);
         assert_eq!(shared.reference.drain_historical_errors(), vec![(5, 162,
             "Historical Market Data Service error message:API historical data query cancelled: 5".to_string())]);
     }

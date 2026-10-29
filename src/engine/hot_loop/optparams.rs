@@ -1,8 +1,8 @@
 //! Option chain parameters on the auth connection (ibx#440), as the
 //! reference runs them (`feature.derivatives`): per underlying, the
-//! derivative query (6040=5, kept per symbol until the auth link drops),
+//! derivative query (kept per symbol until the auth link drops),
 //! then its legs one at a time: a definition lookup per stock, future,
-//! currency or index leg, a chain query (6040=138) per option leg. The
+//! currency or index leg, a chain query per option leg. The
 //! chain answers stay with the underlying, so a later request is answered
 //! without the legs again. No timeout, as in the reference.
 
@@ -22,12 +22,12 @@ use super::HeartbeatState;
 /// option calculation lookups.
 pub(crate) const OPTPARAMS_LOOKUP_FIRST_ID: u32 = 0xB000_0000;
 pub(crate) const OPTPARAMS_LOOKUP_IDS: u32 = 0x1000_0000;
-/// Underlyings kept before the idle ones go (`jutils.thread.c`).
+/// Underlyings kept before the idle ones go.
 const KEPT_UNDERLYINGS: usize = 100;
 /// An underlying idle this long can go once more than 100 are kept.
 const IDLE_UNDERLYING: Duration = Duration::from_secs(60);
 
-/// An underlying of the reference (`feature.derivatives.T`): conId,
+/// An underlying as the reference keeps it: conId,
 /// symbol in upper case, type and the futures option exchange.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Underlying {
@@ -38,18 +38,18 @@ pub(crate) struct Underlying {
 }
 
 impl Underlying {
-    /// The derivative type whose leg must have data (`T.g()`).
+    /// The derivative type whose leg must have data.
     fn derivative(&self) -> &'static str {
         if self.sec_type == "FUT" { "FOP" } else { "OPT" }
     }
 
-    /// The exchange of the default chain query (`T.l()`): a future's only.
+    /// The exchange of the default chain query: a future's only.
     fn query_exchange(&self) -> &str {
         if self.sec_type == "FUT" { &self.exchange } else { "" }
     }
 
-    /// The chain key and query of a leg on an exchange (`T.a(String)`,
-    /// `feature.derivatives.D.b()`/`c()`).
+    /// The chain key and query of a leg on an exchange, as the reference
+    /// builds them.
     fn chain_key(&self, leg: &str, exchange: &str) -> (ChainKey, ChainKey) {
         let fop_of_other = leg == "FOP" && self.sec_type != "FUT";
         let query = ChainKey {
@@ -79,7 +79,7 @@ enum LegStatus {
 struct Leg {
     kind: &'static str,
     status: LegStatus,
-    /// Futures option exchanges of this run (6589).
+    /// Futures option exchanges of this run.
     exchanges: Vec<String>,
 }
 
@@ -100,8 +100,8 @@ struct Entry {
 #[derive(Debug, Default)]
 pub(crate) struct OptParams {
     entries: HashMap<Underlying, Entry>,
-    /// Derivative answers by symbol, until the auth link drops
-    /// (`jclient.mw`).
+    /// Derivative answers by symbol, until the auth link drops, as the
+    /// reference keeps them.
     by_symbol: HashMap<String, UnderlyingAnswer>,
     /// Derivative queries sent, by symbol, and the underlyings waiting.
     asked: HashMap<String, Vec<Underlying>>,
@@ -196,7 +196,7 @@ impl OptParams {
     }
 
     /// A leg joins the underlying unless it is already filled
-    /// (`feature.derivatives.a.b(eh)`).
+    ///.
     fn add_leg(entry: &mut Entry, kind: &'static str, exchanges: Vec<String>) {
         match entry.legs.iter_mut().find(|l| l.kind == kind) {
             Some(leg) => {
@@ -209,7 +209,7 @@ impl OptParams {
         }
     }
 
-    /// A derivative answer (6040=5): kept by symbol; the underlyings that
+    /// A derivative answer: kept by symbol; the underlyings that
     /// wait for it go on.
     pub(crate) fn underlying_reply(
         &mut self, msg: &[u8], conn: &mut Option<Connection>, connected: bool, hb: &mut HeartbeatState, shared: &SharedState,
@@ -263,9 +263,9 @@ impl OptParams {
     }
 
     /// The definition lookup of a stock, future, currency or index leg
-    /// (`jclient.ph`): symbol, conId, type, and the futures option
-    /// exchange except for a future. Not sent: the leg waits, as in the
-    /// reference.
+    ///: symbol, conId, type, and the futures
+    /// option exchange except for a future. Not sent: the leg waits, as in
+    /// the reference.
     fn send_lookup_leg(
         &mut self, under: &Underlying, kind: &'static str, conn: &mut Option<Connection>, connected: bool, hb: &mut HeartbeatState,
     ) {
@@ -352,7 +352,7 @@ impl OptParams {
         true
     }
 
-    /// A chain answer (6040=139), matched to its query by key: kept with
+    /// A chain answer, matched to its query by key: kept with
     /// each underlying that waits for it; its leg is filled with the first
     /// answer (the rows are built from every answer kept).
     pub(crate) fn chain_reply(
@@ -381,7 +381,7 @@ impl OptParams {
 
     /// Every leg filled: the rows of each waiting request, then its end;
     /// or 322 when the option leg (or a futures option leg) has no data
-    /// (`feature.derivatives.l.a(boolean)`).
+    ///.
     fn finish(&mut self, under: &Underlying, shared: &SharedState) {
         let Some(entry) = self.entries.get_mut(under) else { return };
         let missing = |kind: &str| entry.legs.iter().any(|l| l.kind == kind) && !entry.answers.contains_key(kind);
@@ -391,7 +391,7 @@ impl OptParams {
             return;
         }
         // Option rows when the request has no futures option exchange,
-        // else futures option rows (`jextend.cp.a(s)`).
+        // else futures option rows.
         let kind = if under.exchange.is_empty() { "OPT" } else { "FOP" };
         let (no_magnifier_fix, island_to_nasdaq) = shared.reference.option_chain_features();
         let rows = optparams::chain_rows(entry.answers.get(kind).map(Vec::as_slice).unwrap_or(&[]), no_magnifier_fix, island_to_nasdaq);
@@ -417,7 +417,7 @@ impl OptParams {
     }
 
     /// The auth link dropped: the derivative answers are forgotten
-    /// (`jclient.mw.a()`); the chain answers stay.
+    /// (as the reference does); the chain answers stay.
     pub(crate) fn connection_lost(&mut self) {
         self.by_symbol.clear();
     }
@@ -465,7 +465,11 @@ mod tests {
     }
 
     fn scenario(name: &str) -> Vec<Record> {
-        let path = format!("{}/tests/fixtures/gw1040/scenarios/{}", env!("CARGO_MANIFEST_DIR"), name);
+        // A recording of 10.51 under gw1051/ (ibx#604).
+        let path = match name.strip_prefix("gw1051/") {
+            Some(rest) => format!("{}/tests/fixtures/gw1051/scenarios/{}", env!("CARGO_MANIFEST_DIR"), rest),
+            None => format!("{}/tests/fixtures/gw1040/scenarios/{}", env!("CARGO_MANIFEST_DIR"), name),
+        };
         let text = std::fs::read_to_string(&path).unwrap();
         let b64 = |v: &serde_json::Value| base64::engine::general_purpose::STANDARD.decode(v.as_str().unwrap_or("")).unwrap();
         text.lines().skip(1).map(|line| {
@@ -581,7 +585,8 @@ mod tests {
             }
             let got = sent(&mut server);
             match k {
-                0 => assert_eq!(got, [outs[1].replace(&recorded_id, &own_id)], "the stock leg lookup"),
+                // Named in the session series on the wire (ibx#698).
+                0 => assert_eq!(got, [outs[1].replace(&recorded_id, "FixSecDefReqBySymbol1")], "the stock leg lookup"),
                 1 => assert_eq!(got, [outs[2].clone()], "the option leg query after the lookup answer"),
                 _ => assert!(got.is_empty(), "{got:?}"),
             }
@@ -612,6 +617,8 @@ mod tests {
     // each of the trading classes AAPL and 2AAPL.
     #[test]
     fn aapl_chain_as_the_reference() {
+        // Recorded again on 10.51 at level 225 (19/10/2026, ibx#604).
+        replay("gw1051/20261019rth/option_chain_aapl.jsonl", "AAPL", 265598);
         replay("20260928/option_chain_aapl.jsonl", "AAPL", 265598);
         let (rows, _) = recorded_rows(&scenario("20260928/option_chain_aapl.jsonl"));
         assert_eq!(rows.len(), 41);
@@ -665,7 +672,8 @@ mod tests {
             ccp.process_ccp_message(text.replace('|', "\x01").as_bytes(), conn, &mut context, &shared, &None, hb, "DU1");
         };
         feed("8=FIX.4.1|9=1|35=U|52=20260928-14:11:14|6040=5|55=XYZ|6457=99|6070=OPT;STK;|10=0|", &mut conn, &mut hb);
-        let id = format!("FixSecDefReqBySymbol{}", OPTPARAMS_LOOKUP_FIRST_ID);
+        // Named in the session series on the wire; its answer maps back (ibx#698).
+        let id = "FixSecDefReqBySymbol1";
         assert_eq!(sent(&mut server), [format!("35=c|320={id}|321=2|55=XYZ|6457=99|167=CS")]);
         feed(&format!("8=FIX.4.1|9=1|35=d|52=20260928-14:11:14|320={id}|322=*|323=4|55=XYZ|167=STK|207=BEST|6008=99|15=USD|10=0|"), &mut conn, &mut hb);
         assert_eq!(sent(&mut server), ["35=U|6040=138|55=XYZ|310=STK|6346=99|6320=1|6994=1"]);
@@ -704,7 +712,8 @@ mod tests {
         assert_eq!(sent(&mut server), ["35=U|6040=5|55=XYZ|310=STK|6457=99|6320=1"]);
         op.underlying_reply(answer.replace('|', "\x01").as_bytes(), &mut conn, true, &mut hb, &shared);
         let lookup = sent(&mut server);
-        assert_eq!(lookup, [format!("35=c|320=FixSecDefReqBySymbol{}|321=2|55=XYZ|6457=99|167=CS", OPTPARAMS_LOOKUP_FIRST_ID)]);
+        // Named in the session series on the wire (ibx#698).
+        assert!(lookup.len() == 1 && lookup[0].starts_with("35=c|320=FixSecDefReqBySymbol") && lookup[0].ends_with("|321=2|55=XYZ|6457=99|167=CS"), "{lookup:?}");
         assert!(op.leg_reply(&format!("FixSecDefReqBySymbol{}", OPTPARAMS_LOOKUP_FIRST_ID), &mut conn, true, &mut hb, &shared));
         assert_eq!(shared.reference.drain_option_chains(), [(3, vec![])]);
         // The answer is forgotten when the auth link drops.

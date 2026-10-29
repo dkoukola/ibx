@@ -71,6 +71,9 @@ fn main() {
     let client = EClient::connect(&EClientConfig {
         username: env::var("IB_USERNAME").unwrap(), password: env::var("IB_PASSWORD").unwrap(),
         host: "cdc1.ibllc.com".into(), paper: true, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     }).unwrap();
     if !client.account_id.starts_with("DU") { client.disconnect(); panic!("not a paper account"); }
     let s = Arc::new(Mutex::new(S::default()));
@@ -103,10 +106,13 @@ fn main() {
 
     println!("\n=== req_executions");
     client.req_executions(9, &ExecutionFilter::default(), &mut w);
+    client.process_msgs(&mut w);
     println!("\n=== req_executions side=BUY");
     client.req_executions(10, &ExecutionFilter { side: "BUY".into(), ..Default::default() }, &mut w);
+    client.process_msgs(&mut w);
     println!("\n=== req_executions side=SELL");
     client.req_executions(11, &ExecutionFilter { side: "SELL".into(), ..Default::default() }, &mut w);
+    client.process_msgs(&mut w);
 
     let st = s.lock().unwrap();
     let matched = st.execs.iter().filter(|e| st.reports.iter().any(|(r, _, _)| r == *e)).count();

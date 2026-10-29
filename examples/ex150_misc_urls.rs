@@ -1,4 +1,4 @@
-//! Issue #150 — verify FIX tag 6321 (PRIV_LAB_MISC_URLS) is parsed at logon.
+//! Issue #150 — verify the logon's miscellaneous URL field is parsed.
 //!
 //! Connects, prints the populated misc_urls map and the region_dam lookup
 //! used by webapp REST consumers.
@@ -16,6 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = EClient::connect(&EClientConfig {
         username, password, host, paper: true, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     })?;
 
     println!("ccp_session_id: {:?}", client.ccp_session_id());

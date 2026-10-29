@@ -36,8 +36,11 @@ def test_requests_wait_for_the_order_replay():
     w, c = client()
     c._test_set_open_orders_held(True)
     c.req_open_orders()
+    c._test_dispatch_once()
     c.req_open_orders()
+    c._test_dispatch_once()
     c.req_all_open_orders()
+    c._test_dispatch_once()
     c._test_dispatch_once()
     assert w.events == []
 

@@ -4,10 +4,9 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 
 use crate::types::*;
-use super::super::types::PRICE_SCALE_F;
-use super::values::{
-    attr, decimal_from_py, decimal_text_from_py, decimal_text_to_py, decimal_to_py, empty_list, items,
-    list_or_none, official_names,
+use super::values::{decimal_and_text_from_py, decimal_or_text_to_py, 
+    attr, decimal_from_py, decimal_max_string, decimal_text_from_py, decimal_text_to_py, decimal_to_py, empty_list,
+    float_max_string, int_max_string, items, list_or_none, long_max_string, official_names,
 };
 
 // ── Contract ──
@@ -161,6 +160,32 @@ impl Contract {
             self.con_id, self.symbol, self.sec_type, self.exchange)
     }
 
+    /// The official library's text (ibx#750): the fields, then "Combo:"
+    /// with no separator before it, the combo legs and the delta neutral
+    /// contract when there are some.
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        let mut s = format!("ConId: {}, Symbol: {}, SecType: {}, LastTradeDateOrContractMonth: {}, Strike: {}, Right: {}, Multiplier: {}, Exchange: {}, PrimaryExchange: {}, Currency: {}, LocalSymbol: {}, TradingClass: {}, IncludeExpired: {}, SecIdType: {}, SecId: {}, Description: {}, IssuerId: {}",
+            int_max_string(self.con_id), self.symbol, self.sec_type, self.last_trade_date_or_contract_month,
+            float_max_string(self.strike), self.right, self.multiplier, self.exchange, self.primary_exchange,
+            self.currency, self.local_symbol, self.trading_class, py_bool_text(self.include_expired), self.sec_id_type,
+            self.sec_id, self.description, self.issuer_id);
+        s.push_str("Combo:");
+        s.push_str(&self.combo_legs_descrip);
+        let legs = self.combo_legs.bind(py);
+        if legs.is_truthy()? {
+            for leg in legs.try_iter()? {
+                s.push(';');
+                s.push_str(&leg?.str()?.to_string());
+            }
+        }
+        let delta_neutral = self.delta_neutral_contract.bind(py);
+        if delta_neutral.is_truthy()? {
+            s.push(';');
+            s.push_str(&delta_neutral.str()?.to_string());
+        }
+        Ok(s)
+    }
+
     // ibapi camelCase aliases
     #[getter(conId)]
     fn get_con_id_alias(&self) -> i64 { self.con_id }
@@ -233,6 +258,9 @@ pub struct Order {
     /// The official API's Decimal: `decimal.Decimal` in Python, unset
     /// `f64::MAX` here.
     pub total_quantity: f64,
+    /// The quantity as the caller gave it (every digit, trailing zeros
+    /// included), empty for a float (ibx#655).
+    pub total_quantity_text: String,
     #[pyo3(get, set)]
     pub order_type: String,
     #[pyo3(get, set)]
@@ -472,9 +500,10 @@ pub struct Order {
     pub reference_exchange_id: String,
     #[pyo3(get, set)]
     pub reference_price_type: i32,
-    /// None when unset, as the official API's.
+    /// None when unset, as the official API's; the value the caller set,
+    /// or the 0/1 of an echo (ibx#608).
     #[pyo3(get, set)]
-    pub route_marketable_to_bbo: Option<bool>,
+    pub route_marketable_to_bbo: Option<BoolOrInt>,
     #[pyo3(get, set)]
     pub rule80a: String,
     #[pyo3(get, set)]
@@ -499,9 +528,10 @@ pub struct Order {
     pub scale_subs_level_size: i32,
     #[pyo3(get, set)]
     pub scale_table: String,
-    /// None when unset, as the official API's.
+    /// None when unset, as the official API's; the value the caller set,
+    /// or the 0/1 of an echo (ibx#608).
     #[pyo3(get, set)]
-    pub seek_price_improvement: Option<bool>,
+    pub seek_price_improvement: Option<BoolOrInt>,
     #[pyo3(get, set)]
     pub settling_firm: String,
     #[pyo3(get, set)]
@@ -534,9 +564,10 @@ pub struct Order {
     pub submitter: String,
     #[pyo3(get, set)]
     pub trail_stop_price: f64,
-    /// None when unset, as the API (ibx#492).
+    /// None when unset, as the API (ibx#492); the value the caller set,
+    /// or the 0/1 of the reference's openOrder (ibx#546).
     #[pyo3(get, set)]
-    pub use_price_mgmt_algo: Option<bool>,
+    pub use_price_mgmt_algo: Option<BoolOrInt>,
     #[pyo3(get, set)]
     pub volatility: f64,
     #[pyo3(get, set)]
@@ -552,6 +583,7 @@ impl Clone for Order {
             order_id: self.order_id,
             action: self.action.clone(),
             total_quantity: self.total_quantity,
+            total_quantity_text: self.total_quantity_text.clone(),
             order_type: self.order_type.clone(),
             lmt_price: self.lmt_price,
             aux_price: self.aux_price,
@@ -720,6 +752,7 @@ impl Default for Order {
             order_id: 0,
             action: String::new(),
             total_quantity: f64::MAX,
+            total_quantity_text: String::new(),
             order_type: String::new(),
             lmt_price: f64::MAX,
             aux_price: f64::MAX,
@@ -914,6 +947,7 @@ impl Order {
             order_id,
             action,
             total_quantity: total_quantity.map(decimal_from_py).transpose()?.unwrap_or(f64::MAX),
+            total_quantity_text: total_quantity.map(|v| decimal_and_text_from_py(v).map(|(_, t)| t)).transpose()?.unwrap_or_default(),
             order_type,
             lmt_price,
             aux_price,
@@ -933,6 +967,28 @@ impl Order {
             transmit,
             ..Default::default()
         })
+    }
+
+    /// The official library's text (ibx#654): ids, type, side, quantity at
+    /// the limit price, the time in force, then the combo legs and the
+    /// conditions when there are some.
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        let mut s = format!("{},{},{}: {} {} {}@{} {}",
+            int_max_string(self.order_id), int_max_string(self.client_id as i64), long_max_string(self.perm_id),
+            self.order_type, self.action, decimal_max_string(self.total_quantity), float_max_string(self.lmt_price), self.tif);
+        for (name, list) in [("CMB", &self.order_combo_legs), ("COND", &self.conditions)] {
+            let list = list.bind(py);
+            if list.is_none() || list.len().unwrap_or(0) == 0 {
+                continue;
+            }
+            s.push_str(&format!(" {name}("));
+            for item in list.try_iter()? {
+                s.push_str(&item?.str()?.to_string());
+                s.push(',');
+            }
+            s.push(')');
+        }
+        Ok(s)
     }
 
     fn __repr__(&self) -> String {
@@ -956,13 +1012,23 @@ impl Order {
     // The official API's Decimals (ibapi 10.46): a `decimal.Decimal`,
     // unset `UNSET_DECIMAL`; set from a Decimal, an int, a float or a text.
     #[getter(totalQuantity)]
-    fn get_total_quantity_alias(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.total_quantity) }
+    fn get_total_quantity_alias(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        decimal_or_text_to_py(py, self.total_quantity, &self.total_quantity_text)
+    }
     #[setter(totalQuantity)]
-    fn set_total_quantity_alias(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { self.total_quantity = decimal_from_py(v)?; Ok(()) }
+    fn set_total_quantity_alias(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        (self.total_quantity, self.total_quantity_text) = decimal_and_text_from_py(v)?;
+        Ok(())
+    }
     #[getter(total_quantity)]
-    fn get_total_quantity(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.total_quantity) }
+    fn get_total_quantity(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        decimal_or_text_to_py(py, self.total_quantity, &self.total_quantity_text)
+    }
     #[setter(total_quantity)]
-    fn set_total_quantity(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { self.total_quantity = decimal_from_py(v)?; Ok(()) }
+    fn set_total_quantity(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        (self.total_quantity, self.total_quantity_text) = decimal_and_text_from_py(v)?;
+        Ok(())
+    }
     #[getter(filledQuantity)]
     fn get_filled_quantity_alias(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.filled_quantity) }
     #[setter(filledQuantity)]
@@ -1374,9 +1440,9 @@ impl Order {
     #[setter(referencePriceType)]
     fn set_reference_price_type_alias(&mut self, v: i32) { self.reference_price_type = v; }
     #[getter(routeMarketableToBbo)]
-    fn get_route_marketable_to_bbo_alias(&self) -> Option<bool> { self.route_marketable_to_bbo }
+    fn get_route_marketable_to_bbo_alias(&self) -> Option<BoolOrInt> { self.route_marketable_to_bbo }
     #[setter(routeMarketableToBbo)]
-    fn set_route_marketable_to_bbo_alias(&mut self, v: Option<bool>) { self.route_marketable_to_bbo = v; }
+    fn set_route_marketable_to_bbo_alias(&mut self, v: Option<BoolOrInt>) { self.route_marketable_to_bbo = v; }
     #[getter(rule80A)]
     fn get_rule80a_alias(&self) -> String { self.rule80a.clone() }
     #[setter(rule80A)]
@@ -1426,9 +1492,9 @@ impl Order {
     #[setter(scaleTable)]
     fn set_scale_table_alias(&mut self, v: String) { self.scale_table = v; }
     #[getter(seekPriceImprovement)]
-    fn get_seek_price_improvement_alias(&self) -> Option<bool> { self.seek_price_improvement }
+    fn get_seek_price_improvement_alias(&self) -> Option<BoolOrInt> { self.seek_price_improvement }
     #[setter(seekPriceImprovement)]
-    fn set_seek_price_improvement_alias(&mut self, v: Option<bool>) { self.seek_price_improvement = v; }
+    fn set_seek_price_improvement_alias(&mut self, v: Option<BoolOrInt>) { self.seek_price_improvement = v; }
     #[getter(settlingFirm)]
     fn get_settling_firm_alias(&self) -> String { self.settling_firm.clone() }
     #[setter(settlingFirm)]
@@ -1457,6 +1523,20 @@ impl Order {
             display_name: self.soft_dollar_tier_display_name.clone(),
         };
         Ok(Py::new(py, tier)?.into_any().into())
+    }
+    /// The official library's `order.softDollarTier = SoftDollarTier(...)`
+    /// (ibx#506): any object with its three values, read by their official
+    /// names; a missing one reads as empty.
+    #[setter(softDollarTier)]
+    fn set_soft_dollar_tier(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let text = |official: &str, plain: &str| -> String {
+            v.getattr(official).or_else(|_| v.getattr(plain)).ok()
+                .and_then(|a| a.extract::<String>().ok()).unwrap_or_default()
+        };
+        self.soft_dollar_tier_name = text("name", "name");
+        self.soft_dollar_tier_val = text("val", "val");
+        self.soft_dollar_tier_display_name = text("displayName", "display_name");
+        Ok(())
     }
     #[getter(startingPrice)]
     fn get_starting_price_alias(&self) -> f64 { self.starting_price }
@@ -1495,9 +1575,9 @@ impl Order {
     #[setter(triggerPrice)]
     fn set_trigger_price_alias(&mut self, v: f64) { self.trigger_price = v; }
     #[getter(usePriceMgmtAlgo)]
-    fn get_use_price_mgmt_algo_alias(&self) -> Option<bool> { self.use_price_mgmt_algo }
+    fn get_use_price_mgmt_algo_alias(&self) -> Option<BoolOrInt> { self.use_price_mgmt_algo }
     #[setter(usePriceMgmtAlgo)]
-    fn set_use_price_mgmt_algo_alias(&mut self, v: Option<bool>) { self.use_price_mgmt_algo = v; }
+    fn set_use_price_mgmt_algo_alias(&mut self, v: Option<BoolOrInt>) { self.use_price_mgmt_algo = v; }
     #[getter(volatilityType)]
     fn get_volatility_type_alias(&self) -> i32 { self.volatility_type }
     #[setter(volatilityType)]
@@ -1520,7 +1600,7 @@ impl Order {
             .map_err(|e| PyRuntimeError::new_err(e))
     }
 
-    /// Parse the TIF string to FIX byte. Delegates to `api::Order::tif_byte()`.
+    /// Parse the TIF string to the wire byte. Delegates to `api::Order::tif_byte()`.
     pub fn tif_byte(&self) -> u8 {
         self.to_api().tif_byte()
     }
@@ -1562,24 +1642,123 @@ impl Contract {
             description: self.description.clone(),
             issuer_id: self.issuer_id.clone(),
             combo_legs_descrip: self.combo_legs_descrip.clone(),
+            // Read for the order rules (ibx#688): any object with the
+            // official class's attributes.
+            delta_neutral_contract: Python::attach(|py| {
+                let d = self.delta_neutral_contract.bind(py);
+                (!d.is_none()).then(|| crate::api::types::DeltaNeutralContract {
+                    con_id: attr(d, "conId", "con_id").unwrap_or(0),
+                    delta: attr(d, "delta", "delta").unwrap_or(0.0),
+                    price: attr(d, "price", "price").unwrap_or(0.0),
+                })
+            }),
             ..Default::default()
         }
     }
 }
 
+/// The conditions of an order as this module's condition objects, in a
+/// list (an empty one for none, as the official API's order).
+fn conditions_to_py(py: Python<'_>, conditions: &[OrderCondition]) -> PyResult<Py<PyAny>> {
+    let list = pyo3::types::PyList::empty(py);
+    for cond in conditions {
+        let obj: Py<PyAny> = match cond {
+            OrderCondition::Price { con_id, exchange, price, is_more, trigger_method } => Py::new(py, PriceCondition {
+                con_id: Some(*con_id), exchange: Some(exchange.clone()),
+                price: Some(*price as f64 / crate::api::types::PRICE_SCALE_F),
+                is_more: Some(*is_more), trigger_method: Some(i32::from(*trigger_method)),
+            })?.into_any(),
+            OrderCondition::Time { time, is_more } =>
+                Py::new(py, TimeCondition { time: Some(time.clone()), is_more: Some(*is_more) })?.into_any(),
+            OrderCondition::Margin { percent, is_more } =>
+                Py::new(py, MarginCondition { percent: Some(MarginPercent::Int(i64::from(*percent))), is_more: Some(*is_more) })?.into_any(),
+            OrderCondition::Execution { symbol, exchange, sec_type } => Py::new(py, ExecutionCondition {
+                symbol: Some(symbol.clone()), exchange: Some(exchange.clone()), sec_type: Some(sec_type.clone()),
+            })?.into_any(),
+            OrderCondition::Volume { con_id, exchange, volume, is_more } => Py::new(py, VolumeCondition {
+                con_id: Some(*con_id), exchange: Some(exchange.clone()), volume: Some(*volume), is_more: Some(*is_more),
+            })?.into_any(),
+            OrderCondition::PercentChange { con_id, exchange, percent, is_more } => Py::new(py, PercentChangeCondition {
+                con_id: Some(*con_id), exchange: Some(exchange.clone()), change_percent: *percent, is_more: Some(*is_more),
+            })?.into_any(),
+        };
+        list.append(obj)?;
+    }
+    Ok(list.into_any().unbind())
+}
+
+/// A condition object of the official API, read by its attributes
+/// (`condType` 1 price, 3 time, 4 margin, 5 execution, 6 volume, 7 percent
+/// change). `joined`: another condition follows it; the conditions of an
+/// order are joined by "and" here, so one joined by "or" is refused.
+fn official_condition(any: &Bound<'_, PyAny>, joined: bool) -> Result<OrderCondition, String> {
+    fn get<'py, T: pyo3::conversion::FromPyObjectOwned<'py>>(any: &Bound<'py, PyAny>, name: &str) -> Result<T, String> {
+        any.getattr(name).map_err(|_| format!("no `{name}`"))?
+            .extract::<T>().map_err(|_| format!("`{name}` has an unexpected value"))
+    }
+    let kind: i64 = get(any, "condType")?;
+    if joined && !get::<bool>(any, "isConjunctionConnection")? {
+        return Err("conditions joined by \"or\" are not supported".into());
+    }
+    let exchange = |any: &Bound<'_, PyAny>| get::<Option<String>>(any, "exchange").map(Option::unwrap_or_default);
+    let con_id = |any: &Bound<'_, PyAny>| get::<Option<i64>>(any, "conId").map(Option::unwrap_or_default);
+    let is_more = get::<bool>(any, "isMore");
+    Ok(match kind {
+        1 => OrderCondition::Price {
+            con_id: con_id(any)?, exchange: exchange(any)?,
+            price: crate::api::types::price_from_f64(get::<Option<f64>>(any, "price")?.unwrap_or(0.0)),
+            is_more: is_more?, trigger_method: get::<Option<i64>>(any, "triggerMethod")?.unwrap_or(0) as u8,
+        },
+        3 => OrderCondition::Time { time: get::<Option<String>>(any, "time")?.unwrap_or_default(), is_more: is_more? },
+        4 => OrderCondition::Margin { percent: get::<Option<u32>>(any, "percent")?.unwrap_or(0), is_more: is_more? },
+        5 => OrderCondition::Execution {
+            symbol: get::<Option<String>>(any, "symbol")?.unwrap_or_default(), exchange: exchange(any)?,
+            sec_type: get::<Option<String>>(any, "secType")?.unwrap_or_default(),
+        },
+        6 => OrderCondition::Volume {
+            con_id: con_id(any)?, exchange: exchange(any)?,
+            volume: get::<Option<i64>>(any, "volume")?.unwrap_or(0), is_more: is_more?,
+        },
+        7 => OrderCondition::PercentChange {
+            con_id: con_id(any)?, exchange: exchange(any)?,
+            percent: get::<Option<f64>>(any, "changePercent")?.filter(|p| *p != f64::MAX).unwrap_or(0.0),
+            is_more: is_more?,
+        },
+        other => return Err(format!("condition type {other} is unknown")),
+    })
+}
+
 impl Order {
-    /// Convert the conditions (this module's condition classes) to the
-    /// engine's.
-    pub fn convert_conditions(&self, py: Python<'_>) -> Vec<OrderCondition> {
-        items(py, &self.conditions).iter().filter_map(|any| {
-            if let Ok(c) = any.cast::<PriceCondition>() { return Some(c.borrow().to_internal()); }
-            if let Ok(c) = any.cast::<TimeCondition>() { return Some(c.borrow().to_internal()); }
-            if let Ok(c) = any.cast::<MarginCondition>() { return Some(c.borrow().to_internal()); }
-            if let Ok(c) = any.cast::<ExecutionCondition>() { return Some(c.borrow().to_internal()); }
-            if let Ok(c) = any.cast::<VolumeCondition>() { return Some(c.borrow().to_internal()); }
-            if let Ok(c) = any.cast::<PercentChangeCondition>() { return Some(c.borrow().to_internal()); }
-            log::warn!("Unknown order condition type, skipping");
-            None
+    /// Convert the conditions to the engine's: this module's condition
+    /// classes, and the official API's (read by their attributes). A
+    /// condition that is not understood is an error: the order must not go
+    /// out without it (ibx#541; it was skipped, and the order sent as a
+    /// plain order).
+    pub fn convert_conditions(&self, py: Python<'_>) -> PyResult<Vec<OrderCondition>> {
+        let list = items(py, &self.conditions);
+        let last = list.len().saturating_sub(1);
+        list.iter().enumerate().map(|(i, any)| {
+            if let Ok(c) = any.cast::<PriceCondition>() { return Ok(c.borrow().to_internal()); }
+            if let Ok(c) = any.cast::<TimeCondition>() { return Ok(c.borrow().to_internal()); }
+            if let Ok(c) = any.cast::<MarginCondition>() {
+                if matches!(c.borrow().percent, Some(MarginPercent::Float(_))) {
+                    return Err(margin_percent_error(py));
+                }
+                return Ok(c.borrow().to_internal());
+            }
+            // The official class with a float percent, the same (ibx#722).
+            if any.getattr("condType").and_then(|t| t.extract::<i64>()).is_ok_and(|t| t == 4)
+                && any.getattr("percent").is_ok_and(|p| p.is_instance_of::<pyo3::types::PyFloat>())
+            {
+                return Err(margin_percent_error(py));
+            }
+            if let Ok(c) = any.cast::<ExecutionCondition>() { return Ok(c.borrow().to_internal()); }
+            if let Ok(c) = any.cast::<VolumeCondition>() { return Ok(c.borrow().to_internal()); }
+            if let Ok(c) = any.cast::<PercentChangeCondition>() { return Ok(c.borrow().to_internal()); }
+            official_condition(any, i < last).map_err(|why| pyo3::exceptions::PyValueError::new_err(format!(
+                "order condition {} ({}) is not understood: {}. The order is not sent.",
+                i + 1, any.get_type().name().map(|n| n.to_string()).unwrap_or_default(), why,
+            )))
         }).collect()
     }
 
@@ -1605,6 +1784,7 @@ impl Order {
             order_id: self.order_id,
             action: self.action.clone(),
             total_quantity: self.total_quantity,
+            total_quantity_text: self.total_quantity_text.clone(),
             order_type: self.order_type.clone(),
             lmt_price: self.lmt_price,
             aux_price: self.aux_price,
@@ -1675,6 +1855,7 @@ impl Order {
             fa_method: self.fa_method.clone(),
             fa_percentage: self.fa_percentage.clone(),
             filled_quantity: self.filled_quantity,
+            hedge_max_size: self.hedge_max_size,
             hedge_param: self.hedge_param.clone(),
             hedge_type: self.hedge_type.clone(),
             ignore_open_auction: self.ignore_open_auction,
@@ -1751,16 +1932,17 @@ impl Order {
             smart_combo_routing_params,
             order_misc_options,
             // None is the API's unset value (ibx#492).
-            use_price_mgmt_algo: self.use_price_mgmt_algo.map_or(i32::MAX, i32::from),
-            route_marketable_to_bbo: self.route_marketable_to_bbo.unwrap_or(false),
-            seek_price_improvement: self.seek_price_improvement.unwrap_or(false),
+            use_price_mgmt_algo: self.use_price_mgmt_algo.map_or(i32::MAX, |v| i32::from(v.is_on())),
+            route_marketable_to_bbo: self.route_marketable_to_bbo.is_some_and(BoolOrInt::is_on),
+            seek_price_improvement: self.seek_price_improvement.is_some_and(BoolOrInt::is_on),
             ..Default::default()
         }
     }
 
     /// The order an order callback shows, from the Rust API order: every
     /// field; the empty lists are None, as the official API's decoding
-    /// leaves them. The conditions are not shown.
+    /// leaves them; the conditions as this module's condition objects
+    /// (ibx#543).
     pub fn from_api(py: Python<'_>, o: &crate::api::types::Order) -> PyResult<Self> {
         let tag_values = |list: &[crate::api::types::TagValue]| -> PyResult<Py<PyAny>> {
             let objs = list.iter()
@@ -1775,6 +1957,7 @@ impl Order {
             order_id: o.order_id,
             action: o.action.clone(),
             total_quantity: o.total_quantity,
+            total_quantity_text: o.total_quantity_text.clone(),
             order_type: o.order_type.clone(),
             lmt_price: o.lmt_price,
             aux_price: o.aux_price,
@@ -1921,11 +2104,16 @@ impl Order {
             smart_combo_routing_params: tag_values(&o.smart_combo_routing_params)?,
             order_misc_options: tag_values(&o.order_misc_options)?,
             order_combo_legs: list_or_none(py, legs)?,
-            conditions: empty_list(),
-            use_price_mgmt_algo: (o.use_price_mgmt_algo != i32::MAX).then_some(o.use_price_mgmt_algo != 0),
-            route_marketable_to_bbo: o.route_marketable_to_bbo.then_some(true),
-            seek_price_improvement: o.seek_price_improvement.then_some(true),
-            hedge_max_size: i32::MAX,
+            conditions: conditions_to_py(py, &o.conditions)?,
+            // The reference's openOrder gives it as 0 or 1 (ibx#546, paper
+            // 13/10/2026).
+            use_price_mgmt_algo: (o.use_price_mgmt_algo != i32::MAX).then_some(BoolOrInt::Int(i64::from(o.use_price_mgmt_algo != 0))),
+            // The reference's openOrder gives both, as 0 or 1 (ibx#608,
+            // paper 12/10/2026).
+            route_marketable_to_bbo: Some(BoolOrInt::Int(o.route_marketable_to_bbo as i64)),
+            seek_price_improvement: Some(BoolOrInt::Int(o.seek_price_improvement as i64)),
+            // A beta hedge's max size as the report gives it (ibx#614).
+            hedge_max_size: o.hedge_max_size,
         })
     }
 
@@ -1986,6 +2174,23 @@ impl Contract {
     }
 }
 
+/// A flag the caller sets as a bool and the reference's echo gives as the
+/// integer 0 or 1, as the official client's order keeps either (ibx#608).
+#[derive(Clone, Copy, Debug, PartialEq, FromPyObject, IntoPyObject, IntoPyObjectRef)]
+pub enum BoolOrInt {
+    Bool(bool),
+    Int(i64),
+}
+
+impl BoolOrInt {
+    pub fn is_on(self) -> bool {
+        match self {
+            BoolOrInt::Bool(b) => b,
+            BoolOrInt::Int(i) => i != 0,
+        }
+    }
+}
+
 // ── ComboLeg, OrderComboLeg ──
 
 /// ibapi-compatible ComboLeg: one leg of a combo (BAG) contract (ibx#470).
@@ -2035,6 +2240,13 @@ impl ComboLeg {
         format!("ComboLeg(conId={}, ratio={}, action='{}', exchange='{}')", self.con_id, self.ratio, self.action, self.exchange)
     }
 
+    /// The official library's text (ibx#750): the fields joined by commas.
+    fn __str__(&self) -> String {
+        [int_max_string(self.con_id), int_max_string(self.ratio as i64), self.action.clone(), self.exchange.clone(),
+            int_max_string(self.open_close as i64), int_max_string(self.short_sale_slot as i64),
+            self.designated_location.clone(), int_max_string(self.exempt_code as i64)].join(",")
+    }
+
     #[getter(conId)]
     fn get_con_id_alias(&self) -> i64 { self.con_id }
     #[setter(conId)]
@@ -2077,6 +2289,11 @@ impl OrderComboLeg {
     fn __repr__(&self) -> String {
         format!("OrderComboLeg(price={})", self.price)
     }
+
+    /// The official library's text: the price, empty when unset (ibx#654).
+    fn __str__(&self) -> String {
+        float_max_string(self.price)
+    }
 }
 
 // ── TagValue ──
@@ -2104,8 +2321,15 @@ impl TagValue {
         Ok(Self { tag: text(tag)?, value: text(value)? })
     }
 
-    fn __repr__(&self) -> String {
-        format!("TagValue(tag='{}', value='{}')", self.tag, self.value)
+    /// The official library's form: the object's id, then its text, as a
+    /// list of them prints in a contract row (ibx#750).
+    fn __repr__(slf: &Bound<'_, Self>) -> String {
+        format!("{}: {}", slf.as_ptr() as usize, slf.borrow().__str__())
+    }
+
+    /// The official library's text (ibx#750): "tag=value;".
+    fn __str__(&self) -> String {
+        format!("{}={};", self.tag, self.value)
     }
 }
 
@@ -2131,6 +2355,13 @@ impl OrderAllocation {
     #[new]
     #[pyo3(signature = ())]
     fn new() -> Self { Self::default() }
+
+    /// The official library's text (ibx#654).
+    fn __str__(&self) -> String {
+        format!("Account: {}, Position: {}, PositionDesired: {}, PositionAfter: {}, DesiredAllocQty: {}, AllowedAllocQty: {}, IsMonetary: {}",
+            self.account, self.position, self.position_desired, self.position_after, self.desired_alloc_qty,
+            self.allowed_alloc_qty, if self.is_monetary { "True" } else { "False" })
+    }
 
     fn __repr__(&self) -> String {
         format!("OrderAllocation(account='{}', position={})", self.account, self.position)
@@ -2356,6 +2587,33 @@ impl OrderState {
         format!("OrderState(status='{}')", self.status)
     }
 
+    /// The official library's text (ibx#750), with the allocations after it
+    /// when there are some.
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        let mut s = format!("Status: {}, InitMarginBefore: {}, MaintMarginBefore: {}, EquityWithLoanBefore: {}, InitMarginChange: {}, MaintMarginChange: {}, EquityWithLoanChange: {}, InitMarginAfter: {}, MaintMarginAfter: {}, EquityWithLoanAfter: {}, CommissionAndFees: {}, MinCommissionAndFees: {}, MaxCommissionAndFees: {}, CommissionAndFeesCurrency: {}, MarginCurrency: {}, InitMarginBeforeOutsideRTH: {}, MaintMarginBeforeOutsideRTH: {}, EquityWithLoanBeforeOutsideRTH: {}, InitMarginChangeOutsideRTH: {}, MaintMarginChangeOutsideRTH: {}, equityWithLoanChangeOutsideRTH: {}, InitMarginAfterOutsideRTH: {}, MaintMarginAfterOutsideRTH: {}, equityWithLoanAfterOutsideRTH: {}, SuggestedSize: {}, RejectReason: {}, WarningText: {}, CompletedTime: {}, CompletedStatus: {}",
+            self.status, self.init_margin_before, self.maint_margin_before, self.equity_with_loan_before,
+            self.init_margin_change, self.maint_margin_change, self.equity_with_loan_change,
+            self.init_margin_after, self.maint_margin_after, self.equity_with_loan_after,
+            float_max_string(self.commission_and_fees), float_max_string(self.min_commission_and_fees),
+            float_max_string(self.max_commission_and_fees), self.commission_and_fees_currency, self.margin_currency,
+            float_max_string(self.init_margin_before_outside_rth), float_max_string(self.maint_margin_before_outside_rth),
+            float_max_string(self.equity_with_loan_before_outside_rth), float_max_string(self.init_margin_change_outside_rth),
+            float_max_string(self.maint_margin_change_outside_rth), float_max_string(self.equity_with_loan_change_outside_rth),
+            float_max_string(self.init_margin_after_outside_rth), float_max_string(self.maint_margin_after_outside_rth),
+            float_max_string(self.equity_with_loan_after_outside_rth), self.suggested_size, self.reject_reason,
+            self.warning_text, self.completed_time, self.completed_status);
+        let allocations = self.order_allocations.bind(py);
+        if allocations.is_truthy()? {
+            s.push_str(" OrderAllocations(");
+            for allocation in allocations.try_iter()? {
+                s.push_str(&allocation?.str()?.to_string());
+                s.push_str("; ");
+            }
+            s.push(')');
+        }
+        Ok(s)
+    }
+
     #[getter(suggested_size)]
     fn get_suggested_size(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_text_to_py(py, &self.suggested_size) }
     #[setter(suggested_size)]
@@ -2416,9 +2674,45 @@ impl PriceCondition {
         Self { con_id: conId, exchange: exch, price, is_more: isMore, trigger_method: triggerMethod }
     }
 
+    /// The trigger methods by name and number, as the official class's
+    /// table: an attribute per name, `idx2name`, `toStr` (ibx#712).
+    #[classattr]
+    #[pyo3(name = "TriggerMethodEnum")]
+    fn trigger_method_enum(py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let table = small_enum_class(py)?;
+        let names = ("Default", "DoubleBidAsk", "Last", "DoubleLast", "BidAsk", "N/A1", "N/A2", "LastBidAsk", "MidPoint");
+        Ok(table.call1(names)?.unbind())
+    }
+
     #[classattr]
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 1 }
+
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
+
+    // The condition type numbers, class attributes of the official
+    // condition classes (ibx#712).
+    #[classattr]
+    #[pyo3(name = "Price")]
+    fn type_price() -> i32 { 1 }
+    #[classattr]
+    #[pyo3(name = "Time")]
+    fn type_time() -> i32 { 3 }
+    #[classattr]
+    #[pyo3(name = "Margin")]
+    fn type_margin() -> i32 { 4 }
+    #[classattr]
+    #[pyo3(name = "Execution")]
+    fn type_execution() -> i32 { 5 }
+    #[classattr]
+    #[pyo3(name = "Volume")]
+    fn type_volume() -> i32 { 6 }
+    #[classattr]
+    #[pyo3(name = "PercentChange")]
+    fn type_percent_change() -> i32 { 7 }
 
     fn __repr__(&self) -> String {
         let op = if self.is_more.unwrap_or(false) { ">" } else { "<" };
@@ -2465,6 +2759,32 @@ impl TimeCondition {
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 3 }
 
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
+
+    // The condition type numbers, class attributes of the official
+    // condition classes (ibx#712).
+    #[classattr]
+    #[pyo3(name = "Price")]
+    fn type_price() -> i32 { 1 }
+    #[classattr]
+    #[pyo3(name = "Time")]
+    fn type_time() -> i32 { 3 }
+    #[classattr]
+    #[pyo3(name = "Margin")]
+    fn type_margin() -> i32 { 4 }
+    #[classattr]
+    #[pyo3(name = "Execution")]
+    fn type_execution() -> i32 { 5 }
+    #[classattr]
+    #[pyo3(name = "Volume")]
+    fn type_volume() -> i32 { 6 }
+    #[classattr]
+    #[pyo3(name = "PercentChange")]
+    fn type_percent_change() -> i32 { 7 }
+
     fn __repr__(&self) -> String {
         let op = if self.is_more.unwrap_or(false) { ">" } else { "<" };
         format!("TimeCondition(time {} {:?})", op, self.time)
@@ -2483,10 +2803,38 @@ impl TimeCondition {
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct MarginCondition {
-    #[pyo3(get, set)]
-    pub percent: Option<u32>,
+    /// As given: an int, or a float the official client cannot place
+    /// (ibx#722).
+    pub percent: Option<MarginPercent>,
     #[pyo3(get, set)]
     pub is_more: Option<bool>,
+}
+
+/// A margin condition's percent as the official class keeps it (ibx#722).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MarginPercent {
+    Int(i64),
+    Float(f64),
+}
+
+impl MarginPercent {
+    fn from_py(v: &Bound<'_, PyAny>) -> PyResult<Option<Self>> {
+        if v.is_none() {
+            return Ok(None);
+        }
+        if v.is_instance_of::<pyo3::types::PyFloat>() {
+            return Ok(Some(Self::Float(v.extract()?)));
+        }
+        Ok(Some(Self::Int(v.extract()?)))
+    }
+
+    fn to_py<'py>(self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use pyo3::IntoPyObjectExt;
+        match self {
+            Self::Int(i) => i.into_bound_py_any(py),
+            Self::Float(f) => f.into_bound_py_any(py),
+        }
+    }
 }
 
 #[pymethods]
@@ -2494,13 +2842,54 @@ impl MarginCondition {
     #[new]
     #[pyo3(signature = (isMore=None, percent=None))]
     #[allow(non_snake_case)]
-    fn new(isMore: Option<bool>, percent: Option<u32>) -> Self {
-        Self { percent, is_more: isMore }
+    fn new(isMore: Option<bool>, percent: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let percent = match percent { Some(p) => MarginPercent::from_py(p)?, None => None };
+        Ok(Self { percent, is_more: isMore })
+    }
+
+    #[getter(percent)]
+    fn get_percent<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match self.percent {
+            Some(p) => p.to_py(py),
+            None => Ok(py.None().into_bound(py)),
+        }
+    }
+
+    #[setter(percent)]
+    fn set_percent(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.percent = MarginPercent::from_py(value)?;
+        Ok(())
     }
 
     #[classattr]
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 4 }
+
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
+
+    // The condition type numbers, class attributes of the official
+    // condition classes (ibx#712).
+    #[classattr]
+    #[pyo3(name = "Price")]
+    fn type_price() -> i32 { 1 }
+    #[classattr]
+    #[pyo3(name = "Time")]
+    fn type_time() -> i32 { 3 }
+    #[classattr]
+    #[pyo3(name = "Margin")]
+    fn type_margin() -> i32 { 4 }
+    #[classattr]
+    #[pyo3(name = "Execution")]
+    fn type_execution() -> i32 { 5 }
+    #[classattr]
+    #[pyo3(name = "Volume")]
+    fn type_volume() -> i32 { 6 }
+    #[classattr]
+    #[pyo3(name = "PercentChange")]
+    fn type_percent_change() -> i32 { 7 }
 
     fn __repr__(&self) -> String {
         format!("MarginCondition({:?}% {})", self.percent, if self.is_more.unwrap_or(false) { "above" } else { "below" })
@@ -2511,7 +2900,34 @@ official_names!(MarginCondition, [("isMore", "is_more")]);
 
 impl MarginCondition {
     pub fn to_internal(&self) -> OrderCondition {
-        OrderCondition::Margin { percent: self.percent.unwrap_or(0), is_more: self.is_more.unwrap_or(false) }
+        let percent = match self.percent { Some(MarginPercent::Int(i)) => u32::try_from(i).unwrap_or(0), _ => 0 };
+        OrderCondition::Margin { percent, is_more: self.is_more.unwrap_or(false) }
+    }
+}
+
+/// The official client library's `ClientException` (code, msg, text).
+pub fn client_exception_class(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    static CLASS: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    let class = CLASS.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        let code = c"class ClientException(Exception):
+    def __init__(self, code, msg, text):
+        self.code = code
+        self.msg = msg
+        self.text = text
+";
+        Ok(PyModule::from_code(py, code, c"ibx_errors.py", c"ibx_errors")?.getattr("ClientException")?.unbind())
+    })?;
+    Ok(class.bind(py).clone())
+}
+
+/// A margin condition whose percent is a float: the official client fails
+/// to encode the order and raises this from placeOrder, nothing sent
+/// (ibx#722; the official library 10.51 at session level 214, 16/10/2026,
+/// MarginCondition(True, 30.5)).
+fn margin_percent_error(py: Python<'_>) -> PyErr {
+    match client_exception_class(py).and_then(|c| c.call1((588, "Error encoding protobuf - ", "Error encoding conditions"))) {
+        Ok(e) => PyErr::from_value(e),
+        Err(e) => e,
     }
 }
 
@@ -2539,6 +2955,32 @@ impl ExecutionCondition {
     #[classattr]
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 5 }
+
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
+
+    // The condition type numbers, class attributes of the official
+    // condition classes (ibx#712).
+    #[classattr]
+    #[pyo3(name = "Price")]
+    fn type_price() -> i32 { 1 }
+    #[classattr]
+    #[pyo3(name = "Time")]
+    fn type_time() -> i32 { 3 }
+    #[classattr]
+    #[pyo3(name = "Margin")]
+    fn type_margin() -> i32 { 4 }
+    #[classattr]
+    #[pyo3(name = "Execution")]
+    fn type_execution() -> i32 { 5 }
+    #[classattr]
+    #[pyo3(name = "Volume")]
+    fn type_volume() -> i32 { 6 }
+    #[classattr]
+    #[pyo3(name = "PercentChange")]
+    fn type_percent_change() -> i32 { 7 }
 
     fn __repr__(&self) -> String {
         format!("ExecutionCondition(symbol={:?}, exchange={:?})", self.symbol, self.exchange)
@@ -2583,6 +3025,32 @@ impl VolumeCondition {
     #[classattr]
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 6 }
+
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
+
+    // The condition type numbers, class attributes of the official
+    // condition classes (ibx#712).
+    #[classattr]
+    #[pyo3(name = "Price")]
+    fn type_price() -> i32 { 1 }
+    #[classattr]
+    #[pyo3(name = "Time")]
+    fn type_time() -> i32 { 3 }
+    #[classattr]
+    #[pyo3(name = "Margin")]
+    fn type_margin() -> i32 { 4 }
+    #[classattr]
+    #[pyo3(name = "Execution")]
+    fn type_execution() -> i32 { 5 }
+    #[classattr]
+    #[pyo3(name = "Volume")]
+    fn type_volume() -> i32 { 6 }
+    #[classattr]
+    #[pyo3(name = "PercentChange")]
+    fn type_percent_change() -> i32 { 7 }
 
     fn __repr__(&self) -> String {
         let op = if self.is_more.unwrap_or(false) { ">" } else { "<" };
@@ -2631,6 +3099,32 @@ impl PercentChangeCondition {
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 7 }
 
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
+
+    // The condition type numbers, class attributes of the official
+    // condition classes (ibx#712).
+    #[classattr]
+    #[pyo3(name = "Price")]
+    fn type_price() -> i32 { 1 }
+    #[classattr]
+    #[pyo3(name = "Time")]
+    fn type_time() -> i32 { 3 }
+    #[classattr]
+    #[pyo3(name = "Margin")]
+    fn type_margin() -> i32 { 4 }
+    #[classattr]
+    #[pyo3(name = "Execution")]
+    fn type_execution() -> i32 { 5 }
+    #[classattr]
+    #[pyo3(name = "Volume")]
+    fn type_volume() -> i32 { 6 }
+    #[classattr]
+    #[pyo3(name = "PercentChange")]
+    fn type_percent_change() -> i32 { 7 }
+
     fn __repr__(&self) -> String {
         let op = if self.is_more.unwrap_or(false) { ">" } else { "<" };
         format!("PercentChangeCondition(conId={:?}, {}% {})", self.con_id, op, self.change_percent)
@@ -2677,8 +3171,8 @@ pub struct BarData {
     /// Timezone of `date` as reported by the reply (ibx#234) — previously
     /// parsed and then discarded, leaving the bare timestamp string as the
     /// only (unverifiable) evidence of what the bar times mean. Empty on
-    /// streaming updates, which carry no timezone of their own.
-    #[pyo3(get, set)]
+    /// streaming updates, which carry no timezone of their own. Not a
+    /// Python attribute: the official BarData has none (ibx#654).
     pub timezone: String,
 }
 
@@ -2694,11 +3188,11 @@ impl BarData {
 impl BarData {
     /// The official API's defaults: the volume and the WAP unset.
     #[new]
-    #[pyo3(signature = (date="".to_string(), open=0.0, high=0.0, low=0.0, close=0.0, volume=None, wap=None, bar_count=0, timezone="".to_string()))]
+    #[pyo3(signature = (date="".to_string(), open=0.0, high=0.0, low=0.0, close=0.0, volume=None, wap=None, bar_count=0))]
     #[allow(clippy::too_many_arguments)]
-    fn new(date: String, open: f64, high: f64, low: f64, close: f64, volume: Option<&Bound<'_, PyAny>>, wap: Option<&Bound<'_, PyAny>>, bar_count: i32, timezone: String) -> PyResult<Self> {
+    fn new(date: String, open: f64, high: f64, low: f64, close: f64, volume: Option<&Bound<'_, PyAny>>, wap: Option<&Bound<'_, PyAny>>, bar_count: i32) -> PyResult<Self> {
         let decimal = |v: Option<&Bound<'_, PyAny>>| -> PyResult<f64> { Ok(v.map(decimal_from_py).transpose()?.unwrap_or(f64::MAX)) };
-        Ok(Self { date, open, high, low, close, volume: decimal(volume)?, wap: decimal(wap)?, bar_count, timezone })
+        Ok(Self { date, open, high, low, close, volume: decimal(volume)?, wap: decimal(wap)?, bar_count, timezone: String::new() })
     }
 
     #[getter(volume)]
@@ -2709,6 +3203,14 @@ impl BarData {
     fn get_wap(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.wap) }
     #[setter(wap)]
     fn set_wap(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { self.wap = decimal_from_py(v)?; Ok(()) }
+
+    /// The official library's text (ibx#654).
+    fn __str__(&self) -> String {
+        format!("Date: {}, Open: {}, High: {}, Low: {}, Close: {}, Volume: {}, WAP: {}, BarCount: {}",
+            self.date, float_max_string(self.open), float_max_string(self.high), float_max_string(self.low),
+            float_max_string(self.close), decimal_max_string(self.volume), decimal_max_string(self.wap),
+            int_max_string(self.bar_count as i64))
+    }
 
     fn __repr__(&self) -> String {
         format!("BarData(date='{}', O={}, H={}, L={}, C={}, V={})",
@@ -2747,8 +3249,15 @@ impl IneligibilityReasonPy {
         Ok(Self { id_: text(id_)?, description: text(description)? })
     }
 
-    fn __repr__(&self) -> String {
-        format!("IneligibilityReason(id_='{}', description='{}')", self.id_, self.description)
+    /// The official library's form: the object's id, then its text, as a
+    /// list of them prints in a contract row (ibx#750).
+    fn __repr__(slf: &Bound<'_, Self>) -> String {
+        format!("{}: {}", slf.as_ptr() as usize, slf.borrow().__str__())
+    }
+
+    /// The official library's text (ibx#750).
+    fn __str__(&self) -> String {
+        format!("[id: {}, description: {}];", self.id_, self.description)
     }
 }
 
@@ -2779,6 +3288,13 @@ macro_rules! contract_details_class {
             pub min_algo_size: f64,
             pub last_price_precision: f64,
             pub last_size_precision: f64,
+            /// The text of each Decimal size field as the program set it (every
+            /// digit and trailing zero kept for `str()` and the getters), empty
+            /// otherwise (ibx#655, ibx#750).
+            pub decimal_texts: [String; 6],
+            /// The official name is the field's: its getter gives 0 as an
+            /// integer (ibx#602).
+            pub coupon: f64,
             $(
                 #[pyo3(get, set)]
                 pub $field: $ty,
@@ -2799,6 +3315,8 @@ macro_rules! contract_details_class {
                     min_algo_size: self.min_algo_size,
                     last_price_precision: self.last_price_precision,
                     last_size_precision: self.last_size_precision,
+                    decimal_texts: self.decimal_texts.clone(),
+                    coupon: self.coupon,
                     $($field: self.$field.clone(),)*
                 })
             }
@@ -2818,6 +3336,8 @@ macro_rules! contract_details_class {
                     min_algo_size: f64::MAX,
                     last_price_precision: f64::MAX,
                     last_size_precision: f64::MAX,
+                    decimal_texts: Default::default(),
+                    coupon: 0.0,
                     $($field: $default,)*
                 }
             }
@@ -2857,7 +3377,6 @@ contract_details_class! {
     coupon_type: String = String::new(),
     callable: bool = false,
     putable: bool = false,
-    coupon: f64 = 0.0,
     convertible: bool = false,
     maturity: String = String::new(),
     issue_date: String = String::new(),
@@ -2900,30 +3419,175 @@ impl ContractDetails {
             self.contract.borrow(py).symbol, self.long_name)
     }
 
+    /// The official library's text (ibx#750): the contract's text, then the
+    /// row's fields joined by commas; the lists as Python prints them.
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        let text = |v: &Py<PyAny>| -> PyResult<String> { Ok(v.bind(py).str()?.to_string()) };
+        let ev_multiplier = if self.ev_multiplier == i32::MAX as f64 { String::new() } else { text(&zero_as_int(py, self.ev_multiplier)?)? };
+        let fields: Vec<String> = vec![
+            self.contract.bind(py).str()?.to_string(),
+            self.market_name.clone(),
+            float_max_string(self.min_tick),
+            self.order_types.clone(),
+            self.valid_exchanges.clone(),
+            int_max_string(self.price_magnifier as i64),
+            int_max_string(self.under_con_id as i64),
+            self.long_name.clone(),
+            self.contract_month.clone(),
+            self.industry.clone(),
+            self.category.clone(),
+            self.subcategory.clone(),
+            self.time_zone_id.clone(),
+            self.trading_hours.clone(),
+            self.liquid_hours.clone(),
+            self.ev_rule.clone(),
+            ev_multiplier,
+            self.under_symbol.clone(),
+            self.under_sec_type.clone(),
+            self.market_rule_ids.clone(),
+            int_max_string(self.agg_group as i64),
+            text(&self.sec_id_list)?,
+            self.real_expiration_date.clone(),
+            self.stock_type.clone(),
+            self.cusip.clone(),
+            self.ratings.clone(),
+            self.desc_append.clone(),
+            self.bond_type.clone(),
+            self.coupon_type.clone(),
+            py_bool_text(self.callable).to_string(),
+            py_bool_text(self.putable).to_string(),
+            text(&zero_as_int(py, self.coupon)?)?,
+            py_bool_text(self.convertible).to_string(),
+            self.maturity.clone(),
+            self.issue_date.clone(),
+            self.next_option_date.clone(),
+            self.next_option_type.clone(),
+            py_bool_text(self.next_option_partial).to_string(),
+            self.notes.clone(),
+            if self.decimal_texts[0].is_empty() { decimal_max_string(self.min_size) } else { self.decimal_texts[0].clone() },
+            if self.decimal_texts[1].is_empty() { decimal_max_string(self.size_increment) } else { self.decimal_texts[1].clone() },
+            if self.decimal_texts[2].is_empty() { decimal_max_string(self.suggested_size_increment) } else { self.decimal_texts[2].clone() },
+            if self.decimal_texts[3].is_empty() { decimal_max_string(self.min_algo_size) } else { self.decimal_texts[3].clone() },
+            if self.decimal_texts[4].is_empty() { decimal_max_string(self.last_price_precision) } else { self.decimal_texts[4].clone() },
+            if self.decimal_texts[5].is_empty() { decimal_max_string(self.last_size_precision) } else { self.decimal_texts[5].clone() },
+            text(&self.ineligibility_reason_list)?,
+            self.event_contract1.clone(),
+            self.event_contract_description1.clone(),
+            self.event_contract_description2.clone(),
+        ];
+        Ok(fields.join(","))
+    }
+
     #[getter(min_size)]
-    fn get_min_size(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.min_size) }
+    fn get_min_size(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_or_text_to_py(py, self.min_size, &self.decimal_texts[0]) }
     #[setter(min_size)]
-    fn set_min_size(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { self.min_size = decimal_from_py(v)?; Ok(()) }
+    fn set_min_size(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { (self.min_size, self.decimal_texts[0]) = decimal_and_text_from_py(v)?; Ok(()) }
     #[getter(size_increment)]
-    fn get_size_increment(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.size_increment) }
+    fn get_size_increment(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_or_text_to_py(py, self.size_increment, &self.decimal_texts[1]) }
     #[setter(size_increment)]
-    fn set_size_increment(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { self.size_increment = decimal_from_py(v)?; Ok(()) }
+    fn set_size_increment(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { (self.size_increment, self.decimal_texts[1]) = decimal_and_text_from_py(v)?; Ok(()) }
     #[getter(suggested_size_increment)]
-    fn get_suggested_size_increment(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.suggested_size_increment) }
+    fn get_suggested_size_increment(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_or_text_to_py(py, self.suggested_size_increment, &self.decimal_texts[2]) }
     #[setter(suggested_size_increment)]
-    fn set_suggested_size_increment(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { self.suggested_size_increment = decimal_from_py(v)?; Ok(()) }
+    fn set_suggested_size_increment(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { (self.suggested_size_increment, self.decimal_texts[2]) = decimal_and_text_from_py(v)?; Ok(()) }
     #[getter(min_algo_size)]
-    fn get_min_algo_size(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.min_algo_size) }
+    fn get_min_algo_size(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_or_text_to_py(py, self.min_algo_size, &self.decimal_texts[3]) }
     #[setter(min_algo_size)]
-    fn set_min_algo_size(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { self.min_algo_size = decimal_from_py(v)?; Ok(()) }
+    fn set_min_algo_size(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { (self.min_algo_size, self.decimal_texts[3]) = decimal_and_text_from_py(v)?; Ok(()) }
     #[getter(last_price_precision)]
-    fn get_last_price_precision(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.last_price_precision) }
+    fn get_last_price_precision(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_or_text_to_py(py, self.last_price_precision, &self.decimal_texts[4]) }
     #[setter(last_price_precision)]
-    fn set_last_price_precision(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { self.last_price_precision = decimal_from_py(v)?; Ok(()) }
+    fn set_last_price_precision(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { (self.last_price_precision, self.decimal_texts[4]) = decimal_and_text_from_py(v)?; Ok(()) }
     #[getter(last_size_precision)]
-    fn get_last_size_precision(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.last_size_precision) }
+    fn get_last_size_precision(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_or_text_to_py(py, self.last_size_precision, &self.decimal_texts[5]) }
     #[setter(last_size_precision)]
-    fn set_last_size_precision(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { self.last_size_precision = decimal_from_py(v)?; Ok(()) }
+    fn set_last_size_precision(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> { (self.last_size_precision, self.decimal_texts[5]) = decimal_and_text_from_py(v)?; Ok(()) }
+
+    /// The official `FundAssetType` member of the row, `NoneItem` when the
+    /// row has none, as the official library at session level 225 decodes
+    /// it (ibx#602); `fund_asset_type` keeps the server's code.
+    #[getter(fundAssetType)]
+    fn get_fund_asset_type_member(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        fund_enum_member(py, "FundAssetType", &self.fund_asset_type)
+    }
+    #[setter(fundAssetType)]
+    fn set_fund_asset_type_member(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.fund_asset_type = fund_enum_code(v)?;
+        Ok(())
+    }
+    /// The official `FundDistributionPolicyIndicator` member of the row
+    /// (ibx#602); `fund_distribution_policy_indicator` keeps the code.
+    #[getter(fundDistributionPolicyIndicator)]
+    fn get_fund_distribution_policy_indicator_member(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        fund_enum_member(py, "FundDistributionPolicyIndicator", &self.fund_distribution_policy_indicator)
+    }
+    #[setter(fundDistributionPolicyIndicator)]
+    fn set_fund_distribution_policy_indicator_member(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.fund_distribution_policy_indicator = fund_enum_code(v)?;
+        Ok(())
+    }
+    /// The official library leaves the integer 0 when the row has no value
+    /// (ibx#602): a float only when one was given.
+    #[getter(evMultiplier)]
+    fn get_ev_multiplier_official(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { zero_as_int(py, self.ev_multiplier) }
+    #[setter(evMultiplier)]
+    fn set_ev_multiplier_official(&mut self, v: f64) { self.ev_multiplier = v; }
+    #[getter(coupon)]
+    fn get_coupon_official(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { zero_as_int(py, self.coupon) }
+    #[setter(coupon)]
+    fn set_coupon_official(&mut self, v: f64) { self.coupon = v; }
+}
+
+/// The official `FundAssetType` and `FundDistributionPolicyIndicator`
+/// (`enum.Enum`, values (code, name)), made once. `Others` keeps the
+/// official value, a pair inside a tuple, so that no server code finds it
+/// there either (ibx#602).
+fn fund_enums(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
+    static MODULE: pyo3::sync::PyOnceLock<Py<PyModule>> = pyo3::sync::PyOnceLock::new();
+    let module = MODULE.get_or_try_init(py, || -> PyResult<Py<PyModule>> {
+        let code = c"from enum import Enum\n\nclass FundAssetType(Enum):\n    NoneItem = (\"None\", \"None\")\n    Others = (\"000\", \"Others\"),\n    MoneyMarket = (\"001\", \"Money Market\")\n    FixedIncome = (\"002\", \"Fixed Income\")\n    MultiAsset = (\"003\", \"Multi-asset\")\n    Equity = (\"004\", \"Equity\")\n    Sector = (\"005\", \"Sector\")\n    Guaranteed = (\"006\", \"Guaranteed\")\n    Alternative = (\"007\", \"Alternative\")\n\nclass FundDistributionPolicyIndicator(Enum):\n    NoneItem = (\"None\", \"None\")\n    AccumulationFund = (\"N\", \"Accumulation Fund\")\n    IncomeFund = (\"Y\", \"Income Fund\")\n";
+        Ok(PyModule::from_code(py, code, c"ibx_fund.py", c"ibx_fund")?.unbind())
+    })?;
+    Ok(module.bind(py).clone())
+}
+
+/// The member whose code is `code`, else the first (`NoneItem`), as the
+/// official library's lookup by code.
+fn fund_enum_member(py: Python<'_>, class: &str, code: &str) -> PyResult<Py<PyAny>> {
+    let class = fund_enums(py)?.getattr(class)?;
+    for member in class.try_iter()? {
+        let member = member?;
+        if member.getattr("value")?.get_item(0)?.extract::<String>().is_ok_and(|c| c == code) {
+            return Ok(member.unbind());
+        }
+    }
+    Ok(class.getattr("NoneItem")?.unbind())
+}
+
+/// The code of a member, or the text, set on a fund attribute; empty for
+/// `NoneItem`.
+fn fund_enum_code(v: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(text) = v.extract::<String>() {
+        return Ok(text);
+    }
+    let mut code = v.getattr("value")?.get_item(0)?;
+    // `Others`: the pair is inside a tuple.
+    if code.extract::<String>().is_err() {
+        code = code.get_item(0)?;
+    }
+    let code: String = code.extract()?;
+    Ok(if code == "None" { String::new() } else { code })
+}
+
+/// A boolean as Python prints it.
+fn py_bool_text(v: bool) -> &'static str {
+    if v { "True" } else { "False" }
+}
+
+/// 0 as the integer the official object starts with, any other value as a
+/// float.
+fn zero_as_int(py: Python<'_>, v: f64) -> PyResult<Py<PyAny>> {
+    Ok(if v == 0.0 { 0i32.into_pyobject(py)?.into_any().unbind() } else { v.into_pyobject(py)?.into_any().unbind() })
 }
 
 official_names!(ContractDetails, [
@@ -2931,7 +3595,7 @@ official_names!(ContractDetails, [
     ("validExchanges", "valid_exchanges"), ("priceMagnifier", "price_magnifier"), ("underConId", "under_con_id"),
     ("longName", "long_name"), ("contractMonth", "contract_month"), ("timeZoneId", "time_zone_id"),
     ("tradingHours", "trading_hours"), ("liquidHours", "liquid_hours"), ("evRule", "ev_rule"),
-    ("evMultiplier", "ev_multiplier"), ("aggGroup", "agg_group"), ("underSymbol", "under_symbol"),
+    ("aggGroup", "agg_group"), ("underSymbol", "under_symbol"),
     ("underSecType", "under_sec_type"), ("marketRuleIds", "market_rule_ids"), ("secIdList", "sec_id_list"),
     ("realExpirationDate", "real_expiration_date"), ("lastTradeTime", "last_trade_time"), ("stockType", "stock_type"),
     ("minSize", "min_size"), ("sizeIncrement", "size_increment"), ("suggestedSizeIncrement", "suggested_size_increment"),
@@ -2946,7 +3610,7 @@ official_names!(ContractDetails, [
     ("fundNotifyAmount", "fund_notify_amount"), ("fundMinimumInitialPurchase", "fund_minimum_initial_purchase"),
     ("fundSubsequentMinimumPurchase", "fund_subsequent_minimum_purchase"), ("fundBlueSkyStates", "fund_blue_sky_states"),
     ("fundBlueSkyTerritories", "fund_blue_sky_territories"),
-    ("fundDistributionPolicyIndicator", "fund_distribution_policy_indicator"), ("fundAssetType", "fund_asset_type"),
+    
     ("ineligibilityReasonList", "ineligibility_reason_list"), ("eventContract1", "event_contract1"),
     ("eventContractDescription1", "event_contract_description1"),
     ("eventContractDescription2", "event_contract_description2"),
@@ -3016,6 +3680,7 @@ impl ContractDetails {
             min_algo_size: d.min_algo_size,
             last_price_precision: d.last_price_precision,
             last_size_precision: d.last_size_precision,
+            decimal_texts: Default::default(),
             cusip: d.cusip,
             ratings: d.ratings,
             desc_append: d.desc_append,
@@ -3052,6 +3717,33 @@ impl ContractDetails {
             event_contract_description1: d.event_contract_description1,
             event_contract_description2: d.event_contract_description2,
         }
+    }
+}
+
+/// The official library's small table of names by number (attributes per
+/// name, `idx2name`, `toStr`), for the class attributes that are one
+/// (ibx#712).
+fn small_enum_class(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let code = c"class Enum:\n    def __init__(self, *args):\n        self.idx2name = {}\n        for idx, name in enumerate(args):\n            setattr(self, name, idx)\n            self.idx2name[idx] = name\n\n    def toStr(self, idx):\n        return self.idx2name.get(idx, \"NOTFOUND\")\n";
+    PyModule::from_code(py, code, c"ibx_enum.py", c"ibx_enum")?.getattr("Enum")
+}
+
+/// The official `OptionExerciseType` (ibx#712): an `enum.Enum` whose
+/// values are (number, name). Made once, kept in the module.
+pub fn option_exercise_type(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    static CLASS: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    let class = CLASS.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        let code = c"from enum import Enum\n\nclass OptionExerciseType(Enum):\n    NoneItem = (-1, \"None\")\n    Exercise = (1, \"Exercise\")\n    Lapse = (2, \"Lapse\")\n    DoNothing = (3, \"DoNothing\")\n    Assigned = (100, \"Assigned \")\n    AutoexerciseClearing = (101, \"AutoexerciseClearing\")\n    Expired = (102, \"Expired\")\n    Netting = (103, \"Netting\")\n    AutoexerciseTrading = (200, \"AutoexerciseTrading\")\n";
+        Ok(PyModule::from_code(py, code, c"ibx_execution.py", c"ibx_execution")?.getattr("OptionExerciseType")?.unbind())
+    })?;
+    Ok(class.bind(py).clone())
+}
+
+/// The name the official text gives an exercise or lapse type number.
+fn option_exercise_name(n: i32) -> &'static str {
+    match n {
+        1 => "Exercise", 2 => "Lapse", 3 => "DoNothing", 100 => "Assigned ", 101 => "AutoexerciseClearing",
+        102 => "Expired", 103 => "Netting", 200 => "AutoexerciseTrading", _ => "None",
     }
 }
 
@@ -3111,6 +3803,9 @@ pub struct Execution {
     pub combo_parent_execution_id: Option<String>,
     #[pyo3(get, set)]
     pub combo_raw_descriptor: Option<String>,
+    /// The number of the option exercise or lapse type (ibx#712): -1 when
+    /// none, as the official default.
+    pub opt_exercise_or_lapse_type: i32,
 }
 
 impl Default for Execution {
@@ -3136,6 +3831,7 @@ impl Default for Execution {
             last_liquidity: 0,
             pending_price_revision: false,
             submitter: String::new(),
+            opt_exercise_or_lapse_type: -1,
             combo_role: "ordinary".into(),
             combo_leg_index: None,
             combo_leg_count: None,
@@ -3168,6 +3864,7 @@ impl Execution {
             last_liquidity: execution.last_liquidity,
             pending_price_revision: execution.pending_price_revision,
             submitter: String::new(),
+            opt_exercise_or_lapse_type: -1,
             combo_role: execution.component.role().into(),
             combo_leg_index: execution.component.leg_index(),
             combo_leg_count: execution.component.leg_count(),
@@ -3179,9 +3876,43 @@ impl Execution {
 
 #[pymethods]
 impl Execution {
+    /// The official `OptionExerciseType` member of the execution (ibx#712).
+    #[getter(optExerciseOrLapseType)]
+    fn get_opt_exercise_or_lapse_type(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let class = option_exercise_type(py)?;
+        for member in class.try_iter()? {
+            let member = member?;
+            if member.getattr("value")?.get_item(0)?.extract::<i32>()? == self.opt_exercise_or_lapse_type {
+                return Ok(member.unbind());
+            }
+        }
+        Ok(class.getattr("NoneItem")?.unbind())
+    }
+    #[setter(optExerciseOrLapseType)]
+    fn set_opt_exercise_or_lapse_type(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.opt_exercise_or_lapse_type = match v.extract::<i32>() {
+            Ok(n) => n,
+            Err(_) => v.getattr("value")?.get_item(0)?.extract()?,
+        };
+        Ok(())
+    }
+
     #[new]
     #[pyo3(signature = ())]
     fn new() -> Self { Self::default() }
+
+    /// The official library's text (ibx#654); the exercise or lapse type
+    /// by its name (ibx#712).
+    fn __str__(&self) -> String {
+        format!("ExecId: {}, Time: {}, Account: {}, Exchange: {}, Side: {}, Shares: {}, Price: {}, PermId: {}, ClientId: {}, OrderId: {}, Liquidation: {}, CumQty: {}, AvgPrice: {}, OrderRef: {}, EvRule: {}, EvMultiplier: {}, ModelCode: {}, LastLiquidity: {}, PendingPriceRevision: {}, Submitter: {}, OptExerciseOrLapseType: {}",
+            self.exec_id, self.time, self.acct_number, self.exchange, self.side, decimal_max_string(self.shares),
+            float_max_string(self.price), long_max_string(self.perm_id), int_max_string(self.client_id),
+            int_max_string(self.order_id), int_max_string(self.liquidation as i64), decimal_max_string(self.cum_qty),
+            float_max_string(self.avg_price), self.order_ref, self.ev_rule, float_max_string(self.ev_multiplier),
+            self.model_code, int_max_string(self.last_liquidity as i64),
+            if self.pending_price_revision { "True" } else { "False" }, self.submitter,
+            option_exercise_name(self.opt_exercise_or_lapse_type))
+    }
 
     #[getter(shares)]
     fn get_shares(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { decimal_to_py(py, self.shares) }
@@ -3266,6 +3997,11 @@ impl SmartComponentPy {
     #[new]
     #[pyo3(signature = ())]
     fn new() -> Self { Self::default() }
+
+    /// The official library's text (ibx#750).
+    fn __str__(&self) -> String {
+        format!("BitNumber: {}, Exchange: {}, ExchangeLetter: {}", self.bit_number, self.exchange, self.exchange_letter)
+    }
 }
 
 official_names!(SmartComponentPy, [("bitNumber", "bit_number"), ("exchangeLetter", "exchange_letter")]);
@@ -3287,6 +4023,11 @@ impl NewsProviderPy {
     #[new]
     #[pyo3(signature = ())]
     fn new() -> Self { Self::default() }
+
+    /// The official library's text (ibx#750).
+    fn __str__(&self) -> String {
+        format!("Code: {}, Name: {}", self.code, self.name)
+    }
 }
 
 // ── WshEventData ──
@@ -3313,6 +4054,12 @@ pub struct WshEventDataPy {
     pub total_limit: i32,
 }
 
+impl Default for WshEventDataPy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[pymethods]
 impl WshEventDataPy {
     #[new]
@@ -3329,6 +4076,14 @@ impl WshEventDataPy {
             end_date: d.end_date,
             total_limit: d.total_limit,
         }
+    }
+
+    /// The official library's text (ibx#750): the dates and the limit are
+    /// not in it, the flags are 0 or 1.
+    fn __str__(&self) -> String {
+        format!("WshEventData. ConId: {}, Filter: {}, Fill Watchlist: {}, Fill Portfolio: {}, Fill Competitors: {}",
+            int_max_string(self.con_id as i64), self.filter, self.fill_watchlist as i32, self.fill_portfolio as i32,
+            self.fill_competitors as i32)
     }
 }
 
@@ -3361,6 +4116,11 @@ impl SoftDollarTierPy {
     fn new(name: String, val: String, displayName: String) -> Self {
         Self { name, val, display_name: displayName }
     }
+
+    /// The official library's text (ibx#750).
+    fn __str__(&self) -> String {
+        format!("Name: {}, Value: {}, DisplayName: {}", self.name, self.val, self.display_name)
+    }
 }
 
 official_names!(SoftDollarTierPy, [("displayName", "display_name")]);
@@ -3390,6 +4150,13 @@ impl CommissionAndFeesReport {
     #[new]
     #[pyo3(signature = ())]
     fn new() -> Self { Self::default() }
+
+    /// The official library's text (ibx#750).
+    fn __str__(&self) -> String {
+        format!("ExecId: {}, CommissionAndFees: {}, Currency: {}, RealizedPnL: {}, Yield: {}, YieldRedemptionDate: {}",
+            self.exec_id, float_max_string(self.commission_and_fees), self.currency, float_max_string(self.realized_pnl),
+            float_max_string(self.yield_amount), int_max_string(self.get_yield_redemption_date()))
+    }
 
     // ibapi camelCase aliases (ibx#487: the official client library's names)
     #[getter(execId)]
@@ -3456,6 +4223,12 @@ impl ContractDescription {
             self.con_id, self.symbol, self.sec_type, self.currency)
     }
 
+    /// The official class has no text of its own: the base object's
+    /// (ibx#750).
+    fn __str__(&self) -> &'static str {
+        "Object"
+    }
+
     /// The official API's shape: the described contract.
     #[getter(contract)]
     fn get_contract(&self) -> Contract {
@@ -3502,6 +4275,12 @@ impl DepthMktDataDescriptionPy {
         format!("DepthMktDataDescription(exchange='{}', secType='{}', listingExch='{}', serviceDataType='{}', aggGroup={})",
             self.exchange, self.sec_type, self.listing_exch, self.service_data_type, self.agg_group)
     }
+
+    /// The official library's text (ibx#750), with its ", " at the end.
+    fn __str__(&self) -> String {
+        format!("Exchange: {}, SecType: {}, ListingExchange: {}, ServiceDataType: {}, AggGroup: {}, ",
+            self.exchange, self.sec_type, self.listing_exch, self.service_data_type, int_max_string(self.agg_group as i64))
+    }
 }
 
 official_names!(DepthMktDataDescriptionPy, [
@@ -3521,6 +4300,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PriceCondition>()?;
     m.add_class::<TimeCondition>()?;
     m.add_class::<MarginCondition>()?;
+    m.add("ClientException", client_exception_class(m.py())?)?;
     m.add_class::<ExecutionCondition>()?;
     m.add_class::<VolumeCondition>()?;
     m.add_class::<PercentChangeCondition>()?;
@@ -3734,5 +4514,85 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+}
+
+// Their attribute lists give the official names only (ibx#697).
+super::hide_second_spelling!(
+    Contract, Order ["rule80a", "soft_dollar_tier_name", "soft_dollar_tier_val", "soft_dollar_tier_display_name"], ComboLeg, OrderComboLeg, TagValue, OrderAllocation, OrderState, PriceCondition, TimeCondition, MarginCondition, ExecutionCondition, VolumeCondition, PercentChangeCondition, BarData, IneligibilityReasonPy, ContractDetails, Execution, SmartComponentPy, NewsProviderPy, WshEventDataPy, SoftDollarTierPy, CommissionAndFeesReport ["yield_amount"],
+    ContractDescription ["con_id", "currency", "description", "issuer_id", "primary_exchange", "sec_type", "symbol"], DepthMktDataDescriptionPy,
+);
+
+// The text forms of the order conditions, as the official classes' `str()`
+// (ibx#654): an unset value is written as Python writes None, values as
+// Python writes them, the operator part with its two spaces.
+
+/// `str()` of a value, as Python writes it.
+fn py_text<'py, T: IntoPyObject<'py>>(py: Python<'py>, v: T) -> PyResult<String> {
+    use pyo3::IntoPyObjectExt;
+    Ok(v.into_bound_py_any(py)?.str()?.to_string())
+}
+
+/// The operator part: " >=  value" when `isMore` is set, else " <=  value".
+fn operator_text(is_more: Option<bool>, value: &str) -> String {
+    let sign = if is_more.unwrap_or(false) { ">= " } else { "<= " };
+    format!(" {sign} {value}")
+}
+
+/// The contract part: "conId on exchange is <operator> ".
+fn contract_text(py: Python<'_>, con_id: Option<i64>, exchange: &Option<String>, is_more: Option<bool>, value: &str) -> PyResult<String> {
+    Ok(format!("{} on {} is {} ", py_text(py, con_id)?, py_text(py, exchange.clone())?, operator_text(is_more, value)))
+}
+
+#[pymethods]
+impl PriceCondition {
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        const NAMES: [&str; 9] = ["Default", "DoubleBidAsk", "Last", "DoubleLast", "BidAsk", "N/A1", "N/A2", "LastBidAsk", "MidPoint"];
+        let method = self.trigger_method.and_then(|m| usize::try_from(m).ok()).and_then(|m| NAMES.get(m)).copied().unwrap_or("NOTFOUND");
+        let value = py_text(py, self.price)?;
+        Ok(format!("{method} price of {} ", contract_text(py, self.con_id, &self.exchange, self.is_more, &value)?))
+    }
+}
+
+#[pymethods]
+impl TimeCondition {
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!("time is {} ", operator_text(self.is_more, &py_text(py, self.time.clone())?)))
+    }
+}
+
+#[pymethods]
+impl MarginCondition {
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        let value = match self.percent { Some(p) => p.to_py(py)?.str()?.to_string(), None => "None".to_string() };
+        Ok(format!("the margin cushion percent {} ", operator_text(self.is_more, &value)))
+    }
+}
+
+#[pymethods]
+impl ExecutionCondition {
+    /// Joined with `+` in the official class: an unset part raises
+    /// TypeError, as there.
+    fn __str__(&self) -> PyResult<String> {
+        let part = |v: &Option<String>| v.clone().ok_or_else(|| pyo3::exceptions::PyTypeError::new_err(
+            "can only concatenate str (not \"NoneType\") to str"));
+        Ok(format!("trade occurs for {} symbol on {} exchange for {} security type",
+            part(&self.symbol)?, part(&self.exchange)?, part(&self.sec_type)?))
+    }
+}
+
+#[pymethods]
+impl VolumeCondition {
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        let value = py_text(py, self.volume)?;
+        Ok(format!("volume of {} ", contract_text(py, self.con_id, &self.exchange, self.is_more, &value)?))
+    }
+}
+
+#[pymethods]
+impl PercentChangeCondition {
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        let value = py_text(py, self.change_percent)?;
+        Ok(format!("percent change of {} ", contract_text(py, self.con_id, &self.exchange, self.is_more, &value)?))
     }
 }

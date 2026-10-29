@@ -9,19 +9,24 @@ pub(crate) mod pool;
 pub mod order_builder;
 pub mod liveness;
 pub(crate) mod optcalc;
+pub(crate) mod optmd;
+#[cfg(test)]
+mod optmd_tests;
 pub(crate) mod optparams;
+pub(crate) mod fa;
 
 use std::sync::Arc;
 use std::time::Instant;
 use std::io;
 
 use crate::bridge::{Event, SharedState};
-use crate::engine::context::Context;
+use crate::engine::context::{Context, DefAsk};
+use crate::engine::park::{ControlSender, Parker, RawHandle, Waker};
 use crate::config::chrono_free_timestamp;
 use crate::gateway::{ccp_reconnect_host, reconnect_ccp_via, CcpReconnect, ReconnectAuth};
 use crate::protocol::connection::Connection;
 use crate::protocol::fix;
-use crate::types::{ControlCommand, InstrumentId, ReqId, Price, Qty, PRICE_SCALE, QTY_SCALE};
+use crate::types::{ControlCommand, InstrumentId, ReqId, Price, Qty, PRICE_SCALE, QTY_DIGITS, QTY_SCALE};
 #[cfg(any(test, feature = "test-support"))]
 use crate::types::{Fill, TbtQuote, TbtTrade};
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -44,6 +49,22 @@ macro_rules! farm_sink {
             id => $self.pool.get_mut(id).map(|f| f as &mut dyn FixSink),
         }
     };
+}
+
+/// The data field of a message (ibx#443): the bytes its length field
+/// gives, which may hold any character.
+fn raw_data(msg: &[u8]) -> String {
+    let find = |tag: &[u8]| msg.windows(tag.len()).position(|w| w == tag).map(|at| at + tag.len());
+    let Some(len_at) = find(b"\x0195=") else {
+        return fix::fix_parse(msg).get(&96).cloned().unwrap_or_default();
+    };
+    let len_end = msg[len_at..].iter().position(|&c| c == 1).map_or(msg.len(), |p| len_at + p);
+    let len: usize = std::str::from_utf8(&msg[len_at..len_end]).ok().and_then(|l| l.parse().ok()).unwrap_or(0);
+    let data_at = len_end + 1 + 3;
+    match msg.get(len_end + 1..data_at) {
+        Some(b"96=") => String::from_utf8_lossy(&msg[data_at..(data_at + len).min(msg.len())]).into_owned(),
+        _ => fix::fix_parse(msg).get(&96).cloned().unwrap_or_default(),
+    }
 }
 
 /// The pinned-core hot loop. Pushes events to SharedState + optional event channel.
@@ -72,11 +93,41 @@ pub struct HotLoop {
     hb: HeartbeatState,
     /// Reusable buffer for control commands (avoids per-iteration allocation).
     cmd_buf: Vec<ControlCommand>,
+    /// The commands received and not taken yet, in order (ibx#555).
+    cmd_queue: std::collections::VecDeque<crate::engine::pacer::Queued>,
+    /// Commands read from the channel so far.
+    cmd_received: u64,
+    /// The market data messages that wait for the next pass (ibx#560).
+    md_pass: crate::engine::md_pass::MdPass,
+    /// The time the pacing of requests and the market data passes go by,
+    /// when a test sets it (ibx#563); else the clock.
+    pace_clock: Option<Instant>,
+    /// Slots told to market data requests whose turn has not come, by
+    /// conId, oldest first (ibx#561). A slot here is not given back.
+    md_slots_told: Vec<(i64, InstrumentId)>,
+    /// The pacing of API requests, as the reference's; `None` takes every
+    /// command at once (engines built by hand, tests).
+    pacer: Option<crate::engine::pacer::Pacer>,
+    /// Since when the requests wait for the contract lookup of an earlier
+    /// request (ibx#662).
+    lookup_hold_since: Option<Instant>,
     /// Connection states last reported to the clients; `None` until the
     /// first observation (ibx#399).
     links: Option<Links>,
+    /// What the clients were last told about each data connection
+    /// (ibx#520); set with `links`.
+    told: DataLinks,
     /// Market-data farm name, for the farm status messages.
     farm_name: String,
+    /// Contract data farm of the logon, for its status messages; empty
+    /// when the logon names none (ibx#520).
+    secdef_farm_name: String,
+    /// Its host (ibx#443).
+    secdef_farm_host: String,
+    /// The calendar data requests waiting for their answer, by the name
+    /// they were sent under (ibx#443), and the number of the next name.
+    wsh_sent: std::collections::HashMap<String, (bool, i64)>,
+    wsh_next: u32,
     // ── Subsystems ──
     pub(crate) farm: FarmState,
     pub(crate) ccp: CcpState,
@@ -96,6 +147,9 @@ pub struct HotLoop {
     farm_reconnect_attempt: u32,
     pending_ccp_reconnect: Option<Receiver<io::Result<CcpReconnect>>>,
     ccp_reconnect_attempt: u32,
+    /// The server refused the login of a reconnect: no further attempt
+    /// (ibx#496).
+    ccp_login_refused: bool,
     /// HMDS reconnect state (ibx#187). Drives a background reconnect loop with
     /// exponential backoff when the historical-data farm is down — initial
     /// connect failed, or a future runtime disconnect detector trips it.
@@ -107,7 +161,36 @@ pub struct HotLoop {
     /// The timing of the market data resubscription after a data
     /// permission change (ibx#421).
     permission_change: crate::control::logon::PermissionChange,
+    // ── Rest between passes (ibx#530) ──
+    /// The wait of the thread while there is nothing to do.
+    parker: Parker,
+    /// The sockets to wait on, rebuilt for each wait.
+    wait_handles: Vec<RawHandle>,
+    /// The pass handled a command.
+    pass_active: bool,
+    /// Bytes read on all connections up to the last pass.
+    bytes_seen: u64,
+    /// Passes in a row that read nothing and handled no command.
+    idle_passes: u32,
+    /// Last wake of the consumers.
+    notified_at: Instant,
 }
+
+/// Passes with nothing to do before the thread waits (ibx#530): what one
+/// pass leaves for the next is done first.
+const IDLE_PASSES_BEFORE_WAIT: u32 = 4;
+
+/// Longest wait of the thread: the timers of the loop run at least this
+/// often. The system may round it up to its timer tick.
+const WAIT_TIMEOUT_MS: i32 = 1;
+
+/// The consumers are woken at least this often while nothing comes.
+const NOTIFY_PERIOD: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The stack of the engine's thread. A debug build of the loop needs about
+/// 2 MB, the default of a new thread, and overflowed it (ibx#694); the
+/// memory is reserved, not used.
+pub const ENGINE_STACK: usize = 16 * 1024 * 1024;
 
 /// Maximum HMDS reconnect attempts before giving up (ibx#187).
 /// Total wait at cap: 3+6+12+24+48 = 93s before final attempt fires.
@@ -118,6 +201,7 @@ impl HotLoop {
         if let Some(tx) = &event_tx {
             shared.attach_event_channel(tx);
         }
+        let entry_marks = shared.reference.md_entry_marks();
         Self {
             shared,
             event_tx,
@@ -131,7 +215,18 @@ impl HotLoop {
             account_id: String::new(),
             hb: HeartbeatState::new(),
             cmd_buf: Vec::with_capacity(16),
-            farm: FarmState::new(),
+            cmd_queue: std::collections::VecDeque::with_capacity(16),
+            cmd_received: 0,
+            md_pass: Default::default(),
+            pace_clock: None,
+            md_slots_told: Vec::new(),
+            pacer: None,
+            lookup_hold_since: None,
+            farm: {
+                let mut farm = FarmState::new();
+                farm.set_entry_marks(entry_marks);
+                farm
+            },
             ccp: CcpState::new(),
             hmds: HmdsState::new(),
             pool: FarmPool::new(Instant::now()),
@@ -145,18 +240,51 @@ impl HotLoop {
             farm_reconnect_attempt: 0,
             pending_ccp_reconnect: None,
             ccp_reconnect_attempt: 0,
+            ccp_login_refused: false,
             pending_hmds_reconnect: None,
             hmds_reconnect_attempt: 0,
             hmds_next_attempt_at: None,
             links: None,
+            told: DataLinks::default(),
             farm_name: "usfarm".to_string(),
+            secdef_farm_name: String::new(),
+            secdef_farm_host: String::new(),
+            wsh_sent: std::collections::HashMap::new(),
+            wsh_next: 0,
             permission_change: Default::default(),
+            parker: Parker::new(None),
+            wait_handles: Vec::with_capacity(8),
+            pass_active: false,
+            bytes_seen: 0,
+            idle_passes: 0,
+            notified_at: Instant::now(),
         }
     }
 
-    /// Set the control channel receiver. The caller keeps the sender.
+    /// Set the control channel receiver. The caller keeps the sender. A
+    /// command sent on it does not wake a waiting engine: it is read at the
+    /// end of the wait (`control_channel` gives a sender that wakes).
     pub fn set_control_rx(&mut self, rx: Receiver<ControlCommand>) {
         self.control_rx = Some(rx);
+    }
+
+    /// Create the control channel of this engine and give its sender: a
+    /// command sent while the engine waits wakes it (ibx#530).
+    pub fn control_channel(&mut self) -> ControlSender {
+        let (tx, rx) = bounded(64);
+        let waker = match Waker::new() {
+            Ok(waker) => Some(Arc::new(waker)),
+            Err(e) => {
+                log::warn!("No wake socket ({}): commands wait for the end of the rest of the engine", e);
+                None
+            }
+        };
+        self.parker = Parker::new(waker.clone());
+        self.set_control_rx(rx);
+        if self.pacer.is_some() {
+            self.shared.command_clock().set_paced(waker.clone());
+        }
+        ControlSender::new(tx, waker, Some(self.shared.command_clock().clone()))
     }
 
     /// Set the account ID for order submission.
@@ -168,6 +296,52 @@ impl HotLoop {
     /// data sizes of those stocks are multiplied by the contract's lot.
     pub fn set_scale_us_lots(&mut self, on: bool) {
         self.context.scale_us_lots = on;
+    }
+
+    /// The logon's algo providers: an order for one of them goes through
+    /// SMART with the provider as its second destination (ibx#505).
+    pub fn set_algo_providers(&mut self, names: Vec<String>) {
+        self.context.algo_providers = names;
+    }
+
+    /// The server's sizes come in round lots, as in the 10.40 form, whose
+    /// entries had no mark; by default they come in shares (ibx#663).
+    pub fn set_lot_sizes(&mut self, on: bool) {
+        self.context.market.set_lot_sizes(on);
+        self.hmds.form_10_40 = on;
+    }
+
+    /// A contract whose records the session had before (ibx#706): a replay
+    /// of a recording that starts after the reference had them.
+    pub fn mark_order_types_done(&mut self, con_id: i64) {
+        self.context.order_records_any.insert(con_id);
+    }
+
+    /// The order preset of a security type the session had before, with no
+    /// time in force (ibx#728): a replay of a recording that starts after
+    /// the reference asked it.
+    pub fn mark_order_preset_known(&mut self, sec_type: &str) {
+        self.context.order_presets.entry(sec_type.to_string()).or_insert(None);
+    }
+
+    /// An FA session (ibx#507): orders carry their allocation.
+    pub fn set_fa_session(&mut self, fa: bool) {
+        self.context.fa_session = fa;
+    }
+
+    /// The logon's soft dollar tiers by key, the contract's market type
+    /// (ibx#506).
+    pub fn set_soft_dollar_tiers(&mut self, groups: Vec<(String, Vec<(String, String)>)>) {
+        self.context.soft_dollar_tiers = groups.into_iter().collect();
+    }
+
+    /// MiFID on the session (ibx#500): the logon's MIFID2 feature on a
+    /// session that is not a super user's, the account's MiFID config id
+    /// and its covered groups (`+` separated, `*` for all).
+    pub fn set_mifid(&mut self, manager: bool, config_id: &str, groups: &str) {
+        self.context.mifid_manager = manager;
+        self.context.mifid_config_id = config_id.to_string();
+        self.context.mifid_groups = groups.split('+').map(str::trim).filter(|g| !g.is_empty()).map(String::from).collect();
     }
 
     /// The logon's price management feature and exclusion list (ibx#492).
@@ -192,7 +366,7 @@ impl HotLoop {
         self.depth_limit = limit;
     }
 
-    /// The logon turns the user book on (`6247=demo`, as on paper): depth
+    /// The logon turns the user book on (the demo value, as on paper): depth
     /// books are given as an index diff of the book shown (#451).
     pub fn set_user_book(&mut self, on: bool) {
         self.farm.user_book = on;
@@ -228,10 +402,9 @@ impl HotLoop {
         ccp_conn: Connection,
         hmds_conn: Option<Connection>,
         core_id: Option<usize>,
-    ) -> (Self, Sender<ControlCommand>) {
-        let (tx, rx) = bounded(64);
+    ) -> (Self, ControlSender) {
         let mut hl = Self::new(shared, event_tx, core_id);
-        hl.set_control_rx(rx);
+        let tx = hl.control_channel();
         hl.set_account_id(account_id);
         hl.farm_conn = Some(farm_conn);
         hl.ccp_conn = Some(ccp_conn);
@@ -335,7 +508,10 @@ impl HotLoop {
             };
             self.context.market.set_round_lot(id, lot);
         }
-        if !lot_needed && !self.needs_agg_group(sub) {
+        // A conId given without its security type waits for the
+        // definition, which names it (ibx#643).
+        let kind_needed = sub.sec_type.is_empty() && sub.con_id > 0 && !self.context.def_kinds.contains_key(&sub.con_id);
+        if !lot_needed && !kind_needed && !self.needs_agg_group(sub) {
             return false;
         }
         if !self.ask_definition(sub.con_id, &sub.exchange) {
@@ -363,6 +539,59 @@ impl HotLoop {
 
     /// The farm of the route of a contract's market data (#445), for its
     /// top of book and its news (ibx#458).
+    /// The route of a position's P&L quote (ibx#715): None for a US stock
+    /// (the main farm, as recorded); else the farm of the contract's own
+    /// route, with its exchange and type as its market data request writes
+    /// them; Some(None) when it has no route or no definition to ask it by.
+    /// Its type from the position's row, else from its definition (the
+    /// portfolio's batch lookup, ibx#705).
+    fn pnl_route(&mut self, con_id: i64) -> Option<Option<farm::PnlRoute>> {
+        let info = self.shared.portfolio.position_info(con_id);
+        let def = self.shared.reference.get_contract(con_id);
+        let pick = |a: Option<&str>, b: Option<&str>| a.filter(|s| !s.is_empty()).or(b).unwrap_or("").to_string();
+        let sec_type = pick(info.as_ref().map(|p| p.sec_type.as_str()), def.as_ref().map(|k| k.sec_type.as_str()));
+        let currency = pick(info.as_ref().map(|p| p.currency.as_str()), def.as_ref().map(|k| k.currency.as_str()));
+        let symbol = pick(info.as_ref().map(|p| p.symbol.as_str()), def.as_ref().map(|k| k.symbol.as_str()));
+        let stock = sec_type.is_empty() || sec_type == "STK";
+        if stock && (currency.is_empty() || currency == "USD") {
+            return None;
+        }
+        // A pair on IDEALPRO, a stock through SMART, any other type on the
+        // exchange of its definition.
+        let exchange = match sec_type.as_str() {
+            "CASH" => "IDEALPRO".to_string(),
+            _ if stock => "SMART".to_string(),
+            _ => match def.as_ref().map(|k| k.exchange.clone()).filter(|e| !e.is_empty()) {
+                Some(e) => e,
+                None => {
+                    log::warn!("P&L quote of conId {} ({} {}): no definition to ask it by", con_id, symbol, sec_type);
+                    return Some(None);
+                }
+            },
+        };
+        let route_type = if stock { "STK" } else { sec_type.as_str() };
+        let sub = farm::MdSubscribe {
+            con_id, symbol, exchange: exchange.clone(), sec_type: route_type.to_string(),
+            last_trade_date: def.as_ref().map(|k| k.last_trade_date_or_contract_month.clone()).unwrap_or_default(),
+            strike: def.as_ref().map_or(0.0, |k| k.strike),
+            right: def.as_ref().map(|k| k.right.clone()).unwrap_or_default(),
+            multiplier: def.as_ref().map(|k| k.multiplier.clone()).unwrap_or_default(),
+            instrument: 0, mode_9887: 0, snapshot: false,
+        };
+        // No route: not asked (md_route logs it).
+        let Some(farm) = self.md_route(&sub) else { return Some(None) };
+        // A stock the main farm serves goes with the main farm's stocks.
+        if stock && farm == PRIMARY_MD {
+            return None;
+        }
+        Some(Some(farm::PnlRoute {
+            con_id, farm,
+            exchange: farm::routing_exchange(&exchange, route_type).to_string(),
+            sec_type: farm::fix_sec_type(route_type).to_string(),
+            stock,
+        }))
+    }
+
     fn md_route(&mut self, sub: &farm::MdSubscribe) -> Option<pool::FarmId> {
         let Some(table) = self.farm.routing.as_ref() else { return Some(PRIMARY_MD) };
         let sec_type = if sub.sec_type.is_empty() { "STK" } else { sub.sec_type.as_str() };
@@ -393,6 +622,13 @@ impl HotLoop {
     fn start_tbt(&mut self, req_id: ReqId, con_id: i64, id: InstrumentId, symbol: &str, exchange: &str, sec_type: &str,
         tbt_type: crate::types::TbtType, number_of_ticks: i32, ignore_size: bool) {
         use crate::engine::routing::DataType;
+        // An id already in use by a live request: 102, the live one goes
+        // on (ibx#720; the reference 10.51, paper, 16/10/2026, a second
+        // BidAsk request of AAPL under the same id, 0.2 s after it).
+        if self.hmds.tbt_subscriptions.iter().any(|s| s.clients.contains(&req_id)) {
+            self.shared.market.push_tbt_error(req_id, 102, "Duplicate ticker id".to_string());
+            return;
+        }
         let st = if sec_type.is_empty() { "STK" } else { sec_type };
         let route_exchange = farm::routing_exchange(exchange, st).to_string();
         let agg_group = self.agg_group_for(con_id, &route_exchange);
@@ -470,32 +706,165 @@ impl HotLoop {
         true
     }
 
-    /// Ask the auth connection for a contract's definition, unless a lookup
-    /// for it is in flight. False when it cannot be asked.
+    /// Ask the auth connection for the definition of the contract of a
+    /// client's request, unless a lookup for it is in flight. False when it
+    /// cannot be asked.
+    ///
+    /// Asked as the reference asks the definition of a contract a client's
+    /// request gives by its conId: by its name for that, with the client
+    /// source, on the request's exchange (ibx#731; the reference 10.51,
+    /// paper, recordings of 13 and 16/10/2026: 13 historical, real-time
+    /// bar and depth requests given by conId alone, 13 asked so, on
+    /// IDEALPRO, BEST for SMART, CME).
     fn ask_definition(&mut self, con_id: i64, exchange: &str) -> bool {
+        self.ask_definition_named(con_id, exchange, true, |c| farm::next_definition_lookup(c, crate::control::contracts::SECDEF_MSG_NAME))
+    }
+
+    /// A client's historical, real-time bar or depth request given by a
+    /// conId alone asks its contract's definition each time, known or not,
+    /// as [`Self::ask_definition`] asks it, and waits for it (ibx#732;
+    /// observed on paper, recordings of 13 and 16/10/2026: 17 such requests
+    /// of 17 asked it, 11 of them on a contract known from an earlier
+    /// answer). True when the request waits: it comes back to the command
+    /// loop once the answer came (or after the lookup's deadline) and goes
+    /// on then, without asking it again. A lookup is sent for each request,
+    /// even when one for the contract is on its way.
+    fn ask_definition_each_time(&mut self, kind: DefAsk, req_id: ReqId, con_id: i64, exchange: &str,
+        request: impl FnOnce() -> ControlCommand) -> bool
+    {
+        if con_id <= 0 || self.context.def_asked.remove(&(kind, req_id)) {
+            return false;
+        }
+        if self.ccp_conn.is_none() || self.ccp.disconnected {
+            return false;
+        }
+        let name = farm::next_definition_lookup(&mut self.context, crate::control::contracts::SECDEF_MSG_NAME);
+        if !self.send_definition_lookup(con_id, exchange, true, name) {
+            return false;
+        }
+        self.context.def_asked.insert((kind, req_id));
+        self.context.def_parked.push((con_id, request()));
+        true
+    }
+
+    /// A client's request given by an option's conId alone, once its
+    /// definition came: the company lookup of the option's underlying when
+    /// neither known nor asked, and the request waits for its answer, as
+    /// the reference (ibx#733; observed on paper, 13/10/2026, two sessions:
+    /// 2 real-time bar requests of 2 on an option, the company asked 1 to
+    /// 2 ms after the option's definition answered, the query 13 ms after
+    /// the company's answer; 2 of 2 on a future asked none, the query 1 ms
+    /// after the definition). True when the request waits: it comes back
+    /// to the command loop once the company answered and goes on then,
+    /// without asking the definition again.
+    fn wait_for_option_company(&mut self, kind: DefAsk, req_id: ReqId, con_id: i64,
+        request: impl FnOnce() -> ControlCommand) -> bool
+    {
+        let Some(terms) = self.context.option_terms.get(&con_id) else { return false };
+        let under = terms.under_con_id;
+        if terms.sec_type != "OPT" || under <= 0 || self.ccp.company_by_underlying.contains_key(&under) {
+            return false;
+        }
+        if !self.ccp.company_pending(under) {
+            self.ccp.send_company_lookup(under, &mut self.ccp_conn, &mut self.hb);
+            if !self.ccp.company_pending(under) {
+                return false;
+            }
+        }
+        self.context.def_asked.insert((kind, req_id));
+        self.context.company_parked.push((under, request()));
+        // The option's class is asked once the company answered, before
+        // the request goes on (ibx#734; observed on paper, 13/10/2026: 2
+        // first real-time bars of an option given by its conId, the class
+        // 0 to 1 ms after the company's answer, the bar query 12 ms after).
+        if let Some(key) = self.context.permission_keys.get(&con_id).cloned()
+            && !self.context.trading_permissions.contains_key(&key)
+            && !self.context.permissions_asked.contains_key(&key)
+            && !self.context.classes_after_company.iter().any(|(u, k)| *u == under && *k == key)
+        {
+            self.context.classes_after_company.push((under, key));
+        }
+        true
+    }
+
+    /// Drop a request of `kind` waiting for its definition (its cancel came
+    /// first). True when one waited.
+    fn drop_parked(&mut self, kind: DefAsk, req_id: ReqId) -> bool {
+        let of_kind = |c: &ControlCommand| match (kind, c) {
+            (DefAsk::Historical, ControlCommand::FetchHistorical { req_id: r, .. })
+            | (DefAsk::RealTimeBars, ControlCommand::SubscribeRealTimeBar { req_id: r, .. })
+            | (DefAsk::Depth, ControlCommand::SubscribeDepth { req_id: r, .. }) => *r == req_id,
+            _ => false,
+        };
+        let before = self.context.def_parked.len() + self.context.company_parked.len();
+        self.context.def_parked.retain(|(_, c)| !of_kind(c));
+        // Or for its option's company (ibx#733).
+        self.context.company_parked.retain(|(_, c)| !of_kind(c));
+        self.context.def_asked.remove(&(kind, req_id));
+        self.context.def_parked.len() + self.context.company_parked.len() != before
+    }
+
+    /// [`Self::ask_definition`] for the engine's own need, with no client
+    /// source: an option model's or an order quote's (ibx#731).
+    fn ask_own_definition(&mut self, con_id: i64, exchange: &str) -> bool {
+        self.ask_definition_named(con_id, exchange, false, |c| farm::next_definition_lookup(c, crate::control::contracts::SECDEF_MSG_ND_NAME))
+    }
+
+    /// [`Self::ask_definition`], named as the reference names the lookup of
+    /// that kind (an order's option model's, ibx#730).
+    fn ask_definition_as(&mut self, con_id: i64, exchange: &str, kind: &str) -> bool {
+        self.ask_definition_named(con_id, exchange, false, |c| farm::next_model_lookup(c, kind))
+    }
+
+    /// The underlying's definition of a client's option model, as the
+    /// reference asks it when the underlying is not known: its definition
+    /// for the engine's need and its preferred definition, both on any
+    /// exchange, sent together (ibx#731; the reference 10.51, paper,
+    /// recordings of 12-16/10/2026: 5 option requests of 5 whose
+    /// underlying was not known; none of 8 whose underlying was known).
+    /// Either answer gives what the model waits for.
+    fn ask_underlying_definitions(&mut self, under_con_id: i64) {
+        if self.context.lot_lookups.iter().any(|(_, c, _)| *c == under_con_id) {
+            return;
+        }
+        if self.ask_own_definition(under_con_id, "ANYEXCH") {
+            let name = farm::next_definition_lookup(&mut self.context, crate::control::contracts::SECDEF_PREFERRED_NAME);
+            self.send_definition_lookup(under_con_id, "ANYEXCH", false, name);
+        }
+    }
+
+    fn ask_definition_named(&mut self, con_id: i64, exchange: &str, from_client: bool, name: impl FnOnce(&mut Context) -> String) -> bool {
         if self.context.lot_lookups.iter().any(|(_, c, _)| *c == con_id) {
             return true;
         }
-        let Some(conn) = self.ccp_conn.as_mut().filter(|_| !self.ccp.disconnected) else {
+        if self.ccp_conn.is_none() || self.ccp.disconnected {
             return false;
-        };
-        let req_id = format!("ibxlot{}", self.context.next_lot_lookup);
-        self.context.next_lot_lookup = self.context.next_lot_lookup.wrapping_add(1);
+        }
+        let req_id = name(&mut self.context);
+        self.send_definition_lookup(con_id, exchange, from_client, req_id)
+    }
+
+    /// Send a definition lookup by conId and wait for its answer under
+    /// `req_id`. False when it cannot be sent.
+    fn send_definition_lookup(&mut self, con_id: i64, exchange: &str, from_client: bool, req_id: String) -> bool {
+        let Some(conn) = self.ccp_conn.as_mut().filter(|_| !self.ccp.disconnected) else { return false };
         let ts = chrono_free_timestamp();
         let con_id_str = con_id.to_string();
         let exchange = match exchange.to_ascii_uppercase().as_str() {
             "" | "SMART" => "BEST".to_string(),
             other => other.to_string(),
         };
-        let _ = conn.send_fix(&[
+        let mut fields: Vec<(u32, &str)> = vec![
             (fix::TAG_MSG_TYPE, "c"),
             (fix::TAG_SENDING_TIME, &ts),
             (320, &req_id),
             (321, "2"),
-            (146, "1"),
-            (6008, &con_id_str),
-            (6004, &exchange),
-        ]);
+        ];
+        if from_client {
+            fields.push((crate::control::contracts::TAG_IB_SOURCE, "Socket"));
+        }
+        fields.extend([(146, "1"), (6008, con_id_str.as_str()), (6004, exchange.as_str())]);
+        let _ = conn.send_fix(&fields);
         self.hb.last_ccp_sent = Instant::now();
         log::info!("Definition of con_id {} on {} asked ({})", con_id, exchange, req_id);
         self.context.lot_lookups.push((req_id, con_id, Instant::now() + farm::LOT_LOOKUP_TIMEOUT));
@@ -540,6 +909,21 @@ impl HotLoop {
     /// request whose news tick is refused ends with 10094 instead, nothing
     /// sent, as the reference.
     fn route_md_subscribe(&mut self, sub: &farm::MdSubscribe) {
+        // A contract refused for want of an API subscription, delayed data
+        // available: in delayed mode it is asked delayed at once (ibx#674;
+        // the reference 10.51, paper, 14/10/2026, RY on TSE after such a
+        // refusal: a stream asked with 442 and 443 on BEST, delayed; a
+        // snapshot asked in real time again, and refused again).
+        let delayed_sub;
+        let sub = if sub.mode_9887 == 0 && !sub.snapshot && self.farm.md_modes.delayed
+            && self.context.delayed_contracts.contains(&sub.con_id)
+        {
+            delayed_sub = farm::MdSubscribe { mode_9887: crate::types::MarketDataModes::entry_mode(false, true), ..sub.clone() };
+            self.shared.market.push_md_reject(crate::bridge::MdReject::DelayedAtOnce { instrument: sub.instrument });
+            &delayed_sub
+        } else {
+            sub
+        };
         let news = self.take_waiting_news(sub.instrument);
         if let Some(text) = news.iter().find_map(|(_, refusal)| refusal.clone()) {
             self.shared.market.push_md_reject(crate::bridge::MdReject::NewsRefused { instrument: sub.instrument, con_id: sub.con_id, text });
@@ -554,14 +938,50 @@ impl HotLoop {
         let Some(id) = self.md_route(sub) else { return };
         if let Some(f) = self.pool.get_mut(id) {
             f.note_request(Instant::now());
+            f.note_client_request();
+        }
+        farm::publish_increments(&self.context, &self.shared, sub.instrument, sub.con_id);
+        // From level 222, the definition of a contract ibx has not read, for
+        // the steps of its last size (ibx#613).
+        if farm::increments_lookup_needed(crate::client_core::session_level(), &self.context, sub.con_id) {
+            self.ask_own_definition(sub.con_id, &sub.exchange);
+        }
+        // A contract asked before in the session: its request parameters
+        // are known now, before any acknowledgement; the client gives them
+        // now to the requests the reference gives them to (ibx#535).
+        if !news_contract && sub.mode_9887 == 0
+            && let Some((min_tick, bbo_exchange, permissions)) = self.farm.con_params.get(&sub.con_id).cloned()
+        {
+            let option = matches!(sub.sec_type.to_ascii_uppercase().as_str(), "OPT" | "FOP" | "IOPT");
+            self.shared.market.push_early_tick_req_params(crate::bridge::TickReqParams {
+                instrument: sub.instrument, min_tick, bbo_exchange, snapshot_permissions: permissions as i32,
+            }, option);
+        }
+        // The last entry of a stock that is not a US stock, asked on an
+        // exchange of its own, goes to BEST (ibx#674).
+        let own_exchange = !matches!(sub.exchange.as_str(), "" | "SMART" | "BEST" | "IBEOS" | "OVERNIGHT");
+        if own_exchange && self.context.foreign_stocks.contains(&sub.con_id) {
+            self.farm.last_on_best.insert(sub.instrument);
+        } else {
+            self.farm.last_on_best.remove(&sub.instrument);
         }
         if !news_contract {
-            let Some(sink) = farm_sink!(self, id) else { return };
-            self.farm.subscribe_top(sub, id, sink, &mut self.hb);
+            if self.md_pass.on {
+                let now = self.pace_now();
+                let mut sink = crate::engine::md_pass::HoldSink { farm: id, pass: &mut self.md_pass, now };
+                self.farm.subscribe_top(sub, id, &mut sink, &mut self.hb);
+            } else {
+                let Some(sink) = farm_sink!(self, id) else { return };
+                self.farm.subscribe_top(sub, id, sink, &mut self.hb);
+            }
         }
         for (providers, _) in news {
             let msgs = self.farm.start_news(sub.instrument, sub.con_id, &sub.sec_type, &providers, id);
-            self.send_farm_messages(msgs);
+            self.send_md_messages(msgs);
+        }
+        // The option model of an option (ibx#502).
+        if !news_contract {
+            self.start_option_model(sub, id);
         }
         // The generic ticks of its requests, after its top of book
         // (ibx#450).
@@ -576,8 +996,9 @@ impl HotLoop {
         };
         for w in waiting {
             let primary = self.context.listing_exchanges.get(&sub.con_id).cloned().unwrap_or_default();
-            let msgs = self.farm.start_generic(sub.instrument, sub.con_id, &sub.exchange, &sub.sec_type, &primary, &w.codes, id);
-            self.send_farm_messages(msgs);
+            let codes = self.etf_codes_for(sub.con_id, &w.codes);
+            let msgs = self.farm.start_generic(sub.instrument, sub.con_id, &sub.exchange, &sub.sec_type, &primary, &codes, id);
+            self.send_md_messages(msgs);
         }
     }
 
@@ -598,9 +1019,21 @@ impl HotLoop {
             strike: 0.0, right: String::new(), multiplier: String::new(), instrument, mode_9887: 0, snapshot: false,
         };
         let Some(id) = self.md_route(&sub) else { return };
+        if let Some(f) = self.pool.get_mut(id) {
+            f.note_client_request();
+        }
         let primary = self.context.listing_exchanges.get(&con_id).cloned().unwrap_or_default();
+        let codes = self.etf_codes_for(con_id, &codes);
         let msgs = self.farm.start_generic(instrument, con_id, &exchange, &sec_type, &primary, &codes, id);
-        self.send_farm_messages(msgs);
+        self.send_md_messages(msgs);
+    }
+
+    /// The codes of a request without the ETF ticks, unless its contract
+    /// is known as an ETF or ETMF (ibx#641).
+    fn etf_codes_for(&self, con_id: i64, codes: &[i32]) -> Vec<i32> {
+        use crate::control::generic_values as gv;
+        let etf = self.context.stock_types.get(&con_id).is_some_and(|t| gv::is_etf_type(t));
+        codes.iter().copied().filter(|&c| etf || !gv::etf_only(c)).collect()
     }
 
     /// The news ticks waiting for the top of book of an instrument, in the
@@ -638,14 +1071,60 @@ impl HotLoop {
         let Some(id) = self.md_route(&sub) else { return };
         if let Some(f) = self.pool.get_mut(id) {
             f.note_request(Instant::now());
+            f.note_client_request();
         }
         let msgs = self.farm.start_news(instrument, con_id, &sub.sec_type, &providers, id);
-        self.send_farm_messages(msgs);
+        self.send_md_messages(msgs);
     }
 
     /// Cancel the top of book of an instrument on each farm it went to
     /// (#445).
     fn route_md_cancel(&mut self, instrument: InstrumentId) {
+        // The underlying's bid and ask stay for its next request, as the
+        // reference's record of the underlying keeps them (ibx#508).
+        if let Some((con_id, wire, min_tick, size_tick, auto)) = self.farm.optmd.under_book(instrument) {
+            let lot = self.context.market.size_lot(self.context.round_lots.get(&con_id).copied().unwrap_or(1));
+            self.context.market.keep_quote(crate::engine::market_state::KeptQuote::from_wire(con_id, wire, min_tick, size_tick, lot, auto));
+        }
+        // The option model's cancels around the top of book's (ibx#502);
+        // a model an order started stays (ibx#693).
+        let (model_first, model_pre, model_post) = if self.farm.optmd.is_order_model(instrument) {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            self.farm.optmd.stop(instrument)
+        };
+        // The frozen slot its frozen pair fed goes with it (ibx#494).
+        if let Some(pos) = self.farm.model_twins.iter().position(|t| t.0 == instrument) {
+            let (_, twin, _) = self.farm.model_twins.remove(pos);
+            self.context.market.drop_quote_tags(twin);
+            self.try_reclaim_instrument(twin);
+        }
+        if self.md_pass.on {
+            // The model's first cancels in a pass of their own, the rest
+            // in the next (ibx#647; the reference 10.51, 13/10/2026 and
+            // 14/10/2026: 5 to 7 ms apart).
+            if !model_first.is_empty() {
+                self.send_md_messages(model_first);
+                let msgs = self.md_pass.take_due(self.pace_now(), true);
+                self.send_farm_messages(msgs);
+            }
+            // In the order of the reference's cancels: the top of book,
+            // the generic tick entries, the news entry, the market data
+            // status entry (ibx#450, ibx#458, ibx#447).
+            self.send_md_messages(model_pre);
+            let msgs = self.farm.unsubscribe_top(instrument);
+            self.send_md_messages(msgs);
+            self.send_md_messages(model_post);
+            let msgs = self.farm.stop_generic(instrument);
+            self.send_md_messages(msgs);
+            let msgs = self.farm.stop_news(instrument);
+            self.send_md_messages(msgs);
+            let msgs = self.farm.stop_status(instrument);
+            self.send_md_messages(msgs);
+            return;
+        }
+        self.send_farm_messages(model_first);
+        self.send_farm_messages(model_pre);
         let now = Instant::now();
         for (id, msg) in self.farm.unsubscribe_top(instrument) {
             let fields: Vec<(u32, &str)> = msg.iter().map(|(t, v)| (*t, v.as_str())).collect();
@@ -661,6 +1140,7 @@ impl HotLoop {
         // Clear an ack queued after the client's cancel but before the
         // engine removed the old subscription's native request ids.
         self.shared.market.discard_top_acks(instrument);
+        self.send_farm_messages(model_post);
         // Its generic tick entries, then its news entry, after its top of
         // book, as the reference's cancels (ibx#450, ibx#458).
         let msgs = self.farm.stop_generic(instrument);
@@ -670,6 +1150,383 @@ impl HotLoop {
         // Its market data status entry last (ibx#447).
         let msgs = self.farm.stop_status(instrument);
         self.send_farm_messages(msgs);
+    }
+
+    /// Start the option model of an option request whose top of book went
+    /// out on `opt_farm` (ibx#502): real-time data only; once the option's
+    /// terms and its underlying's route are known.
+    fn start_option_model(&mut self, sub: &farm::MdSubscribe, opt_farm: pool::FarmId) {
+        if sub.mode_9887 != 0 || sub.con_id <= 0 || !crate::control::optcalc::market::has_model(&sub.sec_type) {
+            return;
+        }
+        // The model an order started gives way to the request's, which
+        // starts from its values (ibx#693, ibx#646). Not observed on the
+        // reference: its order's model was never followed by a request.
+        if self.farm.optmd.is_order_model(sub.instrument) {
+            let (first, pre, post) = self.farm.optmd.stop(sub.instrument);
+            for msgs in [first, pre, post] {
+                self.send_md_messages(msgs);
+            }
+        }
+        if self.farm.optmd.has(sub.instrument) {
+            return;
+        }
+        let now = Instant::now();
+        self.farm.optmd.starting.push(optmd::Starting {
+            instrument: sub.instrument, con_id: sub.con_id, snapshot: sub.snapshot, opt_farm,
+            deadline: now + optmd::OptMd::start_wait(), order: None,
+        });
+        self.service_option_starts(now);
+    }
+
+    /// The option models the orders started (ibx#693): one per contract,
+    /// kept for the session; none for a contract whose model runs.
+    fn start_order_models(&mut self, now: Instant) {
+        for (instrument, con_id, exchange) in std::mem::take(&mut self.context.order_models) {
+            // A fund order asks the fund's top of book alone (ibx#666).
+            if self.context.market.order_routing(instrument).0 == "FUND" {
+                self.farm.order_quote_starts.push((instrument, con_id, exchange, now + optmd::OptMd::start_wait()));
+                continue;
+            }
+            if self.farm.optmd.has_contract(con_id) || self.farm.optmd.has(instrument) {
+                continue;
+            }
+            log::info!("Option model of con_id {}: started by an order on {}", con_id, exchange);
+            self.farm.optmd.starting.push(optmd::Starting {
+                instrument, con_id, snapshot: false, opt_farm: PRIMARY_MD,
+                deadline: now + optmd::OptMd::start_wait(), order: Some(exchange),
+            });
+        }
+        if !self.farm.order_quote_starts.is_empty() {
+            self.start_order_quotes(now);
+        }
+    }
+
+    /// The top of book of the funds the orders named (ibx#666): one per
+    /// contract, kept for the session, on the farm of the fund's route on
+    /// the order's exchange. The fund's farm, when it is not connected yet,
+    /// connects with its notice at once, as for a client's request (the
+    /// reference 10.51, paper, 16/10/2026: "connecting:usbond" 2 ms after
+    /// the connect began, twice of two).
+    fn start_order_quotes(&mut self, now: Instant) {
+        for (instrument, con_id, exchange, deadline) in std::mem::take(&mut self.farm.order_quote_starts) {
+            if self.farm.has_order_quote(con_id) {
+                continue;
+            }
+            let sub = farm::MdSubscribe {
+                con_id, symbol: String::new(), exchange: exchange.clone(), sec_type: "FUND".into(),
+                last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
+                instrument, mode_9887: 0, snapshot: false,
+            };
+            // A SMART route needs the contract's aggregate group.
+            if self.needs_agg_group(&sub) {
+                if now < deadline && self.ask_own_definition(con_id, "SMART") {
+                    self.farm.order_quote_starts.push((instrument, con_id, exchange, deadline));
+                } else {
+                    log::warn!("Order quote of con_id {}: no definition for its route", con_id);
+                }
+                continue;
+            }
+            let Some(id) = self.md_route(&sub) else {
+                log::warn!("Order quote of con_id {}: no route for it", con_id);
+                continue;
+            };
+            if let Some(f) = self.pool.get_mut(id) {
+                f.note_request(now);
+                f.note_client_request();
+            }
+            let wire_exchange = farm::routing_exchange(&exchange, "FUND").to_string();
+            if let Some(msg) = self.farm.order_quote(con_id, &wire_exchange, "FUND", id) {
+                log::info!("Order quote of con_id {}: asked on farm {} for an order on {}", con_id, id, exchange);
+                self.send_md_messages(vec![msg]);
+            }
+        }
+    }
+
+    /// Whether a farm can take a message now: the primary market data
+    /// farm when connected; a farm opened on demand keeps its messages
+    /// until it is.
+    fn md_farm_up(&self, id: pool::FarmId) -> bool {
+        id != PRIMARY_MD || (!self.farm.disconnected && self.farm_conn.is_some())
+    }
+
+    /// The option models waiting for their definitions (ibx#502): asked
+    /// when missing; started once known.
+    fn service_option_starts(&mut self, now: Instant) {
+        self.farm.optmd.sweep_starting(now);
+        for s in std::mem::take(&mut self.farm.optmd.starting) {
+            // The request ended meanwhile.
+            if s.order.is_none() && !self.farm.has_md_subscription(s.instrument) {
+                continue;
+            }
+            let Some(terms) = self.context.option_terms.get(&s.con_id).cloned() else {
+                // Answered without the contract: no model, not asked again
+                // (ibx#727: a futures option asked on the stock route got
+                // an empty answer, asked again at every pass).
+                if self.context.no_definition.remove(&s.con_id) {
+                    log::warn!("Option model of con_id {}: its definition has no record of it, no option computations", s.con_id);
+                    continue;
+                }
+                // An order's model asks it on the order's exchange.
+                let exchange = s.order.clone().unwrap_or_else(|| "SMART".to_string());
+                self.ask_own_definition(s.con_id, &exchange);
+                self.farm.optmd.starting.push(s);
+                continue;
+            };
+            if terms.under_con_id <= 0 {
+                log::warn!("Option model of con_id {}: no underlying in its definition, no option computations", s.con_id);
+                continue;
+            }
+            // An order's model waits for the preferred definition of its
+            // underlying that the order asked past its permission check
+            // (ibx#730).
+            if s.order.is_some() && matches!(self.context.under_preferred.get(&terms.under_con_id), Some(Some(_))) {
+                self.farm.optmd.starting.push(s);
+                continue;
+            }
+            let under_type = if terms.under_sec_type.is_empty() { "STK".to_string() } else { terms.under_sec_type.clone() };
+            // An order's model: the option's route on the order's exchange,
+            // once the definition its route needs is known (ibx#693).
+            let opt_farm = match &s.order {
+                None => s.opt_farm,
+                Some(exchange) => {
+                    let opt_sub = farm::MdSubscribe {
+                        con_id: s.con_id, symbol: String::new(), exchange: exchange.clone(), sec_type: terms.sec_type.clone(),
+                        last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
+                        instrument: s.instrument, mode_9887: 0, snapshot: false,
+                    };
+                    if self.needs_agg_group(&opt_sub) {
+                        self.ask_own_definition(s.con_id, "SMART");
+                        self.farm.optmd.starting.push(s);
+                        continue;
+                    }
+                    let Some(id) = self.md_route(&opt_sub) else {
+                        log::warn!("Option model of con_id {}: no route for it", s.con_id);
+                        continue;
+                    };
+                    id
+                }
+            };
+            // A futures option ordered on its exchange: its future there
+            // too (the reference 10.51, paper, 15/10/2026: an ES option
+            // ordered on CME, the future's entries on CME).
+            let under_exchange = match s.order.as_deref().map(|x| farm::routing_exchange(x, &terms.sec_type)) {
+                Some(x) if x != "BEST" && under_type == "FUT" => x.to_string(),
+                _ => farm::routing_exchange("SMART", &under_type).to_string(),
+            };
+            let under_sub = farm::MdSubscribe {
+                con_id: terms.under_con_id, symbol: String::new(),
+                exchange: if under_exchange == "BEST" { "SMART".into() } else { under_exchange.clone() }, sec_type: under_type.clone(),
+                last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
+                instrument: s.instrument, mode_9887: 0, snapshot: false,
+            };
+            if self.needs_agg_group(&under_sub) {
+                // A client's model asks its underlying as the reference
+                // (ibx#731), once the company lookup of its underlying, on
+                // its way, answered (ibx#732); an order's on the smart
+                // route.
+                if s.order.is_none() {
+                    if !self.ccp.company_pending(terms.under_con_id) {
+                        self.ask_underlying_definitions(terms.under_con_id);
+                    }
+                } else {
+                    self.ask_own_definition(terms.under_con_id, "SMART");
+                }
+                self.farm.optmd.starting.push(s);
+                continue;
+            }
+            let Some(under_farm) = self.md_route(&under_sub) else {
+                log::warn!("Option model of con_id {}: no route for its underlying {}", s.con_id, terms.under_con_id);
+                continue;
+            };
+            if !self.md_farm_up(opt_farm) || !self.md_farm_up(under_farm) {
+                self.farm.optmd.starting.push(s);
+                continue;
+            }
+            // A futures option order's model: its index part next
+            // (ibx#727); its inputs once the index is known (ibx#730).
+            let by_order = s.order.is_some();
+            let index_part = by_order && under_type == "FUT";
+            if index_part {
+                self.farm.optmd.note_index_start(s.instrument, terms.under_con_id, now);
+            }
+            // An order's model asks its underlying's pair as a client's
+            // request asks it: a farm it starts gives its connecting notice
+            // at once, and the model's later entries the one of the check
+            // (ibx#730; the reference 10.51, paper, 15/10/2026 before the
+            // open, an ES put ordered on CME: "connecting:usfuture" 4 ms
+            // after the futures farm's connect began, with the future's
+            // pair queued, then again 0.56 s later with the model's other
+            // entries queued; an option's own farm, two of two, none at
+            // the start, ibx#693).
+            if s.order.is_some() && let Some(f) = self.pool.get_mut(under_farm) {
+                f.note_client_request();
+            }
+            let f = &mut self.farm;
+            let msgs = f.optmd.launch_with(s.instrument, s.con_id, s.snapshot, terms.clone(), opt_farm, under_farm,
+                &under_exchange, s.order, &mut f.next_md_req_id);
+            self.send_md_messages(msgs);
+            if !index_part {
+                self.ccp.optcalc.want_inputs(&terms, &mut self.ccp_conn, &mut self.hb);
+                if by_order {
+                    self.note_input_hours(&terms.currency, terms.under_con_id, now);
+                }
+            }
+        }
+    }
+
+    /// The steps of the futures option order models after their index
+    /// part's definitions (ibx#730, `optmd::IndexFollow`).
+    fn service_index_follows(&mut self, now: Instant) {
+        for f in std::mem::take(&mut self.farm.optmd.index_follows) {
+            if !self.ccp.schedule_known(&f.future_key) && !f.future_key.is_empty() && now < f.deadline {
+                self.farm.optmd.index_follows.push(f);
+                continue;
+            }
+            if let Some(conn) = self.ccp_conn.as_mut().filter(|_| !self.ccp.disconnected) {
+                farm::start_index_walks(&mut self.context, conn, &mut self.hb, f.target, &f.currency);
+            }
+            self.ccp.optcalc.set_dividend_source(f.future, f.index);
+            self.model_inputs(f.instrument, now);
+        }
+    }
+
+    /// The inputs of the order's model of an instrument, asked when not
+    /// known, then the trading hours that follow them.
+    fn model_inputs(&mut self, instrument: InstrumentId, now: Instant) {
+        if let Some(terms) = self.farm.optmd.models.iter().find(|m| m.instrument == instrument).map(|m| m.terms.clone()) {
+            self.ccp.optcalc.want_inputs(&terms, &mut self.ccp_conn, &mut self.hb);
+            self.note_input_hours(&terms.currency, terms.under_con_id, now);
+        }
+    }
+
+    /// The trading hours an order's model asks once its inputs came
+    /// (`optmd::InputHours`).
+    fn note_input_hours(&mut self, currency: &str, under_con_id: i64, now: Instant) {
+        let waits = &mut self.farm.optmd.input_hours;
+        if !waits.iter().any(|w| w.under_con_id == under_con_id && w.currency == currency) {
+            waits.push(optmd::InputHours { currency: currency.to_string(), under_con_id, deadline: now + optmd::OptMd::start_wait() });
+        }
+    }
+
+    fn service_input_hours(&mut self, now: Instant) {
+        for w in std::mem::take(&mut self.farm.optmd.input_hours) {
+            if self.ccp.optcalc.inputs_known(&w.currency, w.under_con_id) {
+                let source = self.ccp.optcalc.dividend_contract(w.under_con_id);
+                if let Some(key) = self.context.join_keys.get(&source).cloned() {
+                    self.ccp.ask_model_schedule(&key, &mut self.ccp_conn, &mut self.hb);
+                }
+            } else if now < w.deadline {
+                self.farm.optmd.input_hours.push(w);
+            }
+        }
+    }
+
+    /// The index part of the futures option orders' models (ibx#727): the
+    /// definitions that name the index asked in turn, on any exchange, as
+    /// the reference asks them (the future's, which names its index; the
+    /// index's, which names the index it refers to; that one's); then the
+    /// index's entries on the farm of its route, the engine's own. The
+    /// farm, when it is not connected yet, connects as for an option
+    /// model's, with no notice at its start.
+    fn service_index_starts(&mut self, now: Instant) {
+        self.farm.optmd.sweep_index_starts(now);
+        for mut s in std::mem::take(&mut self.farm.optmd.index_starts) {
+            let links = &self.context.def_links;
+            let future = links.get(&s.future).cloned();
+            let index = future.as_ref().filter(|f| f.under_con_id > 0).and_then(|f| links.get(&f.under_con_id).cloned());
+            let target = index.as_ref().filter(|i| i.index_con_id > 0).and_then(|i| links.get(&i.index_con_id).cloned());
+            let missing = match (&future, &index, &target) {
+                (None, ..) => Some(s.future),
+                (Some(f), None, _) if f.under_con_id > 0 => Some(f.under_con_id),
+                (Some(_), Some(i), None) if i.index_con_id > 0 => Some(i.index_con_id),
+                _ => None,
+            };
+            if let Some(con_id) = missing {
+                // Named as the reference names them (ibx#730).
+                if s.asked != Some(con_id) && self.ask_definition_as(con_id, "ANYEXCH", crate::control::contracts::SECDEF_PREFERRED_NAME) {
+                    s.asked = Some(con_id);
+                }
+                self.farm.optmd.index_starts.push(s);
+                continue;
+            }
+            // A definition that names nothing: no index part (not
+            // observed); the model's inputs from the future.
+            let (Some(future), Some(index), Some(target)) = (future, index, target) else {
+                log::info!("Index part of the model of instrument {}: the definitions of future {} name no index", s.instrument, s.future);
+                self.model_inputs(s.instrument, now);
+                continue;
+            };
+            let con_id = index.index_con_id;
+            // Its next steps, once per future (ibx#730): the trading hours
+            // of the future's class first.
+            if self.farm.optmd.followed_futures.insert(s.future) {
+                self.ccp.ask_model_schedule(&future.join_key, &mut self.ccp_conn, &mut self.hb);
+                self.farm.optmd.index_follows.push(optmd::IndexFollow {
+                    instrument: s.instrument, future: s.future, index: future.under_con_id, target: con_id,
+                    future_key: future.join_key.clone(),
+                    currency: self.farm.optmd.models.iter().find(|m| m.instrument == s.instrument)
+                        .map(|m| m.terms.currency.clone()).filter(|c| !c.is_empty()).unwrap_or_else(|| future.currency.clone()),
+                    deadline: now + optmd::OptMd::start_wait(),
+                });
+            }
+            if self.farm.optmd.has_index(con_id) {
+                continue;
+            }
+            let sub = farm::MdSubscribe {
+                con_id, symbol: String::new(), exchange: target.exchange.clone(), sec_type: target.sec_type.clone(),
+                last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
+                instrument: s.instrument, mode_9887: 0, snapshot: false,
+            };
+            let Some(farm_id) = self.md_route(&sub) else {
+                log::warn!("Index part of the model of instrument {}: no route for index {}", s.instrument, con_id);
+                continue;
+            };
+            if !self.md_farm_up(farm_id) {
+                self.farm.optmd.index_starts.push(s);
+                continue;
+            }
+            let exchange = farm::routing_exchange(&target.exchange, &target.sec_type).to_string();
+            let f = &mut self.farm;
+            let msgs = f.optmd.launch_index(s.instrument, s.future, con_id, &exchange, &target.sec_type, farm_id, &mut f.next_md_req_id);
+            self.send_md_messages(msgs);
+        }
+    }
+
+    /// The option models (ibx#502): the starts waiting, the messages made
+    /// while reading the farms, the passes that are due.
+    fn service_option_models(&mut self, now: Instant) {
+        if !self.context.order_models.is_empty() || !self.farm.order_quote_starts.is_empty() {
+            self.start_order_models(now);
+        }
+        if !self.farm.optmd.starting.is_empty() {
+            self.service_option_starts(now);
+        }
+        if !self.farm.optmd.index_starts.is_empty() {
+            self.service_index_starts(now);
+        }
+        if !self.farm.optmd.index_follows.is_empty() {
+            self.service_index_follows(now);
+        }
+        if !self.farm.optmd.input_hours.is_empty() {
+            self.service_input_hours(now);
+        }
+        if !self.farm.optmd.outbox.is_empty() {
+            let msgs = std::mem::take(&mut self.farm.optmd.outbox);
+            self.send_md_messages(msgs);
+        }
+        if self.farm.optmd.is_empty() {
+            return;
+        }
+        // A contract on its frozen slot: the model reads the frozen pair's
+        // prices there (ibx#494).
+        let farm = &mut self.farm;
+        let (optmd, status, optcalc, context, shared) = (&mut farm.optmd, &farm.status, &mut self.ccp.optcalc, &self.context, &self.shared);
+        let twins = &farm.model_twins;
+        let quote_slot = |i: InstrumentId| status.iter().find_map(|e| (e.instrument == i).then_some(e.frozen).flatten())
+            .or_else(|| twins.iter().find(|t| t.0 == i && t.2).map(|t| t.1))
+            .unwrap_or(i);
+        optmd.passes(now, context, shared, quote_slot, |terms, f| optcalc.with_inputs(terms, |inp| f(inp)));
     }
 
     /// The frozen slots whose farm was lost (ibx#447): their requests go
@@ -717,12 +1574,41 @@ impl HotLoop {
     }
 
     /// Send market data messages, each to its farm.
+    /// Market data requests and cancels of the API requests: kept for the
+    /// next pass when the passes are on (ibx#560), else sent at once.
+    fn send_md_messages(&mut self, msgs: Vec<(pool::FarmId, Vec<(u32, String)>)>) {
+        if !self.md_pass.on {
+            return self.send_farm_messages(msgs);
+        }
+        let now = self.pace_now();
+        for (id, msg) in msgs {
+            self.md_pass.hold(now, id, msg);
+        }
+    }
+
+    /// Send the market data pass that is due (ibx#560).
+    fn send_due_md_pass(&mut self) {
+        if !self.md_pass.on {
+            return;
+        }
+        let msgs = self.md_pass.take_due(self.pace_now(), !self.running);
+        if !msgs.is_empty() {
+            self.send_farm_messages(msgs);
+        }
+    }
+
     fn send_farm_messages(&mut self, msgs: Vec<(pool::FarmId, Vec<(u32, String)>)>) {
         let now = Instant::now();
         for (id, msg) in msgs {
             let fields: Vec<(u32, &str)> = msg.iter().map(|(t, v)| (*t, v.as_str())).collect();
             if let Some(f) = self.pool.get_mut(id) {
                 f.note_request(now);
+            }
+            // What leaves, readable on a live session (ibx#558).
+            if log::log_enabled!(log::Level::Debug) {
+                let text: Vec<String> = fields.iter().filter(|(t, _)| *t != fix::TAG_SENDING_TIME)
+                    .map(|(t, v)| format!("{t}={v}")).collect();
+                log::debug!("To farm {}: {}", id, text.join("|"));
             }
             if let Some(sink) = farm_sink!(self, id) {
                 if sink.send_comp(&fields) && id == PRIMARY_MD {
@@ -780,7 +1666,7 @@ impl HotLoop {
     /// the farm of its route.
     fn route_depth_subscribe(&mut self, req_id: ReqId, con_id: i64, exchange: String, sec_type: String, num_rows: i32, is_smart_depth: bool) {
         let refuse = |shared: &SharedState, code: i64, text: String| shared.orders.push_order_error(i64::from(req_id), code, text);
-        let invalid = |cause: &str| format!("Error validating request.-'bR' : cause - {}", cause);
+        let invalid = |cause: &str| format!("Error validating request.-'ReqMktDepth(10)' : cause - {}", cause);
         if exchange.trim().is_empty() {
             return refuse(&self.shared, 321, invalid("Please enter exchange."));
         }
@@ -799,6 +1685,19 @@ impl HotLoop {
         if !contracts.contains(&con_id) && contracts.len() >= self.depth_limit {
             return refuse(&self.shared, 309, format!("Max number ({}) of market depth requests has been reached", self.depth_limit));
         }
+        // Given by its conId alone, with no security type: its definition
+        // is asked each time (ibx#732).
+        if sec_type.is_empty() && self.ask_definition_each_time(DefAsk::Depth, req_id, con_id, &exchange, || ControlCommand::SubscribeDepth {
+            req_id, con_id, exchange: exchange.clone(), sec_type: String::new(), num_rows, is_smart_depth,
+        }) {
+            return;
+        }
+        // A contract given by its conId alone takes the type of its
+        // definition (ibx#678, the rule of #643).
+        let sec_type = match self.context.def_kinds.get(&con_id) {
+            Some((kind, _)) if sec_type.is_empty() => kind.clone(),
+            _ => sec_type,
+        };
         let st = if sec_type.is_empty() { "STK".to_string() } else { sec_type.clone() };
         // The reference knows the contract (its SMART components, listing
         // exchange, aggregate group) first: wait for its definition.
@@ -823,14 +1722,16 @@ impl HotLoop {
             return self.gather_depth_components(req_id, con_id, st, num_rows, valid);
         }
         let Some(farm_id) = self.depth_route(con_id, &exchange, &st) else {
+            // Its cancel answers nothing (ibx#678; the reference 10.51,
+            // 13/10/2026: no 310 after 10092).
+            self.context.depth_unsupported.insert(req_id);
             return refuse(&self.shared, 10092, "Deep market data is not supported for this combination of security type/exchange".into());
         };
         if is_smart_depth {
             // SmartDepth that the contract does not allow: the reference
             // hands the book to its single-exchange requests, where this
-            // request is not (`jextend.dA.c(dy)` -> `jextend.dK.a(int,dy,false)`
-            // finds no entry in its single map): the request stays, with
-            // nothing on the wire and no error.
+            // request is not: the request stays, with nothing on the wire
+            // and no error.
             log::warn!("SmartDepth req {}: not allowed for this contract; nothing is sent, as the reference", req_id);
             let msgs = self.farm.start_depth(req_id, con_id, &st, true, num_rows, 1, false, Vec::new(), None, &self.shared);
             return self.send_farm_messages(msgs);
@@ -848,9 +1749,16 @@ impl HotLoop {
     }
 
     /// The round lot of a contract's depth sizes: its round lot when the
-    /// session counts in round lots, as its top of book (#451).
+    /// session counts in round lots and the server sends lots, as its top
+    /// of book (#451); 1 when the sizes come in shares, as with the mark
+    /// of the reference 10.51 (ibx#663; observed 13/10/2026, AAPL book in
+    /// shares on the reference, multiplied by its lot on ibx).
     fn depth_lot(&self, con_id: i64) -> i64 {
-        if self.context.scale_us_lots { self.context.round_lots.get(&con_id).copied().unwrap_or(1) } else { 1 }
+        if self.context.scale_us_lots {
+            self.context.market.size_lot(self.context.round_lots.get(&con_id).copied().unwrap_or(1))
+        } else {
+            1
+        }
     }
 
     /// The farm of the top-of-book route of a contract on an exchange
@@ -865,7 +1773,7 @@ impl HotLoop {
     }
 
     /// SmartDepth (#452): the contract is looked up on each of its valid
-    /// exchanges first, as the reference does (`jextend.d0.c(dy)`); its
+    /// exchanges first, as the reference does; its
     /// books and tops go out once every lookup answered, or after 10 s
     /// (`start_gathered_depth`).
     fn gather_depth_components(&mut self, req_id: ReqId, con_id: i64, sec_type: String, num_rows: i32, exchanges: Vec<String>) {
@@ -911,15 +1819,14 @@ impl HotLoop {
     }
 
     /// The books and tops of a SmartDepth request, as the reference sorts
-    /// its components (`jextend.d1.process`, `jextend.d0.b(dy)`): a
+    /// its components: a
     /// component found with a depth route gets a book; else one with a top
     /// route gets a top of book, unless it is the smart-routing name or its
     /// order types hold NOT2D; the others nothing. The LAST entry of a top
     /// of book goes to BEST when SMART is a valid exchange (else to the
     /// listing exchange), except on an overnight venue, which keeps its own
-    /// (`jclient.is.a(pa,List,List,..)@531-738`, `jmdclient.aP.a(dy,TopQuote,..)`;
-    /// captured 28/09/2026: `207=ISE|264=442` with `207=BEST|264=443`,
-    /// `207=IBEOS|264=442` with `207=IBEOS|264=443`).
+    /// (captured 28/09/2026: the bid/ask entry on ISE with the last entry on
+    /// BEST; the bid/ask entry on IBEOS with the last entry on IBEOS).
     fn start_smart_depth(&mut self, g: farm::DepthGather) {
         let st = g.sec_type.as_str();
         let has_smart = g.components.iter().any(|c| c.exchange == "SMART");
@@ -982,12 +1889,23 @@ impl HotLoop {
             &mut self.ccp_conn, &mut self.context, &self.shared,
             &self.event_tx, &mut self.hb, &self.account_id,
         );
+        // The FA download of an FA session, and its saves lost with the
+        // link (ibx#507).
+        if self.context.fa_session {
+            let connected = !self.ccp.disconnected;
+            if fa::tick(&mut self.context.fa, &mut self.ccp_conn, &mut self.hb, &self.shared, connected) {
+                order_builder::release_rth_parked(&mut self.context);
+            }
+        }
         self.ccp.sweep_pending_schedule_pairs(&self.shared, &self.event_tx);
         self.ccp.sweep_scanner_enrichments(&self.shared);
-        self.ccp.sweep_contract_details(&self.shared, &self.event_tx, &mut self.ccp_conn, &mut self.hb);
+        self.ccp.sweep_contract_details_and_completed(&self.shared, &self.event_tx, &mut self.ccp_conn, &mut self.hb);
         self.ccp.optcalc.progress(&mut self.ccp_conn, &mut self.hb, &self.shared);
         self.ccp.pump_matching_symbols(Instant::now(), &mut self.ccp_conn, &mut self.hb, &self.shared);
+        self.ccp.pump_fanout(Instant::now(), &mut self.ccp_conn, &mut self.hb);
         order_builder::sweep_rth_lookups(&mut self.context);
+        order_builder::sweep_permission_requests(&mut self.context);
+        order_builder::sweep_underlying_lookups(&mut self.context);
         farm::sweep_md_lookups(&mut self.context, &self.shared);
         self.send_md_resolved();
         farm::sweep_round_lot_lookups(&mut self.context);
@@ -1000,6 +1918,7 @@ impl HotLoop {
             self.send_farm_messages(msgs);
         }
         self.hmds.sweep_head_timestamps(&self.shared);
+        self.sweep_scanner_params();
         self.service_logon_updates(Instant::now());
     }
 
@@ -1010,7 +1929,7 @@ impl HotLoop {
         if std::mem::take(&mut self.ccp.permissions_changed) && self.permission_change.change(now) {
             // The reference's API access manager: a warning to the API
             // clients when a request was refused for an API subscription
-            // since the last change (`jextend.F.onPermissionsChanged()`).
+            // since the last change.
             if self.farm.take_refused_api_subscriptions() {
                 use crate::control::logon::{MARKET_DATA_SUBSCRIPTION_CHANGED, MARKET_DATA_SUBSCRIPTION_CHANGED_CODE};
                 log::info!("Market data subscription has been changed: warning {}", MARKET_DATA_SUBSCRIPTION_CHANGED_CODE);
@@ -1034,7 +1953,7 @@ impl HotLoop {
     }
 
     /// The reference's market data resubscription after a data permission
-    /// change (ibx#421, `jclient.ij.r()`): "Desubscribing all farm mkt
+    /// change (ibx#421): "Desubscribing all farm mkt
     /// data", then every streaming subscription and news entry asked again
     /// on new ids.
     fn resubscribe_market_data(&mut self) {
@@ -1043,15 +1962,15 @@ impl HotLoop {
         let cancels = self.farm.desubscribe_all();
         self.send_farm_messages(cancels);
         self.resend_unsent_subscriptions();
-        let mut msgs = Vec::new();
+        let mut msgs = self.farm.resend_pnl_quotes();
         for farm in self.farm.news_farms_to_resend() {
             msgs.extend(self.farm.resend_news(farm));
         }
         self.send_farm_messages(msgs);
     }
 
-    /// Every farm connection is closed and opened again (ibx#276,
-    /// `jmdclient.aP.j()`): the market data farm, the historical data farm
+    /// Every farm connection is closed and opened again (ibx#276, as the
+    /// reference does): the market data farm, the historical data farm
     /// and the farms opened on demand; their reconnects follow.
     fn reconnect_all_farms(&mut self) {
         if let Some(conn) = self.farm_conn.as_mut() {
@@ -1091,10 +2010,13 @@ impl HotLoop {
             filters,
             continuous: false,
         };
-        let strike = lookup.filters.strike_text();
         match self.ccp_conn.as_mut().filter(|_| !self.ccp.disconnected) {
             Some(conn) => {
-                ccp::send_symbol_lookup_on(conn, ReqId::from(req_id), &lookup, &strike);
+                // With the client source whatever the terms, an option's
+                // strike after its right (ibx#731; the reference 10.51,
+                // paper, recordings of 12-16/10/2026: 46 option requests by
+                // description of 46, as an order's lookup).
+                ccp::send_order_lookup_on(conn, ReqId::from(req_id), &lookup);
                 self.hb.last_ccp_sent = Instant::now();
                 log::info!("Market data for {} {}: contract lookup ({})", sub.symbol, sub.sec_type, req_id);
             }
@@ -1108,12 +2030,34 @@ impl HotLoop {
     /// the round-lot step as any other. A contract another request already
     /// has a top of book for is not asked again: the request joins that
     /// subscription, as the reference attaches it to the contract's record
-    /// (ibx#444, captured 02/10/2026), and its own slot goes.
+    /// (ibx#444, captured 02/10/2026), and its own slot goes. Every slot
+    /// of the contract is looked at, not only the one found by its conId:
+    /// that one can be a slot an order made, with no market data, while
+    /// the top of book runs on the slot of an earlier request like this
+    /// one (ibx#533).
     fn send_md_resolved(&mut self) {
         if self.context.md_resolved.is_empty() { return; }
         for sub in std::mem::take(&mut self.context.md_resolved) {
-            let into = self.context.market.instrument_by_con_id(sub.con_id)
-                .filter(|&into| into != sub.instrument && sub.mode_9887 == 0 && self.joins_top(into, sub.snapshot));
+            let into = if sub.mode_9887 == 0 {
+                self.running_top_slot(sub.con_id, Some(sub.instrument), sub.snapshot)
+            } else {
+                None
+            };
+            let over_limit = match self.context.md_over_limit.iter().position(|&i| i == sub.instrument) {
+                Some(i) => { self.context.md_over_limit.swap_remove(i); true }
+                None => false,
+            };
+            // A contract that needs a line of its own, asked with every API
+            // line taken: 101 and nothing is sent, as the reference's line
+            // manager once the contract is known (observed 12/10/2026: a
+            // request by symbol joining a running contract gets none,
+            // ibx#501).
+            if over_limit && into.is_none() {
+                log::info!("Market data for {} {}: conId {} over the API ticker limit", sub.symbol, sub.sec_type, sub.con_id);
+                self.take_waiting_news(sub.instrument);
+                self.shared.market.push_md_reject(crate::bridge::MdReject::MaxTickers { instrument: sub.instrument });
+                continue;
+            }
             if let Some(into) = into {
                 let news = self.take_waiting_news(sub.instrument);
                 if let Some(text) = news.iter().find_map(|(_, refusal)| refusal.clone()) {
@@ -1132,6 +2076,17 @@ impl HotLoop {
                 self.route_md_subscribe(&sub);
             }
         }
+    }
+
+    /// The slot of contract `con_id`, other than `except`, whose top of book
+    /// a new request can share (`joins_top`). A contract can have several
+    /// slots: the one found by its conId (an order's, or the first request's)
+    /// and the slots of requests made by symbol (ibx#533, ibx#534).
+    fn running_top_slot(&self, con_id: i64, except: Option<InstrumentId>, snapshot: bool) -> Option<InstrumentId> {
+        self.context.market.active_instruments()
+            .filter(|&(slot, c)| c == con_id && Some(slot) != except)
+            .map(|(slot, _)| slot)
+            .find(|&slot| self.joins_top(slot, snapshot))
     }
 
     /// A new top-of-book request of an instrument shares the one already
@@ -1156,6 +2111,11 @@ impl HotLoop {
         }
         if self.context.lot_ready.is_empty() { return; }
         for sub in std::mem::take(&mut self.context.lot_ready) {
+            // A snapshot's type taken from the definition goes to the
+            // client (ibx#676).
+            if sub.snapshot && !sub.sec_type.is_empty() {
+                self.shared.market.push_md_kind(sub.instrument, &sub.sec_type);
+            }
             self.route_md_subscribe(&sub);
         }
     }
@@ -1167,8 +2127,27 @@ impl HotLoop {
     /// stay resident until released. As the reference keeps a contract's
     /// market data while any observer still needs it, dropping one consumer
     /// leaves the others' data running (ibx#291).
+    /// The oldest slot told for `con_id` to a request whose turn comes now
+    /// (ibx#561).
+    fn take_told_slot(&mut self, con_id: i64) -> Option<InstrumentId> {
+        let at = self.md_slots_told.iter().position(|(c, _)| *c == con_id)?;
+        Some(self.md_slots_told.remove(at).1)
+    }
+
     fn try_reclaim_instrument(&mut self, instrument: InstrumentId) {
         if !self.context.open_orders_for(instrument).is_empty() {
+            return;
+        }
+        // Told to a market data request that waits for its turn (ibx#561).
+        if self.md_slots_told.iter().any(|(_, slot)| *slot == instrument) {
+            return;
+        }
+        // Fed by an option model's frozen pair (ibx#494).
+        if self.farm.model_twins.iter().any(|t| t.1 == instrument) {
+            return;
+        }
+        // The contract of an option model an order started (ibx#693).
+        if self.farm.optmd.has(instrument) {
             return;
         }
         if self.farm.has_md_subscription(instrument)
@@ -1215,19 +2194,31 @@ impl HotLoop {
         }
 
         self.running = true;
+        // From here to the end of the loop, also by a panic, the answers
+        // written by the callers wait for the commands before them (ibx#529).
+        struct Running(Arc<SharedState>);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.0.command_clock().set_running(false);
+            }
+        }
+        self.shared.command_clock().set_running(true);
+        let _running = Running(self.shared.clone());
         for conn in [&mut self.farm_conn, &mut self.ccp_conn, &mut self.hmds_conn].into_iter().flatten() {
             conn.set_queued_writes(true);
         }
         // The links are known from the start: one lost in the first pass
         // is reported too (ibx#488: the first look took it as the start).
         if self.links.is_none() {
-            self.links = Some(self.current_links());
+            let now = self.current_links();
+            self.links = Some(now);
+            self.told = DataLinks::of(now);
         }
 
         while self.running {
             self.context.loop_iterations += 1;
 
-            // 1. Busy-poll market data farm socket (non-blocking recv)
+            // 1. Read the market data farm socket (returns at once)
             let farm_was_ok = !self.farm.disconnected;
             self.farm.poll_market_data(
                 &mut self.farm_conn, &mut self.context, &self.shared,
@@ -1235,7 +2226,7 @@ impl HotLoop {
             );
             let _ = farm_was_ok; // reconnects are scheduled below (ibx#218)
 
-            // 1b. Busy-poll historical socket for tick-by-tick data
+            // 1b. Read the historical socket for tick-by-tick data
             self.hmds.poll(
                 &mut self.hmds_conn, &self.shared,
                 &self.event_tx, &mut self.hb,
@@ -1247,6 +2238,7 @@ impl HotLoop {
             self.clean_server_tags(now);
             self.flush_thawed();
             self.send_due_tbt_cancels(now);
+            self.service_option_models(now);
 
             // 1b'. Farms opened on demand (#445): read, then connect,
             //      heartbeat and close them by their rules.
@@ -1258,11 +2250,7 @@ impl HotLoop {
             // 1c. Hand off any scanner results with cache-miss con_ids to CCP for
             //     contract-detail fan-out (ibx#156). Mirrors what the gateway does
             //     internally for binary-API scanner clients — see ib-agent#142.
-            for (req_id, result) in self.hmds.cold_scanner_results.drain(..).collect::<Vec<_>>() {
-                self.ccp.start_scanner_enrichment(
-                    req_id, result, &mut self.ccp_conn, &self.shared, &mut self.hb,
-                );
-            }
+            self.look_up_scanner_rows();
 
             // 2. Drain pending orders → build → sign → send to auth
             //    Skip if CCP is disconnected — orders stay in buffer for retry after reconnect.
@@ -1271,7 +2259,7 @@ impl HotLoop {
                 self.ccp.disconnected, &self.shared,
             );
 
-            // 3. Busy-poll auth socket for execution reports
+            // 3. Read the auth socket for execution reports
             let ccp_was_ok = !self.ccp.disconnected;
             self.poll_auth();
             let _ = ccp_was_ok; // reconnects are scheduled below (ibx#218)
@@ -1298,18 +2286,66 @@ impl HotLoop {
             // 5c. Tell the clients about lost and restored links (ibx#399)
             self.report_link_changes();
             self.maybe_report_restored();
+            self.ccp.send_due_pnl_partition(Instant::now(), &self.account_id, &mut self.ccp_conn, &mut self.hb);
 
-            // 6. Wake any waiting consumers (e.g. Python event loop)
-            self.shared.notify();
+            // 6. Wake any waiting consumers (e.g. Python event loop): after
+            //    a pass that did something and the passes behind it, and
+            //    once per period while nothing comes (ibx#530).
+            let bytes = self.bytes_read();
+            let active = std::mem::take(&mut self.pass_active) || bytes != self.bytes_seen;
+            self.bytes_seen = bytes;
+            self.idle_passes = if active { 0 } else { self.idle_passes.saturating_add(1) };
+            if self.idle_passes <= IDLE_PASSES_BEFORE_WAIT || now.duration_since(self.notified_at) >= NOTIFY_PERIOD {
+                self.shared.notify();
+                self.notified_at = now;
+            }
 
             // 7. With every transport down there is nothing to poll, and the
             //    spin pinned a core for the whole outage (ibx#399). Park 1ms in
-            //    that state only; reconnects run on a seconds-scale backoff and
-            //    the connected path is unchanged.
+            //    that state only; reconnects run on a seconds-scale backoff.
             if self.all_transports_down() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
+            } else if self.idle_passes >= IDLE_PASSES_BEFORE_WAIT && self.core_id.is_none() {
+                // 8. Nothing to do: wait for data on a connection or for a
+                //    command, whichever comes first (ibx#530). A pinned
+                //    engine keeps polling its core instead.
+                self.wait_for_work();
             }
         }
+    }
+
+    /// Bytes read so far on the connections of the loop.
+    fn bytes_read(&self) -> u64 {
+        let primary = [&self.farm_conn, &self.ccp_conn, &self.hmds_conn].into_iter().flatten().map(Connection::bytes_in);
+        let pool = self.pool.farms.iter().filter_map(|f| f.conn.as_ref()).map(Connection::bytes_in);
+        primary.chain(pool).fold(0u64, u64::wrapping_add)
+    }
+
+    /// Wait until a connection the loop reads has data, a command is sent,
+    /// or the timeout passed. Not while output waits for a slow peer, nor
+    /// with a connection that waits in its own read (in-memory, tests).
+    fn wait_for_work(&mut self) {
+        // A market data pass is due in less than 5 ms (ibx#560).
+        if self.md_pass.waits() {
+            std::thread::yield_now();
+            return;
+        }
+        self.wait_handles.clear();
+        let primary = [
+            (&self.farm_conn, self.farm.disconnected),
+            (&self.ccp_conn, self.ccp.disconnected),
+            (&self.hmds_conn, self.hmds.disconnected),
+        ];
+        let read = primary.into_iter().filter(|(_, down)| !down).filter_map(|(conn, _)| conn.as_ref())
+            .chain(self.pool.farms.iter().filter_map(|f| f.conn.as_ref()));
+        for conn in read {
+            match conn.wait_handle() {
+                Some(handle) if !conn.has_queued_output() => self.wait_handles.push(handle),
+                _ => return,
+            }
+        }
+        let rx = self.control_rx.as_ref();
+        self.parker.park(&self.wait_handles, WAIT_TIMEOUT_MS, || rx.is_some_and(|rx| !rx.is_empty()));
     }
 
     /// True when the farm and auth connections are down and no historical
@@ -1336,14 +2372,30 @@ impl HotLoop {
     }
 
     /// A lost link is reported to every client at once, as the reference
-    /// does (ibx#399): 1100 for the auth connection, 2103 / 2105 for the
-    /// market-data and historical farms. The clients stay connected. A farm
-    /// that is up again after its logon gives 2104 / 2106 with its name, as
-    /// in the reference; the auth link gives 1102 after its replay instead
+    /// does (ibx#399): 1100 for the auth connection, 2103 / 2105 / 2157 for
+    /// the market data, historical data and contract data connections. The
+    /// clients stay connected. A connection that is up again gives 2104 /
+    /// 2106 / 2158 with its name; the auth link gives 1102 after its replay
     /// (`maybe_report_restored`).
+    ///
+    /// The reference reports its data connections broken when the auth
+    /// link is lost, also when only that link was closed, and OK again
+    /// after the new logon (recorded 25/09/2026 and 30/09/2026): a data
+    /// connection is told OK only while it is up and the auth link is up
+    /// (ibx#520). The connections themselves are left as they are. Contract
+    /// data is read on the auth link: its notices follow that link.
+    ///
+    /// Order, as recorded: 1100, 2103, 2105, 2157 at the loss; 2106, 2158,
+    /// 2104 at the return (there the reference's order is the order in
+    /// which its connections come back).
     fn report_link_changes(&mut self) {
         let now = self.current_links();
-        let Some(before) = self.links.replace(now) else { return };
+        let ok = DataLinks::of(now);
+        let Some(before) = self.links.replace(now) else {
+            self.told = ok;
+            return;
+        };
+        let told = std::mem::replace(&mut self.told, ok);
         if before == now {
             return;
         }
@@ -1353,23 +2405,34 @@ impl HotLoop {
             self.shared.orders.set_open_orders_held(true);
             self.shared.push_connection_notice(1100, LINK_LOST.to_string());
         }
-        if before.farm && !now.farm {
+        let hmds_name = self.hmds_farm_name().to_string();
+        let secdef = !self.secdef_farm_name.is_empty();
+        if told.farm && !ok.farm {
             self.shared.push_connection_notice(2103, format!("Market data farm connection is broken:{}", self.farm_name));
         }
-        if !before.farm && now.farm {
-            self.shared.push_connection_notice(2104, format!("Market data farm connection is OK:{}", self.farm_name));
+        if told.hmds && !ok.hmds {
+            self.shared.push_connection_notice(2105, format!("HMDS data farm connection is broken:{}", hmds_name));
         }
+        if secdef && told.secdef && !ok.secdef {
+            self.shared.push_connection_notice(2157, format!("Sec-def data farm connection is broken:{}", self.secdef_farm_name));
+        }
+        if !told.hmds && ok.hmds {
+            self.shared.push_connection_notice(2106, format!("HMDS data farm connection is OK:{}", hmds_name));
+        }
+        // The scanner follows the historical data connection itself, its
+        // notices after the farm's (ibx#554: the reference gives the farm
+        // notice to every client before it tells the subscriptions).
         if before.hmds && !now.hmds {
-            let name = self.hmds_farm_name().to_string();
-            self.shared.push_connection_notice(2105, format!("HMDS data farm connection is broken:{}", name));
             self.hmds.scanner_link_lost(&self.shared);
         }
         if !before.hmds && now.hmds {
-            self.hmds.scanner_link_restored(&mut self.hmds_conn, &mut self.hb, &self.shared);
+            self.hmds.scanner_link_restored(Instant::now(), &mut self.hmds_conn, &mut self.hb, &self.shared);
         }
-        if !before.hmds && now.hmds {
-            let name = self.hmds_farm_name().to_string();
-            self.shared.push_connection_notice(2106, format!("HMDS data farm connection is OK:{}", name));
+        if secdef && !told.secdef && ok.secdef {
+            self.shared.push_connection_notice(2158, format!("Sec-def data farm connection is OK:{}", self.secdef_farm_name));
+        }
+        if !told.farm && ok.farm {
+            self.shared.push_connection_notice(2104, format!("Market data farm connection is OK:{}", self.farm_name));
         }
     }
 
@@ -1396,6 +2459,11 @@ impl HotLoop {
         if hmds_expected {
             farms.push((self.hmds_farm_name().to_string(), links.hmds));
         }
+        // The contract data farm is the third name of the reference's list
+        // (recorded 30/09/2026); here it is up with the auth link (ibx#520).
+        if !self.secdef_farm_name.is_empty() {
+            farms.push((self.secdef_farm_name.clone(), links.ccp));
+        }
         let names = |up: bool| farms.iter().filter(|f| f.1 == up).map(|f| f.0.as_str()).collect::<Vec<_>>().join("; ");
         let message = if all_up {
             format!("{} All data farms are connected: {}.", LINK_RESTORED, names(true))
@@ -1417,24 +2485,105 @@ impl HotLoop {
             None => return,
         };
 
-        self.cmd_buf.clear();
-        self.cmd_buf.extend(rx.try_iter());
+        use crate::engine::pacer::Queued;
+        for cmd in rx.try_iter() {
+            self.cmd_received += 1;
+            self.cmd_queue.push_back(Queued { ordinal: self.cmd_received, channel: true, cmd });
+        }
 
         // try_iter() stops on both Empty and Disconnected — do one extra
         // try_recv() to distinguish.  If a straggler command arrived between
         // try_iter() finishing and this call, push it into the batch.
         let sender_dropped = match rx.try_recv() {
-            Ok(cmd)  => { self.cmd_buf.push(cmd); false }
+            Ok(cmd)  => {
+                self.cmd_received += 1;
+                self.cmd_queue.push_back(Queued { ordinal: self.cmd_received, channel: true, cmd });
+                false
+            }
             Err(crossbeam_channel::TryRecvError::Empty)        => false,
             Err(crossbeam_channel::TryRecvError::Disconnected) => true,
         };
+
+        // The answers the client gives itself (ibx#561), each behind the
+        // commands sent before it.
+        if self.pacer.is_some() {
+            for (after, cmd) in self.shared.command_clock().take_deferred() {
+                let at = self.cmd_queue.partition_point(|q| q.ordinal <= after);
+                self.cmd_queue.insert(at, Queued { ordinal: after, channel: false, cmd });
+            }
+        }
+
+        // The commands taken in this pass, in order. API requests are
+        // paced as the reference paces them (ibx#555); a further command
+        // of a request passes in its turn; a command aside of the requests
+        // (a contract registration, housekeeping) is taken at once. A
+        // shutdown ends the pacing.
+        self.cmd_buf.clear();
+        // Told once their answers are written (ibx#529): the commands of
+        // the channel among those taken.
+        let mut taken = 0u64;
+        let mut take = |buf: &mut Vec<ControlCommand>, q: Queued| {
+            taken += u64::from(q.channel);
+            buf.push(q.cmd);
+        };
+        let shutdown = self.cmd_queue.iter().any(|q| matches!(q.cmd, ControlCommand::Shutdown));
+        let pace_now = self.pace_clock.unwrap_or_else(Instant::now);
+        let mut lookup_hold = self.pacer.is_some() && self.lookup_holds(pace_now);
+        match self.pacer.as_mut().filter(|_| !shutdown) {
+            None => {
+                for q in self.cmd_queue.drain(..) {
+                    take(&mut self.cmd_buf, q);
+                }
+            }
+            Some(pacer) => {
+                let now = pace_now;
+                let mut waiting = self.cmd_queue.iter().filter(|q| crate::engine::pacer::is_request(&q.cmd)).count();
+                while let Some(q) = self.cmd_queue.front() {
+                    if crate::engine::pacer::is_request(&q.cmd) {
+                        // One request at a time, as the reference: a request
+                        // waits while an earlier one waits for its contract
+                        // lookup (ibx#662).
+                        if lookup_hold && !crate::engine::pacer::passes_lookup_hold(&q.cmd) {
+                            break;
+                        }
+                        if !pacer.admit(now, waiting) {
+                            break;
+                        }
+                        waiting -= 1;
+                        if crate::engine::pacer::may_look_up(&q.cmd) {
+                            lookup_hold = true;
+                            // The wait counts from the request.
+                            self.lookup_hold_since = Some(now);
+                        }
+                    }
+                    if let Some(q) = self.cmd_queue.pop_front() {
+                        take(&mut self.cmd_buf, q);
+                    }
+                }
+                if waiting == 0 {
+                    pacer.nothing_waits(now);
+                } else if self.cmd_queue.iter().any(|q| crate::engine::pacer::is_aside(&q.cmd)) {
+                    let (aside, held): (Vec<_>, Vec<_>) = self.cmd_queue.drain(..)
+                        .partition(|q| crate::engine::pacer::is_aside(&q.cmd));
+                    for q in aside {
+                        take(&mut self.cmd_buf, q);
+                    }
+                    self.cmd_queue.extend(held);
+                }
+            }
+        }
 
         // Drain the buffer so we can mutably borrow self in the loop body.
         // Requests whose contract was looked up (ibx#427) go first.
         let cmds: Vec<ControlCommand> = self.ccp.resolved_requests.drain(..)
             .chain(self.cmd_buf.drain(..))
             .collect();
+        self.pass_active |= !cmds.is_empty();
         for cmd in cmds {
+            let cmd = match cmd {
+                ControlCommand::Unpaced(inner) => *inner,
+                cmd => cmd,
+            };
             match cmd {
                 ControlCommand::CancelWhatIf { order_id } => {
                     order_builder::cancel_what_if(&mut self.context, order_id);
@@ -1457,18 +2606,82 @@ impl HotLoop {
                 ControlCommand::RequestCompletedOrdersIncludingLifecycles { connection, api_only, start, end } => {
                     self.ccp.completed_history.queue_including_lifecycles(connection, api_only, start, end);
                 }
+                ControlCommand::Unpaced(_) => {}
+                // An answer of the client itself, at the turn of its
+                // request (ibx#561).
+                ControlCommand::LocalError { queue, req_id, code, message } => match queue {
+                    crate::types::ErrorQueue::Order => self.shared.orders.push_order_error(req_id, code, message),
+                    crate::types::ErrorQueue::OrderNotice => self.shared.orders.push_order_notice(req_id, code, message),
+                    crate::types::ErrorQueue::Historical => self.shared.reference.push_historical_error(req_id, code as i32, message),
+                    crate::types::ErrorQueue::TickByTick => self.shared.market.push_tbt_error(req_id, code as i32, message),
+                    crate::types::ErrorQueue::Connection => self.shared.push_connection_notice(code, message),
+                },
+                ControlCommand::MarketDataSlot { con_id, symbol, sec_type, exchange, mode_9887, snapshot, plain, reply_tx } => {
+                    // As the request decides it: the slot of the running
+                    // top of book of the contract, else the slot of its
+                    // conId; a new slot for a contract with no conId.
+                    let found = self.context.market.instrument_by_con_id(con_id);
+                    let joined = (!plain && con_id != 0 && mode_9887 == 0 && !found.is_some_and(|slot| self.joins_top(slot, snapshot)))
+                        .then(|| self.running_top_slot(con_id, found, snapshot)).flatten();
+                    let slot = match joined {
+                        Some(slot) => {
+                            reply_tx.send(Ok(slot)).ok().map(|()| slot)
+                        }
+                        None => self.register_slot_or_reject((con_id != 0).then_some(con_id), symbol, &sec_type, &exchange, &Some(reply_tx)),
+                    };
+                    if let Some(slot) = slot {
+                        self.md_slots_told.push((con_id, slot));
+                    }
+                }
+                ControlCommand::Turn { reply_tx } => {
+                    let _ = reply_tx.send(());
+                }
                 ControlCommand::Subscribe { con_id, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier, mode_9887, snapshot, reply_tx } => {
+                    // The top of book of the contract runs on another slot
+                    // than the one its conId finds (a request made by
+                    // symbol after an order on the contract): the request
+                    // shares it there, nothing is sent (ibx#534).
+                    // The slot told to the call when it was made (ibx#561).
+                    let told = if con_id != 0 { self.take_told_slot(con_id) } else { None };
+                    let found = self.context.market.instrument_by_con_id(con_id);
+                    if told.is_none() && con_id != 0 && mode_9887 == 0 && !found.is_some_and(|slot| self.joins_top(slot, snapshot))
+                        && let Some(slot) = self.running_top_slot(con_id, found, snapshot)
+                    {
+                        log::info!("Market data for con_id {} joins the subscription of instrument {}", con_id, slot);
+                        if let Some(tx) = &reply_tx {
+                            let _ = tx.send(Ok(slot));
+                        }
+                        continue;
+                    }
                     // No conId: resolved first, as the reference (ibx#278).
                     let key = (con_id != 0).then_some(con_id);
-                    if let Some(id) = self.register_slot_or_reject(key, symbol.clone(), &sec_type, &exchange, &reply_tx) {
+                    let slot = match told {
+                        Some(slot) => {
+                            if let Some(tx) = &reply_tx {
+                                let _ = tx.send(Ok(slot));
+                            }
+                            Some(slot)
+                        }
+                        None => self.register_slot_or_reject(key, symbol.clone(), &sec_type, &exchange, &reply_tx),
+                    };
+                    if let Some(id) = slot {
                         let filters = crate::types::SecDefFilters {
                             last_trade_date_or_contract_month: last_trade_date.clone(), strike,
                             right: right.clone(), multiplier: multiplier.clone(), ..Default::default()
                         };
-                        let sub = farm::MdSubscribe {
+                        let mut sub = farm::MdSubscribe {
                             con_id, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier,
                             instrument: id, mode_9887, snapshot,
                         };
+                        // Its type for the routing too: the request's
+                        // parameters name the option's exchange code (ibx#671).
+                        let untyped = sub.sec_type.is_empty();
+                        if farm::fill_from_definition(&self.context, &mut sub) && !sub.sec_type.is_empty() {
+                            self.context.market.set_routing(id, &sub.sec_type, "");
+                            if untyped && sub.snapshot {
+                                self.shared.market.push_md_kind(id, &sub.sec_type);
+                            }
+                        }
                         if con_id == 0 {
                             self.lookup_md_contract(sub, String::new(), filters);
                         } else if mode_9887 == 0 && self.joins_top(id, snapshot) {
@@ -1482,27 +2695,78 @@ impl HotLoop {
                     }
                 }
                 ControlCommand::SubscribeSnapshot { con_id, symbol, exchange, sec_type, reply_tx } => {
-                    if let Some(id) = self.register_slot_or_reject(Some(con_id), symbol.clone(), &sec_type, &exchange, &reply_tx) {
+                    let slot = match self.take_told_slot(con_id) {
+                        Some(slot) => {
+                            if let Some(tx) = &reply_tx {
+                                let _ = tx.send(Ok(slot));
+                            }
+                            Some(slot)
+                        }
+                        None => self.register_slot_or_reject(Some(con_id), symbol.clone(), &sec_type, &exchange, &reply_tx),
+                    };
+                    // A contract whose definition was never read waits for
+                    // it, which tells whether it is a US stock or warrant
+                    // (ibx#645): once, the snapshot then goes on.
+                    let read = self.context.agg_groups.contains_key(&con_id) || self.context.snapshot_def_asked.remove(&con_id);
+                    if let Some(id) = slot.filter(|_| !read && con_id > 0)
+                        && self.ask_definition(con_id, &exchange)
+                    {
+                        let _ = id;
+                        self.context.snapshot_def_asked.insert(con_id);
+                        self.context.def_parked.push((con_id, ControlCommand::SubscribeSnapshot {
+                            con_id, symbol, exchange, sec_type, reply_tx: None,
+                        }));
+                        continue;
+                    }
+                    if let Some(id) = slot {
                         let sub = farm::MdSubscribe {
                             con_id, symbol, exchange, sec_type, last_trade_date: String::new(), strike: 0.0,
                             right: String::new(), multiplier: String::new(), instrument: id, mode_9887: 0, snapshot: false,
                         };
+                        // A US stock or warrant, when its definition was read (ibx#648).
+                        let us_lot = self.context.us_lots.contains(&con_id);
+                        let form_10_40 = self.shared.reference.form_10_40();
                         if let Some(farm_id) = self.md_target(&sub) {
                             if let Some(f) = self.pool.get_mut(farm_id) {
                                 f.note_request(Instant::now());
+                                f.note_client_request();
                             }
-                            if let Some(sink) = farm_sink!(self, farm_id) {
-                                self.farm.subscribe_snapshot(&sub, farm_id, sink, &mut self.hb);
+                            if self.md_pass.on {
+                                let now = self.pace_now();
+                                let mut sink = crate::engine::md_pass::HoldSink { farm: farm_id, pass: &mut self.md_pass, now };
+                                self.farm.subscribe_snapshot(&sub, us_lot, form_10_40, farm_id, &mut sink, &mut self.hb);
+                            } else if let Some(sink) = farm_sink!(self, farm_id) {
+                                self.farm.subscribe_snapshot(&sub, us_lot, form_10_40, farm_id, sink, &mut self.hb);
                             }
                         }
                     }
                 }
                 ControlCommand::DropSnapshot { instrument } => {
+                    if let Some((farm_id, message)) = self.farm.cancel_snapshot_message(instrument)
+                        && let Some(sink) = farm_sink!(self, farm_id)
+                    {
+                        sink.send_comp(&message.iter().map(|(t, v)| (*t, v.as_str())).collect::<Vec<_>>());
+                    }
                     self.farm.drop_snapshot(instrument);
                     self.try_reclaim_instrument(instrument);
                 }
-                ControlCommand::SubscribeBySymbol { symbol, sec_type, exchange, currency, filters, mode_9887, snapshot, reply_tx } => {
-                    if let Some(id) = self.register_slot_or_reject(None, symbol.clone(), &sec_type, &exchange, &reply_tx) {
+                ControlCommand::SubscribeBySymbol { symbol, sec_type, exchange, currency, filters, mode_9887, snapshot, over_limit, reply_tx } => {
+                    // The slot told to the call (ibx#565): those of
+                    // requests with no conId are kept under 0, oldest
+                    // first, the order of the requests.
+                    let slot = match self.take_told_slot(0) {
+                        Some(slot) => {
+                            if let Some(tx) = &reply_tx {
+                                let _ = tx.send(Ok(slot));
+                            }
+                            Some(slot)
+                        }
+                        None => self.register_slot_or_reject(None, symbol.clone(), &sec_type, &exchange, &reply_tx),
+                    };
+                    if let Some(id) = slot {
+                        if over_limit && !snapshot {
+                            self.context.md_over_limit.push(id);
+                        }
                         let sub = farm::MdSubscribe {
                             con_id: 0, symbol, exchange, sec_type,
                             last_trade_date: filters.last_trade_date_or_contract_month.clone(),
@@ -1514,13 +2778,42 @@ impl HotLoop {
                 }
                 ControlCommand::SetMarketDataType { market_data_type } => {
                     self.farm.md_modes.apply(market_data_type);
+                    // Type 2 set while requests run on a frozen option: they
+                    // move onto its model's frozen slot, with its data
+                    // (ibx#494; the reference 10.51, paper, 14/10/2026: the
+                    // switch within 3 ms, no new pair).
+                    if self.farm.md_modes.frozen {
+                        let status = &self.farm.status;
+                        let mut moved = Vec::new();
+                        for t in self.farm.model_twins.iter_mut().filter(|t| !t.2) {
+                            if status.iter().any(|e| e.instrument == t.0 && e.frozen.is_some()) {
+                                continue;
+                            }
+                            t.2 = true;
+                            moved.push(t.0);
+                            self.shared.market.push_md_reject(crate::bridge::MdReject::FrozenWithData { instrument: t.0, frozen: t.1 });
+                        }
+                        let now = Instant::now();
+                        for live in moved {
+                            self.farm.optmd.switched(live, now);
+                        }
+                    }
                 }
                 ControlCommand::Unsubscribe { instrument } => {
+                    // Its lookup on its way: the request ends when the
+                    // lookup answers, with 354, as the reference reads the
+                    // cancel after the request it follows (ibx#662; the
+                    // reference 10.51, paper, regular hours 14/10/2026).
+                    if self.context.md_lookups.iter().any(|(_, s, _)| s.instrument == instrument) {
+                        self.context.md_lookup_cancelled.insert(instrument);
+                        continue;
+                    }
                     // Not sent yet: nothing to cancel on the farm.
                     self.context.lot_parked.retain(|s| s.instrument != instrument);
                     self.context.lot_ready.retain(|s| s.instrument != instrument);
                     self.context.md_lookups.retain(|(_, s, _)| s.instrument != instrument);
                     self.context.md_resolved.retain(|s| s.instrument != instrument);
+                    self.context.md_over_limit.retain(|&i| i != instrument);
                     // The frozen slot of a frozen contract (ibx#447): the
                     // frozen pair is cancelled first, then the real-time
                     // pair and the status entry, as the reference (captured
@@ -1584,14 +2877,14 @@ impl HotLoop {
                 }
                 ControlCommand::UnsubscribeNews { instrument, providers } => {
                     let msgs = self.farm.release_news(instrument, &providers);
-                    self.send_farm_messages(msgs);
+                    self.send_md_messages(msgs);
                 }
                 ControlCommand::SubscribeGeneric { instrument, con_id, exchange, sec_type, codes } => {
                     self.subscribe_generic(instrument, con_id, exchange, sec_type, codes);
                 }
                 ControlCommand::UnsubscribeGeneric { instrument, codes } => {
                     let msgs = self.farm.release_generic(instrument, &codes);
-                    self.send_farm_messages(msgs);
+                    self.send_md_messages(msgs);
                 }
                 ControlCommand::UpdateParam { key, value } => {
                     let _ = (key, value);
@@ -1616,6 +2909,20 @@ impl HotLoop {
                 }
                 ControlCommand::Order(req) => {
                     self.context.pending_orders.push(req);
+                }
+                ControlCommand::OrderGroup(requests) => {
+                    order_builder::take_order_group(&mut self.context, requests);
+                }
+                ControlCommand::HoldOrder { order_id, instrument, qty, parent_id, oca_group } => {
+                    order_builder::hold_order(&mut self.ccp_conn, &mut self.context, &mut self.hb, order_id, instrument, qty, parent_id, &oca_group);
+                    // What it waits for is decided now: the client reads it
+                    // at a later order under it (ibx#718).
+                    if let Some(conn) = self.ccp_conn.as_mut() {
+                        order_builder::advance_held_lookups(&mut self.context, conn, &mut self.hb, &self.shared);
+                    } else {
+                        // No session to ask: not known until it is back.
+                        self.shared.orders.held_waiting(order_id);
+                    }
                 }
                 ControlCommand::RegisterInstrument { con_id, symbol, sec_type, exchange, reply_tx } => {
                     self.register_or_reject(con_id, symbol, &sec_type, &exchange, &reply_tx);
@@ -1648,19 +2955,97 @@ impl HotLoop {
                         }
                     }
                 }
-                ControlCommand::RegisterOrderContract { symbol, sec_type, exchange, currency, reply_tx } => {
+                ControlCommand::RegisterOrderSlot { con_id, symbol, sec_type, exchange, reply_tx } => {
+                    // What the conId's own slot knows and the order left out.
+                    let main = self.context.market.instrument_by_con_id(con_id);
+                    let currency = main.map(|m| self.context.market.currency(m).to_string());
+                    let symbol = match main {
+                        Some(m) if symbol.is_empty() && !matches!(self.context.market.symbol(m), "" | "?") => self.context.market.symbol(m).to_string(),
+                        _ => symbol,
+                    };
+                    let sec_type = match main {
+                        Some(m) if sec_type.is_empty() => self.context.market.order_routing(m).0,
+                        _ => sec_type,
+                    };
+                    if let Some(id) = self.register_slot_or_reject(None, symbol, &sec_type, &exchange, &reply_tx) {
+                        self.context.market.resolve_con_id(id, con_id);
+                        if let Some(currency) = currency {
+                            self.context.market.set_currency(id, &currency);
+                        }
+                    }
+                }
+                ControlCommand::RegisterOrderContract { symbol, sec_type, exchange, currency, filters, reply_tx } => {
                     // Its conId comes from the lookup before the order
-                    // goes out (ibx#486).
+                    // goes out (ibx#486); a contract other than a stock is
+                    // looked up with its terms, as the reference (ibx#666).
                     if let Some(id) = self.register_slot_or_reject(None, symbol, &sec_type, &exchange, &reply_tx) {
                         self.context.market.set_currency(id, &currency);
+                        if !matches!(sec_type.to_ascii_uppercase().as_str(), "" | "STK" | "CS") {
+                            self.context.order_lookup_filters.insert(id, *filters);
+                        } else if !filters.primary_exchange.is_empty() {
+                            // A stock's primary exchange goes into its lookup,
+                            // as the reference writes it (ibx#710).
+                            let primary = crate::types::SecDefFilters { primary_exchange: filters.primary_exchange.clone(), ..Default::default() };
+                            self.context.order_lookup_filters.insert(id, primary);
+                        } else {
+                            self.context.order_lookup_filters.remove(&id);
+                        }
                     }
                 }
                 ControlCommand::ResolveContract { req_id, lookup, request } => {
+                    // A depth request with no exchange is refused before any
+                    // lookup, as the reference refuses it at once (ibx#702:
+                    // +6 ms there, ibx answered after its lookup).
+                    if let ControlCommand::SubscribeDepth { req_id, con_id, exchange, sec_type, num_rows, is_smart_depth } = *request {
+                        if exchange.trim().is_empty() {
+                            self.route_depth_subscribe(req_id, con_id, exchange, sec_type, num_rows, is_smart_depth);
+                        } else {
+                            let request = ControlCommand::SubscribeDepth { req_id, con_id, exchange, sec_type, num_rows, is_smart_depth };
+                            self.ccp.start_contract_resolve(req_id, lookup, request, &mut self.ccp_conn, &mut self.hb);
+                        }
+                        continue;
+                    }
                     // Look the contract up first (ibx#427); the request comes
                     // back through `resolved_requests` with its conId.
                     self.ccp.start_contract_resolve(req_id, lookup, *request, &mut self.ccp_conn, &mut self.hb);
                 }
                 ControlCommand::FetchHistorical { req_id, con_id, symbol, sec_type, exchange, end_date_time, duration, bar_size, what_to_show, use_rth, keep_up_to_date, include_expired, format_date } => {
+                    // Given by its conId alone, with no security type: its
+                    // definition is asked each time (ibx#732).
+                    if sec_type.is_empty()
+                        && self.ask_definition_each_time(DefAsk::Historical, req_id, con_id, &exchange, || ControlCommand::FetchHistorical {
+                            req_id, con_id, symbol: symbol.clone(), sec_type: String::new(), exchange: exchange.clone(),
+                            end_date_time: end_date_time.clone(), duration: duration.clone(), bar_size: bar_size.clone(),
+                            what_to_show: what_to_show.clone(), use_rth, keep_up_to_date, include_expired, format_date,
+                        })
+                    {
+                        continue;
+                    }
+                    // A contract given by its conId alone takes the type of
+                    // its definition, which it waits for when not known
+                    // (ibx#643's rule; the reference 10.51 served an option
+                    // and a future so, 13/10/2026, regular hours).
+                    let sec_type = match self.context.def_kinds.get(&con_id) {
+                        Some((kind, _)) if sec_type.is_empty() => kind.clone(),
+                        _ => sec_type,
+                    };
+                    // Below session level 224 its prices are given in the
+                    // steps of its market rule, which its definition names:
+                    // the reference looks a conId up before the query
+                    // (ibx#615; paper, 16/10/2026).
+                    let rule_needed = crate::client_core::session_level() < crate::client_core::LEVEL_PRICE_FROM_DEFINITION
+                        && !self.shared.reference.knows_contract_rule(con_id);
+                    // Once: a definition that never came leaves the group
+                    // set (-1) and the request goes as it is.
+                    if (sec_type.is_empty() || rule_needed) && con_id > 0 && !self.context.agg_groups.contains_key(&con_id)
+                        && self.ask_definition(con_id, &exchange)
+                    {
+                        self.context.def_parked.push((con_id, ControlCommand::FetchHistorical {
+                            req_id, con_id, symbol, sec_type, exchange, end_date_time, duration, bar_size,
+                            what_to_show, use_rth, keep_up_to_date, include_expired, format_date,
+                        }));
+                        continue;
+                    }
                     // A SMART route needs the contract's aggregate group
                     // (#445): the request waits for the definition. A
                     // keepUpToDate request goes the same way, to the farm of
@@ -1699,6 +3084,9 @@ impl HotLoop {
                     }
                 }
                 ControlCommand::CancelHistorical { req_id } => {
+                    // A request waiting for its definition is never sent
+                    // (ibx#732).
+                    self.drop_parked(DefAsk::Historical, req_id);
                     // 162 or 366 to the client, then the cancels (ibx#431, ibx#429).
                     for (farm_id, xml) in self.hmds.cancel_bar_request(req_id, &self.shared) {
                         if let Some(sink) = farm_sink!(self, farm_id) {
@@ -1734,6 +3122,9 @@ impl HotLoop {
                         self.hmds.pending_head_ts.remove(pos);
                     }
                 }
+                ControlCommand::CompletedOrders { api_only } => {
+                    self.ccp.request_completed_orders(api_only, &mut self.ccp_conn, &mut self.hb, &self.shared);
+                }
                 ControlCommand::FetchMatchingSymbols { req_id, pattern } => {
                     self.ccp.send_matching_symbols_request(req_id, &pattern, &mut self.ccp_conn, &mut self.hb, &self.shared);
                 }
@@ -1753,7 +3144,7 @@ impl HotLoop {
                     self.shared.reference.notify_depth_exchanges();
                 }
                 ControlCommand::FetchScannerParams => {
-                    self.hmds.req_scanner_params(&mut self.hmds_conn, &mut self.hb, &self.shared);
+                    self.hmds.req_scanner_params(self.pace_now(), &mut self.hmds_conn, &mut self.hb, &self.shared);
                 }
                 ControlCommand::SubscribeScanner { req_id, client_id, subscription } => {
                     if let Some(text) = scanner_refusal(&self.hmds, req_id) {
@@ -1761,7 +3152,7 @@ impl HotLoop {
                     } else if self.hmds_conn.is_none() {
                         self.emit_hmds_unavailable(req_id, false);
                     } else {
-                        self.hmds.send_scanner_subscribe(req_id, client_id, subscription, &mut self.hmds_conn, &mut self.hb);
+                        self.hmds.send_scanner_subscribe(req_id, client_id, subscription, self.pace_now(), &mut self.hmds_conn, &mut self.hb, &self.shared);
                     }
                 }
                 ControlCommand::CancelScanner { req_id } => {
@@ -1797,9 +3188,10 @@ impl HotLoop {
                         }
                     }
                 }
-                ControlCommand::CalcOption { req_id, con_id, kind, under_price } => {
-                    self.ccp.optcalc.start(req_id, con_id, kind, under_price, &mut self.ccp_conn, &mut self.hb, &self.shared);
+                ControlCommand::CalcOption { req_id, con_id, exchange, kind, under_price } => {
+                    self.ccp.optcalc.start(req_id, con_id, &exchange, kind, under_price, &mut self.ccp_conn, &mut self.hb, &self.shared);
                 }
+                ControlCommand::WshRequest { req_id, meta, body } => self.send_wsh_request(req_id, meta, &body),
                 ControlCommand::CancelFundamentalData { req_id } => {
                     if let Some((id, xml)) = self.hmds.cancel_fundamental(req_id) {
                         let ts = chrono_free_timestamp();
@@ -1851,6 +3243,34 @@ impl HotLoop {
                     }
                 }
                 ControlCommand::SubscribeRealTimeBar { req_id, con_id, symbol, sec_type, exchange, what_to_show, use_rth } => {
+                    // Given by its conId alone, with no security type: its
+                    // definition is asked each time, and the query names the
+                    // contract by its definition's symbol and type (ibx#732;
+                    // observed on paper, 13/10/2026: an option and a future,
+                    // two sessions, 4 requests of 4).
+                    let alone = sec_type.is_empty();
+                    if alone && self.hmds_conn.is_some() && crate::control::historical::realtime_bar_data(&what_to_show).is_some()
+                        && self.ask_definition_each_time(DefAsk::RealTimeBars, req_id, con_id, &exchange, || ControlCommand::SubscribeRealTimeBar {
+                            req_id, con_id, symbol: symbol.clone(), sec_type: String::new(), exchange: exchange.clone(),
+                            what_to_show: what_to_show.clone(), use_rth,
+                        })
+                    {
+                        continue;
+                    }
+                    // An option's: the company lookup of its underlying
+                    // too, and the query waits for its answer (ibx#733).
+                    if alone && self.hmds_conn.is_some() && crate::control::historical::realtime_bar_data(&what_to_show).is_some()
+                        && self.wait_for_option_company(DefAsk::RealTimeBars, req_id, con_id, || ControlCommand::SubscribeRealTimeBar {
+                            req_id, con_id, symbol: symbol.clone(), sec_type: String::new(), exchange: exchange.clone(),
+                            what_to_show: what_to_show.clone(), use_rth,
+                        })
+                    {
+                        continue;
+                    }
+                    let (symbol, sec_type) = match self.context.def_kinds.get(&con_id) {
+                        Some((kind, name)) if alone => (if symbol.is_empty() { name.clone() } else { symbol }, kind.clone()),
+                        _ => (symbol, sec_type),
+                    };
                     if self.hmds_conn.is_none() {
                         self.emit_hmds_unavailable(req_id, false);
                     } else {
@@ -1861,6 +3281,8 @@ impl HotLoop {
                     // A request waiting for its contract's lookup is never
                     // sent.
                     self.ccp.pending_resolves.retain(|p| !(p.req_id == req_id && matches!(p.request, ControlCommand::SubscribeRealTimeBar { .. })));
+                    // Nor one waiting for its definition (ibx#732).
+                    self.drop_parked(DefAsk::RealTimeBars, req_id);
                     // The router's cancel once no request is left on it
                     // (ibx#454).
                     if let Some(tid) = self.hmds.end_rtbar(req_id) {
@@ -1878,11 +3300,20 @@ impl HotLoop {
                     self.route_depth_subscribe(req_id, con_id, exchange, sec_type, num_rows, is_smart_depth);
                 }
                 ControlCommand::UnsubscribeDepth { req_id } => {
+                    // A request waiting for its definition has nothing on
+                    // the wire (ibx#732).
+                    if self.drop_parked(DefAsk::Depth, req_id) {
+                        self.shared.market.purge_depth_updates(req_id);
+                        continue;
+                    }
                     // A SmartDepth request still waiting for its
                     // components' definitions has nothing on the wire.
                     if let Some(pos) = self.context.depth_gathers.iter().position(|g| g.req_id == req_id) {
                         self.context.depth_gathers.remove(pos);
                         self.shared.market.purge_depth_updates(req_id);
+                        continue;
+                    }
+                    if self.context.depth_unsupported.remove(&req_id) {
                         continue;
                     }
                     match self.farm.stop_depth(req_id) {
@@ -1896,6 +3327,22 @@ impl HotLoop {
                 }
                 ControlCommand::SubscribePnl { req_id, account } => {
                     self.ccp.send_pnl_subscribe(req_id, &account, &mut self.ccp_conn, &mut self.hb);
+                }
+                ControlCommand::PnlQuotes { con_ids, second_price } => {
+                    self.ccp.start_pnl_partition(Instant::now());
+                    // A US stock's quotes go to the main farm; any other
+                    // position's to the farm of its own route (ibx#715).
+                    let mut stocks = Vec::new();
+                    let mut routes = Vec::new();
+                    for con_id in con_ids {
+                        match self.pnl_route(con_id) {
+                            None => stocks.push(con_id),
+                            Some(Some(route)) => routes.push(route),
+                            Some(None) => {}
+                        }
+                    }
+                    let msgs = self.farm.pnl_quotes(&stocks, &routes, second_price);
+                    self.send_farm_messages(msgs);
                 }
                 ControlCommand::SetInstrumentCurrency { con_id, currency } => {
                     if let Some(id) = self.context.market.instrument_by_con_id(con_id) {
@@ -1917,6 +3364,10 @@ impl HotLoop {
                 | ControlCommand::FetchUserInfo { .. } => {
                     // Gateway-local data — handled synchronously in Python EClient.
                     // These variants exist for future CCP round-trip support.
+                }
+                ControlCommand::FaSave { req_id, batches } => {
+                    let connected = !self.ccp.disconnected;
+                    fa::save(&mut self.context.fa, req_id, batches, &mut self.ccp_conn, &mut self.hb, &self.shared, connected);
                 }
                 ControlCommand::Shutdown => {
                     // Unsubscribe all active market data before stopping
@@ -1941,6 +3392,8 @@ impl HotLoop {
                 }
             }
         }
+        self.shared.command_clock().note_handled(taken);
+        self.send_due_md_pass();
 
         // All senders dropped — treat as implicit shutdown.
         if sender_dropped && self.running {
@@ -2153,6 +3606,7 @@ impl HotLoop {
                             &self.shared, &self.event_tx, &mut self.hb);
                         self.farm.rx_farm = PRIMARY_MD;
                     }
+                    FarmKind::SecDef => self.wsh_answer(msg),
                     FarmKind::Historical => {
                         self.hmds.rx_farm = id;
                         self.hmds.process_hmds_message(msg, &mut self.pool.farms[i].conn, &self.shared,
@@ -2190,6 +3644,10 @@ impl HotLoop {
             | pool::FarmEvent::Lost(id) | pool::FarmEvent::IdleClosed(id) => *id,
         };
         let Some(farm) = self.pool.get(id) else { return };
+        // The contract data farm was reported with the connect (ibx#443).
+        if farm.kind == FarmKind::SecDef {
+            return;
+        }
         let (code, text) = pool::farm_notice(farm.kind, event, &farm.name);
         log::info!("Farm notice {}: {}", code, text);
         self.shared.push_connection_notice(code, text);
@@ -2234,7 +3692,12 @@ impl HotLoop {
         }
         let others_up = usize::from(!self.farm.disconnected && self.farm_conn.is_some());
         let farm = &self.farm;
-        for id in self.pool.md_activity_check(now, others_up, |id| farm.uses_farm(id) || farm.depth_uses_farm(id)) {
+        // An option model's entries keep their farm up, as an order's
+        // model has no request of its own (ibx#693); so do a fund order's
+        // top of book entries (ibx#666).
+        for id in self.pool.md_activity_check(now, others_up,
+            |id| farm.uses_farm(id) || farm.depth_uses_farm(id) || farm.optmd.uses_farm(id) || farm.order_quotes_use_farm(id))
+        {
             let event = self.pool.close_idle(id);
             self.pool_notice(&event);
         }
@@ -2259,21 +3722,30 @@ impl HotLoop {
         };
         let (host, name) = (farm.host.clone(), farm.name.clone());
         let slot = if farm.kind == FarmKind::MarketData { 18 } else { 17 };
+        let service = match farm.kind {
+            FarmKind::MarketData => crate::gateway::FarmService::MarketData,
+            FarmKind::Historical => crate::gateway::FarmService::Historical,
+            FarmKind::SecDef => crate::gateway::FarmService::SecDef,
+        };
         log::info!("Opening farm {} ({}) on demand", name, host);
         let (tx, rx) = crossbeam_channel::bounded(1);
+        // Set once the socket is connected: the connecting checks wait for
+        // it (ibx#684).
+        let socket_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let socket_flag = socket_up.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("{}-connect", name))
             .spawn(move || {
-                let link = auth.farm_link(&name, crate::gateway::FarmService::of_slot(slot));
-                let result = crate::gateway::connect_farm_opts(
+                let link = auth.farm_link(&name, service);
+                let result = crate::gateway::connect_farm_signal(
                     &host, &name, &auth.username, &auth.password, auth.paper,
                     &auth.server_session_id, &auth.session_key, &auth.hw_info, &auth.encoded, slot, false,
-                    link,
+                    link, || socket_flag.store(true, std::sync::atomic::Ordering::Release),
                 ).map(|(conn, _)| conn);
                 let _ = tx.send(result);
             });
         if spawned.is_ok() {
-            self.pool.set_connecting(id, rx, now);
+            self.pool.set_connecting(id, rx, socket_up);
         } else {
             self.pool.on_connect_failed(id, now);
         }
@@ -2304,6 +3776,60 @@ impl HotLoop {
         if !name.is_empty() {
             self.farm_name = name;
         }
+    }
+
+    /// Set the contract data farm name used in the farm status messages.
+    pub fn set_secdef_farm_name(&mut self, name: String) {
+        self.secdef_farm_name = name;
+    }
+
+    /// A calendar data request (ibx#443), sent on the contract data farm,
+    /// opened when it is not, under a name its answer carries back. No
+    /// timeout, as the reference. With no such farm in the logon, nothing
+    /// is sent, as the reference sends nothing without it.
+    fn send_wsh_request(&mut self, req_id: i64, meta: bool, body: &str) {
+        if self.secdef_farm_name.is_empty() || self.secdef_farm_host.is_empty() {
+            log::warn!("Calendar data request {}: no contract data farm in the logon, not sent", req_id);
+            return;
+        }
+        let id = self.pool.ensure(&self.secdef_farm_name.clone(), &self.secdef_farm_host.clone(), FarmKind::SecDef, Instant::now());
+        let name = format!("{}{}", if meta { "MetaDataRequest" } else { "CalendarRequest" }, self.wsh_next);
+        self.wsh_next = self.wsh_next.wrapping_add(1);
+        let ts = chrono_free_timestamp();
+        let kind = if meta { "100" } else { "101" };
+        if let Some(sink) = farm_sink!(self, id) {
+            sink.send_comp(&[(fix::TAG_MSG_TYPE, "U"), (fix::TAG_SENDING_TIME, &ts), (6040, "155"), (6556, &name), (8081, kind), (8082, body)]);
+        }
+        log::info!("Calendar data request {} sent as {}", req_id, name);
+        self.wsh_sent.insert(name, (meta, req_id));
+    }
+
+    /// An answer of the contract data farm (ibx#443): success with its
+    /// JSON, or an error with its text, for the request of its name.
+    fn wsh_answer(&mut self, msg: &[u8]) {
+        if fast_extract_msg_type(msg) != Some(b"U") {
+            return;
+        }
+        let fields = fix::fix_parse(msg);
+        let ok = match fields.get(&6040).map(String::as_str) {
+            Some("158") => true,
+            Some("159") => false,
+            _ => return,
+        };
+        let Some(name) = fields.get(&6556) else { return };
+        let Some((meta, req_id)) = self.wsh_sent.remove(name) else {
+            log::debug!("Contract data farm answer for {} (not a calendar data request)", name);
+            return;
+        };
+        let text = if ok { raw_data(msg) } else { fields.get(&58).cloned().unwrap_or_default() };
+        log::info!("Calendar data request {}: {} ({} bytes)", req_id, if ok { "answered" } else { "refused" }, text.len());
+        self.shared.reference.push_wsh_answer(crate::bridge::WshAnswer { req_id, meta, ok, text });
+    }
+
+    /// The host of the contract data farm, from the logon's route: opened
+    /// on demand for the calendar data requests (ibx#443).
+    pub fn set_secdef_farm_host(&mut self, host: String) {
+        self.secdef_farm_host = host;
     }
 
     /// Set cached auth credentials for farm auto-reconnect.
@@ -2362,7 +3888,7 @@ impl HotLoop {
 
     /// See `maybe_spawn_farm_reconnect`.
     fn maybe_spawn_ccp_reconnect(&mut self) {
-        if !self.ccp.disconnected || self.pending_ccp_reconnect.is_some() {
+        if !self.ccp.disconnected || self.pending_ccp_reconnect.is_some() || self.ccp_login_refused {
             return;
         }
         match self.ccp_next_attempt_at {
@@ -2506,6 +4032,21 @@ impl HotLoop {
                 self.ccp_reconnect_attempt = 0;
                 self.ccp_next_attempt_at = None;
                 self.pending_ccp_reconnect = None;
+            }
+            Ok(Err(e)) if crate::auth::session::login_error(&e).is_some_and(|l| !l.kind.is_retryable()) => {
+                // The server refused the login itself (lockout, password
+                // rejected, address not authorized, ...). The reference
+                // ends its session there and asks the user; it goes on
+                // only for site down, site not ready and link errors.
+                // Trying again every few seconds could lock the user out
+                // (ibx#496).
+                log::error!("CCP auto-reconnect refused by the server, session ended: {}", e);
+                self.pending_ccp_reconnect = None;
+                self.ccp_next_attempt_at = None;
+                self.ccp_login_refused = true;
+                self.running = false;
+                self.shared.set_connection_lost();
+                emit(&self.event_tx, Event::Disconnected);
             }
             Ok(Err(e)) => {
                 log::error!("CCP auto-reconnect failed (attempt {}): {}", self.ccp_reconnect_attempt, e);
@@ -2663,6 +4204,121 @@ impl HotLoop {
         self.poll_farm_reconnect();
     }
 
+    /// Scanner results with rows whose contract is not known yet go to the
+    /// contract lookups (ibx#156).
+    fn look_up_scanner_rows(&mut self) {
+        for (req_id, result) in self.hmds.cold_scanner_results.drain(..).collect::<Vec<_>>() {
+            self.ccp.start_scanner_enrichment(
+                req_id, result, &mut self.ccp_conn, &self.shared, &mut self.hb,
+            );
+        }
+    }
+
+    /// Longest wait of the requests behind a contract lookup: past it they
+    /// go on (a lookup with no answer ends its own request later).
+    const LOOKUP_HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Whether a request's contract lookup has not answered yet, so the
+    /// requests after it wait (ibx#662). A display group's lookup is not a
+    /// request's.
+    fn lookup_holds(&mut self, now: Instant) -> bool {
+        let pending = !self.context.md_lookups.is_empty()
+            || self.ccp.pending_resolves.iter().any(|r| !matches!(r.request, ControlCommand::DisplayGroupLookup { .. }));
+        if !pending {
+            self.lookup_hold_since = None;
+            return false;
+        }
+        let since = *self.lookup_hold_since.get_or_insert(now);
+        now.saturating_duration_since(since) < Self::LOOKUP_HOLD_LIMIT
+    }
+
+    /// Pace the API requests as the reference does (ibx#555). On for a
+    /// session opened by a logon; an engine built by hand takes every
+    /// command at once unless this is called. The waits copied from the
+    /// reference are a setting of their own (`set_copied_waits`, ibx#564).
+    pub fn pace_requests(&mut self) {
+        self.pacer = Some(Default::default());
+        // A fan-out's requests leave at the reference's pace (ibx#689):
+        // sent at once, the server lost about one answer in twenty, so this
+        // pace stays with the pacing (ibx#564).
+        self.ccp.fanout_paced = true;
+    }
+
+    /// The paced requests are taken at once (`false`), still in the order
+    /// they were made, the client's own answers at their turn; `true` paces
+    /// them again (ibx#564: for the measurement of what the servers take).
+    #[doc(hidden)]
+    pub fn set_request_pacing(&mut self, on: bool) {
+        if let Some(pacer) = self.pacer.as_mut() {
+            pacer.set_off(!on);
+        }
+    }
+
+    /// The waits copied from the reference that change nothing an API
+    /// client receives nor what the server answers (ibx#564): off for a
+    /// session opened by a logon unless its settings turn them on, to
+    /// compare a session with the reference's timing.
+    /// - the market data messages sent in passes (ibx#560);
+    /// - the delay of the scanner parameters request and the gaps of the
+    ///   requests that waited for it (ibx#553, ibx#572);
+    /// - the gaps of a stock's first order (ibx#729);
+    /// - a transmitted stock order waiting for its contract's records
+    ///   (ibx#706; on by default for an engine built by hand).
+    pub fn set_copied_waits(&mut self, on: bool) {
+        self.md_pass.on = on;
+        self.hmds.scanner_params_delayed = on;
+        self.context.order_gaps = on;
+        self.context.order_records_wait = on;
+    }
+
+    /// Pace the requests and copy the reference's waits, as a session
+    /// opened by a logon with the copied waits setting on: the replays and
+    /// the tests of the reference's timing (ibx#564).
+    pub fn pace_as_reference(&mut self) {
+        self.pace_requests();
+        self.set_copied_waits(true);
+    }
+
+    /// Send the scanner parameters request when its delay has passed
+    /// (ibx#553).
+    pub(crate) fn sweep_scanner_params(&mut self) {
+        let now = self.pace_now();
+        self.hmds.sweep_scanner_params(now, &mut self.hmds_conn, &mut self.hb, &self.shared);
+    }
+
+    /// The time of the pacing, of the market data passes and of the
+    /// scanner parameters delay.
+    #[inline]
+    fn pace_now(&self) -> Instant {
+        self.pace_clock.unwrap_or_else(Instant::now)
+    }
+
+    /// Set the time the pacing of requests and the market data passes go
+    /// by, for a test that replays recorded times (ibx#563). It never goes
+    /// back.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_pace_clock(&mut self, now: Instant) {
+        self.pace_clock = Some(self.pace_clock.map_or(now, |was| was.max(now)));
+        self.context.gap_clock = self.pace_clock;
+    }
+
+    /// The time set by `set_pace_clock`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pace_clock(&self) -> Option<Instant> {
+        self.pace_clock
+    }
+
+    /// The time at which something that waits now is due: the next step of
+    /// the pacing when requests wait, the next market data pass, the
+    /// scanner parameters request, the end of an order's copied wait.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn next_pace_time(&self) -> Option<Instant> {
+        let held = self.cmd_queue.iter().any(|q| crate::engine::pacer::is_request(&q.cmd));
+        let step = self.pacer.as_ref().filter(|_| held).and_then(|p| p.next_step());
+        let order = self.context.order_wake.filter(|_| self.context.order_gaps);
+        [step, self.md_pass.due(), self.hmds.next_scanner_due(), order].into_iter().flatten().min()
+    }
+
     /// Mutably access heartbeat state for testing (e.g., setting timestamps).
     pub fn heartbeat_state_mut(&mut self) -> &mut HeartbeatState {
         &mut self.hb
@@ -2676,6 +4332,7 @@ impl HotLoop {
     pub fn step_for_test(&mut self) {
         self.farm.poll_market_data(&mut self.farm_conn, &mut self.context, &self.shared, &self.event_tx, &mut self.hb);
         self.hmds.poll(&mut self.hmds_conn, &self.shared, &self.event_tx, &mut self.hb);
+        self.look_up_scanner_rows();
         order_builder::drain_and_send_orders(
             &mut self.ccp_conn, &mut self.context, &self.account_id, &mut self.hb,
             self.ccp.disconnected, &self.shared,
@@ -2892,6 +4549,22 @@ struct Links {
     hmds: bool,
 }
 
+/// Whether the clients were told each data connection is OK (ibx#520).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct DataLinks {
+    farm: bool,
+    hmds: bool,
+    secdef: bool,
+}
+
+impl DataLinks {
+    /// A data connection is told OK while it is up and the auth link is
+    /// up; contract data is read on the auth link.
+    fn of(links: Links) -> Self {
+        Self { farm: links.farm && links.ccp, hmds: links.hmds && links.ccp, secdef: links.ccp }
+    }
+}
+
 /// Period of the server tag cleaner, how long a market data record stays
 /// unused before its quote tags go, most records torn down per run, and the
 /// number of waiting records above which the age is not checked (#292).
@@ -2969,7 +4642,7 @@ pub(crate) fn push_hmds_error(shared: &SharedState, req_id: ReqId, message: Stri
     }
 }
 
-/// Format a fixed-point Price as a decimal string for FIX tags. Zero alloc.
+/// Format a fixed-point Price as a decimal string for wire fields. Zero alloc.
 pub(crate) fn format_price(price: Price) -> StackStr {
     let whole = price / PRICE_SCALE;
     let frac = (price % PRICE_SCALE).unsigned_abs();
@@ -3006,7 +4679,7 @@ pub(crate) fn format_price(price: Price) -> StackStr {
 
 /// A price in the reference's number form for its price fields: at least
 /// two decimals, at most eight (`0.00`, `0.05`, `272.885`, `-0.10`), the
-/// pattern `#0.00######` of its price formatter (`jutils.dO.F`, US
+/// pattern `#0.00######` of its price formatter (US
 /// symbols, no grouping), which writes every price tag of its order
 /// messages (ibx#263). Zero alloc.
 pub(crate) fn format_price_ref(price: Price) -> StackStr {
@@ -3020,12 +4693,12 @@ pub(crate) fn format_price_ref(price: Price) -> StackStr {
     s
 }
 
-/// Parse a FIX tag value as a Price (fixed-point). Returns 0 if absent,
+/// Parse a wire field value as a Price (fixed-point). Returns 0 if absent,
 /// unparseable, or non-finite. Rust's f64 parser accepts "nan"/"inf", but on
 /// the wire those are not-available sentinels, not values: the gateway's own
 /// field parser maps nan/unparseable to unset (ibx#214). Without the finite
 /// filter, "nan" saturated to 0 and "inf" to i64::MAX.
-pub(crate) fn parse_price_tag(val: Option<&String>) -> Price {
+pub(crate) fn parse_price_tag(val: Option<&str>) -> Price {
     val.and_then(|s| s.parse::<f64>().ok())
         .filter(|f| f.is_finite())
         .map(|f| (f * PRICE_SCALE as f64) as Price)
@@ -3045,16 +4718,16 @@ pub(crate) fn decode_tif(tif: u8) -> &'static str {
 }
 
 /// The time-in-force code of an order report, as the reference reads it
-/// (ibx#307): DAY when 59 is absent; else the first character of 59, DTC
-/// for 59=1 with the DTC flag (6436=1), OVERNIGHT + DAY with 8534=1, else
-/// OVERNIGHT when the exchange (6004) is OVERNIGHT.
-pub(crate) fn report_tif(parsed: &std::collections::HashMap<u32, String>) -> u8 {
+/// (ibx#307): DAY when the time in force is absent; else its first character,
+/// DTC for good-till-cancel with the DTC flag set, OVERNIGHT + DAY with the
+/// include-overnight flag set, else OVERNIGHT when the exchange is OVERNIGHT.
+pub(crate) fn report_tif(parsed: &fix::FieldMap<'_>) -> u8 {
     let Some(mut code) = parsed.get(&59).and_then(|s| s.bytes().next()) else { return b'0' };
-    let flag = |tag: u32| parsed.get(&tag).map(|s| s.as_str()) == Some("1");
+    let flag = |tag: u32| parsed.get(&tag).copied() == Some("1");
     if code == b'1' && flag(6436) { code = crate::types::TIF_DTC; }
     if flag(8534) {
         code = b'b';
-    } else if parsed.get(&6004).map(|s| s.as_str()) == Some("OVERNIGHT") {
+    } else if parsed.get(&6004).copied() == Some("OVERNIGHT") {
         code = b'j';
     }
     code
@@ -3076,13 +4749,14 @@ pub(crate) fn format_qty(qty: Qty) -> StackStr {
     if frac != 0 {
         s.push(b'.');
         let frac_start = s.len as usize;
-        let digits = [
-            b'0' + (frac / 1_000 % 10) as u8,
-            b'0' + (frac / 100 % 10) as u8,
-            b'0' + (frac / 10 % 10) as u8,
-            b'0' + (frac % 10) as u8,
-        ];
-        let mut end = 4;
+        // QTY_DIGITS digits, zero-padded, the trailing zeros left out.
+        let mut digits = [b'0'; QTY_DIGITS];
+        let mut rest = frac;
+        for d in digits.iter_mut().rev() {
+            *d = b'0' + (rest % 10) as u8;
+            rest /= 10;
+        }
+        let mut end = QTY_DIGITS;
         while end > 0 && digits[end - 1] == b'0' { end -= 1; }
         for i in 0..end {
             s.buf[frac_start + i] = digits[i];
@@ -3092,7 +4766,7 @@ pub(crate) fn format_qty(qty: Qty) -> StackStr {
     s
 }
 
-/// Fast extraction of FIX tag 35 (MsgType) value via byte scan.
+/// Fast extraction of the message type value via byte scan.
 pub(crate) fn fast_extract_msg_type(msg: &[u8]) -> Option<&[u8]> {
     let limit = msg.len().min(48);
     let mut i = 0;
@@ -3120,7 +4794,7 @@ pub(crate) fn find_body_after_tag<'a>(msg: &'a [u8], tag_marker: &[u8]) -> Optio
         .map(|pos| &msg[pos + tag_marker.len()..])
 }
 
-/// Extract the raw bytes of a binary FIX tag value using a length tag.
+/// Extract the raw bytes of a binary field value using its length field.
 pub(crate) fn extract_raw_tag(msg: &[u8], tag: u32) -> Option<Vec<u8>> {
     let len_tag = tag - 1;
     if let Some(len_val) = extract_text_tag(msg, len_tag) {
@@ -3158,7 +4832,7 @@ pub(crate) fn extract_raw_tag(msg: &[u8], tag: u32) -> Option<Vec<u8>> {
     None
 }
 
-/// Extract a text FIX tag value (SOH-delimited) from raw message bytes.
+/// Extract a text field value (SOH-delimited) from raw message bytes.
 fn extract_text_tag(msg: &[u8], tag: u32) -> Option<String> {
     let needle = format!("{}=", tag);
     let needle_bytes = needle.as_bytes();
@@ -3389,6 +5063,19 @@ mod tests {
         assert_eq!((errors[0].0, errors[0].1), (3, 162));
     }
 
+    // ibx#663: the book's sizes follow the top of book's: in shares with
+    // the 10.51 mark, in the contract's lot in the 10.40 form.
+    #[test]
+    fn depth_sizes_take_the_lot_only_in_the_lot_form() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared, None, None);
+        engine.set_scale_us_lots(true);
+        engine.context.round_lots.insert(265598, 40);
+        assert_eq!(engine.depth_lot(265598), 1);
+        engine.set_lot_sizes(true);
+        assert_eq!(engine.depth_lot(265598), 40);
+    }
+
     #[test]
     fn channel_disconnect_sets_connection_lost_flag() {
         let shared = Arc::new(SharedState::new());
@@ -3495,6 +5182,39 @@ mod tests {
         (engine, shared, vec![s1, s2, s3])
     }
 
+    // ibx#645: a regulatory snapshot of a contract whose definition was
+    // never read asks it first and waits for it (it tells whether the
+    // contract is a US stock or warrant); one whose definition is known
+    // goes on at once.
+    #[test]
+    fn a_regulatory_snapshot_waits_for_an_unknown_definition() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (c, mut server) = socket_pair();
+        engine.ccp_conn = Some(Connection::new_mem(c));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        engine.set_control_rx(rx);
+        let snapshot = |con_id: i64| ControlCommand::SubscribeSnapshot {
+            con_id, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "STK".into(), reply_tx: None,
+        };
+        tx.send(snapshot(265598)).unwrap();
+        engine.poll_control_commands();
+        let sent = {
+            use std::io::Read;
+            server.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+            let mut chunk = [0u8; 8192];
+            let n = server.read(&mut chunk).unwrap_or(0);
+            crate::protocol::fix::fix_parse(&chunk[..n])
+        };
+        assert_eq!((sent.get(&35).map(String::as_str), sent.get(&6008).map(String::as_str)), (Some("c"), Some("265598")),
+            "the definition is asked: {sent:?}");
+        assert_eq!(engine.context.def_parked.len(), 1, "the snapshot waits");
+        engine.context.agg_groups.insert(272093, -1);
+        tx.send(snapshot(272093)).unwrap();
+        engine.poll_control_commands();
+        assert_eq!(engine.context.def_parked.len(), 1, "a known contract does not wait");
+    }
+
     // ibx#399: a lost link is told to the clients at once, once, and the
     // session stays open.
     #[test]
@@ -3557,7 +5277,8 @@ mod tests {
         assert!(engine.ccp.disconnected, "reset at 62 s");
         engine.report_link_changes();
         let notices = shared.drain_connection_notices();
-        assert_eq!(notices.iter().map(|n| n.0).collect::<Vec<_>>(), vec![1100]);
+        // 1100, and the data connections told broken with it (ibx#520).
+        assert_eq!(notices.iter().map(|n| n.0).collect::<Vec<_>>(), vec![1100, 2103, 2105]);
         assert!(!shared.take_connection_lost(), "the clients stay connected");
     }
 
@@ -3655,7 +5376,8 @@ mod tests {
             "open-order requests wait immediately when the auth link fails, before 1100"
         );
         engine.report_link_changes();
-        assert_eq!(shared.drain_connection_notices().iter().map(|n| n.0).collect::<Vec<_>>(), vec![1100]);
+        // 1100, and the data connections told broken with it (ibx#520).
+        assert_eq!(shared.drain_connection_notices().iter().map(|n| n.0).collect::<Vec<_>>(), vec![1100, 2103, 2105]);
         assert!(shared.orders.open_orders_held(), "open-order requests wait from the 1100 (ibx#251)");
     }
 
@@ -3773,20 +5495,74 @@ mod tests {
         engine.farm.disconnected = false;
         engine.hmds.disconnected = false;
         engine.report_link_changes();
+        // In the order of the reference's return (recorded 30/09/2026).
         assert_eq!(shared.drain_connection_notices(), vec![
-            (2104, "Market data farm connection is OK:eufarm".to_string()),
             (2106, "HMDS data farm connection is OK:ushmds".to_string()),
+            (2104, "Market data farm connection is OK:eufarm".to_string()),
         ]);
         engine.report_link_changes();
         assert!(shared.drain_connection_notices().is_empty(), "reported once");
 
-        // The auth link coming back gives no farm notice.
+    }
+
+    // ibx#520: the loss of the auth link alone is told for every data
+    // connection, and its return too, as the reference (25/09/2026: 1100
+    // then the three broken notices; 30/09/2026: 2106, 2158, 2104 and then
+    // 1102 with three names).
+    #[test]
+    fn auth_link_loss_and_return_are_told_for_every_data_connection() {
+        let (mut engine, shared, _servers) = engine_with_links();
+        engine.set_secdef_farm_name("secdefil".into());
+        engine.report_link_changes();
+        assert!(shared.drain_connection_notices().is_empty(), "first look: nothing to report");
+
         engine.ccp.disconnected = true;
+        engine.report_link_changes();
+        assert_eq!(shared.drain_connection_notices(), vec![
+            (1100, LINK_LOST.to_string()),
+            (2103, "Market data farm connection is broken:usfarm".to_string()),
+            (2105, "HMDS data farm connection is broken:ushmds".to_string()),
+            (2157, "Sec-def data farm connection is broken:secdefil".to_string()),
+        ]);
+        assert!(!engine.farm.disconnected && !engine.hmds.disconnected, "the data connections are left as they are");
+
+        // A data connection really lost during the outage, and back before
+        // the auth link: already told broken, nothing more.
+        engine.farm.disconnected = true;
+        engine.report_link_changes();
+        engine.farm.disconnected = false;
+        engine.report_link_changes();
+        assert!(shared.drain_connection_notices().is_empty());
+
+        engine.ccp.disconnected = false;
+        engine.report_link_changes();
+        assert_eq!(shared.drain_connection_notices(), vec![
+            (2106, "HMDS data farm connection is OK:ushmds".to_string()),
+            (2158, "Sec-def data farm connection is OK:secdefil".to_string()),
+            (2104, "Market data farm connection is OK:usfarm".to_string()),
+        ]);
+        engine.ccp.status_replay_end_at = Some(Instant::now());
+        engine.maybe_report_restored();
+        assert_eq!(shared.drain_connection_notices(), vec![(1102,
+            format!("{LINK_RESTORED} All data farms are connected: usfarm; ushmds; secdefil."))]);
+    }
+
+    // A data connection still down when the auth link returns is told OK
+    // when it comes up itself.
+    #[test]
+    fn a_data_connection_down_at_the_return_is_told_when_it_is_up() {
+        let (mut engine, shared, _servers) = engine_with_links();
+        engine.report_link_changes();
+        engine.ccp.disconnected = true;
+        engine.hmds.disconnected = true;
         engine.report_link_changes();
         let _ = shared.drain_connection_notices();
         engine.ccp.disconnected = false;
         engine.report_link_changes();
-        assert!(shared.drain_connection_notices().is_empty(), "1102 comes after the replay, not here");
+        assert_eq!(shared.drain_connection_notices().iter().map(|n| n.0).collect::<Vec<_>>(), vec![2104]);
+        engine.hmds.disconnected = false;
+        engine.report_link_changes();
+        assert_eq!(shared.drain_connection_notices().iter().map(|n| n.0).collect::<Vec<_>>(), vec![2106]);
     }
 
     // ibx#399: with every transport down the loop spun at ~1M passes/s and
@@ -3801,7 +5577,8 @@ mod tests {
         engine.ccp.disconnected = true;
         assert!(engine.all_transports_down());
 
-        let handle = std::thread::spawn(move || { engine.run(); engine });
+        let handle = std::thread::Builder::new().stack_size(ENGINE_STACK)
+            .spawn(move || { engine.run(); engine }).unwrap();
         std::thread::sleep(Duration::from_millis(60));
         tx.send(ControlCommand::Shutdown).unwrap();
         let engine = handle.join().unwrap();
@@ -3967,11 +5744,12 @@ mod tests {
         out
     }
 
-    fn scanner_engine(shared: &Arc<SharedState>) -> (HotLoop, crate::protocol::connection::MemTransport, Sender<ControlCommand>) {
+    fn scanner_engine(shared: &Arc<SharedState>) -> (HotLoop, crate::protocol::connection::MemTransport, ControlSender) {
         let mut engine = HotLoop::new(shared.clone(), None, None);
         let (c, server) = socket_pair();
         engine.hmds_conn = Some(Connection::new_mem(c));
         let (tx, rx) = crossbeam_channel::unbounded();
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         (engine, server, tx)
     }
@@ -3984,6 +5762,211 @@ mod tests {
                 scan_code: scan_code.into(), number_of_rows: 10, filters: Vec::new(),
             },
         }
+    }
+
+    // ibx#555: with the pacing on, of three requests made at once the
+    // first is taken at once and the others wait for the next steps; a
+    // command that is not a request passes when its turn comes; a
+    // shutdown is never held.
+    #[test]
+    fn requests_made_at_once_are_paced() {
+        let shared = Arc::new(SharedState::new());
+        let (mut engine, mut server, tx) = scanner_engine(&shared);
+        load_scanner_params(&mut engine, &mut server, "<ScanParameterResponse/>");
+        engine.pace_as_reference();
+        // The test's own clock: no real wait (ibx#567).
+        let start = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        engine.set_pace_clock(start);
+        for req_id in [1, 2, 3] {
+            tx.send(scanner_cmd(req_id, 7, "TOP_PERC_GAIN")).unwrap();
+        }
+        tx.send(ControlCommand::Unpaced(Box::new(scanner_cmd(4, 7, "TOP_PERC_GAIN")))).unwrap();
+        // A command aside of the requests does not wait behind them.
+        tx.send(ControlCommand::Ping).unwrap();
+        // The queue is read at once after each pass: reading the peer
+        // would let time pass.
+        engine.poll_once();
+        assert_eq!(engine.cmd_queue.len(), 3, "the first request only");
+        engine.poll_once();
+        assert_eq!(engine.cmd_queue.len(), 3, "the others wait for the next step");
+
+        engine.set_pace_clock(start + ms(99));
+        engine.poll_once();
+        assert_eq!(engine.cmd_queue.len(), 3, "not before the step");
+        engine.set_pace_clock(start + ms(105));
+        engine.poll_once();
+        assert_eq!(engine.cmd_queue.len(), 2, "one more in the second step");
+        engine.set_pace_clock(start + ms(205));
+        engine.poll_once();
+        assert!(engine.cmd_queue.is_empty(), "the third, and the command behind it that is not a request");
+
+        // At rest again: a request alone is taken at once.
+        engine.set_pace_clock(start + ms(210));
+        engine.poll_once();
+        tx.send(scanner_cmd(5, 7, "TOP_PERC_GAIN")).unwrap();
+        engine.poll_once();
+        assert!(engine.cmd_queue.is_empty());
+        let sent = plain_messages_sent(&mut server);
+        let ids: Vec<&str> = sent.iter().map(|m| {
+            let a = m.find("<id>APISCAN7:").unwrap() + 13;
+            &m[a..a + 1]
+        }).collect();
+        // (The fifth is refused by the limit of scanners that run at once.)
+        assert_eq!(ids, ["1", "2", "3", "4"], "in the order of the requests");
+
+        // A shutdown takes everything that waits with it.
+        tx.send(scanner_cmd(6, 7, "TOP_PERC_GAIN")).unwrap();
+        tx.send(scanner_cmd(8, 7, "TOP_PERC_GAIN")).unwrap();
+        tx.send(ControlCommand::Shutdown).unwrap();
+        engine.poll_once();
+        assert!(engine.cmd_queue.is_empty());
+        assert!(!engine.running);
+    }
+
+    // ibx#561: the slot told to a market data request is kept for it until
+    // its subscribe comes, also when the slot would be given back.
+    #[test]
+    fn the_slot_told_to_a_market_data_request_is_kept_for_it() {
+        let shared = Arc::new(SharedState::new());
+        let (mut engine, _server, tx) = scanner_engine(&shared);
+        let ask = |con_id: i64| {
+            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+            (ControlCommand::MarketDataSlot {
+                con_id, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(),
+                mode_9887: 0, snapshot: false, plain: false, reply_tx: reply_tx.into(),
+            }, reply_rx)
+        };
+        let (cmd, reply) = ask(265598);
+        tx.send(cmd).unwrap();
+        engine.poll_once();
+        let slot = reply.try_recv().unwrap().unwrap();
+        assert_eq!(engine.md_slots_told, [(265598, slot)]);
+        // Nothing runs on the slot yet: it is not given back.
+        engine.try_reclaim_instrument(slot);
+        assert_eq!(engine.context.market.instrument_by_con_id(265598), Some(slot));
+
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        tx.send(ControlCommand::Subscribe {
+            con_id: 265598, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "STK".into(),
+            last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
+            mode_9887: 0, snapshot: false, reply_tx: Some(reply_tx.into()),
+        }).unwrap();
+        engine.poll_once();
+        assert_eq!(reply_rx.try_recv().unwrap(), Ok(slot), "the subscribe takes the slot told");
+        assert!(engine.md_slots_told.is_empty());
+
+        // ibx#565: requests with no conId get a slot each, taken by their
+        // subscribes in the order of the requests; a regulatory snapshot
+        // takes the slot of its conId.
+        let by_symbol = |symbol: &str| {
+            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+            (ControlCommand::MarketDataSlot {
+                con_id: 0, symbol: symbol.into(), sec_type: "STK".into(), exchange: "SMART".into(),
+                mode_9887: 0, snapshot: false, plain: false, reply_tx: reply_tx.into(),
+            }, reply_rx)
+        };
+        let (first, first_reply) = by_symbol("MSFT");
+        let (second, second_reply) = by_symbol("NVDA");
+        tx.send(first).unwrap();
+        tx.send(second).unwrap();
+        engine.poll_once();
+        let (a, b) = (first_reply.try_recv().unwrap().unwrap(), second_reply.try_recv().unwrap().unwrap());
+        assert_ne!(a, b);
+        assert_eq!(engine.md_slots_told, [(0, a), (0, b)]);
+        assert_eq!(engine.take_told_slot(0), Some(a));
+        assert_eq!(engine.take_told_slot(0), Some(b));
+        assert_eq!(engine.take_told_slot(0), None);
+
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        tx.send(ControlCommand::MarketDataSlot {
+            con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(),
+            mode_9887: 0, snapshot: true, plain: true, reply_tx: reply_tx.into(),
+        }).unwrap();
+        engine.poll_once();
+        assert_eq!(reply_rx.try_recv().unwrap(), Ok(slot), "the slot of the conId");
+        assert_eq!(engine.take_told_slot(265598), Some(slot));
+    }
+
+    // ibx#561: an error the client writes itself and a request it answers
+    // itself come out at their turn, behind the requests made before them.
+    #[test]
+    fn answers_of_the_client_take_their_turn() {
+        let shared = Arc::new(SharedState::new());
+        let (mut engine, mut server, _) = scanner_engine(&shared);
+        load_scanner_params(&mut engine, &mut server, "<ScanParameterResponse/>");
+        engine.pace_as_reference();
+        let clock = shared.command_clock().clone();
+        clock.set_paced(None);
+        let (raw_tx, rx) = crossbeam_channel::unbounded();
+        engine.set_control_rx(rx);
+        let tx = ControlSender::new(raw_tx, None, Some(clock.clone()));
+        // This thread is the engine's.
+        clock.set_running(true);
+        // The steps go by the test's own clock: no real wait for them
+        // (ibx#567).
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        engine.set_pace_clock(start);
+        tx.send(scanner_cmd(1, 7, "TOP_PERC_GAIN")).unwrap();
+        tx.send(scanner_cmd(2, 7, "TOP_PERC_GAIN")).unwrap();
+        let client = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                shared.orders.push_order_error(9, 321, "refused".into());
+                shared.command_clock().take_turn();
+            })
+        };
+        // The client's two commands reach the queue.
+        std::thread::sleep(Duration::from_millis(20));
+        engine.poll_once();
+        assert_eq!(engine.cmd_queue.len(), 3, "the second request, the error, the turn");
+        assert!(shared.orders.drain_order_errors().is_empty(), "the error waits for its turn");
+        engine.set_pace_clock(start + ms(100));
+        engine.poll_once();
+        assert!(shared.orders.drain_order_errors().is_empty());
+        engine.set_pace_clock(start + ms(200));
+        engine.poll_once();
+        assert_eq!(shared.orders.drain_order_errors(), [(9, 321, "refused".to_string())]);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!client.is_finished(), "the turn of the call has not come");
+        engine.set_pace_clock(start + ms(300));
+        engine.poll_once();
+        client.join().unwrap();
+        assert!(engine.cmd_queue.is_empty());
+        clock.set_running(false);
+
+        // With no engine running, both are at once.
+        shared.orders.push_order_error(10, 321, "refused".into());
+        shared.command_clock().take_turn();
+        assert_eq!(shared.orders.drain_order_errors().len(), 1);
+        assert!(shared.command_clock().turn_ticket().is_none(), "no ticket: the turn is now");
+
+        // ibx#565: a ticket tells when the turn has come, without a wait;
+        // the commands of one call count once.
+        engine.set_pace_clock(start + ms(305));
+        engine.poll_once();
+        clock.set_running(true);
+        tx.send(scanner_cmd(3, 7, "TOP_PERC_GAIN")).unwrap();
+        let (ticket, late) = std::thread::spawn({
+            let shared = shared.clone();
+            move || {
+                let _request = crate::engine::park::one_request();
+                let ticket = shared.command_clock().turn_ticket().unwrap();
+                // Of the same call: not a second request.
+                shared.orders.push_order_error(11, 321, "refused".into());
+                (ticket, Instant::now())
+            }
+        }).join().unwrap();
+        assert!(late.elapsed() < Duration::from_millis(50));
+        engine.poll_once();
+        assert!(ticket.try_recv().is_err(), "the request before it was taken; its turn is the next step");
+        engine.set_pace_clock(start + ms(410));
+        engine.poll_once();
+        assert!(ticket.try_recv().is_ok());
+        assert_eq!(shared.orders.drain_order_errors(), [(11, 321, "refused".to_string())], "with its turn, not a step later");
+        assert!(engine.cmd_queue.is_empty());
+        clock.set_running(false);
     }
 
     fn load_scanner_params(engine: &mut HotLoop, server: &mut crate::protocol::connection::MemTransport, xml: &str) {
@@ -4003,7 +5986,8 @@ mod tests {
 
     // ibx#457 / ibx#456 (reference scenario scanner_two, 26/09/2026): two
     // scanners open at once; the subscriptions wait for the scanner
-    // parameters, then go out with the asked rows; each result goes to
+    // parameters, then go out in the reference's order (ibx#513) with the
+    // asked rows and an XML declaration; each result goes to
     // the subscription its id names, the ids are client id and request
     // id; each cancel gives the local 162 then its desubscribe; an
     // unknown cancel gives 365 only.
@@ -4011,9 +5995,11 @@ mod tests {
     fn two_scanners_get_their_own_results() {
         let shared = Arc::new(SharedState::new());
         let (mut engine, mut server, tx) = scanner_engine(&shared);
+        let (events_tx, events) = crossbeam_channel::unbounded();
+        shared.attach_event_channel(&events_tx);
         tx.send(scanner_cmd(9005, 198, "TOP_PERC_GAIN")).unwrap();
         tx.send(scanner_cmd(9006, 198, "MOST_ACTIVE")).unwrap();
-        engine.poll_control_commands();
+        engine.poll_once();
         let sent = plain_messages_sent(&mut server);
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert!(sent[0].contains("6040=10001|"), "parameters first: {sent:?}");
@@ -4023,7 +6009,7 @@ mod tests {
         }
         let sent = plain_messages_sent(&mut server);
         assert_eq!(sent.len(), 2, "{sent:?}");
-        for (m, id, code) in [(&sent[0], "APISCAN198:9005", "TOP_PERC_GAIN"), (&sent[1], "APISCAN198:9006", "MOST_ACTIVE")] {
+        for (m, id, code) in [(&sent[0], "APISCAN198:9006", "MOST_ACTIVE"), (&sent[1], "APISCAN198:9005", "TOP_PERC_GAIN")] {
             assert!(m.contains(&format!("<id>{id}</id>")) && m.contains(&format!("<scanCode>{code}</scanCode>")), "{m}");
             assert!(m.contains("<maxItems>10</maxItems><suspend>no</suspend>"), "as the reference: {m}");
         }
@@ -4034,7 +6020,7 @@ mod tests {
         for req_id in [9005, 9006, 99] {
             tx.send(ControlCommand::CancelScanner { req_id }).unwrap();
         }
-        engine.poll_control_commands();
+        engine.poll_once();
         assert_eq!(errors(&shared), [
             "9005:162:Historical Market Data Service error message:API scanner subscription cancelled: 9005",
             "9006:162:Historical Market Data Service error message:API scanner subscription cancelled: 9006",
@@ -4046,6 +6032,14 @@ mod tests {
         assert!(sent[1].contains("<id>APISCAN198:9006</id>"));
         assert!(engine.hmds.cold_scanner_results.is_empty());
         assert!(engine.hmds.pending_scanner.is_empty());
+        // The event channel (ibx#576): rows the server sends after the
+        // cancel give no event; the rows parked for their contracts at the
+        // cancel never gave one.
+        for msg in fixture_hmds_messages("20260926b/scanner_two.jsonl") {
+            engine.inject_hmds_message(&msg);
+        }
+        engine.look_up_scanner_rows();
+        assert!(!events.try_iter().any(|e| matches!(e, crate::bridge::Event::ScannerData { .. })));
     }
 
     // ibx#457: a result whose id is not live is dropped; a refusal text
@@ -4056,7 +6050,7 @@ mod tests {
         let (mut engine, _server, tx) = scanner_engine(&shared);
         tx.send(scanner_cmd(1, 7, "TOP_PERC_GAIN")).unwrap();
         tx.send(scanner_cmd(2, 7, "MOST_ACTIVE")).unwrap();
-        engine.poll_control_commands();
+        engine.poll_once();
         let result = |xml: &str| crate::protocol::fix::fix_build(&[(35, "U"), (6040, "10005"), (6118, xml)], 1);
         engine.inject_hmds_message(&result("<ScanResponse><id>APISCAN3:1</id><Contracts>\
             <Contract><contractID>1</contractID></Contract></Contracts></ScanResponse>"));
@@ -4085,7 +6079,7 @@ mod tests {
         tx.send(scanner_cmd(1, 0, "A")).unwrap();
         tx.send(scanner_cmd(2, 0, "B")).unwrap();
         tx.send(scanner_cmd(3, 0, "C")).unwrap();
-        engine.poll_control_commands();
+        engine.poll_once();
         assert_eq!(errors(&shared), [
             "1:322:Error processing request.-'co' : cause - Duplicate ticker ID for API scanner subscription",
             "3:322:Error processing request.-'co' : cause - Only 2 simultaneous API scanner subscriptions are allowed.",
@@ -4095,33 +6089,272 @@ mod tests {
 
     // ibx#457: the scanner parameters are asked once per connection; the
     // requests waiting for them all get the answer, later ones are served
-    // from the cache; a lost link clears it.
+    // from the cache. The answer ended the parameters' place in the
+    // scanner table, so they no longer follow the link (ibx#554, as read
+    // on the reference): a subscription served from them and a loss of
+    // the link leave them; the subscriptions of the next test are the
+    // case where the loss drops them.
     #[test]
     fn scanner_parameters_are_cached() {
         let shared = Arc::new(SharedState::new());
         let (mut engine, mut server, tx) = scanner_engine(&shared);
         tx.send(ControlCommand::FetchScannerParams).unwrap();
         tx.send(ControlCommand::FetchScannerParams).unwrap();
-        engine.poll_control_commands();
+        engine.poll_once();
         let sent = plain_messages_sent(&mut server);
         assert_eq!(sent.iter().filter(|m| m.contains("6040=10001|")).count(), 1, "{sent:?}");
         let reply = crate::protocol::fix::fix_build(&[(35, "U"), (6040, "10002"), (6118, "<ScanParameterResponse/>")], 1);
         engine.inject_hmds_message(&reply);
         assert_eq!(shared.reference.drain_scanner_params().len(), 2);
         tx.send(ControlCommand::FetchScannerParams).unwrap();
-        engine.poll_control_commands();
+        engine.poll_once();
         assert_eq!(shared.reference.drain_scanner_params(), ["<ScanParameterResponse/>"]);
         assert!(plain_messages_sent(&mut server).is_empty(), "answered from the cache");
+        tx.send(scanner_cmd(4, 1, "TOP_PERC_GAIN")).unwrap();
+        engine.poll_once();
+        let _ = plain_messages_sent(&mut server);
         engine.hmds.scanner_link_lost(&shared);
+        let _ = errors(&shared);
         tx.send(ControlCommand::FetchScannerParams).unwrap();
-        engine.poll_control_commands();
+        engine.poll_once();
+        assert_eq!(shared.reference.drain_scanner_params().len(), 1, "kept");
+        assert!(plain_messages_sent(&mut server).is_empty());
+    }
+
+    // ibx#496: a login the server refuses during a reconnect ends the
+    // session, as the reference does: no further attempt, the clients see
+    // the connection closed once. Site down, site not ready and a link
+    // error are tried again.
+    #[test]
+    fn a_reconnect_refused_by_the_server_ends_the_session() {
+        use crate::auth::session::{LoginError, LoginErrorKind};
+        let outcome = |error: io::Error| {
+            let shared = Arc::new(SharedState::new());
+            let (event_tx, event_rx) = crossbeam_channel::unbounded();
+            let mut engine = HotLoop::new(shared.clone(), Some(event_tx), None);
+            engine.running = true;
+            engine.ccp.disconnected = true;
+            engine.ccp_reconnect_attempt = 1;
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            tx.send(Err(error)).unwrap();
+            engine.pending_ccp_reconnect = Some(rx);
+            engine.poll_ccp_reconnect();
+            assert!(engine.pending_ccp_reconnect.is_none());
+            // The next pass plans an attempt only when the session goes on.
+            engine.maybe_spawn_ccp_reconnect();
+            let closed = matches!(event_rx.try_recv(), Ok(Event::Disconnected));
+            (engine.running, engine.ccp_next_attempt_at.is_some(), shared.take_connection_lost(), closed)
+        };
+        let refused = |kind, code: i64, text: &str| -> io::Error {
+            LoginError { kind, code: Some(code), text: text.into() }.into()
+        };
+        for error in [
+            refused(LoginErrorKind::LockedOut, 1, "lockedout"),
+            refused(LoginErrorKind::PasswordRejected, 23, "pwd"),
+            refused(LoginErrorKind::BadCredentials, 1, "bad"),
+            refused(LoginErrorKind::IpNotAuthorized, 1, "IP address 1.2.3.4"),
+            refused(LoginErrorKind::Other, 99, "other"),
+        ] {
+            let text = error.to_string();
+            assert_eq!(outcome(error), (false, false, true, true), "{text}");
+        }
+        for error in [
+            refused(LoginErrorKind::SiteDown, 4, "site down"),
+            refused(LoginErrorKind::SiteNotReady, 5, "site not ready"),
+            io::Error::new(io::ErrorKind::ConnectionReset, "link"),
+        ] {
+            let text = error.to_string();
+            assert_eq!(outcome(error), (true, true, false, false), "{text}");
+        }
+    }
+
+    // ibx#552: a parameters request that waits counts among the scanner
+    // sessions that order the waiting subscriptions: eight subscriptions
+    // behind it go out 9008 down to 9001 (reference run of 10/10/2026),
+    // and without it 9002, 9001, then 9008 down to 9003.
+    #[test]
+    fn a_waiting_parameters_request_counts_for_the_order_of_the_subscriptions() {
+        let order = |with_request: bool| {
+            let shared = Arc::new(SharedState::new());
+            let (mut engine, mut server, tx) = scanner_engine(&shared);
+            engine.hmds.max_real_time_requests = 100;
+            if with_request {
+                tx.send(ControlCommand::FetchScannerParams).unwrap();
+            }
+            for req_id in 9001..=9008 {
+                tx.send(scanner_cmd(req_id, 198, "TOP_PERC_GAIN")).unwrap();
+            }
+            engine.poll_once();
+            assert_eq!(plain_messages_sent(&mut server).len(), 1, "the parameters request");
+            load_scanner_params_keep(&mut engine, "<ScanParameterResponse/>");
+            // Answered: the request has left the table.
+            assert!(engine.hmds.scanner_table.ids().all(|id| id.starts_with("APISCAN198:")));
+            plain_messages_sent(&mut server).iter()
+                .filter_map(|m| m.split("APISCAN198:").nth(1).map(|t| t[..4].to_string()))
+                .collect::<Vec<_>>().join(" ")
+        };
+        assert_eq!(order(true), "9008 9007 9006 9005 9004 9003 9002 9001");
+        assert_eq!(order(false), "9002 9001 9008 9007 9006 9005 9004 9003");
+    }
+
+    // ibx#564: a session opened by a logon paces its requests and its
+    // fan-outs, and copies none of the reference's other waits unless its
+    // settings turn them on; an engine built by hand asks an order's records.
+    #[test]
+    fn the_copied_waits_are_a_setting_of_their_own() {
+        let shared = Arc::new(SharedState::new());
+        let (mut engine, _server, _tx) = scanner_engine(&shared);
+        assert!(engine.context.order_records_wait, "an engine built by hand");
+        engine.pace_requests();
+        engine.set_copied_waits(false);
+        assert!(engine.pacer.is_some() && engine.ccp.fanout_paced);
+        assert!(!engine.md_pass.on && !engine.hmds.scanner_params_delayed);
+        assert!(!engine.context.order_gaps && !engine.context.order_records_wait);
+        engine.set_copied_waits(true);
+        assert!(engine.md_pass.on && engine.hmds.scanner_params_delayed);
+        assert!(engine.context.order_gaps && engine.context.order_records_wait);
+    }
+
+    // ibx#564: with the pacing set off, requests made at once are all taken
+    // at once, in their order.
+    #[test]
+    fn requests_are_taken_at_once_with_the_pacing_off() {
+        let shared = Arc::new(SharedState::new());
+        let (mut engine, mut server, tx) = scanner_engine(&shared);
+        load_scanner_params(&mut engine, &mut server, "<ScanParameterResponse/>");
+        engine.pace_requests();
+        engine.set_request_pacing(false);
+        let start = Instant::now();
+        engine.set_pace_clock(start);
+        for req_id in [1, 2, 3] {
+            tx.send(scanner_cmd(req_id, 7, "TOP_PERC_GAIN")).unwrap();
+        }
+        engine.poll_once();
+        assert!(engine.cmd_queue.is_empty(), "all at once");
+        assert_eq!(engine.next_pace_time(), None);
+        let sent = plain_messages_sent(&mut server);
+        let ids: Vec<&str> = sent.iter().filter_map(|m| m.find("<id>APISCAN7:").map(|a| &m[a + 13..a + 14])).collect();
+        assert_eq!(ids, ["1", "2", "3"], "in the order of the requests");
+    }
+
+    // ibx#729: the copied gaps of a stock's first order are on with the
+    // pacing, go by its clock, and their end is due for a replay; off, an
+    // order's wake is not reported.
+    #[test]
+    fn an_orders_copied_gap_goes_by_the_pace_clock() {
+        let shared = Arc::new(SharedState::new());
+        let (mut engine, _server, _tx) = scanner_engine(&shared);
+        let start = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        assert!(!engine.context.order_gaps);
+        engine.context.order_wake = Some(start + ms(40));
+        assert_eq!(engine.next_pace_time(), None);
+        engine.pace_as_reference();
+        engine.set_pace_clock(start);
+        assert!(engine.context.order_gaps);
+        assert_eq!(engine.context.gap_now(), start);
+        assert_eq!(engine.next_pace_time(), Some(start + ms(40)));
+    }
+
+    // ibx#553: the scanner parameters request leaves 1 s after the first
+    // need, a parameters request or a subscription; a later need in that
+    // second does not move it, and one request serves them all.
+    #[test]
+    fn scanner_parameters_are_asked_a_second_after_the_first_need() {
+        let shared = Arc::new(SharedState::new());
+        let (mut engine, mut server, tx) = scanner_engine(&shared);
+        let start = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        engine.pace_as_reference();
+        engine.set_pace_clock(start);
+        tx.send(scanner_cmd(1, 0, "TOP_PERC_GAIN")).unwrap();
+        engine.poll_once();
+        engine.sweep_scanner_params();
+        assert!(plain_messages_sent(&mut server).is_empty(), "nothing at once");
+
+        engine.set_pace_clock(start + ms(600));
+        tx.send(ControlCommand::FetchScannerParams).unwrap();
+        engine.poll_once();
+        engine.set_pace_clock(start + ms(999));
+        engine.sweep_scanner_params();
+        assert!(plain_messages_sent(&mut server).is_empty(), "nothing before 1 s");
+
+        engine.set_pace_clock(start + ms(1000));
+        engine.sweep_scanner_params();
+        let sent = plain_messages_sent(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("6040=10001|"), "{sent:?}");
+
+        // The second need did not start a delay of its own.
+        engine.set_pace_clock(start + ms(1700));
+        engine.sweep_scanner_params();
+        assert!(plain_messages_sent(&mut server).is_empty());
+
+        // ibx#572: the requests that waited are taken 300 ms after the
+        // answer, then 60 ms apart, in the reference's walk (here the
+        // parameters request before the subscription).
+        load_scanner_params_keep(&mut engine, "<ScanParameterResponse/>");
+        assert!(shared.reference.drain_scanner_params().is_empty() && plain_messages_sent(&mut server).is_empty(), "not at once");
+        engine.set_pace_clock(start + ms(1999));
+        engine.sweep_scanner_params();
         assert!(shared.reference.drain_scanner_params().is_empty());
-        assert_eq!(plain_messages_sent(&mut server).len(), 1, "asked again");
+        engine.set_pace_clock(start + ms(2000));
+        engine.sweep_scanner_params();
+        assert_eq!(shared.reference.drain_scanner_params().len(), 1, "the first one");
+        assert!(plain_messages_sent(&mut server).is_empty());
+        engine.set_pace_clock(start + ms(2060));
+        engine.sweep_scanner_params();
+        assert_eq!(plain_messages_sent(&mut server).len(), 1, "the waiting subscription goes out 60 ms later");
+        // Known now: a parameters request is answered 285 ms later; a
+        // subscription is sent at once.
+        tx.send(ControlCommand::FetchScannerParams).unwrap();
+        engine.poll_once();
+        engine.set_pace_clock(start + ms(2200));
+        tx.send(scanner_cmd(2, 0, "MOST_ACTIVE")).unwrap();
+        engine.poll_once();
+        assert_eq!(plain_messages_sent(&mut server).len(), 1);
+        engine.sweep_scanner_params();
+        assert!(shared.reference.drain_scanner_params().is_empty());
+        engine.set_pace_clock(start + ms(2345));
+        engine.sweep_scanner_params();
+        assert_eq!(shared.reference.drain_scanner_params().len(), 1);
     }
 
     // ibx#456: the row count follows the scan type's limit in the
     // parameters, the rows are cut to the asked count, and a cancel
     // before the parameters arrive sends nothing.
+    #[test]
+    fn scan_codes_and_filters_the_parameters_do_not_name_are_refused() {
+        // ibx#657 (the reference 10.51, paper, 14/10/2026).
+        let shared = Arc::new(SharedState::new());
+        let (mut engine, mut server, tx) = scanner_engine(&shared);
+        engine.hmds.max_real_time_requests = 100;
+        let cmd = |req_id: ReqId, code: &str, filters: Vec<(String, String)>| ControlCommand::SubscribeScanner {
+            req_id, client_id: 5,
+            subscription: crate::control::scanner::ScannerSubscription {
+                instrument: "STK".into(), location_code: "STK.US.MAJOR".into(),
+                scan_code: code.into(), number_of_rows: 5, filters,
+            },
+        };
+        tx.send(cmd(1, "NOT_A_SCAN_CODE", Vec::new())).unwrap();
+        tx.send(cmd(2, "TOP_PERC_GAIN", vec![("notAFilter".into(), "1".into())])).unwrap();
+        tx.send(cmd(3, "TOP_PERC_GAIN", vec![("moodyRatingAbove".into(), "AAA".into())])).unwrap();
+        engine.poll_once();
+        assert_eq!(plain_messages_sent(&mut server).len(), 1, "parameters request only");
+        load_scanner_params_keep(&mut engine, "<ScanParameterResponse><ScanTypeList>\
+            <ScanType><scanCode>TOP_PERC_GAIN</scanCode></ScanType></ScanTypeList>\
+            <FilterList><RangeFilter><id>MOODY</id><AbstractField><code>moodyRatingAbove</code></AbstractField></RangeFilter>\
+            </FilterList></ScanParameterResponse>");
+        assert_eq!(plain_messages_sent(&mut server).len(), 1, "only the subscription with known codes goes out");
+        // Each refused at its turn in the walk of the waiting requests
+        // (ibx#513, ibx#572), as the reference takes them one by one; two
+        // refusals of one walk not observed yet (#657's were seconds apart).
+        assert_eq!(errors(&shared), [
+            "2:162:Historical Market Data Service error message:Scanner filter notAFilter is disabled.",
+            "1:162:Historical Market Data Service error message:Scanner type with code NOT_A_SCAN_CODE is disabled.",
+        ]);
+    }
+
     #[test]
     fn scanner_rows_follow_the_scan_type_limit() {
         let shared = Arc::new(SharedState::new());
@@ -4140,18 +6373,25 @@ mod tests {
         tx.send(cmd(4, "TOP_PERC_GAIN", 3)).unwrap();
         tx.send(cmd(5, "TOP_PERC_GAIN", 3)).unwrap();
         tx.send(ControlCommand::CancelScanner { req_id: 5 }).unwrap();
-        engine.poll_control_commands();
+        engine.poll_once();
         assert_eq!(plain_messages_sent(&mut server).len(), 1, "parameters request only");
         assert_eq!(errors(&shared), ["5:162:Historical Market Data Service error message:API scanner subscription cancelled: 5"]);
         load_scanner_params_keep(&mut engine, "<ScanParameterResponse><ScanTypeList><ScanType>\
             <scanCode>HIGH_DIVIDEND_YIELD_IB</scanCode><respSizeLimit>750</respSizeLimit></ScanType>\
+            <ScanType><scanCode>TOP_PERC_GAIN</scanCode></ScanType>\
             </ScanTypeList></ScanParameterResponse>");
         let sent = plain_messages_sent(&mut server);
-        let items: Vec<&str> = sent.iter().map(|m| {
-            let a = m.find("<maxItems>").unwrap() + 10;
-            &m[a..a + m[a..].find('<').unwrap()]
-        }).collect();
-        assert_eq!(items, ["100", "50", "50", "3"]);
+        // By request id: the waiting subscriptions go out in the
+        // reference's order (ibx#513).
+        let text = |m: &'_ str, tag: &str| {
+            let a = m.find(tag).unwrap() + tag.len();
+            m[a..a + m[a..].find('<').unwrap()].to_string()
+        };
+        let mut items: Vec<(String, String)> = sent.iter()
+            .map(|m| (text(m, "<id>APISCAN5:"), text(m, "<maxItems>"))).collect();
+        items.sort();
+        let items: Vec<(&str, &str)> = items.iter().map(|(i, n)| (i.as_str(), n.as_str())).collect();
+        assert_eq!(items, [("1", "100"), ("2", "50"), ("3", "50"), ("4", "3")]);
 
         let rows: String = (1..=5).map(|c| format!("<Contract><contractID>{c}</contractID></Contract>")).collect();
         let xml = format!("<ScanResponse><id>APISCAN5:4</id><Contracts>{rows}</Contracts></ScanResponse>");
@@ -4161,27 +6401,80 @@ mod tests {
         assert_eq!(result.entries.len(), 3);
     }
 
-    // ibx#457: a lost and restored link is told to every live scanner
-    // with 165, and the subscription is sent again.
+    // ibx#457, ibx#554: at a loss of the historical data link each live
+    // scanner gets 165, the same at a failed attempt and at the return;
+    // then each one that was on the wire is cancelled and subscribed again
+    // under its id, and the parameters that followed the link are asked
+    // again. The reference tells them in the walk of its listeners, which
+    // changes from one process to the next: ibx keeps the request order.
+    // As read on the reference, not observed yet (#635).
     #[test]
     fn scanner_link_notices_and_resubscribe() {
         let shared = Arc::new(SharedState::new());
         let (mut engine, mut server, tx) = scanner_engine(&shared);
+        let ids = [4, 5, 6, 7];
+        for (id, code) in ids.iter().zip(["TOP_PERC_GAIN", "HOT_BY_VOLUME", "MOST_ACTIVE", "TOP_PERC_LOSE"]) {
+            tx.send(scanner_cmd(*id, 1, code)).unwrap();
+        }
+        engine.poll_once();
+        let sent = plain_messages_sent(&mut server);
+        assert_eq!(sent.len(), 1, "the parameters first: {sent:?}");
+        assert!(sent[0].contains("|6040=10001|"));
         load_scanner_params(&mut engine, &mut server, "<ScanParameterResponse/>");
-        tx.send(scanner_cmd(4, 1, "TOP_PERC_GAIN")).unwrap();
-        engine.poll_control_commands();
-        assert_eq!(plain_messages_sent(&mut server).len(), 1);
         engine.hmds.scanner_link_lost(&shared);
         engine.hmds.scanner_connect_failed(&shared);
-        engine.hmds.scanner_link_restored(&mut engine.hmds_conn, &mut engine.hb, &shared);
+        engine.hmds.scanner_link_restored(Instant::now(), &mut engine.hmds_conn, &mut engine.hb, &shared);
+        let text = |t: &str| format!("Historical Market Data Service query message:{t}");
+        let mut want = Vec::new();
+        for t in ["HMDS server disconnect occurred.  Attempting reconnection...",
+                  "HMDS connection attempt failed.  Connection will be re-attempted...",
+                  "HMDS server connection was successful."] {
+            want.extend(ids.iter().map(|id| format!("{id}:165:{}", text(t))));
+        }
+        assert_eq!(errors(&shared), want);
+        // Each live subscription cancelled and subscribed again under its
+        // id, then the parameters asked again: they followed the link.
+        let sent = plain_messages_sent(&mut server);
+        let kinds: Vec<String> = sent.iter().map(|m| {
+            let id = m.split("<id>").nth(1).and_then(|r| r.split("</id>").next()).unwrap_or("");
+            let kind = ["10004", "10003", "10001"].into_iter().find(|k| m.contains(&format!("|6040={k}|"))).unwrap_or("?");
+            format!("{kind}:{id}")
+        }).collect();
+        assert_eq!(kinds, ["10004:APISCAN1:4", "10003:APISCAN1:4", "10004:APISCAN1:5", "10003:APISCAN1:5",
+            "10004:APISCAN1:6", "10003:APISCAN1:6", "10004:APISCAN1:7", "10003:APISCAN1:7", "10001:"]);
+    }
+
+    // ibx#554 (as read on the reference, not observed yet): a parameters
+    // request sent and not answered is told of the loss and of the return
+    // under the largest int, and answered after the return; parameters
+    // known with no scanner session left are kept across a loss.
+    #[test]
+    fn scanner_parameters_across_a_loss_of_the_link() {
+        let shared = Arc::new(SharedState::new());
+        let (mut engine, mut server, tx) = scanner_engine(&shared);
+        tx.send(ControlCommand::FetchScannerParams).unwrap();
+        engine.poll_once();
+        assert_eq!(plain_messages_sent(&mut server).len(), 1);
+        engine.hmds.scanner_link_lost(&shared);
+        engine.hmds.scanner_link_restored(Instant::now(), &mut engine.hmds_conn, &mut engine.hb, &shared);
+        let max = i32::MAX;
         assert_eq!(errors(&shared), [
-            "4:165:Historical Market Data Service query message:HMDS server disconnect occurred.  Attempting reconnection...",
-            "4:165:Historical Market Data Service query message:HMDS connection attempt failed.  Connection will be re-attempted...",
-            "4:165:Historical Market Data Service query message:HMDS server connection was successful.",
+            format!("{max}:165:Historical Market Data Service query message:HMDS server disconnect occurred.  Attempting reconnection..."),
+            format!("{max}:165:Historical Market Data Service query message:HMDS server connection was successful."),
         ]);
         let sent = plain_messages_sent(&mut server);
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("<id>APISCAN1:4</id>"));
+        assert_eq!(sent.len(), 1, "asked again: {sent:?}");
+        load_scanner_params(&mut engine, &mut server, "<ScanParameterResponse/>");
+        assert_eq!(shared.reference.drain_scanner_params().len(), 1, "answered");
+        // No scanner session left: the parameters stay across a loss and a
+        // new request is answered from them, nothing sent.
+        engine.hmds.scanner_link_lost(&shared);
+        engine.hmds.scanner_link_restored(Instant::now(), &mut engine.hmds_conn, &mut engine.hb, &shared);
+        assert!(errors(&shared).is_empty());
+        tx.send(ControlCommand::FetchScannerParams).unwrap();
+        engine.poll_once();
+        assert!(plain_messages_sent(&mut server).is_empty());
+        assert_eq!(shared.reference.drain_scanner_params().len(), 1);
     }
 
     // ibx#461: a bulletin keeps the server's message id and gets the
@@ -4250,7 +6543,7 @@ mod tests {
             }).unwrap();
         }
         tx.send(ControlCommand::FetchNewsArticle { req_id: 4, provider_code: "BRFG".into(), article_id: "A1".into() }).unwrap();
-        engine.poll_control_commands();
+        engine.poll_once();
         let sent = plain_messages_sent(&mut server);
         assert_eq!(sent.len(), 3, "the equal request shares the query: {sent:?}");
         assert!(sent[0].contains("<id>1-history;;NewsQuery;;0;;true;;0;;U</id>"), "{}", sent[0]);
@@ -4282,7 +6575,7 @@ mod tests {
         load_scanner_params(&mut engine, &mut server, "<ScanParameterResponse/>");
         tx.send(scanner_cmd(460, 0, "TOP_PERC_GAIN")).unwrap();
         tx.send(ControlCommand::FetchFundamentalData { req_id: 470, con_id: 265598, report_type: "ReportSnapshot".into() }).unwrap();
-        engine.poll_control_commands();
+        engine.poll_once();
         let sent = plain_messages_sent(&mut server);
         let fund = sent.iter().find(|m| m.contains("6040=10010|")).expect("fundamentals request sent");
         let a = fund.find("<id>").unwrap() + 4;
@@ -4299,7 +6592,7 @@ mod tests {
         assert_eq!(rows, [(460, 1), (460, 2)]);
         assert!(errors(&shared).is_empty());
         tx.send(ControlCommand::CancelScanner { req_id: 460 }).unwrap();
-        engine.poll_control_commands();
+        engine.poll_once();
 
         let fund: Vec<ReqId> = shared.reference.drain_fundamental_data().into_iter().map(|(r, _)| r).collect();
         assert_eq!(fund, [470]);
@@ -4375,6 +6668,7 @@ mod tests {
     // second subscription of the contract uses the kept lot at once.
     #[test]
     fn stock_subscription_waits_for_its_round_lot() {
+        crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
         let shared = Arc::new(SharedState::new());
         let mut engine = HotLoop::new(shared.clone(), None, None);
         let (c1, mut farm_side) = socket_pair();
@@ -4390,7 +6684,11 @@ mod tests {
         let asked = plain_messages_sent(&mut ccp_side);
         assert_eq!(asked.len(), 1, "{asked:?}");
         assert!(asked[0].contains("|35=c|") && asked[0].contains("|6008=265598|") && asked[0].contains("|6004=BEST|"), "{}", asked[0]);
-        let req_id = asked[0].split('|').find_map(|p| p.strip_prefix("320=")).unwrap().to_string();
+        // Named and asked as the reference asks the definition of a
+        // client's contract (ibx#731).
+        assert!(asked[0].contains("|320=SecDefReqMsgReqByConid1|321=2|6088=Socket|146=1|"), "{}", asked[0]);
+        let wire = asked[0].split('|').find_map(|p| p.strip_prefix("320=")).unwrap();
+        let req_id = engine.ccp_conn.as_ref().unwrap().internal_name(wire);
         assert!(farm_messages_sent(&mut farm_side).is_empty(), "nothing subscribed before the lot is known");
 
         let reply = fix::fix_build(&[(35, "d"), (320, &req_id), (6008, "265598"), (167, "CS"),
@@ -4418,6 +6716,173 @@ mod tests {
         assert!(sent[1].contains("6008=265598|"), "{}", sent[1]);
     }
 
+    // ibx#731 (the reference 10.51, paper, recordings of 12-16/10/2026, 46
+    // AAPL option requests by description): the lookup of an option's
+    // market data request carries the client source, as an order's, the
+    // strike after the right.
+    #[test]
+    fn an_option_request_by_description_is_looked_up_with_the_source() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (c1, _farm_side) = socket_pair();
+        let (c2, mut ccp_side) = socket_pair();
+        engine.farm_conn = Some(Connection::new_mem(c1));
+        engine.ccp_conn = Some(Connection::new_mem(c2));
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        let filters = crate::types::SecDefFilters {
+            last_trade_date_or_contract_month: "20261218".into(), strike: 340.0, right: "C".into(),
+            multiplier: "100".into(), ..Default::default()
+        };
+        tx.send(ControlCommand::SubscribeBySymbol {
+            symbol: "AAPL".into(), sec_type: "OPT".into(), exchange: "SMART".into(), currency: "USD".into(),
+            filters, mode_9887: 0, snapshot: false, over_limit: false, reply_tx: None,
+        }).unwrap();
+        engine.poll_once();
+        let asked = plain_messages_sent(&mut ccp_side);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].contains("|321=2|6088=Socket|55=AAPL|167=OPT|541=20261218|201=1|202=340|231=100|100=BEST|15=USD|"), "{}", asked[0]);
+    }
+
+    /// The request name of a lookup as written.
+    fn lookup_name(msg: &str) -> String {
+        msg.split('|').find_map(|p| p.strip_prefix("320=")).unwrap_or_default().to_string()
+    }
+
+    fn lookups_sent(server: &mut crate::protocol::connection::MemTransport) -> Vec<String> {
+        plain_messages_sent(server).into_iter().filter(|m| m.contains("|35=c|")).collect()
+    }
+
+    // ibx#732 (observed on paper, recordings of 12-16/10/2026: 120 market
+    // data requests by conId after a contract details answer, none asked
+    // the definition): the contracts of the portfolio's batch and of a
+    // contract details answer are known record by record, each with the
+    // round lot of its own size steps; a later market data request on them
+    // asks nothing and goes out at once.
+    #[test]
+    fn contracts_of_every_answer_are_known() {
+        use crate::control::contracts::tests::pipe_msg;
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (c1, mut farm_side) = socket_pair();
+        let (c2, mut ccp_side) = socket_pair();
+        engine.farm_conn = Some(Connection::new_mem(c1));
+        engine.ccp_conn = Some(Connection::new_mem(c2));
+        engine.set_scale_us_lots(true);
+        engine.set_routing_table(crate::engine::routing::TableKind::MarketData,
+            "BEST,STK,Top,1,*,cdc1.example,4000,usfarm;BEST,STK,Top,2,*,cdc1.example,4000,usfarm");
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+
+        // The portfolio's batch: two US stocks in one answer, their rules
+        // with size steps of 40 and 1.
+        engine.ccp.pending_secdef.push((0xF000_0000, false, Instant::now() + std::time::Duration::from_secs(5)));
+        engine.inject_ccp_message(&pipe_msg("35=d|43=N|320=SmallBatchReqByConid4026531840|322=*|323=4|\
+            55=MSFT|167=STK|207=BEST|6008=272093|6031=4563|15=USD|6177=AMEX,NASDAQ,|6178=1|\
+            55=AXTI|167=STK|207=BEST|6008=4726868|6031=557|15=USD|6178=2|\
+            146=2|6038=Y|6019=2|6031=557|6026=1|6023=0|6027=0.0001|6030=1|6023=0|6027=1|\
+            6031=4563|6026=1|6023=0|6027=0.01|6030=1|6023=0|6027=40|\
+            6344=2|6008=272093|6470=NASDAQ|6523=USSTK|6008=4726868|6470=NASDAQ|6523=USSTK"));
+        assert_eq!(engine.context.round_lots.get(&272093), Some(&40));
+        assert_eq!(engine.context.round_lots.get(&4726868), Some(&1));
+        assert_eq!(engine.context.agg_groups.get(&272093), Some(&1));
+        assert_eq!(engine.context.agg_groups.get(&4726868), Some(&2));
+        assert_eq!(engine.context.listing_exchanges.get(&272093).map(String::as_str), Some("NASDAQ"));
+        assert_eq!(engine.context.smart_components.get(&272093).cloned(), Some(vec!["AMEX".to_string(), "NASDAQ".to_string()]));
+        assert!(engine.context.us_lots.contains(&272093) && engine.context.us_lots.contains(&4726868));
+        assert_eq!(engine.context.def_kinds.get(&4726868), Some(&("STK".to_string(), "AXTI".to_string())));
+
+        // A contract details answer by conId.
+        engine.ccp.send_contract_details_by_con_id(7, 265598, "SMART", &mut engine.ccp_conn, &mut engine.hb);
+        let asked = lookups_sent(&mut ccp_side);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        engine.inject_ccp_message(&pipe_msg(&format!("35=d|43=N|320={}|322=*|323=4|\
+            55=AAPL|167=STK|207=BEST|6008=265598|6031=4563|15=USD|6178=1|\
+            146=1|6038=Y|6019=1|6031=4563|6026=1|6023=0|6027=0.01|6030=1|6023=0|6027=100|\
+            6344=1|6008=265598|6470=NASDAQ|6523=USSTK", lookup_name(&asked[0]))));
+        assert_eq!(engine.context.round_lots.get(&265598), Some(&100));
+
+        // Market data on the three: no definition asked, each subscribed
+        // at once with its round lot.
+        for con_id in [272093, 4726868, 265598] {
+            tx.send(subscribe_cmd(con_id, "STK")).unwrap();
+        }
+        engine.poll_once();
+        assert!(lookups_sent(&mut ccp_side).is_empty(), "no definition asked");
+        let sent = farm_messages_sent(&mut farm_side).join("\n");
+        for con_id in [272093, 4726868, 265598] {
+            assert!(sent.contains(&format!("6008={con_id}|")), "{con_id} subscribed: {sent}");
+        }
+        let lot = |c: i64| engine.context.market.round_lot(engine.context.market.instrument_by_con_id(c).unwrap());
+        assert_eq!((lot(272093), lot(4726868), lot(265598)), (40, 1, 100));
+    }
+
+    // ibx#732 (observed on paper, recordings of 12-16/10/2026: 11 option
+    // requests by description of 11 whose underlying's company was not
+    // known): the option's answer is followed by the company lookup of its
+    // underlying; the option model asks the underlying's definitions only
+    // after the company answered (5 of 5); the company's answer does not
+    // make the underlying known. A second request asks no company again.
+    #[test]
+    fn an_option_request_asks_its_underlying_company_first() {
+        use crate::control::contracts::tests::pipe_msg;
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (c1, _farm_side) = socket_pair();
+        let (c2, mut ccp_side) = socket_pair();
+        engine.farm_conn = Some(Connection::new_mem(c1));
+        engine.ccp_conn = Some(Connection::new_mem(c2));
+        engine.set_routing_table(crate::engine::routing::TableKind::MarketData,
+            "BEST,STK,Top,1,*,cdc1.example,4000,usfarm;BEST,OPT,Top,2,*,cdc1.example,4000,usfarm");
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        let request = || {
+            let filters = crate::types::SecDefFilters {
+                last_trade_date_or_contract_month: "20261218".into(), strike: 340.0, right: "C".into(),
+                multiplier: "100".into(), ..Default::default()
+            };
+            ControlCommand::SubscribeBySymbol {
+                symbol: "AAPL".into(), sec_type: "OPT".into(), exchange: "SMART".into(), currency: "USD".into(),
+                filters, mode_9887: 0, snapshot: false, over_limit: false, reply_tx: None,
+            }
+        };
+        let option = |name: &str| pipe_msg(&format!("35=d|43=N|320={name}|322=*|323=4|\
+            55=AAPL|167=OPT|207=BEST|6008=692808239|541=20261218|201=1|202=340|231=100|15=USD|6178=2|6346=265598"));
+        tx.send(request()).unwrap();
+        engine.poll_once();
+        let asked = lookups_sent(&mut ccp_side);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        engine.inject_ccp_message(&option(&lookup_name(&asked[0])));
+        let asked = lookups_sent(&mut ccp_side);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(lookup_name(&asked[0]).starts_with("UnderlyingECNoDupsNDReqByConid")
+            && asked[0].contains("|146=1|6008=265598|6004=ANYEXCH|"), "{}", asked[0]);
+        // The option's model waits for the company's answer.
+        engine.send_md_resolved();
+        for _ in 0..3 {
+            engine.poll_once();
+            engine.service_option_models(Instant::now());
+        }
+        assert!(lookups_sent(&mut ccp_side).is_empty(), "nothing before the company's answer");
+        engine.inject_ccp_message(&pipe_msg(&format!("35=d|43=N|320={}|322=*|323=4|\
+            55=AAPL|167=STK|207=BEST|6008=265598|15=USD|6178=1", lookup_name(&asked[0]))));
+        assert!(!engine.context.agg_groups.contains_key(&265598), "the company's answer gives no knowledge");
+        engine.poll_once();
+        engine.service_option_models(Instant::now());
+        let pair: Vec<String> = lookups_sent(&mut ccp_side).iter()
+            .map(|m| format!("{} {}", lookup_name(m).trim_end_matches(char::is_numeric), m.contains("|6008=265598|6004=ANYEXCH|")))
+            .collect();
+        assert_eq!(pair, ["SecDefReqMsgNDReqByConid true", "PreferredReqByConid true"]);
+
+        // A second request: its company is known, none asked.
+        tx.send(request()).unwrap();
+        engine.poll_once();
+        let asked = lookups_sent(&mut ccp_side);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        engine.inject_ccp_message(&option(&lookup_name(&asked[0])));
+        assert!(lookups_sent(&mut ccp_side).is_empty(), "no company asked again");
+    }
+
     // ibx#278 (captured E6): two requests with no conId get their own
     // slots, a lookup each, then a subscription by the conId found; both
     // run side by side. A lookup that finds several contracts ends its
@@ -4436,7 +6901,7 @@ mod tests {
         let by_symbol = |symbol: &str, sec_type: &str, reply: crossbeam_channel::Sender<Result<InstrumentId, String>>| {
             ControlCommand::SubscribeBySymbol {
                 symbol: symbol.into(), sec_type: sec_type.into(), exchange: "SMART".into(), currency: "USD".into(),
-                filters: Default::default(), mode_9887: 0, snapshot: false, reply_tx: Some(reply.into()),
+                filters: Default::default(), mode_9887: 0, snapshot: false, over_limit: false, reply_tx: Some(reply.into()),
             }
         };
         let (r1, a1) = crossbeam_channel::bounded(1);
@@ -4452,8 +6917,9 @@ mod tests {
         assert_eq!(asked.len(), 3, "{asked:?}");
         assert!(asked[0].contains("|35=c|") && asked[0].contains("|321=2|6088=Socket|55=QQQ|167=CS|100=BEST|15=USD|"), "{}", asked[0]);
         assert!(farm_messages_sent(&mut farm_side).is_empty(), "nothing subscribed before the conId is known");
+        // The internal names of the lookups, as their answers map back (ibx#698).
         let ids: Vec<String> = asked.iter()
-            .map(|m| m.split('|').find_map(|p| p.strip_prefix("320=")).unwrap().to_string()).collect();
+            .map(|m| engine.ccp_conn.as_ref().unwrap().internal_name(m.split('|').find_map(|p| p.strip_prefix("320=")).unwrap())).collect();
 
         let reply = |id: &str, body: &str| pipe_msg(&format!("35=d|43=N|320={id}|322=*|323=4|{body}"));
         let mut context = std::mem::replace(&mut engine.context, Context::new());
@@ -4479,6 +6945,206 @@ mod tests {
         engine.poll_once();
         assert_eq!(engine.context.market.con_id(mnq), None);
         assert_eq!(engine.context.market.con_id(qqq), Some(320227571));
+    }
+
+    // ibx#662: a cancel of a market data request whose lookup is on its
+    // way keeps the lookup; when it answers, the request ends with 354 and
+    // nothing is subscribed.
+    #[test]
+    fn a_cancel_during_the_lookup_subscribes_nothing() {
+        use crate::control::contracts::tests::pipe_msg;
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (c1, mut farm_side) = socket_pair();
+        let (c2, mut ccp_side) = socket_pair();
+        engine.farm_conn = Some(Connection::new_mem(c1));
+        engine.ccp_conn = Some(Connection::new_mem(c2));
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        let (r, a) = crossbeam_channel::bounded(1);
+        tx.send(ControlCommand::SubscribeBySymbol {
+            symbol: "F".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(),
+            filters: Default::default(), mode_9887: 0, snapshot: false, over_limit: false, reply_tx: Some(r.into()),
+        }).unwrap();
+        engine.poll_once();
+        let instrument = a.recv().unwrap().unwrap();
+        tx.send(ControlCommand::Unsubscribe { instrument }).unwrap();
+        engine.poll_once();
+        assert_eq!(engine.context.md_lookups.len(), 1, "the lookup is kept");
+        let asked = plain_messages_sent(&mut ccp_side);
+        let lookup = asked.iter().find(|m| m.contains("|35=c|")).expect("the lookup");
+        let id = engine.ccp_conn.as_ref().unwrap().internal_name(lookup.split('|').find_map(|p| p.strip_prefix("320=")).unwrap());
+        let mut context = std::mem::replace(&mut engine.context, Context::new());
+        assert!(farm::md_contract_reply(&mut context, &shared, &id,
+            &pipe_msg(&format!("35=d|43=N|320={id}|322=*|323=4|55=F|167=STK|207=BEST|6008=9599491|15=USD|"))));
+        engine.context = context;
+        engine.send_md_resolved();
+        assert_eq!(shared.market.drain_md_rejects(), [crate::bridge::MdReject::CancelledDuringLookup { instrument }]);
+        assert!(engine.context.md_lookups.is_empty() && engine.context.md_lookup_cancelled.is_empty());
+        // The client lets the slot go: nothing is cancelled on the farm.
+        tx.send(ControlCommand::Unsubscribe { instrument }).unwrap();
+        engine.poll_once();
+        assert!(farm_messages_sent(&mut farm_side).is_empty(), "nothing subscribed, nothing cancelled");
+        assert_eq!(engine.context.market.con_id(instrument), None);
+    }
+
+    // ibx#662 (the reference 10.51, paper, regular hours 13/10 and
+    // 14/10/2026): with the pacing on, the requests after one that waits
+    // for its contract lookup wait for its answer; a cancel of market data
+    // passes; past the limit they go on.
+    #[test]
+    fn requests_wait_for_the_lookup_of_the_request_before() {
+        use crate::control::contracts::tests::pipe_msg;
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (c1, _farm_side) = socket_pair();
+        let (c2, mut ccp_side) = socket_pair();
+        engine.farm_conn = Some(Connection::new_mem(c1));
+        engine.ccp_conn = Some(Connection::new_mem(c2));
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        engine.pace_requests();
+        let start = Instant::now();
+        let s = std::time::Duration::from_secs;
+        engine.set_pace_clock(start);
+        tx.send(ControlCommand::SubscribeBySymbol {
+            symbol: "F".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(),
+            filters: Default::default(), mode_9887: 0, snapshot: false, over_limit: false, reply_tx: None,
+        }).unwrap();
+        tx.send(ControlCommand::Unsubscribe { instrument: 0 }).unwrap();
+        tx.send(ControlCommand::ResolveContract {
+            req_id: 3,
+            lookup: crate::types::ContractLookup { symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() },
+            request: Box::new(ControlCommand::FetchHeadTimestamp {
+                req_id: 3, con_id: 0, sec_type: "STK".into(), exchange: "SMART".into(),
+                what_to_show: "TRADES".into(), use_rth: true, format_date: 1,
+            }),
+        }).unwrap();
+        let (turn_tx, turn_rx) = crossbeam_channel::bounded(1);
+        tx.send(ControlCommand::Turn { reply_tx: turn_tx }).unwrap();
+        engine.poll_once();
+        assert_eq!(engine.context.md_lookups.len(), 1);
+        let instrument = engine.context.md_lookups[0].1.instrument;
+        assert_eq!(instrument, 0);
+
+        engine.set_pace_clock(start + s(2));
+        engine.poll_once();
+        assert!(engine.context.md_lookup_cancelled.contains(&instrument), "the cancel passes");
+        assert!(engine.ccp.pending_resolves.is_empty(), "the next request waits for the lookup");
+        assert_eq!(engine.cmd_queue.len(), 2);
+
+        let asked = plain_messages_sent(&mut ccp_side);
+        let lookup = asked.iter().find(|m| m.contains("|35=c|")).expect("the lookup");
+        let id = engine.ccp_conn.as_ref().unwrap().internal_name(lookup.split('|').find_map(|p| p.strip_prefix("320=")).unwrap());
+        let mut context = std::mem::replace(&mut engine.context, Context::new());
+        assert!(farm::md_contract_reply(&mut context, &shared, &id,
+            &pipe_msg(&format!("35=d|43=N|320={id}|322=*|323=4|55=F|167=STK|207=BEST|6008=9599491|15=USD|"))));
+        engine.context = context;
+        engine.set_pace_clock(start + s(3));
+        engine.poll_once();
+        assert_eq!(engine.ccp.pending_resolves.len(), 1, "taken once the lookup answered");
+        assert_eq!(engine.cmd_queue.len(), 1, "the turn waits for this one's lookup");
+        assert!(turn_rx.try_recv().is_err());
+
+        engine.set_pace_clock(start + s(14));
+        engine.poll_once();
+        assert!(engine.cmd_queue.is_empty(), "past the limit");
+        assert!(turn_rx.try_recv().is_ok());
+    }
+
+    // ibx#443: a calendar data request goes to the contract data farm,
+    // opened on demand (queued until its logon), under a name; the answer
+    // of that name comes back with its data field read whole, and is
+    // applied to the session's state when it arrives.
+    #[test]
+    fn a_calendar_request_goes_to_the_contract_data_farm() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        engine.set_secdef_farm_name("secdefil".into());
+        engine.set_secdef_farm_host("cdc1.example".into());
+        shared.reference.wsh.lock().unwrap().meta_pending = Some(3);
+        tx.send(ControlCommand::WshRequest { req_id: 3, meta: true, body: crate::control::wsh::meta_request() }).unwrap();
+        engine.poll_once();
+        let farm = engine.pool.find("secdefil").and_then(|id| engine.pool.get(id)).expect("the farm");
+        assert_eq!((farm.kind, farm.queued()), (FarmKind::SecDef, 1));
+        assert_eq!(engine.wsh_sent.get("MetaDataRequest0"), Some(&(true, 3)));
+
+        let json = r#"{"meta_data":{"event_types":[],"filters":[{"type":"string","tag":"t=1","name":"a|b","value":"x"}]}}"#;
+        let mut msg = format!("8=FIX.4.1\x019=0\x0135=U\x016040=158\x016556=MetaDataRequest0\x0195={}\x0196=", json.len()).into_bytes();
+        msg.extend_from_slice(json.as_bytes());
+        msg.extend_from_slice(b"\x01");
+        engine.wsh_answer(&msg);
+        assert!(engine.wsh_sent.is_empty());
+        let out = shared.reference.wsh_answers.drain_stamped().into_iter().map(|(_, o)| o).collect::<Vec<_>>();
+        assert_eq!(out, [crate::client_core::WshOut::Meta(3, crate::control::wsh::meta_answer(json))]);
+        assert!(shared.reference.wsh.lock().unwrap().meta.is_some(), "held from its arrival");
+
+        // An error of the farm, for an event request.
+        engine.wsh_sent.insert("CalendarRequest1".into(), (false, 4));
+        engine.wsh_answer(b"8=FIX.4.1\x019=0\x0135=U\x016040=159\x016556=CalendarRequest1\x0158=Busy\x01");
+        assert_eq!(shared.reference.wsh_answers.drain_stamped().into_iter().map(|(_, o)| o).collect::<Vec<_>>(), [crate::client_core::WshOut::Error(4, 10283, "Failed to request WSH event data.Busy".into())]);
+    }
+
+    // ibx#501 (observed 12/10/2026): a stream without a conId asked with
+    // every API line taken ends with 101 once its contract is found to need
+    // a line of its own, and nothing is sent for it; one whose contract is
+    // already streamed joins it.
+    #[test]
+    fn a_request_without_con_id_over_the_limit_gets_101_unless_it_joins() {
+        use crate::control::contracts::tests::pipe_msg;
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (c1, mut farm_side) = socket_pair();
+        let (c2, mut ccp_side) = socket_pair();
+        engine.farm_conn = Some(Connection::new_mem(c1));
+        engine.ccp_conn = Some(Connection::new_mem(c2));
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        let by_symbol = |symbol: &str, over_limit: bool, reply: crossbeam_channel::Sender<Result<InstrumentId, String>>| {
+            ControlCommand::SubscribeBySymbol {
+                symbol: symbol.into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(),
+                filters: Default::default(), mode_9887: 0, snapshot: false, over_limit, reply_tx: Some(reply.into()),
+            }
+        };
+        let (r1, a1) = crossbeam_channel::bounded(1);
+        let (r2, a2) = crossbeam_channel::bounded(1);
+        let (r3, a3) = crossbeam_channel::bounded(1);
+        tx.send(by_symbol("QQQ", false, r1)).unwrap();
+        tx.send(by_symbol("SPY", true, r2)).unwrap();
+        engine.poll_once();
+        let (qqq, spy) = (a1.recv().unwrap().unwrap(), a2.recv().unwrap().unwrap());
+        let asked = plain_messages_sent(&mut ccp_side);
+        // The internal names of the lookups, as their answers map back (ibx#698).
+        let ids: Vec<String> = asked.iter()
+            .map(|m| engine.ccp_conn.as_ref().unwrap().internal_name(m.split('|').find_map(|p| p.strip_prefix("320=")).unwrap())).collect();
+        let reply = |id: &str, body: &str| pipe_msg(&format!("35=d|43=N|320={id}|322=*|323=4|{body}"));
+        let mut context = std::mem::replace(&mut engine.context, Context::new());
+        assert!(farm::md_contract_reply(&mut context, &shared, &ids[0], &reply(&ids[0], "55=QQQ|167=STK|207=BEST|6008=320227571|15=USD|")));
+        assert!(farm::md_contract_reply(&mut context, &shared, &ids[1], &reply(&ids[1], "55=SPY|167=STK|207=BEST|6008=756733|15=USD|")));
+        engine.context = context;
+        engine.send_md_resolved();
+        let sent = farm_messages_sent(&mut farm_side);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("6008=320227571|"), "{sent:?}");
+        assert_eq!(shared.market.drain_md_rejects(), [crate::bridge::MdReject::MaxTickers { instrument: spy }]);
+        assert!(engine.context.md_over_limit.is_empty());
+
+        // At the limit, a request on the running contract joins it.
+        tx.send(by_symbol("QQQ", true, r3)).unwrap();
+        engine.poll_once();
+        let again = a3.recv().unwrap().unwrap();
+        let asked = plain_messages_sent(&mut ccp_side);
+        let id: String = asked.last().unwrap().split('|').find_map(|p| p.strip_prefix("320=")).map(|n| engine.ccp_conn.as_ref().unwrap().internal_name(n)).unwrap();
+        let mut context = std::mem::replace(&mut engine.context, Context::new());
+        assert!(farm::md_contract_reply(&mut context, &shared, &id, &reply(&id, "55=QQQ|167=STK|207=BEST|6008=320227571|15=USD|")));
+        engine.context = context;
+        engine.send_md_resolved();
+        assert!(farm_messages_sent(&mut farm_side).is_empty());
+        assert!(shared.market.drain_md_rejects().is_empty());
+        assert_eq!(shared.market.drain_md_merges().into_iter().map(|(f, i, _)| (f, i)).collect::<Vec<_>>(), [(again, qqq)]);
+        assert!(engine.context.md_over_limit.is_empty());
     }
 
     // ibx#455: the query names the type as the API does, asks for past
@@ -4547,6 +7213,7 @@ mod tests {
     // waits is never sent.
     #[test]
     fn round_lot_lookup_only_where_it_can_apply() {
+        crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
         let shared = Arc::new(SharedState::new());
         let mut engine = HotLoop::new(shared.clone(), None, None);
         let (c1, mut farm_side) = socket_pair();
@@ -4630,7 +7297,7 @@ mod tests {
     }
 
     // ibx#421: a logon update with a new data permission stamp makes the
-    // reference resubscribe its market data (`jclient.ij`): every
+    // reference resubscribe its market data: every
     // streaming top of book and news entry cancelled, then asked again on
     // new ids, at once the first time, then at most every 30 s; a change
     // within 1 s of the last one is ignored. A refusal for an API
@@ -4681,8 +7348,7 @@ mod tests {
     }
 
     // ibx#421: a relogin's stamp is a change only when the old and the
-    // new one are both set and differ (`jclient.gi.a(jfix.dk, jfix.bb,
-    // LogonType)@297-388`).
+    // new one are both set and differ.
     #[test]
     fn relogin_data_permission_rule() {
         let mut ccp = CcpState::new();
@@ -4730,8 +7396,8 @@ mod tests {
     }
 
     // ibx#447 (captured 28/09/2026): the subscribe is the 442 / 443 pair
-    // with no 9839; with delayed data enabled, a reject with delayed data
-    // available asks again on new ids with 9887=1 on each entry, and the
+    // with no entry mark; with delayed data enabled, a reject with delayed data
+    // available asks again on new ids with the delayed mode on each entry, and the
     // client learns it (marketDataType 3, 10167). Without it, the
     // subscription stops (354 with the "delayed available" text).
     #[test]
@@ -4748,7 +7414,9 @@ mod tests {
             let first = farm_messages_sent(&mut s1);
             assert_eq!(first.len(), 1);
             assert!(first[0].contains("264=442|") && first[0].contains("264=443|"), "{}", first[0]);
-            assert!(!first[0].contains("9839=") && !first[0].contains("9887="), "{}", first[0]);
+            // The entry marks of the reference 10.51 (ibx#648), no delayed mode.
+            assert!(first[0].contains("264=442|6088=Socket|9830=1|9839=1|") && first[0].contains("264=443|6088=Socket|9830=1|9839=1|"), "{}", first[0]);
+            assert!(!first[0].contains("9887="), "{}", first[0]);
             let ids: Vec<String> = engine.farm.md_req_to_instrument.iter().map(|(r, _)| r.to_string()).collect();
 
             let reject = crate::protocol::fix::fix_build(&[(35, "3"), (45, "0"),
@@ -4768,11 +7436,47 @@ mod tests {
             } else {
                 assert!(farm_messages_sent(&mut s1).is_empty());
                 assert_eq!(rejects, [crate::bridge::MdReject::NotSubscribed {
-                    instrument: jp, delayed_available: true, needs_api_subscription: false, description: String::new(), kept_params: None }]);
+                    instrument: jp, delayed_available: true, needs_api_subscription: false, description: String::new(), kept_params: None,
+                    part: None, farm_text: "Error&BEST/STK/Top&BEST/STK/Top".into() }]);
                 // The rejected entries stay until the request ends, whose
                 // cancel covers them (captured 05/10/2026).
                 assert_eq!(engine.farm.instrument_md_reqs[0].1.len(), 2);
             }
+        }
+    }
+
+    // ibx#650 (the reference 10.51, paper, 16/10/2026, BTC on PAXOS with no
+    // crypto data): the last entry is confirmed, then the bid/ask entry is
+    // refused; the reference names the side refused (10090) before 354,
+    // which ends with the farm's text. Both refused at once: no side.
+    #[test]
+    fn one_side_refused_after_the_other_was_confirmed() {
+        for confirm_first in [true, false] {
+            let shared = Arc::new(SharedState::new());
+            let mut engine = HotLoop::new(shared.clone(), None, None);
+            let (c1, mut s1) = socket_pair();
+            engine.farm_conn = Some(Connection::new_mem(c1));
+            let btc = engine.context.market.register(479624278);
+            engine.farm.send_mktdata_subscribe(479624278, "BTC", "PAXOS", "CRYPTO", "", 0.0, "", "", btc, 0,
+                &mut engine.farm_conn, &mut engine.hb);
+            farm_messages_sent(&mut s1);
+            let ids: Vec<u32> = engine.farm.md_req_to_instrument.iter().map(|(r, _)| *r).collect();
+            let (bid_ask, last) = (ids[0], ids[1]);
+            let refused = if confirm_first {
+                engine.inject_farm_message(format!("8=O35=Q1,{last},0.25,0,1,ffffffff,,1,1e-08").as_bytes());
+                bid_ask.to_string()
+            } else {
+                format!("{bid_ask};{last}")
+            };
+            let n = if confirm_first { "0" } else { "0;0" };
+            let reject = crate::protocol::fix::fix_build(&[(35, "3"), (45, "0"), (58, "Error&PAXOS/CRYPTO/Top"),
+                (262, &refused), (9887, n), (9888, if confirm_first { "1" } else { "1;1" })], 1);
+            engine.farm.process_farm_message(&reject, &mut engine.farm_conn, &mut engine.context,
+                &shared, &None, &mut engine.hb);
+            let rejects = shared.market.drain_md_rejects();
+            assert_eq!(rejects, [crate::bridge::MdReject::NotSubscribed {
+                instrument: btc, delayed_available: false, needs_api_subscription: false, description: String::new(),
+                kept_params: None, part: confirm_first.then_some("BID_ASK"), farm_text: "Error&PAXOS/CRYPTO/Top".into() }]);
         }
     }
 }
@@ -4854,7 +7558,8 @@ mod routing_tests {
         assert!(msgs[1].contains("|207=FXSUBPIP|167=CASH|264=442|"), "{}", msgs[1]);
         assert!(msgs[1].contains("|207=IDEALPRO|167=CASH|264=443|"), "{}", msgs[1]);
         assert!(msgs[2].contains("|207=BEST|167=CS|264=442|"), "{}", msgs[2]);
-        assert!(msgs.iter().all(|m| !m.contains("|9839=")));
+        // Every bid/ask and last entry ends with its mark (ibx#648).
+        assert!(msgs.iter().all(|m| m.matches("|9830=1|9839=1|").count() == m.matches("|264=44").count()), "{msgs:?}");
     }
 
     // #445: the cancel repeats the entries of the subscribe in one message
@@ -4870,7 +7575,7 @@ mod routing_tests {
         engine.route_md_cancel(s.instrument);
         let msgs = sent(&mut farm_side);
         assert_eq!(msgs.len(), 1, "{msgs:?}");
-        let want = format!("|263=2|146=2|262={}|6008=815824267|207=CME|167=FUT|264=442|9830=1|262={}|6008=815824267|207=CME|167=FUT|264=443|9830=1|",
+        let want = format!("|263=2|146=2|262={}|6008=815824267|207=CME|167=FUT|264=442|9830=1|9839=1|262={}|6008=815824267|207=CME|167=FUT|264=443|9830=1|9839=1|",
             first, first + 1);
         assert!(msgs[0].contains(&want), "{}\nwant {}", msgs[0], want);
         assert!(!msgs[0].contains("6088"), "{}", msgs[0]);
@@ -4940,7 +7645,7 @@ mod routing_tests {
         let n = ccp_side.read(&mut buf).unwrap();
         let asked = String::from_utf8_lossy(&buf[..n]).replace('\x01', "|");
         assert!(asked.contains("|35=c|") && asked.contains("|6008=14094|"), "{asked}");
-        let req_id = asked.split('|').find_map(|p| p.strip_prefix("320=")).unwrap().to_string();
+        let req_id = engine.ccp_conn.as_ref().unwrap().internal_name(asked.split('|').find_map(|p| p.strip_prefix("320=")).unwrap());
         assert!(sent(&mut farm_side).is_empty());
 
         let reply = fix::fix_build(&[(35, "d"), (320, &req_id), (6008, "14094"), (167, "CS"), (6178, "3")], 1);
@@ -5448,17 +8153,18 @@ mod news_tests {
         out
     }
 
-    pub(super) fn engine() -> (HotLoop, Arc<SharedState>, crate::protocol::connection::MemTransport, Sender<ControlCommand>) {
+    pub(super) fn engine() -> (HotLoop, Arc<SharedState>, crate::protocol::connection::MemTransport, ControlSender) {
         let shared = Arc::new(SharedState::new());
         let mut engine = HotLoop::new(shared.clone(), None, None);
         let (c, server) = socket_pair();
         engine.farm_conn = Some(Connection::new_mem(c));
         let (tx, rx) = crossbeam_channel::unbounded();
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         (engine, shared, server, tx)
     }
 
-    pub(super) fn aapl(tx: &Sender<ControlCommand>, engine: &mut HotLoop, providers: &str) -> InstrumentId {
+    pub(super) fn aapl(tx: &ControlSender, engine: &mut HotLoop, providers: &str) -> InstrumentId {
         tx.send(ControlCommand::Subscribe {
             con_id: 265598, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "STK".into(),
             last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
@@ -5499,7 +8205,9 @@ mod news_tests {
         let out = sent(&mut farm_side);
         assert_eq!(out.len(), 2, "{out:?}");
         assert!(out[0].contains("|264=442|") && out[0].contains("|262=1|") && out[0].contains("|262=2|"), "{}", out[0]);
-        // Captured: 35=V|263=1|146=1|262=35|6008=265598|207=NEWS|167=CS|264=292|6472=...|6088=Socket|9830=1
+        // Captured: a market data request subscribing one entry: its request id, the
+        // contract id 265598 on the NEWS exchange, security type CS, the news entry, the
+        // provider keys, the source Socket and the API flag.
         assert_eq!(out[1], format!("35=V|263=1|146=1|262=3|6008=265598|207=NEWS|167=CS|264=292|6472={ALL}|6088=Socket|9830=1|"));
 
         tx.send(ControlCommand::Unsubscribe { instrument: id }).unwrap();
@@ -5507,13 +8215,15 @@ mod news_tests {
         let out = sent(&mut farm_side);
         assert_eq!(out.len(), 2, "{out:?}");
         assert!(out[0].starts_with("35=V|263=2|146=2|"), "{}", out[0]);
-        // Captured: 35=V|263=2|146=2|262=38|...|9830=1|262=35|6008=265598|207=NEWS|167=CS|264=292|6472=...|9830=1
+        // Captured: a market data request cancelling two entries: the request's other
+        // entry (with the API flag), then the news entry (its request id, the contract id
+        // 265598 on NEWS, security type CS, the news entry, the provider keys, the API flag).
         assert_eq!(out[1], format!("35=V|263=2|146=1|262=3|6008=265598|207=NEWS|167=CS|264=292|6472={ALL}|9830=1|"));
         assert!(engine.farm.news.is_empty());
         assert_eq!(engine.context.market.con_id(id), None, "the slot is freed");
     }
 
-    // ibx#458: no provider key (no news source), no 6472.
+    // ibx#458: no provider key (no news source), no provider key field.
     #[test]
     fn empty_provider_key_is_not_written() {
         let (mut engine, _shared, mut farm_side, tx) = engine();
@@ -5557,11 +8267,9 @@ mod news_tests {
             row(1790920800000, "DJ-RTG", "DJ-RTG$1f798bd2", math, "L:en:A:800015"),
             row(1790920800000, "DJ-RTPRO", "DJ-RTPRO$1f798bd2", math, "L:en:A:800015"),
         ]);
-        // The reference held back the fifth (Chinese and English story);
-        // its rule is not known (ibx#458).
-        assert_eq!(news.len(), 5);
-        assert_eq!(news[4].3, "DJ-N$1f79997f");
-        assert_eq!(news[4].4, "Apple Bids to Put China in Its Fold -- WSJ");
+        // The reference held back the fifth, a story whose languages also
+        // name Chinese: ibx too (ibx#755).
+        assert_eq!(news.len(), 4);
 
         // The same articles again (the reference sent AMZN repeats with
         // the first number 3, never given again): nothing.
@@ -5587,7 +8295,7 @@ mod news_tests {
             let (reply, answer) = crossbeam_channel::bounded(1);
             tx.send(ControlCommand::SubscribeBySymbol {
                 symbol: symbol.into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(),
-                filters: Default::default(), mode_9887: 0, snapshot: false, reply_tx: Some(reply.into()),
+                filters: Default::default(), mode_9887: 0, snapshot: false, over_limit: false, reply_tx: Some(reply.into()),
             }).unwrap();
             engine.poll_once();
             let id = answer.recv().unwrap().unwrap();
@@ -5606,7 +8314,7 @@ mod news_tests {
             let mut chunk = [0u8; 8192];
             while let Ok(n) = ccp_side.read(&mut chunk) { if n == 0 { break; } buf.extend_from_slice(&chunk[..n]); }
             String::from_utf8_lossy(&buf).replace('\x01', "|").split("|320=").skip(1)
-                .map(|m| m.split('|').next().unwrap().to_string()).collect()
+                .map(|m| engine.ccp_conn.as_ref().unwrap().internal_name(m.split('|').next().unwrap())).collect()
         };
         assert_eq!(asked.len(), 2, "{asked:?}");
         let reply = |id: &str, body: &str| pipe_msg(&format!("35=d|43=N|320={id}|322=*|323=4|{body}"));
@@ -5717,7 +8425,7 @@ mod sharing_tests {
         let (reply, answer) = crossbeam_channel::bounded(1);
         tx.send(ControlCommand::SubscribeBySymbol {
             symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(),
-            filters: Default::default(), mode_9887: 0, snapshot: false, reply_tx: Some(reply.into()),
+            filters: Default::default(), mode_9887: 0, snapshot: false, over_limit: false, reply_tx: Some(reply.into()),
         }).unwrap();
         engine.poll_once();
         let second = answer.recv().unwrap().unwrap();
@@ -5743,6 +8451,57 @@ mod sharing_tests {
         assert!(sent(&mut farm_side).is_empty());
         assert_eq!(engine.context.market.con_id(second), None, "the slot is freed");
         assert_eq!(engine.context.market.instrument_by_con_id(265598), Some(first));
+    }
+
+    // ibx#533, paper 09/10/2026: an order made a slot for the contract, with
+    // no market data. Two symbol-only requests follow: the first runs on its
+    // own slot, and the second joins it, although the slot found by the
+    // conId is the order's.
+    #[test]
+    fn a_looked_up_contract_joins_the_request_before_it_past_the_slot_of_an_order() {
+        use crate::control::contracts::tests::pipe_msg;
+        let (mut engine, shared, mut farm_side, tx) = engine();
+        let (c2, _ccp_side) = socket_pair();
+        engine.ccp_conn = Some(Connection::new_mem(c2));
+        let order_slot = engine.context.market.register(265598);
+        let mut by_symbol = |engine: &mut HotLoop| {
+            let (reply, answer) = crossbeam_channel::bounded(1);
+            tx.send(ControlCommand::SubscribeBySymbol {
+                symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(),
+                filters: Default::default(), mode_9887: 0, snapshot: false, over_limit: false, reply_tx: Some(reply.into()),
+            }).unwrap();
+            engine.poll_once();
+            let slot = answer.recv().unwrap().unwrap();
+            let lookup = format!("{}", engine.context.md_lookups[0].0);
+            let mut context = std::mem::replace(&mut engine.context, Context::new());
+            let body = format!("35=d|43=N|320={lookup}|322=*|323=4|55=AAPL|167=STK|207=BEST|6008=265598|15=USD|");
+            assert!(farm::md_contract_reply(&mut context, &shared, &lookup, &pipe_msg(&body)));
+            engine.context = context;
+            engine.send_md_resolved();
+            engine.send_lot_ready();
+            slot
+        };
+        let first = by_symbol(&mut engine);
+        assert_ne!(first, order_slot);
+        assert!(shared.market.drain_md_merges().is_empty(), "the slot of the order has no market data to join");
+        assert!(engine.joins_top(first, false), "the first request runs or waits on its own slot");
+        let _ = sent(&mut farm_side);
+        let second = by_symbol(&mut engine);
+        assert_eq!(shared.market.drain_md_merges(), [(second, first, 0)]);
+        assert!(sent(&mut farm_side).is_empty(), "no second subscription of the contract");
+        assert_eq!(engine.context.market.instrument_by_con_id(265598), Some(order_slot));
+
+        // ibx#534, paper 09/10/2026: a request with the conId then shares
+        // the running one too, where the conId alone finds the order's slot.
+        let (reply, answer) = crossbeam_channel::bounded(1);
+        tx.send(ControlCommand::Subscribe {
+            con_id: 265598, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "STK".into(),
+            last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
+            mode_9887: 0, snapshot: false, reply_tx: Some(reply.into()),
+        }).unwrap();
+        engine.poll_once();
+        assert_eq!(answer.recv().unwrap().unwrap(), first, "the slot of the running request");
+        assert!(sent(&mut farm_side).is_empty(), "no second subscription of the contract");
     }
 }
 
@@ -5809,7 +8568,7 @@ mod tbt_tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn subscribe_with(engine: &mut HotLoop, tx: &crossbeam_channel::Sender<ControlCommand>, req_id: ReqId, con_id: i64, symbol: &str, exchange: &str, sec_type: &str,
+    fn subscribe_with(engine: &mut HotLoop, tx: &ControlSender, req_id: ReqId, con_id: i64, symbol: &str, exchange: &str, sec_type: &str,
         tbt_type: crate::types::TbtType, number_of_ticks: i32, ignore_size: bool) {
         tx.send(ControlCommand::SubscribeTbt {
             req_id, con_id, symbol: symbol.into(), exchange: exchange.into(), sec_type: sec_type.into(),
@@ -5819,7 +8578,7 @@ mod tbt_tests {
     }
 
     /// Subscribe with the next request id of the test; the request id.
-    fn subscribe(engine: &mut HotLoop, tx: &crossbeam_channel::Sender<ControlCommand>, con_id: i64, symbol: &str, exchange: &str, sec_type: &str, tbt_type: crate::types::TbtType) -> ReqId {
+    fn subscribe(engine: &mut HotLoop, tx: &ControlSender, con_id: i64, symbol: &str, exchange: &str, sec_type: &str, tbt_type: crate::types::TbtType) -> ReqId {
         static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
         let req_id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         subscribe_with(engine, tx, req_id, con_id, symbol, exchange, sec_type, tbt_type, 0, false);
@@ -5839,6 +8598,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         subscribe(&mut engine, &tx, 12087792, "EUR", "IDEALPRO", "CASH", crate::types::TbtType::BidAsk);
         subscribe(&mut engine, &tx, 815824267, "MNQ", "CME", "FUT", crate::types::TbtType::AllLast);
@@ -5861,6 +8621,7 @@ mod tbt_tests {
         let (conn, _side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         let quotes_req = subscribe(&mut engine, &tx, 815824267, "MNQ", "CME", "FUT", crate::types::TbtType::BidAsk);
         let trades_req = subscribe(&mut engine, &tx, 815824267, "MNQ", "CME", "FUT", crate::types::TbtType::AllLast);
@@ -5883,7 +8644,7 @@ mod tbt_tests {
         assert_eq!(trades.len(), 2);
         assert_eq!((trades[0].instrument, trades[0].req_id, trades[0].tbt_type), (mnq, trades_req, crate::types::TbtType::AllLast));
         assert_eq!(trades[0].price, 25_000 * PRICE_SCALE);
-        assert_eq!(trades[0].size, 3);
+        assert_eq!(trades[0].size, 3.0);
         assert_eq!(trades[0].exchange, "CME");
         assert_eq!(trades[1].price, 25_000 * PRICE_SCALE - PRICE_SCALE / 4);
         let quotes = shared.market.drain_tbt_quotes();
@@ -5900,6 +8661,55 @@ mod tbt_tests {
         assert!(shared.market.drain_tbt_quotes().is_empty());
     }
 
+    // ibx#613 (the 10.51 rules, not observed yet: no fractional trade on the
+    // paper account; ibx#604: stock trades observed 19/10/2026): a trade of
+    // 0.4 and of 1.6 in steps of 0.0001 is given as its whole part, at
+    // least 1, at level 214, below 222; from 222 its fraction is kept
+    // (`hmds::trade_size_at`).
+    #[test]
+    fn a_fractional_trade_is_whole_at_the_session_level() {
+        crate::client_core::set_session_level_for_test(Some(214));
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (conn, _side) = loopback();
+        engine.hmds_conn = Some(conn);
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
+        engine.set_control_rx(rx);
+        subscribe(&mut engine, &tx, 815824267, "MNQ", "CME", "FUT", crate::types::TbtType::AllLast);
+        engine.inject_hmds_message(&ack("rtTicker1;;MNQ@CMEAllLast;;1;;true;;0;;U", 1, "0.25", "0.0001"));
+        let e = [trade_entry(1, 1_790_000_000, 100_000, 0, 4_000, "CME"), trade_entry(1, 1_790_000_001, 0, 0, 16_000, "CME")].concat();
+        engine.inject_hmds_message(&tbt_frame(&e));
+        let sizes: Vec<f64> = shared.market.drain_tbt_trades().iter().map(|t| t.size).collect();
+        assert_eq!(sizes, [1.0, 1.0]);
+        assert_eq!(hmds::trade_size_at(222, 4_000, Some(0.0001), crate::md_events::Increment::from_step(0.0001)), 0.4);
+        assert_eq!(hmds::trade_size_at(222, 16_000, Some(0.0001), crate::md_events::Increment::from_step(0.0001)), 1.6);
+    }
+
+    // ibx#604 (the reference 10.51 at level 225, AAPL AllLast, 19/10/2026
+    // pre-market): the acknowledgement gives a fractional step; a trade
+    // whose attributes carry 0x20 is counted in it (987479 steps of
+    // 0.000001: 0.987479), the others in the size step.
+    #[test]
+    fn a_trade_marked_fractional_takes_the_fractional_step() {
+        crate::client_core::set_session_level_for_test(Some(225));
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (conn, _side) = loopback();
+        engine.hmds_conn = Some(conn);
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
+        engine.set_control_rx(rx);
+        subscribe(&mut engine, &tx, 265598, "AAPL", "SMART", "STK", crate::types::TbtType::AllLast);
+        let xml = "<ResultSetTickerId><id>rtTicker1;;AAPL@SMARTLast;;1;;true;;0;;U</id><rtTickerId>1</rtTickerId>            <minTick>0.01</minTick><sizeMinTick>1</sizeMinTick><fracSizeMinTick>0.000001</fracSizeMinTick><eoq>false</eoq></ResultSetTickerId>";
+        engine.inject_hmds_message(&fix::fix_build(&[(35, "W"), (6118, xml)], 1));
+        let e = [trade_entry(1, 1_792_400_148, 34_336, 0xe, 11, "NASDAQ"), trade_entry(1, 1_792_400_148, 0, 0x2e, 987_479, "FINRA")].concat();
+        engine.inject_hmds_message(&tbt_frame(&e));
+        let sizes: Vec<f64> = shared.market.drain_tbt_trades().iter().map(|t| t.size).collect();
+        assert_eq!(sizes, [11.0, 0.987479]);
+        crate::client_core::set_session_level_for_test(None);
+    }
+
     // ibx#404 (captured 18/06/2026, seq 11453, ALAB AllLast, minTick 0.01,
     // sizeMinTick 1): attribute bits 0 and 1 are the past limit and
     // unreported flags of the trade (14: unreported), bits 0 and 1 of a
@@ -5912,6 +8722,7 @@ mod tbt_tests {
         let (conn, _side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         let last = subscribe(&mut engine, &tx, 692196414, "ALAB", "SMART", "STK", crate::types::TbtType::AllLast);
         let quotes = subscribe(&mut engine, &tx, 12087792, "EUR", "IDEALPRO", "CASH", crate::types::TbtType::BidAsk);
@@ -5935,7 +8746,7 @@ mod tbt_tests {
         let trades = shared.market.drain_tbt_trades();
         assert_eq!(trades.len(), 2, "{trades:?}");
         assert_eq!((trades[0].req_id, trades[0].price, trades[0].past_limit, trades[0].unreported), (last, 619 * PRICE_SCALE, true, false));
-        assert_eq!((trades[1].price, trades[1].size, trades[1].timestamp), (619 * PRICE_SCALE, 26, 1_781_783_174));
+        assert_eq!((trades[1].price, trades[1].size, trades[1].timestamp), (619 * PRICE_SCALE, 26.0, 1_781_783_174));
         assert_eq!((trades[1].exchange.as_str(), trades[1].conditions.as_str()), ("FINRA", "TI"));
         assert_eq!((trades[1].past_limit, trades[1].unreported), (false, true));
         let q = shared.market.drain_tbt_quotes();
@@ -5960,6 +8771,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         use crate::types::TbtType::Last;
         subscribe_with(&mut engine, &tx, 1, 265598, "AAPL", "SMART", "STK", Last, 0, false);
@@ -5994,6 +8806,26 @@ mod tbt_tests {
         assert_eq!(reqs, [5]);
     }
 
+    // ibx#720 (the reference 10.51, paper, 16/10/2026): a second request
+    // under the id of a live one gets 102, nothing is asked, and the live
+    // request goes on.
+    #[test]
+    fn a_duplicate_tick_by_tick_id_gets_102() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (conn, mut side) = loopback();
+        engine.hmds_conn = Some(conn);
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
+        engine.set_control_rx(rx);
+        use crate::types::TbtType::BidAsk;
+        subscribe_with(&mut engine, &tx, 9904, 265598, "AAPL", "SMART", "STK", BidAsk, 0, false);
+        subscribe_with(&mut engine, &tx, 9904, 265598, "AAPL", "SMART", "STK", BidAsk, 0, false);
+        assert_eq!(plain_sent(&mut side).len(), 1, "one query");
+        assert_eq!(shared.market.drain_tbt_errors(), [(9904, 102, "Duplicate ticker id".to_string())]);
+        assert!(engine.hmds.tbt_subscriptions[0].clients.contains(&9904), "the live request goes on");
+    }
+
     // ibx#455: a refused query ends its own request with 10189; a request
     // that joined while it was out waits, and the next request sends a new
     // query whose answer feeds both.
@@ -6004,6 +8836,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         use crate::types::TbtType::BidAsk;
         subscribe_with(&mut engine, &tx, 1, 265598, "AAPL", "SMART", "STK", BidAsk, 0, false);
@@ -6038,6 +8871,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         use crate::types::TbtType::Last;
         subscribe_with(&mut engine, &tx, 1, 265598, "AAPL", "SMART", "STK", Last, 2, false);
@@ -6076,6 +8910,7 @@ mod tbt_tests {
         let (conn, _side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         let gone = subscribe(&mut engine, &tx, 272093, "MSFT", "SMART", "STK", crate::types::TbtType::Last);
         let live = subscribe(&mut engine, &tx, 265598, "AAPL", "SMART", "STK", crate::types::TbtType::Last);
@@ -6107,6 +8942,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         shared.reference.set_tick_by_tick_limits(3, false);
         use crate::types::TbtType::{Last, BidAsk};
@@ -6144,6 +8980,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         let mnq = subscribe(&mut engine, &tx, 815824267, "MNQ", "CME", "FUT", crate::types::TbtType::AllLast);
         let eur = subscribe(&mut engine, &tx, 12087792, "EUR", "IDEALPRO", "CASH", crate::types::TbtType::BidAsk);
@@ -6183,6 +9020,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         let r = subscribe(&mut engine, &tx, 265598, "AAPL", "SMART", "STK", crate::types::TbtType::Last);
         let _ = plain_sent(&mut side);
@@ -6220,6 +9058,7 @@ mod tbt_tests {
             IDEALPRO,CASH,TickByTick,4,*,ndc1.example,4000,cashhmds;\
             CME,FUT,DayChart|EODChart|Bar5Sec,-1,*,cdc1.example,4000,ushmds");
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         subscribe(&mut engine, &tx, 12087792, "EUR", "IDEALPRO", "CASH", crate::types::TbtType::BidAsk);
         let cash = engine.pool.find("cashhmds").expect("cashhmds opened on demand");
@@ -6228,7 +9067,7 @@ mod tbt_tests {
         subscribe(&mut engine, &tx, 14094, "BMW", "SMART", "STK", crate::types::TbtType::Last);
         let asked = plain_sent(&mut ccp_side);
         assert!(asked.len() == 1 && asked[0].contains("|35=c|") && asked[0].contains("|6008=14094|"), "{asked:?}");
-        let req_id = asked[0].split('|').find_map(|p| p.strip_prefix("320=")).unwrap().to_string();
+        let req_id = engine.ccp_conn.as_ref().unwrap().internal_name(asked[0].split('|').find_map(|p| p.strip_prefix("320=")).unwrap());
         let reply = fix::fix_build(&[(35, "d"), (320, &req_id), (6008, "14094"), (167, "CS"), (6178, "3")], 1);
         assert!(farm::round_lot_reply(&mut engine.context, &req_id, &reply));
         engine.send_lot_ready();
@@ -6289,6 +9128,393 @@ mod bars_routing_tests {
         engine.poll_once();
         assert_eq!(engine.pool.get(day).unwrap().queued(), 2, "the cancel goes to the same farm");
     }
+
+    // ibx#643: bars of a contract given by its conId alone take the type of
+    // its definition (the reference 10.51 served an option and a future so,
+    // 13/10/2026); without it they were routed as a stock (162).
+    #[test]
+    fn bars_of_a_con_id_alone_take_the_definitions_type() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (client, _server) = crate::protocol::connection::mem_pair();
+        engine.hmds_conn = Some(Connection::new_mem(client));
+        engine.set_routing_table(TableKind::Historical,
+            "IDEALPRO,CASH,DayChart|Bar5Sec,4,*,ndc1.example,4000,cashhmds");
+        engine.context.def_kinds.insert(12087792, ("CASH".into(), "EUR".into()));
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        tx.send(bars(1, 12087792, "IDEALPRO", "", "1 hour")).unwrap();
+        engine.poll_once();
+        let day = engine.pool.find("cashhmds").expect("day charts farm");
+        assert_eq!(engine.pool.get(day).unwrap().queued(), 1);
+        assert!(shared.reference.drain_historical_errors().is_empty());
+    }
+
+    // ibx#615 (the reference 10.51, paper, 16/10/2026): bars of a contract
+    // given by its conId, type and exchange wait for its definition when
+    // its market rule is not known, below session level 224; the rule of
+    // the engine's own lookup is kept, and the bars then go.
+    #[test]
+    fn bars_of_a_con_id_wait_for_the_market_rule() {
+        crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+        use crate::control::contracts::*;
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (client, _server) = crate::protocol::connection::mem_pair();
+        engine.hmds_conn = Some(Connection::new_mem(client));
+        let (ccp, _ccp_side) = crate::protocol::connection::mem_pair();
+        engine.ccp_conn = Some(Connection::new_mem(ccp));
+        engine.set_routing_table(TableKind::Historical,
+            "IDEALPRO,CASH,DayChart|Bar5Sec,4,*,ndc1.example,4000,cashhmds");
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        tx.send(bars(1, 12087792, "IDEALPRO", "CASH", "1 min")).unwrap();
+        engine.poll_once();
+        assert!(engine.pool.find("cashhmds").is_none(), "nothing asked before the definition");
+        let lookup = engine.context.lot_lookups[0].0.clone();
+        let reply = fix::fix_build(&[(35, "d"), (320, &lookup), (55, "EUR"), (167, "CASH"), (6008, "12087792"),
+            (TAG_IB_MARKET_RULE_ID, "239"), (TAG_MARKET_RULE_COUNT, "1"), (TAG_MARKET_RULE_ID, "239"),
+            (TAG_PRICE_INCREMENT_COUNT, "1"), (TAG_LOW_EDGE, "0"), (TAG_INCREMENT, "0.00005")], 1);
+        engine.inject_ccp_message(&reply);
+        assert_eq!(shared.reference.price_step(12087792, 1.1), Some(0.00005));
+        engine.send_lot_ready();
+        engine.poll_once();
+        let day = engine.pool.find("cashhmds").expect("day charts farm");
+        assert_eq!(engine.pool.get(day).unwrap().queued(), 1);
+    }
+
+    // ibx#731 (the reference 10.51, paper, 16/10/2026, EUR bars given by
+    // conId alone on IDEALPRO, four sessions): the definition the request
+    // waits for is asked under the reference's name for a client's
+    // contract, in the session series of the lookups by conId, with the
+    // client source, on the request's exchange; its answer, under the
+    // session name, releases the request.
+    #[test]
+    fn bars_of_a_con_id_alone_ask_the_definition_as_the_reference() {
+        use std::io::Read;
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (client, _server) = crate::protocol::connection::mem_pair();
+        engine.hmds_conn = Some(Connection::new_mem(client));
+        let (ccp, mut ccp_side) = crate::protocol::connection::mem_pair();
+        engine.ccp_conn = Some(Connection::new_mem(ccp));
+        engine.set_routing_table(TableKind::Historical,
+            "IDEALPRO,CASH,DayChart|Bar5Sec,4,*,ndc1.example,4000,cashhmds");
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        tx.send(bars(1, 12087792, "IDEALPRO", "", "1 hour")).unwrap();
+        engine.poll_once();
+        ccp_side.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+        let mut buf = [0u8; 4096];
+        let n = ccp_side.read(&mut buf).unwrap();
+        let asked = String::from_utf8_lossy(&buf[..n]).replace('\x01', "|");
+        assert!(asked.contains("|35=c|") && asked.contains("|320=SecDefReqMsgReqByConid1|321=2|6088=Socket|146=1|6008=12087792|6004=IDEALPRO|"), "{asked}");
+        assert!(engine.pool.find("cashhmds").is_none(), "nothing asked before the definition");
+        let reply = fix::fix_build(&[(35, "d"), (320, "SecDefReqMsgReqByConid1"), (55, "EUR"), (167, "CASH"), (6008, "12087792")], 1);
+        engine.inject_ccp_message(&reply);
+        engine.send_lot_ready();
+        engine.poll_once();
+        let day = engine.pool.find("cashhmds").expect("day charts farm");
+        assert_eq!(engine.pool.get(day).unwrap().queued(), 1);
+        assert!(shared.reference.drain_historical_errors().is_empty());
+    }
+
+    /// Everything written on a test connection, as text.
+    fn written(side: &mut crate::protocol::connection::MemTransport) -> String {
+        use std::io::Read;
+        side.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = side.read(&mut chunk) {
+            if n == 0 { break; }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&out).replace('\x01', "|")
+    }
+
+    fn definition_names(text: &str) -> Vec<String> {
+        text.split("|35=c|").skip(1).filter_map(|m| m.split('|').find_map(|p| p.strip_prefix("320=")).map(String::from)).collect()
+    }
+
+    // ibx#732 (observed on paper, recordings of 16/10/2026: EUR bars given
+    // by conId alone, 5 requests of 5, the last on a contract known from
+    // the request before): bars of a conId alone ask the definition each
+    // time, known or not, and wait for it; once it came the request goes
+    // on with no second lookup.
+    #[test]
+    fn bars_of_a_con_id_alone_ask_the_definition_each_time() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (client, _server) = crate::protocol::connection::mem_pair();
+        engine.hmds_conn = Some(Connection::new_mem(client));
+        let (ccp, mut ccp_side) = crate::protocol::connection::mem_pair();
+        engine.ccp_conn = Some(Connection::new_mem(ccp));
+        engine.set_routing_table(TableKind::Historical,
+            "IDEALPRO,CASH,DayChart|Bar5Sec,4,*,ndc1.example,4000,cashhmds");
+        // Known: its kind, group and rule.
+        engine.context.agg_groups.insert(12087792, -1);
+        engine.context.def_kinds.insert(12087792, ("CASH".into(), "EUR".into()));
+        shared.reference.note_contract_rule(12087792, 239);
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        for (req_id, number, size) in [(1, 1, "1 hour"), (2, 2, "30 mins")] {
+            tx.send(bars(req_id, 12087792, "IDEALPRO", "", size)).unwrap();
+            engine.poll_once();
+            let asked = written(&mut ccp_side);
+            let name = format!("SecDefReqMsgReqByConid{number}");
+            assert_eq!(definition_names(&asked), [name.clone()], "{asked}");
+            assert!(asked.contains("|6088=Socket|146=1|6008=12087792|6004=IDEALPRO|"), "{asked}");
+            let queued = engine.pool.find("cashhmds").map_or(0, |d| engine.pool.get(d).unwrap().queued());
+            assert_eq!(queued, req_id as usize - 1, "nothing asked before the definition");
+            let reply = fix::fix_build(&[(35, "d"), (320, &name), (55, "EUR"), (167, "CASH"), (6008, "12087792")], 1);
+            engine.inject_ccp_message(&reply);
+            engine.send_lot_ready();
+            engine.poll_once();
+            let day = engine.pool.find("cashhmds").expect("day charts farm");
+            assert_eq!(engine.pool.get(day).unwrap().queued(), req_id as usize);
+            assert!(definition_names(&written(&mut ccp_side)).is_empty(), "no second lookup");
+        }
+        // With its description, nothing is asked.
+        tx.send(bars(3, 12087792, "IDEALPRO", "CASH", "15 mins")).unwrap();
+        engine.poll_once();
+        assert!(definition_names(&written(&mut ccp_side)).is_empty());
+        assert!(engine.context.def_asked.is_empty());
+        assert!(shared.reference.drain_historical_errors().is_empty());
+    }
+
+    // ibx#732 (observed on paper, 13/10/2026, two sessions: an option and a
+    // future given by conId alone, 4 real-time bar requests of 4): the
+    // definition is asked first, as for bars; the query goes out once it
+    // came, naming the contract by its definition's symbol and type. A
+    // second request asks it again.
+    #[test]
+    fn real_time_bars_of_a_con_id_alone_ask_the_definition_first() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (client, mut hmds_side) = crate::protocol::connection::mem_pair();
+        engine.hmds_conn = Some(Connection::new_mem(client));
+        let (ccp, mut ccp_side) = crate::protocol::connection::mem_pair();
+        engine.ccp_conn = Some(Connection::new_mem(ccp));
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        let request = |req_id: ReqId| ControlCommand::SubscribeRealTimeBar {
+            req_id, con_id: 692806985, symbol: String::new(), sec_type: String::new(), exchange: "SMART".into(),
+            what_to_show: "MIDPOINT".into(), use_rth: true,
+        };
+        tx.send(request(1)).unwrap();
+        engine.poll_once();
+        let asked = written(&mut ccp_side);
+        assert_eq!(definition_names(&asked), ["SecDefReqMsgReqByConid1"], "{asked}");
+        assert!(asked.contains("|321=2|6088=Socket|146=1|6008=692806985|6004=BEST|"), "{asked}");
+        assert!(!written(&mut hmds_side).contains("realTime"), "no query before the definition");
+        let reply = fix::fix_build(&[(35, "d"), (320, "SecDefReqMsgReqByConid1"), (55, "AAPL"), (167, "OPT"), (207, "BEST"),
+            (6008, "692806985"), (541, "20261218"), (201, "1"), (202, "100"), (231, "100"), (15, "USD")], 1);
+        engine.inject_ccp_message(&reply);
+        engine.send_lot_ready();
+        engine.poll_once();
+        let query = written(&mut hmds_side);
+        assert!(query.contains("realTime1;;AAPL@SMART Midpoint;;") && query.contains("<secType>OPT</secType>")
+            && query.contains("<contractID>692806985</contractID>"), "{query}");
+        assert!(definition_names(&written(&mut ccp_side)).is_empty(), "no second lookup");
+
+        // Known now, asked again.
+        tx.send(request(2)).unwrap();
+        engine.poll_once();
+        assert_eq!(definition_names(&written(&mut ccp_side)), ["SecDefReqMsgReqByConid2"]);
+        assert!(shared.reference.drain_historical_errors().is_empty());
+    }
+
+    // ibx#733 (observed on paper, 13/10/2026, two sessions: 2 real-time bar
+    // requests of 2 on an AAPL option given by conId alone): once the
+    // option's definition came, the company lookup of its underlying; the
+    // query once the company answered. A request once the company is
+    // known asks the definition again but no company. A cancel drops a
+    // waiting request.
+    #[test]
+    fn real_time_bars_of_an_option_alone_wait_for_its_company() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (client, mut hmds_side) = crate::protocol::connection::mem_pair();
+        engine.hmds_conn = Some(Connection::new_mem(client));
+        let (ccp, mut ccp_side) = crate::protocol::connection::mem_pair();
+        engine.ccp_conn = Some(Connection::new_mem(ccp));
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        let request = |req_id: ReqId| ControlCommand::SubscribeRealTimeBar {
+            req_id, con_id: 692806985, symbol: String::new(), sec_type: String::new(), exchange: "SMART".into(),
+            what_to_show: "MIDPOINT".into(), use_rth: true,
+        };
+        let definition = |name: &str| fix::fix_build(&[(35, "d"), (320, name), (55, "AAPL"), (167, "OPT"), (207, "BEST"),
+            (6008, "692806985"), (541, "20261218"), (201, "1"), (202, "100"), (231, "100"), (15, "USD"), (6346, "265598")], 1);
+        // A first request, cancelled while it waits for the company.
+        tx.send(request(1)).unwrap();
+        engine.poll_once();
+        assert_eq!(definition_names(&written(&mut ccp_side)), ["SecDefReqMsgReqByConid1"]);
+        engine.inject_ccp_message(&definition("SecDefReqMsgReqByConid1"));
+        engine.send_lot_ready();
+        engine.poll_once();
+        let asked = written(&mut ccp_side);
+        let names = definition_names(&asked);
+        assert_eq!(names.len(), 1, "{asked}");
+        assert!(names[0].starts_with("UnderlyingECNoDupsNDReqByConid") && asked.contains("|146=1|6008=265598|6004=ANYEXCH|"), "{asked}");
+        assert!(!written(&mut hmds_side).contains("realTime"), "no query before the company's answer");
+        assert_eq!(engine.context.company_parked.len(), 1);
+        tx.send(ControlCommand::CancelRealTimeBar { req_id: 1 }).unwrap();
+        engine.poll_once();
+        assert!(engine.context.company_parked.is_empty() && engine.context.def_asked.is_empty());
+
+        // A second request while the company is on its way: no second
+        // company lookup; the query once it answered.
+        tx.send(request(2)).unwrap();
+        engine.poll_once();
+        assert_eq!(definition_names(&written(&mut ccp_side)), ["SecDefReqMsgReqByConid3"]);
+        engine.inject_ccp_message(&definition("SecDefReqMsgReqByConid3"));
+        engine.send_lot_ready();
+        engine.poll_once();
+        assert!(definition_names(&written(&mut ccp_side)).is_empty(), "the company is on its way");
+        assert!(!written(&mut hmds_side).contains("realTime"));
+        let company = fix::fix_build(&[(35, "d"), (320, &names[0]), (55, "AAPL"), (167, "STK"), (207, "BEST"), (6008, "265598")], 1);
+        engine.inject_ccp_message(&company);
+        engine.send_lot_ready();
+        engine.poll_once();
+        let query = written(&mut hmds_side);
+        assert!(query.contains(";;AAPL@SMART Midpoint;;") && query.contains("<secType>OPT</secType>"), "{query}");
+        assert!(engine.context.company_parked.is_empty() && engine.context.def_asked.is_empty());
+
+        // The company known: the definition only, then the query.
+        tx.send(request(3)).unwrap();
+        engine.poll_once();
+        assert_eq!(definition_names(&written(&mut ccp_side)), ["SecDefReqMsgReqByConid4"]);
+        engine.inject_ccp_message(&definition("SecDefReqMsgReqByConid4"));
+        engine.send_lot_ready();
+        engine.poll_once();
+        assert!(definition_names(&written(&mut ccp_side)).is_empty(), "no company lookup");
+        assert!(written(&mut hmds_side).contains(";;AAPL@SMART Midpoint;;"));
+        assert!(shared.reference.drain_historical_errors().is_empty());
+    }
+
+    /// The classes asked in written text, in order (ibx#734 tests).
+    fn classes_asked(text: &str) -> Vec<String> {
+        text.split("|35=U|").skip(1).filter(|m| m.contains("6040=65|"))
+            .filter_map(|m| m.split('|').find_map(|p| p.strip_prefix("6411=")).map(String::from)).collect()
+    }
+
+    // ibx#734 (observed on paper, 13/10/2026, two sessions: the first
+    // real-time bars of an AAPL option given by its conId, the option's
+    // class 0 to 1 ms after the company's answer, the bar query 12 ms
+    // after): the class once the company answered, before the query; a
+    // later request of the session asks it no more.
+    #[test]
+    fn real_time_bars_of_an_option_ask_its_class_after_its_company() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (client, mut hmds_side) = crate::protocol::connection::mem_pair();
+        engine.hmds_conn = Some(Connection::new_mem(client));
+        let (ccp, mut ccp_side) = crate::protocol::connection::mem_pair();
+        engine.ccp_conn = Some(Connection::new_mem(ccp));
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        let request = |req_id: ReqId| ControlCommand::SubscribeRealTimeBar {
+            req_id, con_id: 692806985, symbol: String::new(), sec_type: String::new(), exchange: "SMART".into(),
+            what_to_show: "MIDPOINT".into(), use_rth: true,
+        };
+        let definition = |name: &str| fix::fix_build(&[(35, "d"), (320, name), (55, "AAPL"), (167, "OPT"), (207, "BEST"),
+            (6008, "692806985"), (6411, "2/OPT/R"), (541, "20261218"), (201, "1"), (202, "100"), (231, "100"), (15, "USD"),
+            (6346, "265598")], 1);
+        tx.send(request(1)).unwrap();
+        engine.poll_once();
+        assert_eq!(definition_names(&written(&mut ccp_side)), ["SecDefReqMsgReqByConid1"]);
+        engine.inject_ccp_message(&definition("SecDefReqMsgReqByConid1"));
+        engine.send_lot_ready();
+        engine.poll_once();
+        let asked = written(&mut ccp_side);
+        let names = definition_names(&asked);
+        assert!(names.len() == 1 && names[0].starts_with("UnderlyingECNoDupsNDReqByConid"), "{asked}");
+        assert!(classes_asked(&asked).is_empty(), "no class before the company's answer");
+        let company = fix::fix_build(&[(35, "d"), (320, &names[0]), (55, "AAPL"), (167, "STK"), (207, "BEST"), (6008, "265598")], 1);
+        engine.inject_ccp_message(&company);
+        assert_eq!(classes_asked(&written(&mut ccp_side)), ["2/OPT/R"]);
+        assert!(!written(&mut hmds_side).contains("realTime"), "the class before the query");
+        engine.send_lot_ready();
+        engine.poll_once();
+        assert!(written(&mut hmds_side).contains(";;AAPL@SMART Midpoint;;"));
+
+        tx.send(request(2)).unwrap();
+        engine.poll_once();
+        let names = definition_names(&written(&mut ccp_side));
+        engine.inject_ccp_message(&definition(&names[0]));
+        engine.send_lot_ready();
+        engine.poll_once();
+        assert!(classes_asked(&written(&mut ccp_side)).is_empty(), "asked once in the session");
+    }
+
+    // ibx#734 (observed on paper, recordings of 12-16/10/2026: 9 option
+    // market data requests by description, the class 1 to 6 ms after the
+    // company's answer, before the model's lookups; VOD on LSE, NESN on
+    // EBS, 7203 on TSEJ and ES on CME, 0 to 6 ms after the lookup's answer;
+    // SPX on CBOE, an index, nothing): market data by description asks the
+    // class of its contract.
+    #[test]
+    fn market_data_by_description_asks_the_class_of_its_contract() {
+        use crate::control::contracts::tests::pipe_msg;
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (c1, _farm_side) = crate::protocol::connection::mem_pair();
+        let (c2, mut ccp_side) = crate::protocol::connection::mem_pair();
+        engine.farm_conn = Some(Connection::new_mem(c1));
+        engine.ccp_conn = Some(Connection::new_mem(c2));
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        engine.set_control_rx(rx);
+        let by_symbol = |symbol: &str, sec_type: &str, exchange: &str, filters: crate::types::SecDefFilters| ControlCommand::SubscribeBySymbol {
+            symbol: symbol.into(), sec_type: sec_type.into(), exchange: exchange.into(), currency: "USD".into(),
+            filters, mode_9887: 0, snapshot: false, over_limit: false, reply_tx: None,
+        };
+        let name_of = |side: &mut crate::protocol::connection::MemTransport| definition_names(&written(side)).remove(0);
+
+        // An option: its class once the company answered, first.
+        let filters = crate::types::SecDefFilters {
+            last_trade_date_or_contract_month: "20261218".into(), strike: 340.0, right: "C".into(),
+            multiplier: "100".into(), ..Default::default()
+        };
+        tx.send(by_symbol("AAPL", "OPT", "SMART", filters)).unwrap();
+        engine.poll_once();
+        let lookup = name_of(&mut ccp_side);
+        engine.inject_ccp_message(&pipe_msg(&format!("35=d|43=N|320={lookup}|322=*|323=4|\
+            55=AAPL|167=OPT|207=BEST|6008=692808239|6411=2/OPT/R|541=20261218|201=1|202=340|231=100|15=USD|6178=2|6346=265598")));
+        let asked = written(&mut ccp_side);
+        assert!(classes_asked(&asked).is_empty(), "{asked}");
+        let company = definition_names(&asked).remove(0);
+        engine.inject_ccp_message(&pipe_msg(&format!("35=d|43=N|320={company}|322=*|323=4|\
+            55=AAPL|167=STK|207=BEST|6008=265598|15=USD|6178=1")));
+        let after = written(&mut ccp_side);
+        assert_eq!(classes_asked(&after), ["2/OPT/R"]);
+        assert!(definition_names(&after).is_empty(), "the class before the model's lookups");
+
+        // A stock off the US markets and a future: at once.
+        for (symbol, sec_type, exchange, body, class) in [
+            ("VOD", "STK", "LSE", "55=VOD|167=STK|207=LSE|6008=140148322|6411=LSE/STK/NONE|15=GBP", "LSE/STK/NONE"),
+            ("ES", "FUT", "CME", "55=ES|167=FUT|207=CME|6008=515416632|6411=CME/FUT/GLOBEX|15=USD|541=20261218", "CME/FUT/GLOBEX"),
+        ] {
+            tx.send(by_symbol(symbol, sec_type, exchange, Default::default())).unwrap();
+            engine.poll_once();
+            let lookup = name_of(&mut ccp_side);
+            engine.inject_ccp_message(&pipe_msg(&format!("35=d|43=N|320={lookup}|322=*|323=4|{body}")));
+            assert_eq!(classes_asked(&written(&mut ccp_side)), [class]);
+        }
+
+        // An index: nothing; the stock again: nothing.
+        for (symbol, sec_type, exchange, body) in [
+            ("SPX", "IND", "CBOE", "55=SPX|167=IND|207=CBOE|6008=416904|6411=CBOE/IND/NONE|15=USD"),
+            ("VOD", "STK", "LSE", "55=VOD|167=STK|207=LSE|6008=140148322|6411=LSE/STK/NONE|15=GBP"),
+        ] {
+            tx.send(by_symbol(symbol, sec_type, exchange, Default::default())).unwrap();
+            engine.poll_once();
+            let asked = written(&mut ccp_side);
+            let Some(lookup) = definition_names(&asked).into_iter().next() else { continue };
+            engine.inject_ccp_message(&pipe_msg(&format!("35=d|43=N|320={lookup}|322=*|323=4|{body}")));
+            assert!(classes_asked(&written(&mut ccp_side)).is_empty(), "{symbol}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6341,7 +9567,7 @@ mod depth_tests {
 
     /// An engine with the table, and the definitions of the contracts
     /// known (group and components).
-    fn engine() -> (HotLoop, Arc<SharedState>, crate::protocol::connection::MemTransport, crossbeam_channel::Sender<ControlCommand>) {
+    fn engine() -> (HotLoop, Arc<SharedState>, crate::protocol::connection::MemTransport, ControlSender) {
         let shared = Arc::new(SharedState::new());
         let mut engine = HotLoop::new(shared.clone(), None, None);
         engine.set_farm_name("usfarm".into());
@@ -6354,12 +9580,86 @@ mod depth_tests {
         engine.context.valid_exchanges.insert(265598, ["SMART", "NASDAQ", "MEMX", "IEX", "ZZZ", "TPLUS0", "PSX", "IBEOS"]
             .into_iter().map(String::from).collect());
         let (tx, rx) = crossbeam_channel::bounded(16);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         (engine, shared, side, tx)
     }
 
     fn errors(shared: &SharedState) -> Vec<String> {
         shared.orders.drain_order_errors().into_iter().map(|(id, code, text)| format!("{}:{}:{}", id, code, text)).collect()
+    }
+
+    // ibx#732 (observed on paper, 13/10/2026, two sessions: an option and a
+    // future given by conId alone, 4 depth requests of 4, each contract
+    // known from the requests before it): a depth request of a conId alone
+    // asks the definition each time, on its exchange, and waits for it;
+    // once it came the request goes on with no second lookup.
+    #[test]
+    fn a_depth_request_of_a_con_id_alone_asks_the_definition_each_time() {
+        use std::io::Read;
+        let (mut engine, shared, mut side, tx) = engine();
+        let (ccp, mut ccp_side) = loopback();
+        engine.ccp_conn = Some(ccp);
+        engine.context.def_kinds.insert(265598, ("STK".into(), "AAPL".into()));
+        let mut lookups = || {
+            ccp_side.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = ccp_side.read(&mut chunk) {
+                if n == 0 { break; }
+                out.extend_from_slice(&chunk[..n]);
+            }
+            let text = String::from_utf8_lossy(&out).replace('\x01', "|");
+            text.split("|35=c|").skip(1).map(|m| m.split("|10=").next().unwrap_or("").to_string()).collect::<Vec<String>>()
+        };
+        for (req_id, number, exchange) in [(7, 1, "NASDAQ"), (8, 2, "IEX")] {
+            tx.send(depth(req_id, 265598, exchange, "", 5, false)).unwrap();
+            engine.poll_once();
+            let asked = lookups();
+            assert_eq!(asked.len(), 1, "{asked:?}");
+            let name = format!("SecDefReqMsgReqByConid{number}");
+            assert!(asked[0].contains(&format!("320={name}|321=2|6088=Socket|146=1|6008=265598|6004={exchange}")), "{}", asked[0]);
+            assert!(sent(&mut side).is_empty(), "no book before the definition");
+            let reply = crate::protocol::fix::fix_build(&[(35, "d"), (320, &name), (55, "AAPL"), (167, "STK"), (207, "NASDAQ"),
+                (6008, "265598"), (6178, "1")], 1);
+            engine.inject_ccp_message(&reply);
+            engine.send_lot_ready();
+            engine.poll_once();
+            let book = sent(&mut side);
+            assert_eq!(book.len(), 1, "{book:?}");
+            assert!(book[0].contains(&format!("6008=265598|207={exchange}|")), "{}", book[0]);
+            assert!(lookups().is_empty(), "no second lookup");
+        }
+        assert!(engine.context.def_asked.is_empty());
+        assert!(errors(&shared).is_empty());
+
+        // Cancelled while its definition is on its way: never sent, no
+        // error.
+        tx.send(depth(9, 265598, "MEMX", "", 5, false)).unwrap();
+        engine.poll_once();
+        assert_eq!(lookups().len(), 1);
+        tx.send(ControlCommand::UnsubscribeDepth { req_id: 9 }).unwrap();
+        engine.poll_once();
+        assert!(engine.context.def_parked.is_empty() && engine.context.def_asked.is_empty());
+        let reply = crate::protocol::fix::fix_build(&[(35, "d"), (320, "SecDefReqMsgReqByConid3"), (55, "AAPL"), (167, "STK"),
+            (6008, "265598"), (6178, "1")], 1);
+        engine.inject_ccp_message(&reply);
+        engine.send_lot_ready();
+        engine.poll_once();
+        assert!(sent(&mut side).is_empty());
+        assert!(errors(&shared).is_empty());
+    }
+
+    // ibx#702 (the reference 10.51, paper 15/10/2026: +6 ms): a depth
+    // request by symbol with no exchange is refused before any lookup.
+    #[test]
+    fn a_depth_request_by_symbol_with_no_exchange_is_refused_before_its_lookup() {
+        let (mut engine, shared, _side, tx) = engine();
+        let lookup = crate::types::ContractLookup { symbol: "AAPL".into(), sec_type: "STK".into(), currency: "USD".into(), ..Default::default() };
+        tx.send(ControlCommand::ResolveContract { req_id: 7107, lookup, request: Box::new(depth(7107, 0, "", "STK", 5, false)) }).unwrap();
+        engine.poll_once();
+        assert_eq!(errors(&shared), ["7107:321:Error validating request.-'ReqMktDepth(10)' : cause - Please enter exchange."]);
+        assert!(engine.ccp.pending_resolves.is_empty(), "no lookup");
     }
 
     // #452: the reference's local refusals, in its order.
@@ -6376,11 +9676,14 @@ mod depth_tests {
         tx.send(depth(7, 9999, "NASDAQ", "STK", 5, false)).unwrap();
         tx.send(depth(8, 4391, "MEMX", "STK", 5, false)).unwrap();
         tx.send(ControlCommand::UnsubscribeDepth { req_id: 77 }).unwrap();
+        // The cancel of a request refused with 10092 answers nothing
+        // (ibx#678).
+        tx.send(ControlCommand::UnsubscribeDepth { req_id: 8 }).unwrap();
         engine.poll_once();
         assert_eq!(errors(&shared), [
-            "1:321:Error validating request.-'bR' : cause - Please enter exchange.",
-            "2:321:Error validating request.-'bR' : cause - Market depth does not support combos.",
-            "3:321:Error validating request.-'bR' : cause - Market depth rows requested must be greater than zero.",
+            "1:321:Error validating request.-'ReqMktDepth(10)' : cause - Please enter exchange.",
+            "2:321:Error validating request.-'ReqMktDepth(10)' : cause - Market depth does not support combos.",
+            "3:321:Error validating request.-'ReqMktDepth(10)' : cause - Market depth rows requested must be greater than zero.",
             "4:322:Error processing request.-'bR' : cause - Duplicate ticker id",
             "7:309:Max number (3) of market depth requests has been reached",
             "8:10092:Deep market data is not supported for this combination of security type/exchange",
@@ -6420,6 +9723,18 @@ mod depth_tests {
                 Management choose Market Data Subscription Manager and/or availability of delayed data.".to_string(),
             "10:310:Can't find the subscribed market depth with tickerId:10".to_string(),
         ]);
+    }
+
+    // ibx#678: a future given by its conId alone (no type) takes the type
+    // of its definition: its book goes to the futures farm, as the
+    // reference's (354 on paper, 13/10/2026).
+    #[test]
+    fn a_con_id_alone_takes_the_definitions_type_for_depth() {
+        let (mut engine, _shared, _side, tx) = engine();
+        engine.context.def_kinds.insert(815824267, ("FUT".into(), "MES".into()));
+        tx.send(depth(11, 815824267, "CME", "", 5, false)).unwrap();
+        engine.poll_once();
+        assert!(engine.pool.find("usfuture").is_some(), "the future's book farm");
     }
 
     // #452: SmartDepth takes the contract's valid exchanges: each is looked
@@ -6476,6 +9791,58 @@ mod depth_tests {
         engine.inject_farm_message(format!("8=O\x0135=Q\x01777,{first},0.01,0,0").as_bytes());
         let req = engine.farm.depth_reqs.iter().find(|r| r.req_id == 11).unwrap();
         assert!(req.smart && req.entries.iter().any(|e| e.server_tag == Some(777) && e.farm_req == first && e.farm == pool::PRIMARY_MD));
+    }
+
+    // ibx#734 (observed on paper, 13/10/2026: AAPL's depth on SMART, its
+    // components on IBEOS, OVERNIGHT, TPLUS0, T24X and TXSE naming a class,
+    // each asked within 1 ms of the component's answer; the others name
+    // none): a component's class with its answer, once.
+    #[test]
+    fn smart_depth_components_ask_their_class() {
+        let (mut engine, _shared, _side, tx) = engine();
+        let (ccp, mut ccp_side) = loopback();
+        engine.ccp_conn = Some(ccp);
+        let _nj = nj_farm(&mut engine);
+        let classes = |side: &mut crate::protocol::connection::MemTransport| -> Vec<String> {
+            use std::io::Read;
+            side.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = side.read(&mut chunk) {
+                if n == 0 { break; }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            String::from_utf8_lossy(&buf).split("\x0135=U\x01").skip(1).filter(|m| m.contains("6040=65\x01"))
+                .filter_map(|m| m.split('\x01').find_map(|p| p.strip_prefix("6411=")).map(String::from)).collect()
+        };
+        tx.send(depth(12, 265598, "SMART", "STK", 5, true)).unwrap();
+        engine.poll_once();
+        let lookups = ccp_lookups(&mut ccp_side);
+        assert!(["IBEOS", "TPLUS0", "NASDAQ"].iter().all(|x| lookups.iter().any(|(_, e)| e == x)), "{lookups:?}");
+        for (name, exch) in &lookups {
+            let class = match exch.as_str() {
+                "IBEOS" | "TPLUS0" => format!("\x016411={exch}/STK/NP"),
+                _ => "\x016411=".to_string(),
+            };
+            let msg = format!("8=FIX.4.1\x0135=d\x01320={name}\x01322=*\x01323=4\x0155=AAPL\x01167=STK\x01207={exch}\x016008=265598{class}\x01\
+                146=0\x016344=1\x016008=265598\x016432=1\x016430=1/STK\x016431=LMT/3\x01");
+            engine.inject_ccp_message(msg.as_bytes());
+            let asked = classes(&mut ccp_side);
+            match exch.as_str() {
+                "IBEOS" | "TPLUS0" => assert_eq!(asked, [format!("{exch}/STK/NP")]),
+                _ => assert!(asked.is_empty(), "{exch}: {asked:?}"),
+            }
+        }
+        // A second request: the classes are not asked again.
+        tx.send(depth(13, 265598, "SMART", "STK", 5, true)).unwrap();
+        engine.poll_once();
+        for (name, exch) in ccp_lookups(&mut ccp_side) {
+            let class = if exch == "IBEOS" || exch == "TPLUS0" { format!("{exch}/STK/NP") } else { String::new() };
+            let msg = format!("8=FIX.4.1\x0135=d\x01320={name}\x01322=*\x01323=4\x0155=AAPL\x01167=STK\x01207={exch}\x016008=265598\
+                \x016411={class}\x01146=0\x01");
+            engine.inject_ccp_message(msg.as_bytes());
+            assert!(classes(&mut ccp_side).is_empty(), "{exch}");
+        }
     }
 
     // #452: a cancel while the components are looked up sends nothing; a
@@ -6624,9 +9991,19 @@ mod depth_tests {
     // reference did not send it; the engine does.
     #[test]
     fn smart_depth_status_as_the_reference() {
+        smart_depth_status_of("gw1040/scenarios/20260928/depth_smart_status.jsonl");
+    }
+
+    // The same on 10.51 at level 225 (19/10/2026, regular hours, ibx#604).
+    #[test]
+    fn smart_depth_status_on_10_51() {
+        smart_depth_status_of("gw1051/scenarios/20261019rth/depth_smart_status.jsonl");
+    }
+
+    fn smart_depth_status_of(fixture: &str) {
         use base64::Engine as _;
         let b64 = |v: &serde_json::Value| base64::engine::general_purpose::STANDARD.decode(v.as_str().unwrap()).unwrap();
-        let path = format!("{}/tests/fixtures/gw1040/scenarios/20260928/depth_smart_status.jsonl", env!("CARGO_MANIFEST_DIR"));
+        let path = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(path).unwrap();
         let recs: Vec<serde_json::Value> = text.lines().skip(1).map(|l| serde_json::from_str(l).unwrap()).collect();
         let shared = Arc::new(SharedState::new());
@@ -6852,7 +10229,7 @@ mod depth_tests {
 
     // #451: a book with market makers (the Deep2 service of the routing
     // table) is written with updateMktDepthL2 and its market makers; a
-    // 35=P message gives no depth row.
+    // tick data message gives no depth row.
     #[test]
     fn market_maker_book_is_level_two() {
         let (mut engine, shared, mut side, tx) = engine();
@@ -6915,7 +10292,7 @@ mod depth_tests {
 
     /// #451: replay a recorded reference scenario through the engine: the
     /// depth requests with the entries the reference sent, the farm's
-    /// acknowledgements, refusals, 35=Y and 35=P frames as recorded (the
+    /// acknowledgements, refusals, depth and tick data messages as recorded (the
     /// farm ids mapped to the engine's), and the callbacks the engine gives,
     /// next to the callbacks the reference gave the API client.
     fn replay_depth(path: &str) -> (Vec<Callback>, Vec<Callback>) {
@@ -6923,10 +10300,14 @@ mod depth_tests {
         let b64 = |v: &serde_json::Value| base64::engine::general_purpose::STANDARD.decode(v.as_str().unwrap()).unwrap();
         let text = std::fs::read_to_string(path).unwrap();
         let recs: Vec<serde_json::Value> = text.lines().skip(1).map(|l| serde_json::from_str(l).unwrap()).collect();
+        // A recording of 10.51: its sizes come in shares, no lot applies,
+        // as the engine's depth lot in that form (ibx#604).
+        let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        let in_shares = header["gateway_version"].as_str().and_then(|v| v.parse::<i64>().ok()).is_some_and(|v| v >= 10500);
         let farm_of = |conn: &str| -> pool::FarmId { if conn == "usfarm" { pool::PRIMARY_MD } else { 1 } };
         let shared = Arc::new(SharedState::new());
         let mut engine = HotLoop::new(shared.clone(), None, None);
-        // A paper session: the user book is on (6247=demo).
+        // A paper session: the user book is on (the logon's demo value).
         engine.set_user_book(true);
         let mut lots: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
         let mut ours: Vec<Callback> = Vec::new();
@@ -6996,7 +10377,7 @@ mod depth_tests {
                     }
                     _ => None,
                 }).collect();
-                let lot = lots.get(&con_id).copied().unwrap_or(1);
+                let lot = if in_shares { 1 } else { lots.get(&con_id).copied().unwrap_or(1) };
                 engine.farm.start_depth(req_id, con_id, "STK", smart, num_rows, lot, false, specs, None, &shared);
             } else if leg == "api_out" && name == "CANCEL_MKT_DEPTH" {
                 let f = proto_fields(&b64(&r["body_b64"]));
@@ -7028,7 +10409,8 @@ mod depth_tests {
                             engine.inject_farm_message(&fix::fix_build(&[(35, "3"), (262, &id), (58, &text)], 1));
                         }
                     }
-                    "Y" | "P" => engine.inject_farm_message(&raw),
+                    // Z: the extended depth frame of 10.51's recordings (ibx#604).
+                    "Y" | "P" | "Z" => engine.inject_farm_message(&raw),
                     _ => {}
                 }
                 drain(&shared, &mut ours);
@@ -7066,6 +10448,11 @@ mod depth_tests {
         let (ours, theirs) = replay_depth(&path);
         assert_eq!(theirs.len(), 610);
         assert_same_callbacks(&ours, &theirs);
+        // Recorded again on 10.51 at level 225 (19/10/2026, ibx#604).
+        let path = format!("{}/tests/fixtures/gw1051/scenarios/20261019rth/depth_single_iex.jsonl", env!("CARGO_MANIFEST_DIR"));
+        let (ours, theirs) = replay_depth(&path);
+        assert!(theirs.len() > 500, "{}", theirs.len());
+        assert_same_callbacks(&ours, &theirs);
     }
 
     // #451: AAPL SmartDepth, 50 rows (the IEX book with the top of book of
@@ -7077,6 +10464,11 @@ mod depth_tests {
         let path = format!("{}/tests/fixtures/gw1040/scenarios/20260928/depth_smart.jsonl", env!("CARGO_MANIFEST_DIR"));
         let (ours, theirs) = replay_depth(&path);
         assert_eq!(theirs.len(), 1177);
+        assert!(theirs.iter().any(|c| c.2 == 2), "the slice has deletes");
+        assert_same_callbacks(&ours, &theirs);
+        // Recorded again on 10.51 at level 225 (19/10/2026, ibx#604).
+        let path = format!("{}/tests/fixtures/gw1051/scenarios/20261019rth/depth_smart.jsonl", env!("CARGO_MANIFEST_DIR"));
+        let (ours, theirs) = replay_depth(&path);
         assert!(theirs.iter().any(|c| c.2 == 2), "the slice has deletes");
         assert_same_callbacks(&ours, &theirs);
     }
@@ -7114,7 +10506,7 @@ mod frozen_tests {
     }
 
     /// reqMarketDataType(2), then the option of the capture.
-    fn frozen_option(engine: &mut HotLoop, tx: &Sender<ControlCommand>) -> InstrumentId {
+    fn frozen_option(engine: &mut HotLoop, tx: &ControlSender) -> InstrumentId {
         tx.send(ControlCommand::SetMarketDataType { market_data_type: 2 }).unwrap();
         tx.send(ControlCommand::Subscribe {
             con_id: OPT, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "OPT".into(),
@@ -7127,9 +10519,41 @@ mod frozen_tests {
 
     const PAIR: &str = "|6008=929914886|207=BEST|167=OPT|264=";
 
-    // ibx#447 (captured 07/10/2026, b4_447_frozen_option): in frozen mode
-    // the market data status entry goes first, without the API source, then
-    // the pair. Status 1: the frozen pair is asked with mode 2 and without
+    /// The head of a market data request as the tests read it: its type,
+    /// the action and the number of entries.
+    fn head(action: u32, entries: u32) -> String {
+        [(35, "V".to_string()), (263, action.to_string()), (146, entries.to_string())]
+            .iter().map(|(t, v)| format!("{t}={v}|")).collect()
+    }
+
+    /// A whole request: the head, then per entry its id, the contract,
+    /// its code and its other fields.
+    fn req(action: u32, entries: &[(u32, &str, &[(u32, &str)])]) -> String {
+        let mut out = head(action, entries.len() as u32);
+        for (id, code, extra) in entries {
+            out.push_str(&format!("{}={id}{PAIR}{code}|", 262));
+            for (t, v) in extra.iter() {
+                out.push_str(&format!("{t}={v}|"));
+            }
+        }
+        out
+    }
+
+    /// A farm ack frame: the head fields, the body, the signature when
+    /// given, each ended by the separator.
+    fn ack(head: &[(u32, &str)], body: &str, sig: Option<&str>) -> Vec<u8> {
+        let mut out: Vec<String> = head.iter().map(|(t, v)| format!("{t}={v}")).collect();
+        out.push(body.to_string());
+        if let Some(sig) = sig {
+            out.push(format!("8349={sig}"));
+        }
+        out.iter().map(|f| format!("{f}\x01")).collect::<String>().into_bytes()
+    }
+
+    // ibx#447 (captured 07/10/2026, b4_447_frozen_option; the order of the
+    // requests as the reference 10.51 in nine fresh sessions on 17 and
+    // 18/10/2026, ibx#749): in frozen mode the pair goes first, then the
+    // market data status entry with the API source. Status 1: the frozen pair is asked with mode 2 and without
     // the API source, on a slot of its own, and the requests are told. The
     // captured frames give the frozen quote the client got (close 5.0, bid
     // 4.75 x 597, ask 5.35 x 675) and leave the real-time slot with the
@@ -7140,27 +10564,27 @@ mod frozen_tests {
         let (mut engine, shared, mut farm_side, tx) = engine();
         let live = frozen_option(&mut engine, &tx);
         assert_eq!(sent(&mut farm_side), [
-            format!("35=V|263=1|146=1|262=1{PAIR}398|"),
-            format!("35=V|263=1|146=2|262=2{PAIR}442|6088=Socket|9830=1|262=3{PAIR}443|6088=Socket|9830=1|"),
+            req(1, &[(1, "442", &[(6088, "Socket"), (9830, "1"), (9839, "1")]), (2, "443", &[(6088, "Socket"), (9830, "1"), (9839, "1")])]),
+            req(1, &[(3, "398", &[(6088, "Socket")])]),
         ]);
 
         // Frame 183: the status ack; frame 185: status 1, before the pair's acks.
-        engine.inject_farm_message(b"8=O\x019=0046\x0135=Q\x01128617,1,0.01,0,0,c7,,0,1\x018349=928EC0B4\x01");
+        engine.inject_farm_message(&ack(&[(8, "O"), (9, "0046"), (35, "Q")], "128617,3,0.01,0,0,c7,,0,1", Some("928EC0B4")));
         assert!(shared.market.drain_tick_req_params().is_empty(), "a status ack gives no request parameters");
         engine.inject_farm_message(&status_frame(1));
         let frozen = engine.farm.frozen_slot(live).expect("a frozen slot");
         assert_ne!(frozen, live);
         assert_eq!(shared.market.drain_md_rejects(), [MdReject::Frozen { instrument: live, frozen }]);
         assert_eq!(sent(&mut farm_side), [
-            format!("35=V|263=1|146=2|262=4{PAIR}442|9887=2|9830=1|262=5{PAIR}443|9887=2|9830=1|"),
+            format!("35=V|263=1|146=2|262=4{PAIR}442|9887=2|9830=1|9839=1|262=5{PAIR}443|9887=2|9830=1|9839=1|"),
         ]);
         // The same status again changes nothing.
         engine.inject_farm_message(&status_frame(1));
         assert!(shared.market.drain_md_rejects().is_empty() && sent(&mut farm_side).is_empty());
 
         // Frames 194-197: the real-time pair's acks, its trade tag, its quote.
-        engine.inject_farm_message(b"8=O\x019=0046\x0135=Q\x01128612,2,0.01,0,3,c7,,1,1\x018349=36A7B14D\x01");
-        engine.inject_farm_message(b"8=O\x019=0046\x0135=Q\x01128612,3,0.01,0,3,c7,,1,1\x018349=3FCCD8EC\x01");
+        engine.inject_farm_message(&ack(&[(8, "O"), (9, "0046"), (35, "Q")], "128612,1,0.01,0,3,c7,,1,1", Some("36A7B14D")));
+        engine.inject_farm_message(&ack(&[(8, "O"), (9, "0046"), (35, "Q")], "128612,2,0.01,0,3,c7,,1,1", Some("3FCCD8EC")));
         engine.inject_farm_message(b"8=O\x019=0044\x0135=L\x01929914886,0.01,128613,,1\x018349=E35764CA\x01");
         engine.inject_farm_message(&hex("383d4f01393d303034320133353d500100a00001f66404e424000ce42c003c0c84008c00580001383334393d384133324244353101"));
         // Frames 209-212: the frozen pair's acks (mode 2 in the fourth field), then its quote.
@@ -7182,9 +10606,9 @@ mod frozen_tests {
         tx.send(ControlCommand::Unsubscribe { instrument: frozen }).unwrap();
         engine.poll_once();
         assert_eq!(sent(&mut farm_side), [
-            format!("35=V|263=2|146=2|262=4{PAIR}442|9887=2|9830=1|262=5{PAIR}443|9887=2|9830=1|"),
-            format!("35=V|263=2|146=2|262=2{PAIR}442|9830=1|262=3{PAIR}443|9830=1|"),
-            format!("35=V|263=2|146=1|262=1{PAIR}398|"),
+            format!("35=V|263=2|146=2|262=4{PAIR}442|9887=2|9830=1|9839=1|262=5{PAIR}443|9887=2|9830=1|9839=1|"),
+            req(2, &[(1, "442", &[(9830, "1"), (9839, "1")]), (2, "443", &[(9830, "1"), (9839, "1")])]),
+            req(2, &[(3, "398", &[])]),
         ]);
         assert!(engine.farm.status.is_empty());
         assert_eq!(engine.context.market.con_id(live), None, "the real-time slot is freed");
@@ -7201,7 +10625,7 @@ mod frozen_tests {
         let (mut engine, shared, mut farm_side, tx) = engine();
         let live = frozen_option(&mut engine, &tx);
         sent(&mut farm_side);
-        engine.inject_farm_message(b"8=O\x0135=Q\x01128617,1,0.01,0,0,c7,,0,1\x01");
+        engine.inject_farm_message(&ack(&[(8, "O"), (35, "Q")], "128617,3,0.01,0,0,c7,,0,1", None));
         engine.inject_farm_message(&status_frame(2));
         assert!(shared.market.drain_md_rejects().is_empty() && sent(&mut farm_side).is_empty());
         assert_eq!(engine.farm.frozen_slot(live), None);
@@ -7216,7 +10640,7 @@ mod frozen_tests {
         tx.send(ControlCommand::Unsubscribe { instrument: frozen }).unwrap();
         engine.poll_once();
         assert_eq!(sent(&mut farm_side), [
-            format!("35=V|263=2|146=2|262=4{PAIR}442|9887=2|9830=1|262=5{PAIR}443|9887=2|9830=1|"),
+            format!("35=V|263=2|146=2|262=4{PAIR}442|9887=2|9830=1|9839=1|262=5{PAIR}443|9887=2|9830=1|9839=1|"),
         ]);
         assert_eq!(engine.farm.status.len(), 1);
         assert_eq!(engine.context.market.con_id(live), Some(OPT));
@@ -7225,9 +10649,57 @@ mod frozen_tests {
         tx.send(ControlCommand::Unsubscribe { instrument: live }).unwrap();
         engine.poll_once();
         assert_eq!(sent(&mut farm_side), [
-            format!("35=V|263=2|146=2|262=2{PAIR}442|9830=1|262=3{PAIR}443|9830=1|"),
-            format!("35=V|263=2|146=1|262=1{PAIR}398|"),
+            req(2, &[(1, "442", &[(9830, "1"), (9839, "1")]), (2, "443", &[(9830, "1"), (9839, "1")])]),
+            req(2, &[(3, "398", &[])]),
         ]);
+    }
+
+    // ibx#749 (the reference 10.51, paper, AAPL on 17/10/2026, the market
+    // closed): a snapshot in frozen mode is asked as a stream, with the API
+    // source, then the status entry with it; its end cancels the pair and
+    // the status entry. In real-time mode it keeps the snapshot action.
+    #[test]
+    fn a_snapshot_in_frozen_mode_is_asked_as_a_stream() {
+        // A message as the tests read it: `tag=value|` per field.
+        fn msg(head: &[(u32, &str)], entries: &[(&str, &str, &[(u32, &str)])]) -> String {
+            let mut fields: Vec<(u32, &str)> = head.to_vec();
+            for &(id, code, extra) in entries {
+                fields.extend([(262, id), (6008, "265598"), (207, "BEST"), (167, "CS"), (264, code)]);
+                fields.extend_from_slice(extra);
+            }
+            fields.iter().map(|(t, v)| format!("{t}={v}|")).collect()
+        }
+        let snapshot = |tx: &ControlSender| tx.send(ControlCommand::Subscribe {
+            con_id: 265598, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "STK".into(),
+            last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
+            mode_9887: 0, snapshot: true, reply_tx: None,
+        }).unwrap();
+        let (sub, cancel) = ([(35, "V"), (263, "1")], [(35, "V"), (263, "2")]);
+        let source: &[(u32, &str)] = &[(6088, "Socket"), (9830, "1"), (9839, "1")];
+        let marks: &[(u32, &str)] = &[(9830, "1"), (9839, "1")];
+        let (mut eng, _shared, mut farm_side, tx) = engine();
+        tx.send(ControlCommand::SetMarketDataType { market_data_type: 2 }).unwrap();
+        snapshot(&tx);
+        eng.poll_once();
+        assert_eq!(sent(&mut farm_side), [
+            msg(&[sub[0], sub[1], (146, "2")], &[("1", "442", source), ("2", "443", source)]),
+            msg(&[sub[0], sub[1], (146, "1")], &[("3", "398", &[(6088, "Socket")])]),
+        ]);
+        let live = eng.context.market.instrument_by_con_id(265598).unwrap();
+        tx.send(ControlCommand::Unsubscribe { instrument: live }).unwrap();
+        eng.poll_once();
+        assert_eq!(sent(&mut farm_side), [
+            msg(&[cancel[0], cancel[1], (146, "2")], &[("1", "442", marks), ("2", "443", marks)]),
+            msg(&[cancel[0], cancel[1], (146, "1")], &[("3", "398", &[])]),
+        ]);
+
+        let (mut eng, _shared, mut farm_side, tx) = engine();
+        snapshot(&tx);
+        eng.poll_once();
+        let out = sent(&mut farm_side);
+        assert_eq!(out.len(), 1, "{out:?}");
+        let action = msg(&[(263, "3")], &[]);
+        assert!(out[0].contains(&action) && !out[0].contains("6088") && !out[0].contains("|264=398"), "{}", out[0]);
     }
 
     // ibx#447: outside frozen mode no status entry is asked (type 1, and

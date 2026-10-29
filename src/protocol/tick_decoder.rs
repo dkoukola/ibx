@@ -1,10 +1,10 @@
 //! Binary tick decoder for market data messages.
 //!
-//! Decodes bid/ask/last/size/volume fields from IB's proprietary binary format.
-//! Also includes VLQ and hi-bit string decoders for 35=E tick-by-tick data,
-//! and the RTBAR decoder for 35=G real-time bar data.
+//! Decodes bid/ask/last/size/volume fields from the server's binary format.
+//! Also includes VLQ and hi-bit string decoders for tick-by-tick messages,
+//! and the RTBAR decoder for real-time bar messages.
 
-/// MSB-first bit-level reader for 8=O 35=P binary tick data.
+/// MSB-first bit-level reader for the binary tick data of binary frames.
 pub struct BitReader<'a> {
     data: &'a [u8],
     bit_pos: usize,
@@ -86,7 +86,7 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// LSB-first bit-level reader for 35=G real-time bar data.
+/// LSB-first bit-level reader for real-time bar messages.
 /// Uses word-aligned u64 loads (1-2 ops per field instead of n iterations per bit).
 struct LsbBitReader<'a> {
     data: &'a [u8],
@@ -167,6 +167,10 @@ pub const O_VOLUME: u64 = 10;
 /// On a quote, attribute bits with the auto-execution bits; on a trade,
 /// its trading status.
 pub const O_ATTRIBUTES: u64 = 13;
+/// In a quote block: 1 while the contract is in its pre-open state, 0
+/// once it opens (the reference 10.51, paper, 14/10/2026: an AAPL call
+/// from 15:26 Paris, 0 at 15:29:56; the API's preOpen attribute; ibx#692).
+pub const O_PRE_OPEN: u64 = 11;
 pub const O_BID_EXCH: u64 = 16;
 pub const O_ASK_EXCH: u64 = 17;
 pub const O_HALTED: u64 = 18;
@@ -177,10 +181,10 @@ pub const O_TIMESTAMP_DELTA: u64 = 21;
 pub const O_OPEN_PRICE: u64 = 22;
 pub const O_LAST_EXCH: u64 = 27;
 
-/// Volume multiplier: IB encodes volume * 10000.
+/// Volume multiplier: the server encodes volume * 10000.
 pub const VOLUME_MULT: f64 = 0.0001;
 
-/// A single decoded tick from a 35=P message.
+/// A single decoded tick from a binary tick message.
 #[derive(Debug, Clone, Copy)]
 pub struct RawTick {
     pub server_tag: u32,
@@ -190,11 +194,14 @@ pub struct RawTick {
     pub stats_block: bool,
     /// The tick is the first of its block.
     pub first: bool,
+    /// Decimal places of the value (the 10.51 form's extended entries: the
+    /// volume in shares with six decimals), 0 for a whole value (ibx#663).
+    pub scale: u8,
 }
 
-/// Decode all ticks from a 35=P binary payload.
+/// Decode all ticks from a binary tick message payload.
 ///
-/// `body` is the raw message body after stripping FIX framing and HMAC signature.
+/// `body` is the raw message body after stripping the wire framing and HMAC signature.
 /// Returns a list of raw ticks with server_tag, tick_type, and signed magnitude.
 pub fn decode_ticks_35p(body: &[u8]) -> Vec<RawTick> {
     let mut ticks = Vec::with_capacity(8);
@@ -235,9 +242,8 @@ pub fn decode_ticks_35p_into(body: &[u8], ticks: &mut Vec<RawTick>) -> bool {
 
         let mut has_more = 1u64;
         // The type of the block's last entry: on a quote tag, a time base
-        // after a close is the close date, not a time (`jmdclient.bl.a(...)`
-        // types 20/21 of a quote block, `@2611-2900`; captured 05/10/2026,
-        // 7203 on delayed data).
+        // after a close is the close date, not a time (types 20/21 of a quote
+        // block; captured 05/10/2026, 7203 on delayed data).
         let mut prev_type: Option<u64> = None;
         while has_more == 1 {
             if reader.remaining() < 8 {
@@ -247,6 +253,11 @@ pub fn decode_ticks_35p_into(body: &[u8], ticks: &mut Vec<RawTick>) -> bool {
             }
             let tick_type;
             let byte_width;
+            // The extended entry's width byte: its low half is the width in
+            // bytes, its high half the decimal places of the value (the
+            // 10.51 form, ibx#663: the volume as 0x65, five bytes, six
+            // decimals; the 10.40 form wrote the width alone).
+            let mut scale = 0u8;
 
             let raw_tick_type = match reader.read_unsigned(5) {
                 Some(v) => v,
@@ -271,10 +282,12 @@ pub fn decode_ticks_35p_into(body: &[u8], ticks: &mut Vec<RawTick>) -> bool {
                     Some(v) => v,
                     None => { ticks.truncate(block_start); return true; }
                 };
-                byte_width = match reader.read_unsigned(8) {
+                let width_byte = match reader.read_unsigned(8) {
                     Some(v) => v,
                     None => { ticks.truncate(block_start); return true; }
                 };
+                byte_width = width_byte & 0x0F;
+                scale = (width_byte >> 4) as u8;
             } else {
                 tick_type = raw_tick_type;
                 byte_width = raw_width;
@@ -307,6 +320,7 @@ pub fn decode_ticks_35p_into(body: &[u8], ticks: &mut Vec<RawTick>) -> bool {
                 magnitude,
                 stats_block: stats_block || (tick_type == O_TIMESTAMP_BASE && prev_type == Some(O_CLOSE_PRICE)),
                 first: ticks.len() == block_start,
+                scale,
             });
             prev_type = Some(tick_type);
         }
@@ -392,7 +406,7 @@ pub fn read_hibit_str(data: &[u8], pos: usize) -> (String, usize) {
     (chars.into_iter().collect(), p - pos)
 }
 
-/// Decoded real-time bar from 35=G.
+/// Decoded real-time bar from a real-time bar message.
 #[derive(Debug, Clone, Copy)]
 pub struct RtBar {
     pub low: f64,
@@ -404,7 +418,7 @@ pub struct RtBar {
     pub count: u32,
 }
 
-/// Decode a 35=G real-time bar payload.
+/// Decode a real-time bar message payload.
 ///
 /// Uses LSB-first bit reader with 4-byte group byte reversal.
 pub fn decode_bar_payload(payload: &[u8], min_tick: f64) -> Option<RtBar> {
@@ -486,7 +500,8 @@ pub fn decode_bar_payload(payload: &[u8], min_tick: f64) -> Option<RtBar> {
 
 /// The bars of a 5-second bar frame body, read as the reference reads
 /// them (ibx#454): ticker id, bar time and payload of each. The body is
-/// what follows `35=G` (bit length, then the entries).
+/// what follows the message type of a real-time bar message (bit length,
+/// then the entries).
 pub fn rtbar_entries(body: &[u8]) -> Vec<(u32, u32, &[u8])> {
     let mut entries = Vec::new();
     if body.len() < 2 {
@@ -788,9 +803,9 @@ mod tests {
 
     // ibx#446, captured 28/09/2026 (fix-agent-gw.20260928-164130.jsonl,
     // 16:07:16.345): a side with no quote comes as -100 at tick 0.01, a
-    // price of -1, with size 0. The reference keeps it as it is
-    // (`jccp.f.a(jutils.a)` = raw x tick, `jclient.record.ck.a(jccp.h, ar,
-    // MarketDataType)@282-357`) and sends tickPrice -1 with size 0.
+    // price of -1, with size 0. The reference keeps it as it is (raw
+    // count times the tick) and sends
+    // tickPrice -1 with size 0.
     #[test]
     fn empty_quote_side_is_minus_one_tick_count() {
         let hex = "01480000055004e424000ce42c005800000005501600851634016c00a76aba1e3dac00d80000000550b000";
@@ -891,7 +906,7 @@ mod tests {
     // ── Helper: build bit-packed payloads for decode_ticks_35p ──────────
 
     /// Accumulates individual bits (MSB-first order) and produces the
-    /// complete 35=P body: 2-byte big-endian bit_count + payload bytes.
+    /// complete binary tick message body: 2-byte big-endian bit_count + payload bytes.
     struct PayloadBuilder {
         bits: Vec<u8>, // each element is 0 or 1
     }

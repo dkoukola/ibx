@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crossbeam_channel::{Receiver, SendError, Sender, TrySendError};
+use crate::engine::park::ControlSender;
+use crossbeam_channel::{SendError, TrySendError};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
@@ -22,7 +23,6 @@ use crate::bridge::{Event, SharedState};
 use crate::client_core::ClientCore;
 use crate::gateway::{Gateway, GatewayConfig};
 use crate::types::*;
-use super::contract::{Contract, Order};
 
 /// ibapi-compatible EClient class.
 /// Wraps the internal engine and dispatches events to an EWrapper subclass.
@@ -49,7 +49,7 @@ pub struct EClient {
     /// Set by connect(), cleared by disconnect().
     pub(crate) shared: Mutex<Option<Arc<SharedState>>>,
     /// Set by connect(), cleared by disconnect().
-    pub(crate) control_tx: Mutex<Option<Sender<ControlCommand>>>,
+    pub(crate) control_tx: Mutex<Option<ControlSender>>,
     pub(crate) _thread: Mutex<Option<thread::JoinHandle<()>>>,
     /// Set by connect(), cleared by disconnect().
     pub(crate) account_id: Mutex<Option<String>>,
@@ -68,6 +68,27 @@ pub struct EClient {
     /// Connection time of the session; set by connect(), cleared by
     /// disconnect() (ibx#426).
     pub(crate) connection_time: Mutex<Option<String>>,
+    /// Requests the client answers itself, each waiting for its turn among
+    /// the paced requests; the event loop answers them (ibx#565), at their
+    /// place among the answers (ibx#532).
+    pub(crate) local_calls: Mutex<std::collections::VecDeque<PendingCall>>,
+}
+
+/// A request the client answers itself: its turn when the requests are
+/// paced, and once the turn has come its place among the answers of the
+/// session (ibx#532).
+pub(crate) struct PendingCall {
+    ticket: Option<crossbeam_channel::Receiver<()>>,
+    at: Option<u64>,
+    call: LocalCall,
+}
+
+/// A request the client answers itself, to run when its turn has come.
+pub(crate) type LocalCall = Box<dyn for<'py> FnOnce(&EClient, Python<'py>) -> PyResult<()> + Send>;
+
+thread_local! {
+    /// The event loop is answering a request whose turn has come.
+    static ANSWERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Drop for EClient {
@@ -92,6 +113,18 @@ impl Drop for EClient {
 
 #[pymethods]
 impl EClient {
+    /// The intent to verify, as the official client's `extraAuth`: set
+    /// before the connect, the verify requests are sent (ibx#556).
+    #[getter(extraAuth)]
+    fn get_extra_auth(&self) -> bool {
+        self.core.extra_auth()
+    }
+
+    #[setter(extraAuth)]
+    fn set_extra_auth(&self, on: bool) {
+        self.core.set_extra_auth(on);
+    }
+
     #[new]
     #[pyo3(signature = (wrapper))]
     fn new(wrapper: Py<PyAny>) -> Self {
@@ -107,10 +140,11 @@ impl EClient {
             _test_control_rx: Mutex::new(None),
             core: ClientCore::new(),
             connection_time: Mutex::new(None),
+            local_calls: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
-    /// Connect to IB and start the engine.
+    /// Connect to the broker and start the engine.
     ///
     /// Live logins (``paper=False``) enter a second-factor approval window and
     /// **block** until the factor is approved (mobile push) or the server ends
@@ -125,16 +159,33 @@ impl EClient {
     /// ``code_provider``: a callable used for the typed-code variant of the
     /// second factor. When the server sends the challenge it is called once,
     /// during ``connect()``, with a dict ``{"display_id": str, "avth_url":
-    /// str}``, and must return the code as a ``str``; an exception it raises
-    /// ends the login. It runs on its own thread while the login keeps
-    /// answering the keepalives. ``None`` (default): wait for the mobile push
-    /// approval.
+    /// str, "kind": str, "message": str, "image": bytes, "delivery": str}``,
+    /// and must return the code as a ``str``; an exception it raises ends
+    /// the login. It runs on its own thread while the login keeps answering
+    /// the keepalives. ``None`` (default): wait for the mobile push approval.
+    /// An account whose second factor is a security code card (``kind``
+    /// "3", ``image`` the card indexes to look up), an authenticator app or
+    /// a passcode ("4", "4.1", "4.2", ``delivery`` how it was sent) or a
+    /// temporary code ("6") needs one (ibx#350).
     ///
     /// Multiple ``EClient`` instances can run concurrently in one process; each
     /// owns its own state, sockets, and engine thread, and ``connect()`` does
     /// not serialize across instances. If you pin engines via ``core_id``, give
     /// each a distinct value. See ibx#203 / ibx#207.
-    #[pyo3(signature = (host="cdc1.ibllc.com".to_string(), port=0, client_id=0, username="".to_string(), password="".to_string(), paper=true, core_id=None, ib_key_timeout_secs=None, ib_key_token_sub_type=None, code_provider=None))]
+    ///
+    /// An engine pinned with ``core_id`` polls without pause and keeps that
+    /// core busy; without it the engine thread rests while there is nothing
+    /// to do and is woken by the first byte received or the first request
+    /// (ibx#530).
+    ///
+    /// ``copied_waits``: copy the reference's own waits, which change
+    /// nothing the client receives nor what the server answers (the market
+    /// data messages sent in passes, the scanner parameters delay and the
+    /// gaps after it, the gaps and the contract records a stock's first
+    /// order waits for). ``False`` (default): left out, for the lowest
+    /// latency; ``True``: a session's timing comparable with the
+    /// reference's. The pacing of requests stays on either way (ibx#564).
+    #[pyo3(signature = (host="cdc1.ibllc.com".to_string(), port=0, client_id=0, username="".to_string(), password="".to_string(), paper=true, core_id=None, ib_key_timeout_secs=None, ib_key_token_sub_type=None, code_provider=None, copied_waits=false))]
     fn connect(
         &self,
         py: Python<'_>,
@@ -148,6 +199,7 @@ impl EClient {
         ib_key_timeout_secs: Option<u64>,
         ib_key_token_sub_type: Option<String>,
         code_provider: Option<Py<PyAny>>,
+        copied_waits: bool,
     ) -> PyResult<()> {
         if self.connected.load(Ordering::Relaxed) {
             return Err(PyRuntimeError::new_err("Already connected"));
@@ -181,9 +233,11 @@ impl EClient {
         let (event_tx, event_rx) = crossbeam_channel::bounded(256);
         let (mut hot_loop, control_tx) = gw.into_hot_loop_with_farms(shared.clone(), Some(event_tx), farm_conn, ccp_conn, hmds_conn, core_id);
         hot_loop.update_reconnect_auth(connect_host, connect_username, connect_password, connect_paper);
+        hot_loop.set_copied_waits(copied_waits);
 
         let handle = thread::Builder::new()
             .name("ib-engine-hotloop".into())
+            .stack_size(crate::engine::hot_loop::ENGINE_STACK)
             .spawn(move || {
                 hot_loop.run_with_panic_recovery();
             })
@@ -199,6 +253,10 @@ impl EClient {
         let _ = port; // unused but kept for ibapi signature compat
         // The clientId of this client's executions (ibx#474).
         self.core.client_id.store(client_id as i64, Ordering::Relaxed);
+        // The highest order id of this client id's earlier sessions (ibx#518).
+        if let Some(account) = self.account_id.lock().unwrap().as_deref() {
+            self.core.keep_order_ids(account);
+        }
         // The client id every new order carries (ibx#466).
         if let Some(shared) = self.shared.lock().unwrap().as_ref() {
             shared.reference.set_api_client_id(client_id as i64);
@@ -210,7 +268,9 @@ impl EClient {
         self.wrapper.call_method1(py, "managed_accounts", (self.managed_accounts_text().as_str(),))?;
         // nextValidId once the orders of the logon are known, as the
         // reference sends it (ibx#466).
-        let next_id = match self.shared.lock().unwrap().clone() {
+        // The lock is let go before the wait (see `req_completed_orders`).
+        let shared = self.shared.lock().unwrap().clone();
+        let next_id = match shared {
             Some(shared) => py.detach(|| {
                 ClientCore::wait_order_replay(&shared);
                 self.core.next_valid_id(&shared)
@@ -222,7 +282,7 @@ impl EClient {
         Ok(())
     }
 
-    /// Disconnect from IB.
+    /// Disconnect from the broker.
     fn disconnect(&self, py: Python<'_>) -> PyResult<()> {
         if let Some(shared) = self.shared.lock().unwrap().as_ref() {
             shared.portfolio.invalidate_position_snapshot();
@@ -230,6 +290,8 @@ impl EClient {
             shared.orders.set_open_orders_held(true);
             shared.orders.invalidate_execution_history();
         }
+        // Requests still waiting for their turn get no answer.
+        self.local_calls.lock().unwrap().clear();
         let tx = self.control_tx.lock().unwrap().clone();
         let handle = self._thread.lock().unwrap().take();
         // Stop the engine with the interpreter lock released: a slow engine
@@ -249,14 +311,15 @@ impl EClient {
         *self.event_rx.lock().unwrap() = None;
         *self.account_id.lock().unwrap() = None;
         *self.connection_time.lock().unwrap() = None;
+        self.core.stop_keeping_order_ids();
         self.core.reset();
         Ok(())
     }
 
-    /// API level of the session: 214, the level the reference gives a
+    /// API level of the session: 225, the level the reference gives a
     /// current client; None when not connected (ibx#426).
     fn server_version(&self) -> Option<i32> {
-        self.connection_time.lock().unwrap().as_ref().map(|_| crate::client_core::SERVER_VERSION)
+        self.connection_time.lock().unwrap().as_ref().map(|_| crate::client_core::session_level())
     }
 
     /// Time the session started, as `yyyyMMdd HH:mm:ss {zone}` in the
@@ -316,7 +379,8 @@ impl EClient {
     /// KeyboardInterrupt or SystemExit is raised (ibx#270).
     pub(crate) fn not_connected(&self, id: i64) -> Option<PyResult<()>> {
         if self.control_tx.lock().unwrap().is_some() {
-            return None;
+            // A session that takes no more requests (ibx#556).
+            return self.core.requests_ignored().then_some(Ok(()));
         }
         Some(Python::attach(|py| {
             match self.wrapper.call_method1(py, "error", (id, 504i64, "Not connected", "")) {
@@ -327,12 +391,75 @@ impl EClient {
     }
 
     /// Clone the control channel sender, or return "Not connected".
-    pub(crate) fn tx(&self) -> PyResult<Sender<ControlCommand>> {
+    pub(crate) fn tx(&self) -> PyResult<ControlSender> {
         self.control_tx.lock().unwrap().clone()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))
     }
 
     /// Clone the shared state Arc, or return "Not connected".
+    /// A request the client answers itself (ibx#561, ibx#565, ibx#532):
+    /// the call returns at once and `call` runs from the event loop, as the
+    /// reference answers from its reader thread: after the answers written
+    /// before the request's turn (its turn among the paced requests, or at
+    /// once when they are not paced). True when the answer was put off;
+    /// false when the caller answers now (the event loop answering, or not
+    /// connected).
+    pub(crate) fn later(&self, call: impl for<'py> FnOnce(&EClient, Python<'py>) -> PyResult<()> + Send + 'static) -> bool {
+        if ANSWERING.with(|a| a.get()) {
+            return false;
+        }
+        let Ok(shared) = self.shared_state() else { return false };
+        let (ticket, at) = match shared.command_clock().turn_ticket() {
+            Some(ticket) => (Some(ticket), None),
+            None => (None, Some(shared.answer_stamp())),
+        };
+        self.local_calls.lock().unwrap().push_back(PendingCall { ticket, at, call: Box::new(call) });
+        shared.notify();
+        true
+    }
+
+    /// The requests whose turn has come, in the order they were made, each
+    /// with its place among the answers. Called by the event loop before
+    /// it reads the answer clock, so that these places are below it.
+    pub(crate) fn ready_local_calls(&self, shared: &SharedState) -> std::collections::VecDeque<(u64, LocalCall)> {
+        let mut calls = self.local_calls.lock().unwrap();
+        let mut ready = std::collections::VecDeque::new();
+        while let Some(front) = calls.front_mut() {
+            if front.at.is_none() {
+                // The turn has come, or the engine stopped.
+                if front.ticket.as_ref().is_some_and(|t| matches!(t.try_recv(), Err(crossbeam_channel::TryRecvError::Empty))) {
+                    break;
+                }
+                front.at = Some(shared.answer_stamp());
+            }
+            let call = calls.pop_front().unwrap();
+            ready.push_back((call.at.unwrap_or(0), call.call));
+        }
+        ready
+    }
+
+    /// Requests a pass did not answer (an interrupt in a callback): first
+    /// again, with their places.
+    pub(crate) fn put_back_local_calls(&self, left: std::collections::VecDeque<(u64, LocalCall)>) {
+        if left.is_empty() {
+            return;
+        }
+        let mut calls = self.local_calls.lock().unwrap();
+        for (at, call) in left.into_iter().rev() {
+            calls.push_front(PendingCall { ticket: None, at: Some(at), call });
+        }
+    }
+
+    /// Answer a request whose turn has come. Called by the event loop.
+    pub(crate) fn answer_local_call(&self, py: Python<'_>, call: LocalCall) -> PyResult<()> {
+        // Its turn has come: what it sends now is not paced again.
+        let _answering = crate::engine::park::not_a_request();
+        ANSWERING.with(|a| a.set(true));
+        let done = call(self, py);
+        ANSWERING.with(|a| a.set(false));
+        done
+    }
+
     pub(crate) fn shared_state(&self) -> PyResult<Arc<SharedState>> {
         self.shared.lock().unwrap().clone()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))
@@ -351,26 +478,6 @@ impl EClient {
             None => self.account(),
         }
     }
-
-    /// Find instrument ID for a contract, registering if needed. A known
-    /// contract is a lookup; a registration waits for the engine with the
-    /// interpreter lock released (ibx#271).
-    pub(crate) fn find_or_register_instrument(&self, py: Python<'_>, contract: &Contract) -> PyResult<u32> {
-        self.find_or_register_con_id(py, contract.con_id, contract)
-    }
-
-    /// `find_or_register_instrument` under another conId: a smart combo
-    /// goes out on its currency's smart combo conId (ibx#470).
-    pub(crate) fn find_or_register_con_id(&self, py: Python<'_>, con_id: i64, contract: &Contract) -> PyResult<u32> {
-        let tx = self.tx()?;
-        if let Some(&id) = self.core.con_id_to_instrument.lock().unwrap().get(&con_id) {
-            return Ok(id);
-        }
-        py.detach(|| self.core.find_or_register_instrument(
-            &tx,
-            con_id, &contract.symbol, &contract.exchange, &contract.sec_type,
-        )).map_err(|e| PyRuntimeError::new_err(e))
-    }
 }
 
 /// A second-factor code provider calling a Python callable (ibx#208). The
@@ -383,6 +490,11 @@ fn python_code_provider(callable: Py<PyAny>) -> crate::auth::session::CodeProvid
             let info = pyo3::types::PyDict::new(py);
             info.set_item("display_id", challenge.display_id.as_str())?;
             info.set_item("avth_url", challenge.avth_url.as_str())?;
+            // The factor and its challenge (ibx#350).
+            info.set_item("kind", challenge.kind.as_str())?;
+            info.set_item("message", challenge.message.as_str())?;
+            info.set_item("image", pyo3::types::PyBytes::new(py, &challenge.image))?;
+            info.set_item("delivery", challenge.delivery.as_str())?;
             callable.call1(py, (info,))?.extract::<String>(py)
         })
         .map_err(|e: PyErr| std::io::Error::other(format!("code_provider raised: {}", e)))
@@ -394,7 +506,7 @@ fn python_code_provider(callable: Py<PyAny>) -> crate::auth::session::CodeProvid
 /// with the lock released, so a slow engine stalls only this caller, not
 /// every Python thread (ibx#271). Hold no mutex guard across this call.
 #[inline]
-pub(crate) fn send_cmd(py: Python<'_>, tx: &Sender<ControlCommand>, cmd: ControlCommand) -> PyResult<()> {
+pub(crate) fn send_cmd(py: Python<'_>, tx: &ControlSender, cmd: ControlCommand) -> PyResult<()> {
     match tx.try_send(cmd) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(cmd)) => py.detach(|| tx.send(cmd)).map_err(engine_stopped),

@@ -43,8 +43,8 @@ impl std::hash::Hasher for TagHasher {
 /// different steps (a currency pair's bid/ask book and its last price).
 /// `trade` is set for a trade stream tag. `size_tick` is the size
 /// increment of the tag times QTY_SCALE: the reference keeps it per server
-/// tag too (`jmdclient.bB` from the first acknowledgement of the tag,
-/// `jmdclient.p` from the latest trade setup; ibx#446).
+/// tag too (a value from the first acknowledgement of the tag, another
+/// from the latest trade setup; ibx#446).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TagRoute {
     pub instrument: InstrumentId,
@@ -71,6 +71,20 @@ fn scale_size(size_min_tick: Option<f64>) -> i64 {
     if scaled.is_finite() && scaled >= 1.0 { scaled as i64 } else { QTY_SCALE }
 }
 
+/// A last size of the farm as kept (ibx#613): from session level 222 with
+/// the decimals the farm gave it (the 10.51 form's extended entries), down
+/// to the quantity's steps of 0.00000001 (ibx#655); below 222 in whole units, `whole`
+/// (the value without its decimals) times `sizes`, as before. The 10.51
+/// rule, not observed yet: no fractional trade on the paper account.
+#[inline(always)]
+fn last_size_value(level: i32, tick: &RawTick, whole: i64, sizes: i64) -> Option<i64> {
+    if level < crate::client_core::LEVEL_FRACTIONAL_LAST_SIZE || tick.scale == 0 {
+        return whole.checked_mul(sizes);
+    }
+    let v = tick.magnitude as i128 * sizes as i128 / 10i128.pow(tick.scale.min(30) as u32);
+    i64::try_from(v).ok()
+}
+
 #[inline(always)]
 fn tag_key(farm: u8, server_tag: u32) -> u64 {
     ((farm as u64) << 32) | server_tag as u64
@@ -83,6 +97,64 @@ const SERVER_TAG_CAPACITY: usize = MAX_INSTRUMENTS * 4;
 /// Sentinel conId marking a freed instrument slot (ibx#233). Cannot collide
 /// with a real conId (0 occurs in practice for conId-less contracts).
 const FREE_SLOT: i64 = i64::MIN;
+
+/// How many contracts keep their last bid and ask after their last request
+/// ended (ibx#508).
+pub const KEPT_QUOTES: usize = 64;
+
+/// A contract's last bid, ask, their sizes and auto-execution flags, kept
+/// after its last market data request ended, as the reference's contract
+/// record keeps them for the session (ibx#508; the reference 10.51, paper,
+/// pre-market 13/10/2026: still given after 300 s, to another API
+/// connection too, and after the contract was only an option's
+/// underlying). Kept until another contract needs the entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeptQuote {
+    /// 0: an empty entry.
+    pub con_id: i64,
+    pub bid: Price,
+    pub bid_size: Qty,
+    pub ask: Price,
+    pub ask_size: Qty,
+    /// The last trade's exchange (`Quote::last_exch_mask`), 0 when none.
+    pub last_exch: i64,
+    /// `QuoteMarks::auto_word`.
+    pub auto: u8,
+    stamp: u64,
+}
+
+impl KeptQuote {
+    /// The kept bid and ask of values as the farm sent them, scaled as the
+    /// farm path scales them (`MarketState::apply_tick_sized`): the price
+    /// tick and size increment of the book entry, the contract's round lot.
+    pub fn from_wire(con_id: i64, wire: [Option<i64>; 4], min_tick: f64, size_tick: Option<f64>, round_lot: i64, auto_bits: Option<i64>) -> Self {
+        let price = |v: Option<i64>| v.and_then(|m| m.checked_mul(scale_tick(min_tick))).unwrap_or(0);
+        let size = |v: Option<i64>| v.and_then(|m| m.checked_mul(scale_size(size_tick) * round_lot)).unwrap_or(0);
+        let mut marks = QuoteMarks::default();
+        if let Some(bits) = auto_bits {
+            marks.set_auto_bits(bits);
+        }
+        Self::new(con_id, price(wire[0]), size(wire[2]), price(wire[1]), size(wire[3]), marks.auto_word())
+    }
+
+    pub fn new(con_id: i64, bid: Price, bid_size: Qty, ask: Price, ask_size: Qty, auto: u8) -> Self {
+        Self { con_id, bid, bid_size, ask, ask_size, last_exch: 0, auto, stamp: 0 }
+    }
+}
+
+/// How many quote tags of freed slots are remembered (ibx#694).
+const ENDED_TAGS: usize = 16;
+
+/// A quote tag of a request whose slot was freed (ibx#694): its contract
+/// and the scale of its prices and sizes.
+#[derive(Debug, Clone, Copy, Default)]
+struct EndedTag {
+    /// 0: an empty entry.
+    key: u64,
+    con_id: i64,
+    price_tick: i64,
+    sizes: i64,
+}
 
 /// Pre-allocated quote storage indexed by InstrumentId.
 /// All quotes live in a contiguous array for cache efficiency.
@@ -97,7 +169,7 @@ pub struct MarketState {
     active_count: u32,
     /// Freed slot ids available for reuse.
     free_ids: Vec<InstrumentId>,
-    /// Maps IB conId → internal InstrumentId. O(1) lookup.
+    /// Maps the broker's conId → internal InstrumentId. O(1) lookup.
     con_id_to_instrument: HashMap<i64, InstrumentId>,
     /// Reverse map: InstrumentId → conId. Flat array lookup. `FREE_SLOT`
     /// marks a reclaimed slot.
@@ -126,7 +198,7 @@ pub struct MarketState {
     round_lots: [i64; MAX_INSTRUMENTS],
     /// Per-instrument symbol name. Flat array indexed by InstrumentId.
     symbols: [Option<String>; MAX_INSTRUMENTS],
-    /// Contract currency for the orders (tag 15, ibx#466).
+    /// Contract currency for the orders (the currency field, ibx#466).
     currencies: [Option<String>; MAX_INSTRUMENTS],
     /// Per-instrument security type (API string, e.g. "STK"/"CASH"). Empty
     /// slot = unknown, treated as stock. Registration used to DROP this
@@ -137,12 +209,29 @@ pub struct MarketState {
     /// The terms of an option, written on its orders; None for any other
     /// contract.
     option_terms: [Option<Box<OptionTerms>>; MAX_INSTRUMENTS],
+    /// The last bid and ask of contracts whose requests ended (ibx#508),
+    /// given to the next request at its acknowledgement. Preallocated: the
+    /// cancel path writes it without allocating.
+    kept: [KeptQuote; KEPT_QUOTES],
+    /// Write counter of `kept`: the entry with the smallest stamp is the
+    /// oldest, overwritten when the table is full.
+    kept_clock: u64,
+    /// The quote tags of requests whose slot was freed, with what their
+    /// values need (ibx#694): the farm's data that comes for them after the
+    /// cancel goes to the contract's kept bid and ask. Preallocated, written
+    /// in turn.
+    ended_tags: [EndedTag; ENDED_TAGS],
+    ended_next: usize,
+    /// The server sends the sizes in round lots (the 10.40 form, replays of
+    /// its recordings); false: in shares, as with the entry mark ibx writes
+    /// since #648 (ibx#663).
+    lot_sizes: bool,
 }
 
 /// The terms of an option contract its orders carry, as the reference
-/// writes them after the symbol (`jclient.pe.c(StringBuffer)@1195-1235`,
-/// `@1485`): the maturity (tag 200, the definition's own 200), the right
-/// (201: 1 call, 0 put), the strike (202) and the multiplier (231).
+/// writes them after the symbol: the
+/// maturity (the definition's own), the right
+/// (1 call, 0 put), the strike and the multiplier.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OptionTerms {
     pub maturity: String,
@@ -172,10 +261,105 @@ impl MarketState {
             sec_types: std::array::from_fn(|_| None),
             exchanges: std::array::from_fn(|_| None),
             option_terms: std::array::from_fn(|_| None),
+            kept: [KeptQuote::default(); KEPT_QUOTES],
+            kept_clock: 0,
+            ended_tags: [EndedTag::default(); ENDED_TAGS],
+            ended_next: 0,
+            lot_sizes: false,
         }
     }
 
-    /// Register an IB contract, returns the assigned InstrumentId, or None
+    /// The sizes come in round lots (the 10.40 form) or in shares (ibx#663).
+    pub fn set_lot_sizes(&mut self, on: bool) {
+        self.lot_sizes = on;
+    }
+
+    /// The server's sizes come in round lots (the 10.40 form).
+    pub fn lot_sizes(&self) -> bool {
+        self.lot_sizes
+    }
+
+    /// The round lot the sizes of the server are counted in: the
+    /// instrument's in the 10.40 form, 1 when they come in shares.
+    #[inline(always)]
+    pub fn size_lot(&self, round_lot: i64) -> i64 {
+        if self.lot_sizes { round_lot.max(1) } else { 1 }
+    }
+
+    /// Keep a contract's last bid and ask (ibx#508): in its own entry, else
+    /// an empty one, else over the oldest. Nothing without a bid or an ask.
+    pub fn keep_quote(&mut self, mut k: KeptQuote) {
+        if k.con_id == 0 || (k.bid == 0 && k.ask == 0) {
+            return;
+        }
+        self.kept_clock += 1;
+        k.stamp = self.kept_clock;
+        let mut at = 0;
+        for (i, e) in self.kept.iter().enumerate() {
+            if e.con_id == k.con_id {
+                at = i;
+                break;
+            }
+            if self.kept[at].con_id != 0 && (e.con_id == 0 || e.stamp < self.kept[at].stamp) {
+                at = i;
+            }
+        }
+        self.kept[at] = k;
+    }
+
+    /// The bid and ask a contract kept, taken out of the table (ibx#508).
+    pub fn take_kept(&mut self, con_id: i64) -> Option<KeptQuote> {
+        if con_id == 0 {
+            return None;
+        }
+        let e = self.kept.iter_mut().find(|e| e.con_id == con_id)?;
+        Some(std::mem::take(e))
+    }
+
+    /// The farm's data for a quote tag of a freed slot (ibx#694): its bid,
+    /// ask and sizes go to the contract's kept quote, as the reference's
+    /// contract record takes them after the cancel (paper, 14/10/2026,
+    /// regular hours: the image that came 0.1 s after the cancel gave the
+    /// next request its sizes). False when the tag is not such a tag.
+    pub fn apply_ended_tick(&mut self, farm: u8, tick: &RawTick) -> bool {
+        let key = tag_key(farm, tick.server_tag);
+        let Some(e) = self.ended_tags.iter().find(|e| e.key == key && e.key != 0).copied() else { return false };
+        let Some(k) = self.kept.iter_mut().find(|k| k.con_id == e.con_id) else { return true };
+        let m = if tick.scale == 0 { tick.magnitude } else { tick.magnitude / 10i64.pow(tick.scale.min(18) as u32) };
+        match tick.tick_type {
+            td::O_BID_PRICE => if let Some(v) = m.checked_mul(e.price_tick) { k.bid = v },
+            td::O_ASK_PRICE => if let Some(v) = m.checked_mul(e.price_tick) { k.ask = v },
+            td::O_BID_SIZE => if let Some(v) = m.checked_mul(e.sizes) { k.bid_size = v },
+            td::O_ASK_SIZE => if let Some(v) = m.checked_mul(e.sizes) { k.ask_size = v },
+            _ => {}
+        }
+        true
+    }
+
+    /// A kept bid and ask become the quote of a new request's slot, with
+    /// their sizes seen and their auto-execution flags (ibx#508).
+    pub fn seed_kept(&mut self, id: InstrumentId, k: &KeptQuote) {
+        let i = id as usize;
+        if i >= MAX_INSTRUMENTS {
+            return;
+        }
+        let q = &mut self.quotes[i];
+        q.bid = k.bid;
+        q.bid_size = k.bid_size;
+        q.ask = k.ask;
+        q.ask_size = k.ask_size;
+        q.last_exch_mask = k.last_exch;
+        let m = &mut self.marks[i];
+        let auto = QuoteMarks::from_auto_word(k.auto);
+        if let Some(on) = auto.bid_auto() { m.set_bid_auto(on); }
+        if let Some(on) = auto.ask_auto() { m.set_ask_auto(on); }
+        // A kept -1 has no size: the farm's first size, also 0, is then
+        // given (ibx#647; the reference 10.51, 13/10/2026 pre-market).
+        if k.bid > 0 { m.set_seen(SizeKind::Bid); }
+        if k.ask > 0 { m.set_seen(SizeKind::Ask); }
+    }
+
+    /// Register a broker contract, returns the assigned InstrumentId, or None
     /// when MAX_INSTRUMENTS distinct contracts are live concurrently
     /// (ibx#233). Freed slots are reused first, so unsubscribed contracts
     /// no longer count against the cap.
@@ -229,7 +413,7 @@ impl MarketState {
         self.con_id_to_instrument.entry(con_id).or_insert(instrument);
     }
 
-    /// Register an IB contract, returns the assigned InstrumentId.
+    /// Register a broker contract, returns the assigned InstrumentId.
     /// Panics when the table is full — use `try_register` on any path that
     /// must survive that condition (the engine's handlers do; ibx#233).
     pub fn register(&mut self, con_id: i64) -> InstrumentId {
@@ -258,6 +442,23 @@ impl MarketState {
             self.con_id_to_instrument.remove(&con_id);
         }
         self.instrument_to_con_id[instrument as usize] = FREE_SLOT;
+        // Its quote tags are remembered: the farm's data that comes after
+        // the cancel still goes to the kept bid and ask (ibx#694).
+        if con_id > 0 {
+            let lot = if self.lot_sizes { self.round_lots[instrument as usize].max(1) } else { 1 };
+            for (key, r) in self.server_tags.iter().filter(|(_, r)| r.instrument == instrument) {
+                self.ended_tags[self.ended_next] = EndedTag {
+                    key: *key, con_id, price_tick: r.price_tick, sizes: r.size_tick * lot,
+                };
+                self.ended_next = (self.ended_next + 1) % ENDED_TAGS;
+            }
+        }
+        // Its last bid and ask stay for the next request (ibx#508).
+        let q = self.quotes[instrument as usize];
+        self.keep_quote(KeptQuote {
+            last_exch: q.last_exch_mask,
+            ..KeptQuote::new(con_id, q.bid, q.bid_size, q.ask, q.ask_size, self.marks[instrument as usize].auto_word())
+        });
         self.quotes[instrument as usize] = Quote::default();
         self.marks[instrument as usize] = QuoteMarks::default();
         self.symbols[instrument as usize] = None;
@@ -305,7 +506,11 @@ impl MarketState {
     pub fn register_farm_tag_sized(
         &mut self, farm: u8, server_tag: u32, instrument: InstrumentId, min_tick: f64, size_min_tick: Option<f64>,
     ) {
-        self.server_tags.entry(tag_key(farm, server_tag))
+        let key = tag_key(farm, server_tag);
+        for e in self.ended_tags.iter_mut().filter(|e| e.key == key) {
+            *e = EndedTag::default();
+        }
+        self.server_tags.entry(key)
             .and_modify(|r| r.instrument = instrument)
             .or_insert(TagRoute {
                 instrument, price_tick: scale_tick(min_tick), size_tick: scale_size(size_min_tick), trade: false,
@@ -366,6 +571,11 @@ impl MarketState {
 
     /// Look up con_id by InstrumentId. O(1) flat array lookup. None for
     /// out-of-range ids and freed slots.
+    /// The slots of a contract (ibx#613).
+    pub fn instruments_of(&self, con_id: i64) -> impl Iterator<Item = InstrumentId> + '_ {
+        (0..self.active_count).filter(move |i| self.instrument_to_con_id[*i as usize] == con_id)
+    }
+
     pub fn con_id(&self, instrument: InstrumentId) -> Option<i64> {
         if instrument < self.active_count {
             let con_id = self.instrument_to_con_id[instrument as usize];
@@ -485,6 +695,12 @@ impl MarketState {
     }
 
     /// Get symbol name for an instrument. O(1) flat array lookup.
+    /// Whether an instrument was registered with an empty symbol: a
+    /// contract an order gives by its conId alone (ibx#666).
+    pub fn blank_symbol(&self, id: InstrumentId) -> bool {
+        self.symbols.get(id as usize).and_then(|s| s.as_deref()).is_some_and(str::is_empty)
+    }
+
     pub fn symbol(&self, id: InstrumentId) -> &str {
         self.symbols[id as usize].as_deref().unwrap_or("?")
     }
@@ -559,8 +775,16 @@ impl MarketState {
         }
         let i = id as usize;
         let mts = price_tick;
-        let sizes = size_tick * self.round_lots[i];
-        let m = tick.magnitude;
+        // In shares, or in round lots in the 10.40 form (ibx#663).
+        let lot = self.round_lots[i];
+        // Saturating: a bad frame can carry any increment (robustness tests).
+        let sizes = size_tick.saturating_mul(if self.lot_sizes { lot } else { 1 });
+        // Decimal places of the value (the 10.51 form's extended entries).
+        let m = if tick.scale == 0 || tick.tick_type == td::O_VOLUME {
+            tick.magnitude
+        } else {
+            tick.magnitude / 10i64.pow(tick.scale.min(18) as u32)
+        };
         let q = &mut self.quotes[i];
         match tick.tick_type {
             td::O_BID_PRICE => set(&mut q.bid, m.checked_mul(mts)),
@@ -579,8 +803,17 @@ impl MarketState {
                 self.marks[i].set_seen(SizeKind::Ask);
             }
             td::O_LAST_SIZE => {
-                set(&mut q.last_size, m.checked_mul(sizes));
+                set(&mut q.last_size, last_size_value(crate::client_core::session_level(), tick, m, sizes));
                 self.marks[i].set_seen(SizeKind::Last);
+            }
+            // The 10.51 form gives the volume in shares with decimals; the
+            // client gets it in round lots, rounded down (the reference
+            // 10.51, paper, 13/10/2026: 64962.113269 shares of a lot of 40
+            // give 1624, eight of eight values floored).
+            td::O_VOLUME if tick.scale > 0 => {
+                let unit = 10i64.pow(tick.scale.min(18) as u32).saturating_mul(lot.max(1));
+                set(&mut q.volume, (m / unit).checked_mul(size_tick));
+                self.marks[i].set_seen(SizeKind::Volume);
             }
             td::O_VOLUME => {
                 set(&mut q.volume, m.checked_mul(size_tick));
@@ -590,6 +823,7 @@ impl MarketState {
             td::O_ASK_EXCH => q.ask_exch_mask = m,
             td::O_LAST_EXCH => q.last_exch_mask = m,
             td::O_AUTO_EXEC if !trade && !tick.stats_block => self.marks[i].set_auto_bits(m),
+            td::O_PRE_OPEN if !trade && !tick.stats_block => self.marks[i].set_pre_open(m != 0),
             td::O_ATTRIBUTES if !tick.stats_block => {
                 if trade { self.marks[i].set_halted(m) } else { self.marks[i].set_auto_bits(m) }
             }
@@ -695,6 +929,92 @@ impl MarketState {
 mod tests {
     use super::*;
     use crate::types::PRICE_SCALE;
+
+    // ibx#508: a freed slot keeps its contract's bid and ask for the next
+    // request, by conId; the table is fixed and overwrites the oldest.
+    #[test]
+    fn a_freed_slot_keeps_its_bid_and_ask() {
+        let mut m = MarketState::new();
+        let id = m.try_register(265598).unwrap();
+        let q = &mut m.quotes[id as usize];
+        q.bid = 34045 * PRICE_SCALE / 100;
+        q.ask = 34052 * PRICE_SCALE / 100;
+        q.bid_size = 320 * QTY_SCALE;
+        q.ask_size = 40 * QTY_SCALE;
+        q.last_exch_mask = 8;
+        m.marks[id as usize].set_auto_bits(12);
+        m.unregister(id);
+        assert_eq!(m.quote(id).bid, 0);
+        let k = m.take_kept(265598).unwrap();
+        assert_eq!((k.bid, k.bid_size, k.ask, k.ask_size, k.last_exch), (q_bid(), 320 * QTY_SCALE, 34052 * PRICE_SCALE / 100, 40 * QTY_SCALE, 8));
+        assert_eq!(QuoteMarks::from_auto_word(k.auto).ask_auto(), Some(true));
+        // Taken once.
+        assert!(m.take_kept(265598).is_none());
+        // A slot without a bid or an ask keeps nothing.
+        let id = m.try_register(1).unwrap();
+        m.unregister(id);
+        assert!(m.take_kept(1).is_none());
+        fn q_bid() -> i64 { 34045 * PRICE_SCALE / 100 }
+    }
+
+    // ibx#694 (the reference 10.51, paper, 14/10/2026): the farm's data for
+    // a request whose slot was freed goes to the kept bid and ask, scaled as
+    // the request's; once the tag is acknowledged again it routes as usual.
+    #[test]
+    fn data_after_the_cancel_goes_to_the_kept_quote() {
+        let mut m = MarketState::new();
+        let id = m.try_register(9599491).unwrap();
+        m.register_farm_tag(0, 4172, id, 0.01);
+        let q = &mut m.quotes[id as usize];
+        q.bid = 1195 * PRICE_SCALE / 100;
+        q.ask = 1196 * PRICE_SCALE / 100;
+        q.bid_size = 32800 * QTY_SCALE;
+        q.ask_size = 96700 * QTY_SCALE;
+        m.unregister(id);
+        let tick = |tick_type, magnitude| RawTick { server_tag: 4172, tick_type, magnitude, stats_block: false, first: false, scale: 0 };
+        assert!(m.apply_ended_tick(0, &tick(td::O_BID_SIZE, 15800)));
+        assert!(m.apply_ended_tick(0, &tick(td::O_ASK_SIZE, 96900)));
+        assert!(m.apply_ended_tick(0, &tick(td::O_BID_PRICE, 1194)));
+        assert!(!m.apply_ended_tick(1, &tick(td::O_BID_SIZE, 1)), "another farm's tag");
+        let k = m.take_kept(9599491).unwrap();
+        assert_eq!((k.bid, k.bid_size, k.ask, k.ask_size),
+            (1194 * PRICE_SCALE / 100, 15800 * QTY_SCALE, 1196 * PRICE_SCALE / 100, 96900 * QTY_SCALE));
+        let id = m.try_register(9599491).unwrap();
+        m.register_farm_tag(0, 4172, id, 0.01);
+        assert!(!m.apply_ended_tick(0, &tick(td::O_BID_SIZE, 1)), "routed again");
+    }
+
+    #[test]
+    fn the_kept_table_overwrites_the_oldest_and_seeds_a_slot() {
+        let mut m = MarketState::new();
+        for c in 1..=(KEPT_QUOTES as i64 + 1) {
+            m.keep_quote(KeptQuote::new(c, c * PRICE_SCALE, QTY_SCALE, c * PRICE_SCALE + 1, QTY_SCALE, 0));
+        }
+        // The first one was the oldest.
+        assert!(m.take_kept(1).is_none());
+        assert!(m.take_kept(2).is_some());
+        // The same conId again: its own entry, not a second one.
+        m.keep_quote(KeptQuote::new(3, 7, 1, 8, 1, 0));
+        assert_eq!(m.take_kept(3).map(|k| k.bid), Some(7));
+        assert!(m.take_kept(3).is_none());
+        // Seeded into a new slot: the quote and its sizes seen.
+        let id = m.try_register(9).unwrap();
+        m.seed_kept(id, &KeptQuote::new(9, 5, 2, 6, 3, 0));
+        assert_eq!((m.quote(id).bid, m.quote(id).ask_size), (5, 3));
+        assert!(m.marks(id).seen(SizeKind::Bid) && m.marks(id).seen(SizeKind::Ask));
+    }
+
+    // ibx#508: an option's underlying book, as the farm sent it, scaled as
+    // the farm path scales it.
+    #[test]
+    fn a_kept_quote_from_the_wire_is_scaled_as_the_farm_path() {
+        let k = KeptQuote::from_wire(265598, [Some(34188), Some(34207), Some(2), Some(1)], 0.01, Some(1.0), 40, Some(12));
+        assert_eq!((k.bid, k.ask), (34188 * scale_tick(0.01), 34207 * scale_tick(0.01)));
+        assert_eq!((k.bid_size, k.ask_size), (80 * QTY_SCALE, 40 * QTY_SCALE));
+        assert_eq!(QuoteMarks::from_auto_word(k.auto).bid_auto(), Some(true));
+        // No ask: kept as 0.
+        assert_eq!(KeptQuote::from_wire(1, [Some(1), None, None, None], 0.01, None, 1, None).ask, 0);
+    }
 
     #[test]
     fn register_returns_sequential_ids() {
@@ -1187,7 +1507,7 @@ mod tests {
     const CENT: i64 = PRICE_SCALE / 100;
 
     fn raw(tick_type: u64, magnitude: i64) -> RawTick {
-        RawTick { server_tag: 7, tick_type, magnitude, stats_block: false, first: true }
+        RawTick { server_tag: 7, tick_type, magnitude, stats_block: false, first: true, scale: 0 }
     }
 
     #[test]
@@ -1273,11 +1593,20 @@ mod tests {
     }
 
     #[test]
-    fn apply_tick_round_lot_scales_bid_ask_last_not_volume() {
+    fn apply_tick_takes_shares_and_the_round_lot_only_in_the_lot_form() {
+        // The sizes of 10.51 come in shares: as they are (ibx#663, ibx#604).
         let mut ms = MarketState::new();
         let id = ms.register(265598); // AAPL, round lot 40
         ms.set_size_min_tick(id, 1.0);
         ms.set_round_lot(id, 40);
+        for t in [raw(4, 57), raw(5, 3), raw(6, 2), raw(10, 1466)] {
+            ms.apply_tick(id, CENT, false, &t);
+        }
+        let q = ms.quote(id);
+        assert_eq!((q.bid_size, q.ask_size, q.last_size, q.volume),
+                   (57 * QTY_SCALE, 3 * QTY_SCALE, 2 * QTY_SCALE, 1466 * QTY_SCALE));
+        // The 10.40 form (its replays): bid, ask and last in round lots.
+        ms.set_lot_sizes(true);
         for t in [raw(4, 57), raw(5, 3), raw(6, 2), raw(10, 1466)] {
             ms.apply_tick(id, CENT, false, &t);
         }
@@ -1296,6 +1625,7 @@ mod tests {
         let mut ms = MarketState::new();
         let id = ms.register(265598);
         ms.set_round_lot(id, 40);
+        ms.set_lot_sizes(true); // the 10.40 form (ibx#663)
         ms.register_farm_tag_sized(0, 1101, id, 0.01, Some(0.01));
         ms.register_farm_tag_sized(0, 1101, id, 0.01, Some(1.0));
         ms.register_trade_tag_sized(0, 1098, id, 0.01, Some(0.5));
@@ -1324,6 +1654,7 @@ mod tests {
         let id = ms.register(1);
         ms.set_size_min_tick(id, 0.01);
         ms.set_round_lot(id, 100);
+        ms.set_lot_sizes(true); // the 10.40 form (ibx#663)
         ms.apply_tick(id, CENT, false, &raw(4, 5));
         ms.apply_tick(id, CENT, false, &raw(10, 250));
         assert_eq!(ms.quote(id).bid_size, 5 * QTY_SCALE); // 5 x 0.01 x 100
@@ -1334,6 +1665,34 @@ mod tests {
         assert_eq!(ms.round_lot(id), 1);
         ms.apply_tick(id, CENT, false, &raw(4, 5));
         assert_eq!(ms.quote(id).bid_size, 5 * QTY_SCALE);
+    }
+
+    // ibx#655: a size increment finer than 0.0001 (a crypto pair, 1e-8) is
+    // kept, no longer read as an invalid one (1).
+    #[test]
+    fn a_fine_size_increment_is_kept() {
+        assert_eq!(scale_size(Some(1e-8)), 1);
+        assert_eq!(scale_size(Some(1e-5)), 1_000);
+        assert_eq!(scale_size(Some(0.0)), QTY_SCALE);
+        let mut ms = MarketState::new();
+        let id = ms.register(1);
+        ms.set_size_min_tick(id, 1e-8);
+        assert_eq!(ms.size_min_tick_scaled[id as usize], 1);
+    }
+
+    #[test]
+    fn last_size_decimals_from_level_222() {
+        // ibx#613: a last size of 0.4 shares, one decimal, on an increment of
+        // 1: whole units below 222 (0), its decimals from 222.
+        let tick = RawTick { server_tag: 1, tick_type: td::O_LAST_SIZE, magnitude: 4, stats_block: false, first: true, scale: 1 };
+        assert_eq!(last_size_value(214, &tick, 0, QTY_SCALE), Some(0));
+        assert_eq!(last_size_value(222, &tick, 0, QTY_SCALE), Some(QTY_SCALE * 4 / 10));
+        // To the quantity's steps of 0.00000001 (ibx#655): 0.00123456.
+        let fine = RawTick { magnitude: 123_456, scale: 8, ..tick };
+        assert_eq!(last_size_value(222, &fine, 0, QTY_SCALE), Some(123_456));
+        // A whole value: as before.
+        let whole = RawTick { magnitude: 80, scale: 0, ..tick };
+        assert_eq!(last_size_value(222, &whole, 80, QTY_SCALE), Some(80 * QTY_SCALE));
     }
 
     #[test]

@@ -199,6 +199,7 @@ fn order_lifecycle_modify_then_fill() {
 /// What-if order: margin preview without actual execution.
 #[test]
 fn order_lifecycle_what_if_preview() {
+    ibx::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     client.seed_instrument(756733, 0);
@@ -398,7 +399,7 @@ fn market_data_tbt_trades_and_quotes() {
 
     // TBT trade
     shared.market.push_tbt_trade(TbtTrade {
-        instrument: 0, req_id: 10, tbt_type: TbtType::AllLast, price: 150 * PRICE_SCALE, size: 100,
+        instrument: 0, req_id: 10, tbt_type: TbtType::AllLast, price: 150 * PRICE_SCALE, size: 100.0,
         timestamp: 1700000001, exchange: "ARCA".into(), conditions: "".into(), past_limit: false, unreported: false,
     });
     // TBT quote
@@ -408,7 +409,7 @@ fn market_data_tbt_trades_and_quotes() {
     });
     // Second trade
     shared.market.push_tbt_trade(TbtTrade {
-        instrument: 0, req_id: 10, tbt_type: TbtType::AllLast, price: 151 * PRICE_SCALE, size: 200,
+        instrument: 0, req_id: 10, tbt_type: TbtType::AllLast, price: 151 * PRICE_SCALE, size: 200.0,
         timestamp: 1700000003, exchange: "NYSE".into(), conditions: "".into(), past_limit: false, unreported: false,
     });
 
@@ -522,18 +523,21 @@ fn account_state_via_eclient() {
 fn account_req_positions_reflects_fills() {
     let (client, _rx, shared) = test_client();
 
-    // Set position info (as engine would after fills)
+    // Set position info (as engine would after fills), with the symbols
+    // of the portfolio list: a row known by its conId alone waits a little
+    // for its contract (ibx#742).
     shared.portfolio.set_position_info(PositionInfo {
-        con_id: 756733, position_fixed: (100) as i64 * ibx::types::QTY_SCALE, avg_cost: 450 * PRICE_SCALE, ..Default::default()
+        con_id: 756733, position_fixed: (100) as i64 * ibx::types::QTY_SCALE, avg_cost: 450.0, symbol: "SPY".into(), ..Default::default()
     });
     shared.portfolio.set_position_info(PositionInfo {
-        con_id: 265598, position_fixed: (-50) as i64 * ibx::types::QTY_SCALE, avg_cost: 150 * PRICE_SCALE, ..Default::default()
+        con_id: 265598, position_fixed: (-50) as i64 * ibx::types::QTY_SCALE, avg_cost: 150.0, symbol: "AAPL".into(), ..Default::default()
     });
 
     // The rows wait for the position store, as the reference: nothing
     // before the account download is complete.
     let mut w = RecordingWrapper::default();
     client.req_positions(&mut w);
+    client.process_msgs(&mut w);
     assert!(w.events.is_empty(), "{:?}", w.events);
 
     shared.portfolio.set_account_download_complete();
@@ -906,7 +910,7 @@ fn mixed_all_data_types_single_process() {
 
     // TBT trade
     shared.market.push_tbt_trade(TbtTrade {
-        instrument: 0, req_id: 1, tbt_type: TbtType::AllLast, price: 150 * PRICE_SCALE, size: 50,
+        instrument: 0, req_id: 1, tbt_type: TbtType::AllLast, price: 150 * PRICE_SCALE, size: 50.0,
         timestamp: 0, exchange: "".into(), conditions: "".into(), past_limit: false, unreported: false,
     });
 
@@ -929,7 +933,12 @@ fn mixed_all_data_types_single_process() {
     });
 
     // Scanner params
-    shared.reference.push_scanner_params("<xml/>".into());
+    // A text the client can rebuild (one that cannot gets no answer, ibx#596).
+    shared.reference.push_scanner_params(concat!(
+        "<ScanParameterResponse><InstrumentList><Instrument><name>I</name></Instrument></InstrumentList>",
+        "<LocationTree><Location><locationCode>L</locationCode></Location></LocationTree>",
+        "<ScanTypeList><ScanType><scanCode>S0</scanCode></ScanType></ScanTypeList>",
+        "<FilterList varName=\"filterList\"/><SidecarScannerDefaults/></ScanParameterResponse>").into());
 
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
@@ -947,6 +956,9 @@ fn mixed_all_data_types_single_process() {
 //  COMPLETED ORDERS
 // ═══════════════════════════════════════════════════════════════════════
 
+// ibx#695: reqCompletedOrders asks the engine, which asks the server for
+// the day's finished orders; its rows, then the end, are given by
+// process_msgs in the order written.
 #[test]
 fn req_completed_orders_requests_fresh_history_not_local_archive() {
     let (client, rx, shared) = test_client();
@@ -957,19 +969,19 @@ fn req_completed_orders_requests_fresh_history_not_local_archive() {
         filled_qty_fixed: 50 * QTY_SCALE, timestamp_ns: 1000,
     });
     let mut w = RecordingWrapper::default();
-    client.req_completed_orders(&mut w);
+    client.req_completed_orders_range("20261003-00:00:00", "20261004-00:00:00", false, &mut w);
     assert!(w.events.is_empty());
     assert!(matches!(rx.recv().unwrap(), ControlCommand::RequestCompletedOrders { api_only: false, .. }));
     client.process_msgs(&mut w);
     assert!(w.events.is_empty(), "local archive is not a broker end");
     shared.orders.push_completed_history_reply(ibx::bridge::CompletedHistoryReply {
-        connection: "today4".into(), result: Ok(Vec::new()),
+        connection: "today4".into(), result: Ok(Vec::new()), lifecycle_reports: Vec::new(),
     });
     client.process_msgs(&mut w);
     assert_eq!(w.events, vec!["completed_orders_end"]);
     assert!(shared.orders.drain_completed_orders().is_empty(), "old local archive is retired");
     w.events.clear();
-    client.req_completed_orders(&mut w);
+    client.req_completed_orders_range("20261003-00:00:00", "20261004-00:00:00", false, &mut w);
     assert!(w.events.is_empty());
     assert!(matches!(rx.recv().unwrap(), ControlCommand::RequestCompletedOrders { .. }));
 }
@@ -981,18 +993,47 @@ fn req_completed_orders_failure_or_connection_change_never_fires_end() {
     shared.orders.complete_execution_history("today4");
     let mut w = RecordingWrapper::default();
     shared.orders.push_completed_history_reply(ibx::bridge::CompletedHistoryReply {
-        connection: "today4".into(), result: Err("timed out".into()),
+        connection: "today4".into(), result: Err("timed out".into()), lifecycle_reports: Vec::new(),
     });
     client.process_msgs(&mut w);
     assert!(!w.events.iter().any(|event| event == "completed_orders_end"));
     shared.orders.push_completed_history_reply(ibx::bridge::CompletedHistoryReply {
-        connection: "today4".into(), result: Ok(Vec::new()),
+        connection: "today4".into(), result: Ok(Vec::new()), lifecycle_reports: Vec::new(),
     });
     shared.orders.begin_execution_history("today5");
     shared.orders.complete_execution_history("today5");
     w.events.clear();
     client.process_msgs(&mut w);
     assert!(!w.events.iter().any(|event| event == "completed_orders_end"));
+}
+
+#[test]
+fn req_completed_orders_drains_and_dispatches() {
+    let (client, rx, shared) = test_client();
+    let mut w = RecordingWrapper::default();
+    client.req_completed_orders(&mut w);
+    assert!(rx.try_iter().any(|c| matches!(c, ControlCommand::CompletedOrders { api_only: false })));
+
+    let row = |id: i64, status: &str| Some(Box::new((
+        ibx::api::types::Contract { symbol: "AAPL".into(), ..Default::default() },
+        ibx::api::types::Order { perm_id: id, ..Default::default() },
+        ibx::api::types::OrderState { status: status.into(), ..Default::default() },
+    )));
+    shared.orders.push_completed_row(row(100, "Filled"));
+    shared.orders.push_completed_row(row(200, "Cancelled"));
+    shared.orders.push_completed_row(None);
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, vec!["completed_order", "completed_order", "completed_orders_end"]);
+}
+
+#[test]
+fn req_completed_orders_empty_still_fires_end() {
+    let (client, _rx, shared) = test_client();
+    let mut w = RecordingWrapper::default();
+    client.req_completed_orders(&mut w);
+    shared.orders.push_completed_row(None);
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, vec!["completed_orders_end"]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1005,7 +1046,7 @@ fn req_completed_orders_failure_or_connection_change_never_fires_end() {
 fn set_aapl_position_marked(shared: &SharedState, mark: i64) {
     shared.portfolio.set_position_info(PositionInfo {
         con_id: 265598, position_fixed: (100) as i64 * ibx::types::QTY_SCALE,
-        avg_cost: 150 * PRICE_SCALE, ..Default::default()
+        avg_cost: 150.0, ..Default::default()
     });
     shared.portfolio.set_position_marks(265598, mark * PRICE_SCALE, 0, 0, 0);
 }
@@ -1016,9 +1057,13 @@ fn pnl_subscription_fires_on_change() {
 
     client.req_pnl(10, "DU123", "");
 
-    // 100 shares, avg cost 150, mark 155, opened today: daily 500,
-    // unrealized 500, realized 0.
+    // 100 shares, avg cost 150, mark 155, opened today (its seed: flat at
+    // midnight, 15000 paid, nothing realized): daily 500, unrealized 500,
+    // realized 0.
     set_aapl_position_marked(&shared, 155);
+    shared.portfolio.set_midnight_seeds(vec![ibx::types::MidnightSeed {
+        con_id: 265598, qty_midnight_fixed: 0, money_traded: -15000.0, realized_pnl: 0.0,
+    }]);
 
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
@@ -1029,8 +1074,10 @@ fn pnl_subscription_fires_on_change() {
     client.process_msgs(&mut w);
     assert!(!w.events.iter().any(|e| e.starts_with("pnl:")), "No duplicate PnL expected");
 
-    // Changed values → fires again
+    // Changed values → fires again, at the next computation (one a
+    // second, ibx#511)
     set_aapl_position_marked(&shared, 156);
+    client.pnl_second_later_for_test();
     w.events.clear();
     client.process_msgs(&mut w);
     assert!(w.events.iter().any(|e| e == "pnl:10:600:600:0"), "Changed PnL should fire callback: {:?}", w.events);
@@ -1068,12 +1115,16 @@ fn pnl_single_dispatches_position_info() {
     shared.portfolio.set_position_info(PositionInfo {
         con_id: 265598,
         position_fixed: (100) as i64 * ibx::types::QTY_SCALE,
-        avg_cost: 150 * PRICE_SCALE,
+        avg_cost: 150.0,
         market_price: 155 * PRICE_SCALE,
         ..Default::default()
     });
 
     let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    // None with the first computation; the next, a second later, gives it
+    // (ibx#737).
+    std::thread::sleep(std::time::Duration::from_millis(1050));
     client.process_msgs(&mut w);
     assert!(w.events.iter().any(|e| e.starts_with("pnl_single:20:")), "PnL single callback expected");
     // 100 shares, avg cost 150, mark 155, opened today: daily 500, unrealized
@@ -1110,6 +1161,7 @@ fn summary_row(key: &str, value: &str, currency: &str) -> ibx::bridge::AccountRo
 /// account_summary_end, and nothing is sent between batches (no timer).
 #[test]
 fn account_summary_delivers_each_server_batch() {
+    ibx::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
 
     client.req_account_summary(5, "All", "NetLiquidation,BuyingPower,AvailableFunds");
@@ -1131,11 +1183,11 @@ fn account_summary_delivers_each_server_batch() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
 
-    // The 3 rows and the end, each frame twice as the reference gives them
-    // (ibx#486: its listener is registered twice).
+    // The 3 rows and the end, each frame once: no account updates were
+    // asked in the session (ibx#752).
     let summaries: Vec<_> = w.events.iter().filter(|e| e.starts_with("account_summary:5:")).collect();
-    assert_eq!(summaries.len(), 6, "Expected the 3 summary tags twice, got {:?}", summaries);
-    assert_eq!(w.events.iter().filter(|e| *e == "account_summary_end:5").count(), 2);
+    assert_eq!(summaries.len(), 3, "Expected the 3 summary tags once, got {:?}", summaries);
+    assert_eq!(w.events.iter().filter(|e| *e == "account_summary_end:5").count(), 1);
 
     // Verify specific tags
     assert!(summaries.iter().any(|e| e.contains(":NetLiquidation:")));
@@ -1177,7 +1229,7 @@ fn account_summary_empty_tags_refused_with_321() {
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
 
-    assert!(w.events.iter().any(|e| e == "error:7:321:Error validating request.-'b2' : cause - Tags cannot be null"), "{:?}", w.events);
+    assert!(w.events.iter().any(|e| e == "error:7:321:Error validating request.-'ReqAccountSummary(62)' : cause - Tags cannot be null"), "{:?}", w.events);
     assert!(!w.events.iter().any(|e| e.starts_with("account_summary:7:")), "{:?}", w.events);
     assert!(!w.events.iter().any(|e| e == "account_summary_end:7"), "{:?}", w.events);
 }

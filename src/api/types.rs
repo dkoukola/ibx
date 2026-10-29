@@ -9,7 +9,7 @@ pub const PRICE_SCALE_F: f64 = PRICE_SCALE as f64;
 
 /// An API price (a double) as a fixed-point price: rounded half to even at
 /// the eighth decimal, as the reference's price formatter rounds the
-/// double it writes (`jutils.dO.F`, `#0.00######`, Java's HALF_EVEN). A
+/// double it writes (`#0.00######`, Java's HALF_EVEN). A
 /// cast truncated, so 0.29 went out as 0.28999999 (ibx#263).
 #[inline]
 pub fn price_from_f64(v: f64) -> crate::types::Price {
@@ -127,6 +127,10 @@ pub struct Order {
     pub order_id: i64,
     pub action: String,
     pub total_quantity: f64,
+    /// The quantity as the caller wrote it (a Python `Decimal`'s text),
+    /// empty when given as a number: sent as given when the fixed-point
+    /// quantity cannot hold it (ibx#655).
+    pub total_quantity_text: String,
     pub order_type: String,
     pub lmt_price: f64,
     pub aux_price: f64,
@@ -200,6 +204,9 @@ pub struct Order {
     pub fa_method: String,
     pub fa_percentage: String,
     pub filled_quantity: f64,
+    /// The largest hedge a beta hedge may take (session level 223,
+    /// ibx#614); unset `i32::MAX`.
+    pub hedge_max_size: i32,
     pub hedge_param: String,
     pub hedge_type: String,
     pub ignore_open_auction: bool,
@@ -289,6 +296,7 @@ impl Default for Order {
             order_id: 0,
             action: String::new(),
             total_quantity: f64::MAX,
+            total_quantity_text: String::new(),
             order_type: String::new(),
             lmt_price: f64::MAX,
             aux_price: f64::MAX,
@@ -362,6 +370,7 @@ impl Default for Order {
             fa_method: String::new(),
             fa_percentage: String::new(),
             filled_quantity: f64::MAX,
+            hedge_max_size: i32::MAX,
             hedge_param: String::new(),
             hedge_type: String::new(),
             ignore_open_auction: false,
@@ -445,9 +454,13 @@ impl Default for Order {
     }
 }
 
+/// The max size of a selling beta hedge sent without one (ibx#614), as
+/// `ClientCore::hedge_sent` marks it for the engine's 10364.
+pub const HEDGE_MAX_SIZE_MISSING: i32 = i32::MIN;
+
 impl Order {
     /// Parse the action string to Side: the reference's names, case
-    /// ignored (`jfix.eU.a(String, boolean)`; SSHRT is its short form of
+    /// ignored (SSHRT is its short form of
     /// SSHORT). An action the reference does not know is refused by it
     /// with 321 (`ClientCore::refusal_before_sending`).
     pub fn side(&self) -> Result<Side, String> {
@@ -459,7 +472,7 @@ impl Order {
         }
     }
 
-    /// Parse the TIF string to FIX byte.
+    /// Parse the TIF string to the wire byte.
     pub fn tif_byte(&self) -> u8 {
         match self.tif.as_str() {
             "GTC" => b'1',
@@ -471,6 +484,8 @@ impl Order {
             // (ibx#467).
             "DTC" => crate::types::TIF_DTC,
             "AUC" => b'8',
+            // Its own code on the wire, as the reference (ibx#660).
+            "Minutes" => b'p',
             // The overnight values keep their own codes; both go out as
             // DAY (ibx#467).
             "OVERNIGHT" => b'j',
@@ -480,6 +495,30 @@ impl Order {
     }
 
     /// Build OrderAttrs from Order fields.
+    /// The scale fields of a scale order (ibx#751): one with an initial
+    /// level size. The profit taker's id is given by the client.
+    pub fn scale(&self) -> Option<Box<crate::types::Scale>> {
+        if self.scale_init_level_size == i32::MAX {
+            return None;
+        }
+        let int = |v: i32| (v != i32::MAX).then_some(v);
+        let price = |v: f64| (v != f64::MAX).then(|| crate::api::types::price_from_f64(v));
+        Some(Box::new(crate::types::Scale {
+            init_level_size: self.scale_init_level_size,
+            subs_level_size: int(self.scale_subs_level_size),
+            price_increment: price(self.scale_price_increment),
+            price_adjust_value: price(self.scale_price_adjust_value),
+            price_adjust_interval: int(self.scale_price_adjust_interval),
+            profit_offset: price(self.scale_profit_offset),
+            auto_reset: self.scale_auto_reset,
+            init_position: int(self.scale_init_position),
+            init_fill_qty: int(self.scale_init_fill_qty),
+            random_percent: self.scale_random_percent,
+            total_qty: (self.total_quantity * crate::types::QTY_SCALE as f64).round() as crate::types::Qty,
+            profit_child_id: None,
+        }))
+    }
+
     pub fn attrs(&self) -> OrderAttrs {
         // Parse the good-till expiry string into either a UTC instant or a
         // calendar date. An expiry that does not parse is refused with 343
@@ -497,17 +536,20 @@ impl Order {
             };
         OrderAttrs {
             order_ref: self.order_ref.clone(),
+            qty_text: self.quantity_text_to_send(),
             display_size: self.display_size.max(0) as u32,
             // Unset (`i32::MAX`) is no minimum quantity.
             min_qty: if self.min_qty == i32::MAX { 0 } else { self.min_qty.max(0) as u32 },
             hidden: self.hidden,
+            tif_preset: self.tif.is_empty() && !self.include_overnight,
+            after_lookup: Vec::new(),
+            after_lookup_refused: false,
+            zone_checks: Vec::new(),
             outside_rth: self.outside_rth,
-            // A goodAfterTime that is not a date and time is refused before
-            // sending (ibx#467), so only an instant reaches here.
-            good_after: match crate::config::parse_ib_expiry(&self.good_after_time) {
-                Ok(Some(crate::config::IbExpiry::Instant(secs))) => secs,
-                _ => 0,
-            },
+            // A goodAfterTime that is not a date and time is left out, as
+            // the reference leaves it out (ibx#594); a time alone is today's,
+            // and no zone is the machine's (ibx#598).
+            good_after: crate::config::good_after_secs(&self.good_after_time).unwrap_or(0),
             good_till,
             good_till_date_ymd,
             oca_group: self.oca_group.parse().unwrap_or(0),
@@ -519,6 +561,8 @@ impl Order {
             parent_id: self.parent_id.max(0),
             discretionary_amt: price_from_f64(self.discretionary_amt),
             sweep_to_fill: self.sweep_to_fill,
+            block_order: self.block_order,
+            imbalance_only: self.imbalance_only,
             all_or_none: self.all_or_none,
             // Valid trigger-method codes only (ibx#223): the raw `as u8`
             // cast wrapped the gateway's -1 (Unknown) to 255, and
@@ -542,8 +586,25 @@ impl Order {
             },
             customer_account: self.customer_account.clone(),
             professional_customer: self.professional_customer,
+            mifid: [self.mifid2_decision_maker.clone(), self.mifid2_decision_algo.clone(),
+                self.mifid2_execution_trader.clone(), self.mifid2_execution_algo.clone()],
+            soft_dollar_tier: (self.soft_dollar_tier_name.clone(), self.soft_dollar_tier_val.clone()),
+            fa: [self.fa_group.clone(), self.fa_method.clone(), self.fa_percentage.clone(), self.model_code.clone(), self.account.clone()],
             reference_exchange: self.reference_exchange_id.clone(),
             include_overnight: self.include_overnight,
+            duration: (self.duration != i32::MAX).then_some(self.duration),
+            // Set where the order is placed (`ClientCore::carry_kept_refusal`).
+            kept_refusal: None,
+            hedge_precaution: None,
+            // Not sent with the AccuDistr algo, as the reference (ibx#607,
+            // paper 12/10/2026: the order accepted without it).
+            post_only: self.post_only && !self.algo_strategy.eq_ignore_ascii_case("AccuDistr"),
+            allow_pre_open: self.allow_pre_open,
+            ignore_open_auction: self.ignore_open_auction,
+            deactivate: self.deactivate,
+            route_marketable_to_bbo: self.route_marketable_to_bbo,
+            seek_price_improvement: self.seek_price_improvement,
+            not_held: self.not_held,
             clearing_intent: self.clearing_intent.clone(),
             short_sale: ShortSale {
                 slot: self.short_sale_slot,
@@ -551,11 +612,50 @@ impl Order {
                 exempt_code: self.exempt_code,
             },
             use_price_mgmt_algo: self.price_mgmt_algo(),
+            attached_from_preset: (self.attached_leg(self.pt_order_id, &self.pt_order_type),
+                self.attached_leg(self.sl_order_id, &self.sl_order_type)),
+            // Its max size is set where the order is placed, which knows
+            // the parent's side (ibx#614).
+            hedge: self.hedge(),
             // Set where a new order is built (ibx#263).
             algo: None,
             // Set where a combo order is built, from its contract (ibx#470).
             combo: None,
+            scale: self.scale(),
         }
+    }
+
+    /// The hedge of a hedge order (ibx#614): its kind's number from the
+    /// API letter (exactly F, D, P, B or S), the beta or the ratio read
+    /// from its parameter. None for an order without a hedge type or with
+    /// one the reference refuses (refused before sending).
+    pub fn hedge(&self) -> Option<crate::types::Hedge> {
+        let kind = match self.hedge_type.as_str() {
+            "F" => 1, "D" => 2, "P" => 3, "B" => 4, "S" => 5,
+            _ => return None,
+        };
+        let param = || self.hedge_param.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+        Some(crate::types::Hedge {
+            kind,
+            beta: if kind == 4 { param() } else { None },
+            ratio: if kind == 3 { param() } else { None },
+            // Sent for a beta hedge whose hedge sells only: the client
+            // clears it for the others (`ClientCore::hedge_sent`).
+            max_size: (kind == 4 && !matches!(self.hedge_max_size, i32::MAX | HEDGE_MAX_SIZE_MISSING)).then_some(self.hedge_max_size),
+            max_size_missing: kind == 4 && self.hedge_max_size == HEDGE_MAX_SIZE_MISSING,
+        })
+    }
+
+    /// An attached order leg given (ibx#609): its id set (not the API's
+    /// unset value) or its type not empty, as the official client sends
+    /// them.
+    pub fn attached_leg(&self, id: i32, kind: &str) -> bool {
+        id != i32::MAX || !kind.is_empty()
+    }
+
+    /// Whether the order asks for attached orders (ibx#609).
+    pub fn has_attached_orders(&self) -> bool {
+        self.attached_leg(self.sl_order_id, &self.sl_order_type) || self.attached_leg(self.pt_order_id, &self.pt_order_type)
     }
 
     /// The usePriceMgmtAlgo value: None when unset (`i32::MAX`, the API's
@@ -565,9 +665,38 @@ impl Order {
     }
 
     /// Check if the order has any extended attributes set.
+    /// The caller's quantity text when the fixed-point quantity cannot hold
+    /// it exactly, as the official library sends every digit given
+    /// (ibx#655); empty otherwise, and for a text in exponent form.
+    pub fn quantity_text_to_send(&self) -> String {
+        let text = self.total_quantity_text.trim();
+        if text.is_empty() || text.contains(['e', 'E']) || !self.total_quantity.is_finite() || self.total_quantity == f64::MAX {
+            return String::new();
+        }
+        let normal = |t: &str| -> String {
+            let (sign, digits) = match t.strip_prefix('-') { Some(d) => ("-", d), None => ("", t.trim_start_matches('+')) };
+            let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
+            let whole = whole.trim_start_matches('0');
+            let frac = frac.trim_end_matches('0');
+            let whole = if whole.is_empty() { "0" } else { whole };
+            let body = if frac.is_empty() { whole.to_string() } else { format!("{whole}.{frac}") };
+            if body == "0" { body } else { format!("{sign}{body}") }
+        };
+        let fixed = (self.total_quantity * crate::types::QTY_SCALE as f64).round() as i64;
+        let scale = crate::types::QTY_SCALE;
+        let held = format!("{}{}.{:0width$}", if fixed < 0 { "-" } else { "" }, (fixed / scale).abs(), (fixed % scale).abs(),
+            width = crate::types::QTY_DIGITS);
+        if normal(text) == normal(&held) { String::new() } else { text.to_string() }
+    }
+
+    /// Check if the order has any extended attributes set.
     pub fn has_extended_attrs(&self) -> bool {
         // An orderRef rides the extended encoders, which send it (ibx#466).
         !self.order_ref.is_empty()
+            // A quantity the fixed point cannot hold, sent as given (ibx#655).
+            || !self.quantity_text_to_send().is_empty()
+            // A scale order (ibx#751).
+            || self.scale_init_level_size != i32::MAX
             || self.display_size > 0
             || (self.min_qty > 0 && self.min_qty != i32::MAX)
             || self.hidden
@@ -576,10 +705,23 @@ impl Order {
             || !self.good_till_date.is_empty()
             || !self.customer_account.is_empty()
             || self.professional_customer
+            // The MiFID values (ibx#500).
+            || !self.mifid2_decision_maker.is_empty() || !self.mifid2_decision_algo.is_empty()
+            || !self.mifid2_execution_trader.is_empty() || !self.mifid2_execution_algo.is_empty()
+            // The soft dollar tier (ibx#506).
+            || !self.soft_dollar_tier_name.is_empty() || !self.soft_dollar_tier_val.is_empty()
+            // The FA allocation (ibx#507).
+            || !self.fa_group.is_empty() || !self.fa_method.is_empty() || !self.fa_percentage.is_empty()
+            || !self.model_code.is_empty()
+            // The account, which an FA session sends (the same message
+            // otherwise).
+            || !self.account.is_empty()
             || !self.oca_group.is_empty()
             || self.parent_id > 0
             || self.discretionary_amt > 0.0
             || self.sweep_to_fill
+            || self.block_order
+            || self.imbalance_only
             || self.all_or_none
             || self.trigger_method > 0
             || (self.cash_qty > 0.0 && self.cash_qty != f64::MAX)
@@ -588,6 +730,18 @@ impl Order {
             || !self.conditions.is_empty()
             // includeOvernight rides the attributes (ibx#467).
             || self.include_overnight
+            // The order attributes of ibx#607.
+            || self.post_only
+            || self.allow_pre_open
+            || self.ignore_open_auction
+            || self.deactivate
+            // The attached orders of ibx#609.
+            || self.has_attached_orders()
+            // The order attributes of ibx#608.
+            || self.route_marketable_to_bbo
+            || self.seek_price_improvement
+            // Not-held (ibx#690).
+            || self.not_held
             // The clearing intent and the short-sale instructions reach the
             // side check and the short-sale fields (ibx#417).
             || !self.clearing_intent.is_empty()
@@ -596,6 +750,8 @@ impl Order {
             || self.exempt_code != -1
             // A usePriceMgmtAlgo the caller set (ibx#492).
             || self.use_price_mgmt_algo != i32::MAX
+            // A duration, sent as an order attribute (ibx#688).
+            || self.duration != i32::MAX
     }
 }
 
@@ -1158,7 +1314,7 @@ impl Default for ContractDetails {
 }
 
 /// Minimum size, size increment and suggested size increment of a row
-/// (`jextend.dL.a/b/c(dy, o)`): from the size set of the record's market
+///: from the size set of the record's market
 /// rule; for a contract with fractional sizes (a rule increment below 1,
 /// or detail 8193) the fractional increment (the rule's when below 1,
 /// else detail 8175, else 1/10000) is the minimum and the increment.
@@ -1177,7 +1333,13 @@ fn size_fields(def: &crate::control::contracts::ContractDefinition, fund: bool) 
     (min_low, min_inc, min_inc)
 }
 
-/// EV rule text of a row (`feature.evrule.h.b(h)`): `name:value`.
+/// The size increment of a definition, as its contract details give it
+/// (`f64::MAX` when its market rule has no size set) (ibx#613).
+pub(crate) fn definition_size_increment(def: &crate::control::contracts::ContractDefinition) -> f64 {
+    size_fields(def, def.api_sec_type() == "FUND").1
+}
+
+/// EV rule text of a row, as the reference writes it: `name:value`.
 fn ev_rule_text(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
@@ -1189,10 +1351,9 @@ fn ev_rule_text(raw: &str) -> String {
 }
 
 impl ContractDetails {
-    /// The API row of a definition, as the reference fills it (ibx#436,
-    /// `jextend.protobuf.outgoing.a.a(dy, o, lh.D, String, boolean)` and the
-    /// client's decoding). A bond row without the BONDAPI feature has most
-    /// bond texts empty and its short description as `desc_append`.
+    /// The API row of a definition, as the reference fills it (ibx#436). A
+    /// bond row without the BONDAPI feature has most bond texts empty and its
+    /// short description as `desc_append`.
     pub fn from_definition(def: &crate::control::contracts::ContractDefinition) -> Self {
         let bond = def.is_bond();
         let sec_type = def.api_sec_type();
@@ -1230,17 +1391,25 @@ impl ContractDetails {
         if !def.isin.is_empty() {
             sec_id_list.push(TagValue { tag: "ISIN".into(), value: def.isin.clone() });
         }
-        // The CUSIP when it is not an internal id (`jsecdef.cm.ak()`).
+        // The CUSIP when it is not an internal id, as the reference gives it.
         if !def.cusip.is_empty() && !def.cusip.starts_with("IBCID") {
             sec_id_list.push(TagValue { tag: "CUSIP".into(), value: def.cusip.clone() });
         }
         let fund = sec_type == "FUND";
-        let (min_size, size_increment, suggested_size_increment) = size_fields(def, fund);
+        let (min_size, mut size_increment, suggested_size_increment) = size_fields(def, fund);
+        // A bond row's size increment is 1, whatever its rule's increment
+        // (the reference 10.51, paper, 18/10/2026, market closed: 2,000
+        // bond rows of ten issuers, minimum sizes 1 to 1,000,000; the
+        // reference 10.40 gave the rule's, ibx#754). The rule still sizes
+        // the bond's orders.
+        if sec_type == "BOND" && size_increment != f64::MAX {
+            size_increment = 1.0;
+        }
         let mut d = Self {
             contract: c,
             market_name: shown(&def.market_name),
             min_tick: def.min_tick,
-            // Each order type without its flags (`jibtypes.i.aK()`).
+            // Each order type without its flags, as the reference gives them.
             order_types: def.order_types.iter()
                 .map(|t| t.split('/').next().unwrap_or(""))
                 .collect::<Vec<_>>()
@@ -1271,6 +1440,13 @@ impl ContractDetails {
             min_size,
             size_increment,
             suggested_size_increment,
+            // The reference 10.51 gives the minimum algo size as 0 and the
+            // last price and size precisions of the definition, at every
+            // session level from 214 to 225 (ibx#605; paper, 18/10/2026);
+            // 10.40 left all three unset.
+            min_algo_size: 0.0,
+            last_price_precision: def.last_price_precision.unwrap_or(f64::MAX),
+            last_size_precision: def.last_size_precision.unwrap_or(f64::MAX),
             ineligibility_reason_list: def.ineligibility.iter()
                 .map(|(id, description)| IneligibilityReason { id: id.clone(), description: description.clone() })
                 .collect(),
@@ -1300,7 +1476,7 @@ impl ContractDetails {
             let b = &def.bond;
             let api = def.bond_api;
             // The request symbol when it reads as a CUSIP, else the local
-            // symbol (`jextend.dK.a(dy, String)`; the CUSIP feature of the
+            // symbol (the CUSIP feature of the
             // account is not known here).
             d.cusip = if def.lookup_cusip.is_empty() { def.local_symbol.clone() } else { def.lookup_cusip.clone() };
             d.maturity = if api { expiry } else { String::new() };
@@ -1502,6 +1678,23 @@ mod tests {
             assert!(o.has_extended_attrs());
             assert_eq!(o.attrs().use_price_mgmt_algo, want);
         }
+    }
+
+    // ibx#655: the caller's quantity text rides with the order only when the
+    // fixed point cannot hold it; trailing zeros alone do not need it.
+    #[test]
+    fn a_quantity_text_is_sent_only_when_the_fixed_point_cannot_hold_it() {
+        let o = |q: f64, t: &str| Order { total_quantity: q, total_quantity_text: t.into(), ..Default::default() };
+        assert_eq!(o(100.0, "100").quantity_text_to_send(), "");
+        assert_eq!(o(100.0, "100.00").quantity_text_to_send(), "");
+        assert_eq!(o(0.00000001, "0.00000001").quantity_text_to_send(), "");
+        assert_eq!(o(12.345678901234567, "12.345678901234567890").quantity_text_to_send(), "12.345678901234567890");
+        assert_eq!(o(0.000000001, "0.000000001").quantity_text_to_send(), "0.000000001");
+        assert_eq!(o(100.0, "1E+2").quantity_text_to_send(), "");
+        assert_eq!(o(100.0, "").quantity_text_to_send(), "");
+        assert!(o(12.345678901234567, "12.345678901234567890").has_extended_attrs());
+        assert!(!o(100.0, "100.0").has_extended_attrs());
+        assert_eq!(o(12.345678901234567, "12.345678901234567890").attrs().qty_text, "12.345678901234567890");
     }
 
     #[test]
@@ -1721,6 +1914,31 @@ mod tests {
         def.size_increments.clear();
         assert_eq!(ContractDetails::from_definition(&def).min_size, f64::MAX);
         assert_eq!(ContractDetails::default().min_algo_size, f64::MAX);
+
+        // ibx#754 (the reference 10.51, paper, 18/10/2026): a bond row's
+        // size increment is 1 (the JPY bond 253849463: minimum 100000,
+        // suggested 10000); its orders keep the rule's step.
+        let bond = ContractDefinition { wire_sec_type: "BOND".into(), size_increments: set(&[(100000.0, 10000.0)]), ..Default::default() };
+        let d = ContractDetails::from_definition(&bond);
+        assert_eq!((d.min_size, d.size_increment, d.suggested_size_increment), (100000.0, 1.0, 10000.0));
+        assert_eq!(definition_size_increment(&bond), 10000.0);
+    }
+
+    // ibx#605 (the reference 10.51, paper, 18/10/2026, levels 214 to 225):
+    // a row's minimum algo size is 0, its last price and size precisions
+    // those of the record (BRK A, AAPL: 0.000001), unset without them (a
+    // future).
+    #[test]
+    fn min_algo_size_and_precisions_of_a_row() {
+        let fields: [(u32, &str); 12] = [(35, "d"), (320, "1"), (55, "BRK A"), (167, "STK"), (207, "BEST"), (6008, "5222"),
+            (15, "USD"), (146, "0"), (6344, "1"), (6008, "5222"), (8598, "0.000001"), (8599, "0.000001")];
+        let msg = crate::protocol::fix::fix_build(&fields, 1);
+        let def = crate::control::contracts::parse_secdef_response(&msg).unwrap();
+        let d = ContractDetails::from_definition(&def);
+        assert_eq!((d.min_algo_size, d.last_price_precision, d.last_size_precision), (0.0, 0.000001, 0.000001));
+        let fut = crate::control::contracts::ContractDefinition { wire_sec_type: "FUT".into(), ..Default::default() };
+        let d = ContractDetails::from_definition(&fut);
+        assert_eq!((d.min_algo_size, d.last_price_precision, d.last_size_precision), (0.0, f64::MAX, f64::MAX));
     }
 
     // Order types without their flags, the multiplier as received, the

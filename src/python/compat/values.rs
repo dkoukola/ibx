@@ -10,14 +10,33 @@ pub const UNSET_DECIMAL_TEXT: &str = "170141183460469231731687303715884105727";
 /// The unset Decimal as a double (2**127), what `float(UNSET_DECIMAL)` gives.
 const UNSET_DECIMAL_F64: f64 = 170141183460469231731687303715884105727.0;
 
-fn decimal_class(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-    py.import("decimal")?.getattr("Decimal")
+/// `decimal.Decimal`, looked up once.
+static DECIMAL: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+
+fn decimal_class(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    Ok(DECIMAL.get_or_try_init(py, || py.import("decimal")?.getattr("Decimal").map(Bound::unbind))?.bind(py))
 }
 
 /// A quantity (the official API's Decimal) as a `decimal.Decimal`: ibx's
-/// unset quantity (`f64::MAX`) is the API's unset Decimal.
+/// unset quantity (`f64::MAX`) is the API's unset Decimal. A whole number
+/// has no decimal point ("100", as the server writes it).
 pub fn decimal_to_py(py: Python<'_>, v: f64) -> PyResult<Py<PyAny>> {
     let text = if v == f64::MAX { UNSET_DECIMAL_TEXT.to_string() } else { format!("{}", v) };
+    Ok(decimal_class(py)?.call1((text,))?.unbind())
+}
+
+/// A quantity kept in fixed point (`QTY_SCALE`) as a `decimal.Decimal`,
+/// exactly: "100", "0.5", "-2.0001", "0.00000001".
+pub fn decimal_fixed_to_py(py: Python<'_>, v: i64) -> PyResult<Py<PyAny>> {
+    let scale = crate::types::QTY_SCALE as i64;
+    let (whole, part) = (v / scale, (v % scale).unsigned_abs());
+    let sign = if v < 0 && whole == 0 { "-" } else { "" };
+    let text = if part == 0 {
+        format!("{whole}")
+    } else {
+        let digits = format!("{part:0width$}", width = crate::types::QTY_DIGITS);
+        format!("{sign}{whole}.{}", digits.trim_end_matches('0'))
+    };
     Ok(decimal_class(py)?.call1((text,))?.unbind())
 }
 
@@ -30,6 +49,28 @@ pub fn decimal_from_py(v: &Bound<'_, PyAny>) -> PyResult<f64> {
         Err(_) => v.extract()?,
     };
     Ok(if f == UNSET_DECIMAL_F64 { f64::MAX } else { f })
+}
+
+/// A quantity from Python and its text as given: the text of a Decimal or
+/// a str (every digit, trailing zeros included), or of an int; empty for a
+/// float and for the API's unset Decimal (ibx#655).
+pub fn decimal_and_text_from_py(v: &Bound<'_, PyAny>) -> PyResult<(f64, String)> {
+    let value = decimal_from_py(v)?;
+    if value == f64::MAX || v.extract::<f64>().is_ok() && !v.is_instance_of::<pyo3::types::PyInt>() && v.cast::<PyString>().is_err()
+        && v.get_type().name()? != "Decimal"
+    {
+        return Ok((value, String::new()));
+    }
+    Ok((value, v.str()?.to_string().trim().to_string()))
+}
+
+/// A quantity as the caller gave it: its text when it has one (a Decimal
+/// built from it, every digit and trailing zero kept), else the value.
+pub fn decimal_or_text_to_py(py: Python<'_>, v: f64, text: &str) -> PyResult<Py<PyAny>> {
+    if text.is_empty() || v == f64::MAX {
+        return decimal_to_py(py, v);
+    }
+    Ok(decimal_class(py)?.call1((text,))?.unbind())
 }
 
 /// A quantity carried as text as a `decimal.Decimal`: empty is the API's
@@ -104,3 +145,32 @@ macro_rules! official_names {
     };
 }
 pub(crate) use official_names;
+
+/// The official library's text of a float (`floatMaxString`): at most 8
+/// decimals with the trailing zeros cut, empty when unset (ibx#654).
+pub fn float_max_string(v: f64) -> String {
+    if v == f64::MAX {
+        return String::new();
+    }
+    let s = format!("{v:.8}");
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.') } else { s.as_str() };
+    s.to_string()
+}
+
+/// The official library's text of a Decimal (`decimalMaxString`), empty
+/// when unset (ibx#654).
+pub fn decimal_max_string(v: f64) -> String {
+    if v == f64::MAX { String::new() } else { format!("{v}") }
+}
+
+/// The official library's text of an int (`intMaxString`), empty when
+/// unset (ibx#654).
+pub fn int_max_string(v: i64) -> String {
+    if v == i32::MAX as i64 { String::new() } else { v.to_string() }
+}
+
+/// The official library's text of a long (`longMaxString`), empty when
+/// unset (ibx#654).
+pub fn long_max_string(v: i64) -> String {
+    if v == i64::MAX { String::new() } else { v.to_string() }
+}

@@ -1,19 +1,20 @@
 //! Pure broker-report projection. Accounting and publication stay with the caller.
-use super::ccp::perm_id_from_clord_id;
+use super::ccp::{hedge_letter, hedge_param_text, perm_id_from_clord_id, report_order_type};
 use super::{decode_tif, parse_qty};
 use crate::api::types as api;
 use crate::bridge::{ComboView, RichOrderInfo};
 use crate::engine::context::TrailLimitReported;
 use crate::types::{Order, OrderStatus, PRICE_SCALE, Side};
+#[cfg(test)]
 use std::collections::HashMap;
 
-pub(super) fn report_revision(fields: &HashMap<u32, String>) -> Option<u32> {
+pub(super) fn report_revision(fields: &crate::protocol::fix::FieldMap<'_>) -> Option<u32> {
     let clord = fields.get(&11)?;
     clord.split_once('.').map_or(Some(0), |(_, version)| version.parse().ok())
 }
 
-pub(super) fn report_time(fields: &HashMap<u32, String>) -> Option<&str> {
-    fields.get(&6699).or_else(|| fields.get(&60)).or_else(|| fields.get(&52)).map(String::as_str)
+pub(super) fn report_time<'a>(fields: &crate::protocol::fix::FieldMap<'a>) -> Option<&'a str> {
+    fields.get(&6699).or_else(|| fields.get(&60)).or_else(|| fields.get(&52)).copied()
 }
 
 /// Native dR checks event time before ClOrd revision; only a cancellation may
@@ -39,7 +40,7 @@ pub(super) struct ReportProjection<'a> {
     pub combo_leg_prices: Vec<f64>,
 }
 pub(super) fn project_report(
-    parsed: &HashMap<u32, String>,
+    parsed: &crate::protocol::fix::FieldMap<'_>,
     input: ReportProjection<'_>,
 ) -> RichOrderInfo {
     let ReportProjection {
@@ -58,33 +59,36 @@ pub(super) fn project_report(
         .get(&12)
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
-    let exec_id = parsed.get(&17).map(String::as_str).unwrap_or("");
+    let exec_id = parsed.get(&17).copied().unwrap_or("");
     let last_px = parsed
         .get(&31)
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
     let last_shares = parsed.get(&32).and_then(|s| parse_qty(s)).unwrap_or(0);
-    let account = parsed.get(&1).cloned().unwrap_or_default();
-    let symbol = parsed.get(&55).cloned().unwrap_or_default();
-    let exchange = parsed.get(&207).cloned().unwrap_or_default();
-    let sec_type = parsed.get(&167).cloned().unwrap_or_default();
-    let currency = parsed.get(&15).cloned().unwrap_or_default();
+    let account = parsed.get(&1).map(|v| (*v).to_owned()).unwrap_or_default();
+    let symbol = parsed.get(&55).map(|v| (*v).to_owned()).unwrap_or_default();
+    // The order's routing destination, not the venue where it rests.
+    let exchange = parsed.get(&6004).filter(|value| !value.is_empty())
+        .map(|value| crate::control::contracts::exchange_from_fix(value).to_string())
+        .or_else(|| parsed.get(&207).map(|value| (*value).to_owned()))
+        .unwrap_or_default();
+    let sec_type = parsed.get(&167).map(|v| (*v).to_owned()).unwrap_or_default();
+    let currency = parsed.get(&15).map(|v| (*v).to_owned()).unwrap_or_default();
     let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let local_symbol = parsed.get(&6035).cloned().unwrap_or_default();
-    let _routing_exchange = parsed.get(&6004).cloned().unwrap_or_default();
+    let local_symbol = parsed.get(&6035).map(|v| (*v).to_owned()).unwrap_or_default();
     let perm_id: i64 = parsed
         .get(&11)
         .map(|s| perm_id_from_clord_id(s))
         .unwrap_or(0);
     let total_qty: f64 = parsed.get(&38).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let ord_type_tag = parsed.get(&40).map(|s| s.as_str()).unwrap_or("");
+    let ord_type_tag = parsed.get(&40).copied().unwrap_or("");
     let limit_price: f64 = parsed.get(&44).and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let stop_px: f64 = parsed.get(&99).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let outside_rth = parsed.get(&6433).map(|s| s == "1").unwrap_or(false);
-    let clearing_intent = parsed.get(&6419).cloned().unwrap_or_default();
-    let auto_cancel_date = parsed.get(&6596).cloned().unwrap_or_default();
-    let exec_exchange = parsed.get(&30).cloned().unwrap_or_default();
-    let transact_time = parsed.get(&60).cloned().unwrap_or_default();
+    let outside_rth = parsed.get(&6433).map(|s| *s == "1").unwrap_or(false);
+    let clearing_intent = parsed.get(&6419).map(|v| (*v).to_owned()).unwrap_or_default();
+    let auto_cancel_date = parsed.get(&6596).map(|v| (*v).to_owned()).unwrap_or_default();
+    let exec_exchange = parsed.get(&30).map(|v| (*v).to_owned()).unwrap_or_default();
+    let transact_time = parsed.get(&60).map(|v| (*v).to_owned()).unwrap_or_default();
     let avg_px: f64 = parsed.get(&6).and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let cum_qty: f64 = parsed.get(&14).and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let last_liq: i32 = parsed.get(&851).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -105,29 +109,13 @@ pub(super) fn project_report(
         _ => &sec_type,
     };
 
-    let order_type_str = match ord_type_tag {
-        "1" => "MKT",
-        "2" => "LMT",
-        "3" => "STP",
-        "4" => "STP LMT",
-        "P" => "TRAIL",
-        "5" => "MOC",
-        "B" => "LOC",
-        "J" => "MIT",
-        "K" => "MTL",
-        "R" => "REL",
-        "TMIT" => "TRAIL MIT",
-        "TLIT" => "TRAIL LIT",
-        "E2M" => "PEG BEST",
-        "PSVR" => "PASSV REL",
-        _ => ord_type_tag,
-    };
+    let order_type_str = report_order_type(ord_type_tag, parsed.get(&18).copied().unwrap_or(""));
 
     // As the reference: an unknown code is kept ("???"), not read
     // as DAY; each report sets the order's time in force (ibx#307).
     let tif_str = decode_tif(super::report_tif(parsed));
 
-    let action = match parsed.get(&54).map(|s| s.as_str()) {
+    let action = match parsed.get(&54).copied() {
         Some("1") => "BUY",
         Some("2") => "SELL",
         Some("5") => "SSHORT",
@@ -217,17 +205,17 @@ pub(super) fn project_report(
     };
 
     // Derive 3 order-dependent fields from FIX tags
-    let oca_type: i32 = match parsed.get(&6209).map(|s| s.as_str()) {
+    let oca_type: i32 = match parsed.get(&6209).copied() {
         Some("CancelOnFillWBlock") => 1,
         Some("ReduceOnFillWBlock") => 2,
         Some("ReduceOnFillNonBlock") => 3,
         Some("ReduceOnFillWBlockFromTotal") => 4,
         _ => 3, // default
     };
-    let algo_strategy = parsed.get(&847).cloned().unwrap_or_default();
+    let algo_strategy = parsed.get(&847).map(|v| (*v).to_owned()).unwrap_or_default();
     // The price management flag the server echoes, 0 without it
     // (ibx#492).
-    let use_price_mgmt_algo: i32 = i32::from(parsed.get(&8339).is_some_and(|v| v == "1"));
+    let use_price_mgmt_algo: i32 = i32::from(parsed.get(&8339).is_some_and(|v| *v == "1"));
     let trail_stop_price: f64 = parsed
         .get(&6117)
         .and_then(|s| s.parse().ok())
@@ -263,7 +251,7 @@ pub(super) fn project_report(
         aux_price: stop_px,
         tif: tif_str.to_string(),
         good_till_date: parsed.get(&126).map(|time| format!("{} UTC", time.replace('-', " ")))
-            .or_else(|| parsed.get(&432).cloned()).unwrap_or_default(),
+            .or_else(|| parsed.get(&432).map(|v| (*v).to_owned())).unwrap_or_default(),
         account: if account.is_empty() {
             account_id.to_string()
         } else {
@@ -277,13 +265,13 @@ pub(super) fn project_report(
         clearing_intent,
         auto_cancel_date,
         submitter: account_id.to_string(),
-        oca_group: parsed.get(&583).cloned().unwrap_or_default(),
+        oca_group: parsed.get(&583).map(|v| (*v).to_owned()).unwrap_or_default(),
         oca_type,
         use_price_mgmt_algo,
         trail_stop_price,
         algo_strategy,
         // The orderRef the server echoes (ibx#466).
-        order_ref: parsed.get(&6010).cloned().unwrap_or_default(),
+        order_ref: parsed.get(&6010).map(|v| (*v).to_owned()).unwrap_or_default(),
         // The cash quantity the server echoes in 152, which the
         // reference reads into the order's cash quantity
         // (`jexec.fq.<init>(dk, boolean)@2005-2120`, ibx#263).
@@ -293,6 +281,13 @@ pub(super) fn project_report(
         // A combo's per-leg prices as reported (ibx#470).
         order_combo_legs: combo_leg_prices,
         client_id: parsed.get(&6119).and_then(|s| s.parse().ok()).unwrap_or(0),
+        min_compete_size: if parsed.get(&6205).copied() == Some("1") { i32::MAX } else { 100 },
+        compete_against_best_offset: if parsed.get(&6205).copied() == Some("1") { f64::MAX } else { 0.02 },
+        scale_auto_reset: parsed.get(&6461).copied() == Some("1"),
+        hedge_type: hedge_letter(parsed.get(&6665).copied().unwrap_or("")).to_string(),
+        hedge_param: parsed.get(&6703).or_else(|| parsed.get(&6666))
+            .and_then(|value| value.parse::<f64>().ok()).map(hedge_param_text).unwrap_or_default(),
+        hedge_max_size: parsed.get(&6690).and_then(|value| value.parse().ok()).unwrap_or(i32::MAX),
         ..Default::default()
     };
 
@@ -305,7 +300,7 @@ pub(super) fn project_report(
         // The effective event time can differ from the report's SendingTime.
         // Native eO.a(fb) selects 6699, then TransactTime, then SendingTime.
         parsed.get(&6699).or_else(|| parsed.get(&60)).or_else(|| parsed.get(&52))
-            .cloned().unwrap_or_default()
+            .map(|v| (*v).to_owned()).unwrap_or_default()
     } else {
         String::new()
     };
@@ -314,7 +309,7 @@ pub(super) fn project_report(
         crate::types::OrderStatus::Cancelled => "Cancelled".to_string(),
         crate::types::OrderStatus::Rejected => parsed
             .get(&58)
-            .cloned()
+            .map(|v| (*v).to_owned())
             .unwrap_or_else(|| "Rejected".to_string()),
         _ => String::new(),
     };
@@ -356,7 +351,7 @@ pub(super) fn project_report(
         order_state,
         last_exec,
         parent_id_known: parsed.contains_key(&6107)
-            || parsed.get(&20).is_some_and(|value| value == "3"),
+            || parsed.get(&20).is_some_and(|value| *value == "3"),
         report_revision: report_revision(parsed),
         report_time: report_time(parsed).map(str::to_owned),
     }
@@ -421,7 +416,7 @@ mod tests {
         .map(|(tag, value)| (tag, value.to_string()))
         .collect();
         let original = report.clone();
-        let projected = project_report(&report, input());
+        let projected = project_report(&crate::protocol::fix::field_view(&report), input());
         assert_eq!(report, original);
         assert_eq!(projected.contract.con_id, 123);
         assert_eq!(projected.contract.symbol, "TEST");
@@ -457,8 +452,34 @@ mod tests {
         assert_eq!(projected.last_exec.last_liquidity, 2);
         assert_eq!(
             format!("{projected:?}"),
-            format!("{:?}", project_report(&report, input()))
+            format!("{:?}", project_report(&crate::protocol::fix::field_view(&report), input()))
         );
+    }
+
+    #[test]
+    fn projection_keeps_upstream_route_hedge_and_order_type_fields() {
+        let mut fields = crate::protocol::fix::FieldMap::from([
+            (6004, "BEST"), (207, "ARCA"), (40, "P"), (18, "M"),
+            (6665, "2"), (6666, "0.5"), (6703, "2"), (6690, "5"),
+            (6461, "1"),
+        ]);
+        let projected = project_report(&fields, input());
+        assert_eq!(projected.contract.exchange, "SMART");
+        assert_eq!(projected.order.order_type, "PEG MID");
+        assert_eq!(projected.order.hedge_type, "D");
+        assert_eq!(projected.order.hedge_param, "2.0");
+        assert_eq!(projected.order.hedge_max_size, 5);
+        assert!(projected.order.scale_auto_reset);
+        assert_eq!(projected.order.min_compete_size, 100);
+        assert_eq!(projected.order.compete_against_best_offset, 0.02);
+        fields.insert(6205, "1");
+        fields.insert(40, "TSL");
+        fields.remove(&6703);
+        let projected = project_report(&fields, input());
+        assert_eq!(projected.order.order_type, "TRAIL LIMIT");
+        assert_eq!(projected.order.hedge_param, "0.5");
+        assert_eq!(projected.order.min_compete_size, i32::MAX);
+        assert_eq!(projected.order.compete_against_best_offset, f64::MAX);
     }
 
     #[test]
@@ -469,17 +490,17 @@ mod tests {
             (6699, "20260102-12:02:52"),
         ].into_iter().map(|(tag, value)| (tag, value.to_string())).collect();
         for status in [OrderStatus::Filled, OrderStatus::Cancelled, OrderStatus::Rejected] {
-            assert_eq!(project_report(&report, ReportProjection { status, ..input() })
+            assert_eq!(project_report(&crate::protocol::fix::field_view(&report), ReportProjection { status, ..input() })
                 .order_state.completed_time, "20260102-12:02:52");
         }
-        assert_eq!(project_report(&report, ReportProjection { status: OrderStatus::Submitted, ..input() })
+        assert_eq!(project_report(&crate::protocol::fix::field_view(&report), ReportProjection { status: OrderStatus::Submitted, ..input() })
             .order_state.completed_time, "");
         report.remove(&6699);
-        assert_eq!(project_report(&report, input()).order_state.completed_time, "20260102-12:02:53");
+        assert_eq!(project_report(&crate::protocol::fix::field_view(&report), input()).order_state.completed_time, "20260102-12:02:53");
         report.remove(&60);
-        assert_eq!(project_report(&report, input()).order_state.completed_time, "20260102-12:03:24");
+        assert_eq!(project_report(&crate::protocol::fix::field_view(&report), input()).order_state.completed_time, "20260102-12:03:24");
         report.remove(&52);
-        assert_eq!(project_report(&report, input()).order_state.completed_time, "");
+        assert_eq!(project_report(&crate::protocol::fix::field_view(&report), input()).order_state.completed_time, "");
     }
 
     #[test]
@@ -492,7 +513,7 @@ mod tests {
         let report = crate::protocol::fix::fix_parse(wire.as_bytes());
         assert!(!report.contains_key(&6556));
         assert_eq!(report.get(&20).map(String::as_str), Some("3"));
-        let projected = project_report(&report, input());
+        let projected = project_report(&crate::protocol::fix::field_view(&report), input());
         assert_eq!(projected.order.perm_id, 1_234_567_890);
         assert_eq!(projected.order.order_ref, "sanitized-paper-history-fixture");
         assert_eq!(projected.contract.con_id, 265598);
@@ -523,7 +544,7 @@ mod tests {
         let report = HashMap::from([(59, "1".into())]);
         for combo_view in [None, Some(&combo)] {
             let projected = project_report(
-                &report,
+                &crate::protocol::fix::field_view(&report),
                 ReportProjection {
                     order_id: 77,
                     status: OrderStatus::Submitted,

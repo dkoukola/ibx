@@ -1,4 +1,4 @@
-//! Historical data (35=W queries, compressed answers): the queries against
+//! Historical data (historical farm queries, compressed answers): the queries against
 //! the reference's, the bars and head timestamps against the reference's
 //! callbacks.
 
@@ -15,7 +15,7 @@ fn tag(f: &Fields, t: u32) -> Option<&str> {
     f.iter().find(|(k, _)| *k == t).map(|(_, v)| v.as_str())
 }
 
-/// The window id of a 35=W: the `<id>` up to its first `;;`.
+/// The window id of a historical query: the `<id>` up to its first `;;`.
 fn query_id(f: &Fields) -> Option<String> {
     let q = tag(f, 6118)?;
     let a = q.find("<id>")? + 4;
@@ -38,7 +38,7 @@ struct HmdsReplayed {
 /// ids in place of the reference's, compressed again) and the contract
 /// lookups' replies (to ibx's lookup of the same symbol, in order).
 fn replay_hmds(fx: &Fixture) -> HmdsReplayed {
-    let mut s = Session::new().in_zone(&fx.header);
+    let mut s = Session::new().as_recorded(&fx.header);
     let mut theirs = Vec::new();
     let mut queries_theirs: Vec<(Fields, bool)> = Vec::new();
     let mut no_end: Vec<bool> = Vec::new();
@@ -127,7 +127,7 @@ fn replay_hmds(fx: &Fixture) -> HmdsReplayed {
 }
 
 /// The layout of a query left out: the reference writes it with a new
-/// line after each element and tabs (`jxmlable.XmlGenerator`), ibx on one
+/// line after each element and tabs (its XML writer), ibx on one
 /// line.
 fn flat(q: &str) -> String {
     q.replace(['\n', '\t'], "")
@@ -154,7 +154,7 @@ fn bars_and_head_timestamp_as_the_reference() {
 }
 
 // A second head timestamp of the same contract and data: the reference
-// answers from its cache (`hmdscore.store.b`, HIST-BARS 4.3), no query,
+// answers from its cache (HIST-BARS 4.3), no query,
 // here with formatDate 2 (345479400).
 #[test]
 fn second_head_timestamp_from_the_cache() {
@@ -164,7 +164,8 @@ fn second_head_timestamp_from_the_cache() {
 }
 
 // The query layout: a new line after the header and each element, tabs
-// before the elements, as every captured 35=W and 35=Z; and 34=000000.
+// before the elements, as every captured query and cancel; and the
+// sequence number 000000.
 #[test]
 fn query_layout_as_the_reference() {
     let r = replay_hmds(&load("hmds_bars_and_head_timestamp"));

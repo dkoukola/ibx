@@ -1,9 +1,10 @@
-//! Tag order of the new order (35=D), replace (35=G) and cancel (35=F)
+//! Field order of the new order, replace and cancel
 //! messages against the gateway's writers (ibx#485 items 3 and 4).
 //!
-//! The writer table (`order_writers.csv`) lists, in bytecode order, every
-//! tag the gateway writes, with its condition; the sub-writers are
-//! flattened, a tag listed twice is two branches, and a block (the order
+//! The writer table (`order_writers.csv`) lists every tag the gateway
+//! writes, in the gateway's order, with its condition; the
+//! sub-writers are flattened, a tag listed twice is two branches, and a
+//! block (the order
 //! attributes, the algo parameters, the conditions, the combo legs) is one
 //! place whose tags come in any order. For each `OrderRequest` variant the
 //! engine's frame, read from the in-memory server, must:
@@ -44,7 +45,7 @@ struct Expect {
 }
 
 /// A new order. Every new stock order of these cases has a currency and
-/// the stock multiplier, and the origin attribute (`6122=c` on every
+/// the stock multiplier, and the origin attribute (set on every
 /// captured new order and replace of an API order).
 fn d(order_type: &'static str, facts: &[&'static str]) -> Expect {
     let mut all = vec!["currency", "multiplier", "attr:6122"];
@@ -196,6 +197,8 @@ fn cases() -> Vec<Case> {
     use OrderRequest::*;
     let (i, s, q) = (0, Side::Buy, 1);
     let case = |name, requests, expect| Case { name, requests, expect, open: None };
+    let price_condition = OrderCondition::Price {
+        con_id: 265598, exchange: "SMART".into(), price: 900 * P, is_more: true, trigger_method: 0 };
     let vwap = AlgoParams::Vwap {
         max_pct_vol: 0.1, no_take_liq: false, allow_past_end_time: true,
         start_time: String::new(), end_time: String::new(),
@@ -331,6 +334,13 @@ fn cases() -> Vec<Case> {
                 ..attrs()
             } }],
             vec![d("LMT", &["lmt_price", "oca", "gtd_date", "conditions", "attr:583"])]),
+        // The replace restates the conditions (ibx#726).
+        case("Modify with conditions", vec![
+            SubmitEx { order_id: 150, instrument: i, side: s, qty: q, kind: OrderKind::Limit { price: 50 * P }, tif: b'1',
+                attrs: OrderAttrs { conditions: vec![price_condition.clone()], ..attrs() } },
+            Modify { new_order_id: 150, order_id: 150, qty: q, kind: OrderKind::Limit { price: 51 * P }, tif: b'1',
+                attrs: OrderAttrs { conditions: vec![price_condition], ..attrs() } }],
+            vec![d("LMT", &["lmt_price", "conditions"]), g("LMT", &["lmt_price", "conditions"])]),
         // The order attributes ibx writes: each with the value kind of the
         // attribute table.
         case("SubmitLimitEx with attributes", vec![SubmitLimitEx {
@@ -385,9 +395,9 @@ fn frame_ids(requests: &[OrderRequest]) -> Vec<i64> {
     out
 }
 
-/// The order id of a message: its API order id (6121) on a new order, the
-/// ClOrdID being the server's id of the order (ibx#466, ibx#486); else the
-/// API order id of the new order sent under the id part of its ClOrdID.
+/// The order id of a message: its API order id on a new order, the
+/// client id being the server's id of the order (ibx#466, ibx#486); else the
+/// API order id of the new order sent under the id part of its client id.
 fn frame_id(frame: &Fields, frames: &[Fields]) -> Option<i64> {
     let api_id = |f: &Fields| super::harness::field(f, 6121).and_then(|v| v.parse().ok());
     if let Some(id) = api_id(frame) {
@@ -519,8 +529,8 @@ fn attribute_values_follow_the_attribute_table_kinds() {
 }
 
 /// The checks find each kind of difference: a tag the gateway never
-/// writes (21, ibx#466), a tag out of order, a missing attribute
-/// (orderRef, ibx#466), a tag whose condition is false (44 on a MKT).
+/// writes (the handling instruction, ibx#466), a tag out of order, a missing attribute
+/// (orderRef, ibx#466), a tag whose condition is false (a price on a MKT).
 #[test]
 fn the_checks_find_each_kind_of_difference() {
     let rows = catalog::writer("D");

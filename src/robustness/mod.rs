@@ -2,7 +2,7 @@
 //! D). No gateway reference is needed: no input from the network may
 //! panic, block the hot loop or corrupt the state. Bad input gives an error
 //! value and the session goes on, as the gateway drops a bad block and
-//! continues (`jmdclient.bl.a(...)@5249-5332`, log "Exception top3").
+//! continues (log "Exception top3").
 //!
 //! - `decoders`: property tests, any bytes into each decoder: no panic,
 //!   allocation bounded by the input.
@@ -168,7 +168,7 @@ pub(crate) struct Sample {
     pub file: String,
     /// The link: `CCP`, `usfarm`, `ushmds`, ...
     pub conn: String,
-    /// The message type (tag 35), empty for an NS or XYZ frame.
+    /// The message type, empty for an NS or XYZ frame.
     pub msg_type: String,
     pub raw: Vec<u8>,
     pub inner: bool,
@@ -224,7 +224,7 @@ pub(crate) fn server_frames() -> &'static [Sample] {
     })
 }
 
-/// The value of tag 35 of a frame.
+/// The message type of a frame.
 pub(crate) fn msg_type(raw: &[u8]) -> String {
     crate::engine::hot_loop::fast_extract_msg_type(raw)
         .map(|t| String::from_utf8_lossy(t).into_owned())

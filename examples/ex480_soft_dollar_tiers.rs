@@ -1,6 +1,6 @@
 //! ibx#480 probe. Read-only: login, reqSoftDollarTiers, disconnect.
 //!
-//! Prints the soft dollar tiers ibx returns (from logon tag 6522; none when
+//! Prints the soft dollar tiers ibx returns (from the logon's soft dollar tier field; none when
 //! the logon has no tiers, as on paper).
 //!
 //! Paper: IB_USERNAME, IB_PASSWORD.
@@ -28,9 +28,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         username: env::var(user)?, password: env::var(pass)?,
         host: env::var("IB_HOST").unwrap_or_else(|_| "cdc1.ibllc.com".into()),
         paper: !live, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     })?;
     println!("logged in {} (account {})", if live { "LIVE" } else { "paper" }, client.account_id);
     client.req_soft_dollar_tiers(1, &mut W);
+    client.process_msgs(&mut W);
     client.disconnect();
     Ok(())
 }

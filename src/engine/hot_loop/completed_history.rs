@@ -22,11 +22,11 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// SMART may have different leg routes and remains unsupported here.
 pub(super) fn parse_direct_combo_report(
     msg: &[u8],
-    fields: &HashMap<u32, String>,
+    fields: &crate::protocol::fix::FieldMap<'_>,
 ) -> Result<Option<ComboView>, &'static str> {
     use super::ccp::all_values;
 
-    if fields.get(&167).map(String::as_str) != Some("BAG") {
+    if fields.get(&167).copied() != Some("BAG") {
         return Ok(None);
     }
     let counts: Vec<_> = all_values(msg, 6079).collect();
@@ -170,9 +170,9 @@ pub(super) fn parse_direct_combo_report(
             con_id: fields.get(&6008).and_then(|id| id.parse().ok()).unwrap_or(0),
             sec_type: "BAG".into(),
             exchange: route.into(),
-            currency: fields.get(&15).cloned().unwrap_or_default(),
-            symbol: fields.get(&55).cloned().unwrap_or_default(),
-            local_symbol: fields.get(&6035).cloned().unwrap_or_default(),
+            currency: fields.get(&15).map(|v| (*v).to_owned()).unwrap_or_default(),
+            symbol: fields.get(&55).map(|v| (*v).to_owned()).unwrap_or_default(),
+            local_symbol: fields.get(&6035).map(|v| (*v).to_owned()).unwrap_or_default(),
             combo_legs: legs,
             ..Contract::default()
         },
@@ -228,16 +228,16 @@ impl HistoryRequests {
         self.waiting.back_mut().unwrap().include_lifecycles = true;
     }
 
-    pub(super) fn collect_option_lifecycle(&mut self, fields: &HashMap<u32, String>, shared: &SharedState, account: &str) {
+    pub(super) fn collect_option_lifecycle(&mut self, fields: &crate::protocol::fix::FieldMap<'_>, shared: &SharedState, account: &str) {
         if !self.active.as_ref().is_some_and(|active| active.request.include_lifecycles) {
             self.reject_option_lifecycle(fields, account);
             return;
         }
         let Some(active) = self.active.as_mut().filter(|active| !active.timed_out) else { return };
         if fields.get(&6556).is_some_and(|id| !id.starts_with("PT."))
-            || fields.get(&20).map(String::as_str) != Some("3")
-            || fields.get(&11).map(String::as_str) == Some("*")
-            || fields.get(&1).is_some_and(|owner| !owner.is_empty() && owner != account) { return; }
+            || fields.get(&20).copied() != Some("3")
+            || fields.get(&11).copied() == Some("*")
+            || fields.get(&1).is_some_and(|owner| !owner.is_empty() && *owner != account) { return; }
         let result = super::lifecycle_history::project(fields, shared, account).and_then(|row| {
             let version = report_revision(fields).ok_or("Invalid lifecycle order revision")?;
             Ok((version, row))
@@ -247,7 +247,7 @@ impl HistoryRequests {
                 let Some(start) = super::ccp::fix_utc_to_unix_secs(&active.request.start) else { return };
                 let Some(end) = super::ccp::fix_utc_to_unix_secs(&active.request.end) else { return };
                 if row.time_secs < start || row.time_secs > end { return; }
-                if active.request.api_only && !fields.get(&6088).is_some_and(|origin| origin == "Socket")
+                if active.request.api_only && !fields.get(&6088).is_some_and(|origin| *origin == "Socket")
                     && !row.observation.api_order_id.is_some_and(|id| id > 0 && id != i64::from(i32::MAX)) { return; }
                 let key = row.execution.perm_id;
                 if active.lifecycle_rows.get(&key).is_none_or(|(old_version, old)| {
@@ -263,16 +263,16 @@ impl HistoryRequests {
     /// otherwise collect is instead quarantined as an option lifecycle
     /// report. Explicit foreign-account rows are unrelated; absent or empty
     /// account identity cannot support a successful omission.
-    pub(super) fn reject_option_lifecycle(&mut self, fields: &HashMap<u32, String>, account: &str) {
+    pub(super) fn reject_option_lifecycle(&mut self, fields: &crate::protocol::fix::FieldMap<'_>, account: &str) {
         let Some(active) = self.active.as_mut().filter(|active| !active.timed_out) else {
             return;
         };
         if fields.get(&6556).is_some_and(|id| !id.starts_with("PT."))
-            || fields.get(&20).map(String::as_str) != Some("3")
-            || fields.get(&11).map(String::as_str) == Some("*")
+            || fields.get(&20).copied() != Some("3")
+            || fields.get(&11).copied() == Some("*")
             || fields
                 .get(&1)
-                .is_some_and(|reported| !reported.is_empty() && reported != account)
+                .is_some_and(|reported| !reported.is_empty() && *reported != account)
         {
             return;
         }
@@ -318,8 +318,8 @@ impl HistoryRequests {
             .or_default() += 1;
     }
 
-    pub(super) fn status_reply(&mut self, fields: &HashMap<u32, String>) {
-        if fields.get(&20).map(String::as_str) == Some("3")
+    pub(super) fn status_reply(&mut self, fields: &crate::protocol::fix::FieldMap<'_>) {
+        if fields.get(&20).copied() == Some("3")
             && let Some(clord) = fields.get(&11)
         {
             let base = perm_id_from_clord_id(clord);
@@ -339,12 +339,12 @@ impl HistoryRequests {
     /// attributable because the native H reply is not request-tagged.
     pub(super) fn option_lifecycle_status_reply(
         &mut self,
-        fields: &HashMap<u32, String>,
+        fields: &crate::protocol::fix::FieldMap<'_>,
         account: &str,
     ) {
         if fields
             .get(&1)
-            .is_some_and(|reported| !reported.is_empty() && reported != account)
+            .is_some_and(|reported| !reported.is_empty() && *reported != account)
         {
             return;
         }
@@ -381,15 +381,15 @@ impl HistoryRequests {
     /// Only the exact query end is consumed unconditionally by this collector.
     pub(super) fn classify(
         &mut self,
-        fields: &HashMap<u32, String>,
+        fields: &crate::protocol::fix::FieldMap<'_>,
         shared: &SharedState,
         _account: &str,
     ) -> HistoryReport {
         let Some(active) = self.active.as_mut() else {
             return HistoryReport::Unrelated;
         };
-        if fields.get(&6556) == Some(&active.wire_id)
-            && fields.get(&55).map(String::as_str) == Some("*")
+        if fields.get(&6556).copied() == Some(active.wire_id.as_str())
+            && fields.get(&55).copied() == Some("*")
         {
             let active = self.active.take().unwrap();
             if !active.timed_out {
@@ -406,8 +406,8 @@ impl HistoryRequests {
         }
         // Non-PT request IDs are other end markers, never ordinary rows.
         if fields.get(&6556).is_some_and(|id| !id.starts_with("PT."))
-            || fields.get(&20).map(String::as_str) != Some("3")
-            || fields.get(&11).map(String::as_str) == Some("*")
+            || fields.get(&20).copied() != Some("3")
+            || fields.get(&11).copied() == Some("*")
         {
             return HistoryReport::Unrelated;
         }
@@ -416,7 +416,7 @@ impl HistoryRequests {
 
     pub(super) fn collect(
         &mut self,
-        fields: &HashMap<u32, String>,
+        fields: &crate::protocol::fix::FieldMap<'_>,
         account: &str,
         known: Option<&RichOrderInfo>,
         known_combo: bool,
@@ -451,7 +451,7 @@ impl HistoryRequests {
     #[cfg(test)]
     fn report(
         &mut self,
-        fields: &HashMap<u32, String>,
+        fields: &crate::protocol::fix::FieldMap<'_>,
         shared: &SharedState,
         account: &str,
     ) -> HistoryReport {
@@ -599,13 +599,13 @@ struct Reducer {
 
 impl Reducer {
     #[cfg(test)]
-    fn push(&mut self, fields: &HashMap<u32, String>, account: &str) {
+    fn push(&mut self, fields: &crate::protocol::fix::FieldMap<'_>, account: &str) {
         self.push_report(fields, account, &Ok(None));
     }
 
     fn push_report(
         &mut self,
-        fields: &HashMap<u32, String>,
+        fields: &crate::protocol::fix::FieldMap<'_>,
         account: &str,
         reported_combo: &Result<Option<ComboView>, &'static str>,
     ) {
@@ -619,11 +619,11 @@ impl Reducer {
 
     fn add(
         &mut self,
-        fields: &HashMap<u32, String>,
+        fields: &crate::protocol::fix::FieldMap<'_>,
         account: &str,
         reported_combo: &Result<Option<ComboView>, &'static str>,
     ) -> Result<(), &'static str> {
-        let tag = |t| fields.get(&t).map(String::as_str);
+        let tag = |t| fields.get(&t).copied();
         let owner = tag(1).ok_or("History row has no account")?;
         if owner != account {
             return Err("History row belongs to a different account");
@@ -674,14 +674,14 @@ impl Reducer {
                 for t in [39, 150, 6699, 60, 52] {
                     previous.fields.remove(&t);
                     if let Some(value) = fields.get(&t) {
-                        previous.fields.insert(t, value.clone());
+                        previous.fields.insert(t, (*value).to_owned());
                     }
                 }
                 // Cancellation preserves amended terms, not stale execution
                 // totals/fees when the broker supplies newer values.
                 for t in [14, 151, 6, 12] {
                     if let Some(value) = fields.get(&t) {
-                        previous.fields.insert(t, value.clone());
+                        previous.fields.insert(t, (*value).to_owned());
                     }
                 }
                 return Ok(());
@@ -692,7 +692,7 @@ impl Reducer {
             Row {
                 version,
                 time: time.to_string(),
-                fields: fields.clone(),
+                fields: fields.iter().map(|(&tag, &value)| (tag, value.to_owned())).collect(),
                 status,
                 known: None,
                 known_combo: false,
@@ -723,8 +723,9 @@ impl Reducer {
             if !row.status.is_terminal() {
                 continue;
             }
-            let fields = &row.fields;
-            let from_api = fields.get(&6088).is_some_and(|origin| origin == "Socket")
+            let fields: &crate::protocol::fix::FieldMap<'_> = &row.fields.iter()
+                .map(|(&tag, value)| (tag, value.as_str())).collect();
+            let from_api = fields.get(&6088).is_some_and(|origin| *origin == "Socket")
                 || fields
                     .get(&6121)
                     .and_then(|id| id.parse::<i64>().ok())
@@ -732,7 +733,7 @@ impl Reducer {
             if api_only && !from_api {
                 continue;
             }
-            let reported_combo = if fields.get(&167).map(String::as_str) == Some("BAG")
+            let reported_combo = if fields.get(&167).copied() == Some("BAG")
                 && !row.known_combo
             {
                 Some(
@@ -761,23 +762,23 @@ impl Reducer {
             // explicit zero current total (paper STANDARD reply, 2026-10-08).
             // Preserve that broker value, not an invented original quantity.
             // Missing totals, fills, and every non-cancel status still fail.
-            let zero_quantity_cancel = fields.get(&39).map(String::as_str) == Some("4")
+            let zero_quantity_cancel = fields.get(&39).copied() == Some("4")
                 && number(38) == Some(0.0)
                 && number(14) == Some(0.0)
                 && number(151) == Some(0.0);
             // A broker-rejected unknown contract has no 6008 (captured paper
             // STANDARD reply, 2026-10-20). Retain its order identity and exact
             // zero-fill rejection with API conId=0, not an invented instrument.
-            let rejected_unknown_contract = fields.get(&20).map(String::as_str) == Some("3")
-                && fields.get(&39).map(String::as_str) == Some("8")
-                && fields.get(&150).map(String::as_str) == Some("8")
+            let rejected_unknown_contract = fields.get(&20).copied() == Some("3")
+                && fields.get(&39).copied() == Some("8")
+                && fields.get(&150).copied() == Some("8")
                 && !fields.contains_key(&6008)
                 && number(38).is_some_and(|quantity| quantity > 0.0)
                 && number(14) == Some(0.0)
                 && number(32) == Some(0.0)
                 && fields
                     .get(&167)
-                    .is_some_and(|kind| !kind.is_empty() && kind != "BAG");
+                    .is_some_and(|kind| !kind.is_empty() && *kind != "BAG");
             if known.is_none()
                 && ((!rejected_unknown_contract
                     && !fields
@@ -785,18 +786,18 @@ impl Reducer {
                         .and_then(|v| v.parse::<i64>().ok())
                         .is_some_and(|v| v > 0))
                     || !(number(38).is_some_and(|v| v > 0.0) || zero_quantity_cancel)
-                    || !matches!(fields.get(&54).map(String::as_str), Some("1" | "2" | "5"))
+                    || !matches!(fields.get(&54).copied(), Some("1" | "2" | "5"))
                     || !fields.get(&15).is_some_and(|v| !v.is_empty())
                     || !fields
                         .get(&167)
-                        .is_some_and(|v| !v.is_empty() && (v != "BAG" || reported_combo.is_some()))
-                    || fields.get(&8302).is_some_and(|v| v == "1")
-                    || fields.get(&6406).is_some_and(|v| v == "1"))
+                        .is_some_and(|v| !v.is_empty() && (*v != "BAG" || reported_combo.is_some()))
+                    || fields.get(&8302).is_some_and(|v| *v == "1")
+                    || fields.get(&6406).is_some_and(|v| *v == "1"))
             {
                 return Err("Incomplete or unsupported completed-order snapshot".into());
             }
             if known.is_none() {
-                match fields.get(&40).map(String::as_str) {
+                match fields.get(&40).copied() {
                     Some("1") => {}
                     Some("2") if number(44).is_some() => {}
                     Some("3") if number(99).is_some() => {}
@@ -821,7 +822,7 @@ impl Reducer {
                 project_report(
                     fields,
                     ReportProjection {
-                        order_id: api_id(*base, fields),
+                        order_id: api_id(*base, &row.fields),
                         parent_id,
                         status: row.status,
                         account_id: account,
@@ -836,6 +837,11 @@ impl Reducer {
                     },
                 )
             });
+            if known.is_some() {
+                // The live view formats completed_time for display. History
+                // keeps the reducer's authoritative native event timestamp.
+                projected.order_state.completed_time.clone_from(&row.time);
+            }
             let combo = projected.contract.sec_type == "BAG";
             if combo && !row.known_combo && reported_combo.is_none() {
                 return Err("Completed-order BAG snapshot has no known per-order combo".into());
@@ -874,8 +880,8 @@ impl Reducer {
                 || order.filled_quantity < 0.0
                 || (row.status == OrderStatus::Filled && order.filled_quantity <= 0.0)
                 || !projected.parent_id_known
-                || fields.get(&8302).is_some_and(|value| value == "1")
-                || fields.get(&6406).is_some_and(|value| value == "1")
+                || fields.get(&8302).is_some_and(|value| *value == "1")
+                || fields.get(&6406).is_some_and(|value| *value == "1")
             {
                 return Err("Incomplete or unsupported completed-order snapshot".into());
             }
@@ -957,12 +963,12 @@ mod tests {
             request.start = "20261003-00:00:00".into();
             request.end = "20261003-23:59:59".into();
             for row in captured_lapse_rows() {
-                requests.collect_option_lifecycle(&row, &shared, "DU123456");
-                requests.collect_option_lifecycle(&row, &shared, "DU123456");
+                requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
+                requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
             }
             assert_eq!(
                 requests.classify(
-                    &HashMap::from([(6556, "other".into()), (55, "*".into())]),
+                    &crate::protocol::fix::field_view(&HashMap::from([(6556, "other".into()), (55, "*".into())])),
                     &shared,
                     "DU123456",
                 ),
@@ -971,7 +977,7 @@ mod tests {
             assert!(shared.orders.drain_completed_history_replies().is_empty());
             assert_eq!(
                 requests.classify(
-                    &HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into()),]),
+                    &crate::protocol::fix::field_view(&HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into()),])),
                     &shared,
                     "DU123456",
                 ),
@@ -1019,15 +1025,15 @@ mod tests {
             request.start = "20261003-00:00:00".into();
             request.end = "20261003-23:59:59".into();
             for row in captured_manual_rows() {
-                requests.collect_option_lifecycle(&row, &shared, "DU123456");
+                requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
             }
             for pending in [false, true] {
-                requests.collect_option_lifecycle(&captured_instruction(pending), &shared, "DU123456");
-                requests.collect_option_lifecycle(&captured_instruction(pending), &shared, "DU123456");
+                requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&captured_instruction(pending)), &shared, "DU123456");
+                requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&captured_instruction(pending)), &shared, "DU123456");
             }
-            assert_eq!(requests.classify(&HashMap::from([(6556, "other".into()), (55, "*".into())]), &shared, "DU123456"), HistoryReport::Unrelated);
+            assert_eq!(requests.classify(&crate::protocol::fix::field_view(&HashMap::from([(6556, "other".into()), (55, "*".into())])), &shared, "DU123456"), HistoryReport::Unrelated);
             assert!(shared.orders.drain_completed_history_replies().is_empty());
-            assert_eq!(requests.classify(&HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into())]), &shared, "DU123456"), HistoryReport::End);
+            assert_eq!(requests.classify(&crate::protocol::fix::field_view(&HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into())])), &shared, "DU123456"), HistoryReport::End);
             let reply = shared.orders.drain_completed_history_replies().pop().unwrap();
             assert_eq!(reply.result.is_ok(), include);
             if include {
@@ -1060,8 +1066,8 @@ mod tests {
             request.end = "20261003-23:59:59".into();
             let mut row = captured_instruction(false);
             if malformed { row.remove(&32); }
-            requests.collect_option_lifecycle(&row, &shared, "DU123456");
-            requests.classify(&HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into())]), &shared, "DU123456");
+            requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&row), &shared, "DU123456");
+            requests.classify(&crate::protocol::fix::field_view(&HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into())])), &shared, "DU123456");
             let reply = shared.orders.drain_completed_history_replies().pop().unwrap();
             assert_eq!(reply.result.is_err(), malformed);
             assert!(reply.lifecycle_reports.is_empty(), "do not infer missing API ownership");
@@ -1073,14 +1079,14 @@ mod tests {
         use super::super::lifecycle_history::captured_instruction;
         let shared = SharedState::new();
         let mut requests = HistoryRequests::default();
-        requests.collect_option_lifecycle(&captured_instruction(true), &shared, "DU123456");
+        requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&captured_instruction(true)), &shared, "DU123456");
         assert!(requests.waiting.is_empty());
         assert!(shared.orders.drain_completed_history_replies().is_empty());
         requests = active();
         requests.active.as_mut().unwrap().request.include_lifecycles = true;
         // The request is for January: the October instruction is not admitted.
-        requests.collect_option_lifecycle(&captured_instruction(true), &shared, "DU123456");
-        requests.classify(&HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into())]), &shared, "DU123456");
+        requests.collect_option_lifecycle(&crate::protocol::fix::field_view(&captured_instruction(true)), &shared, "DU123456");
+        requests.classify(&crate::protocol::fix::field_view(&HashMap::from([(6556, "SANITIZED_HISTORY_QUERY_2".into()), (55, "*".into())])), &shared, "DU123456");
         let reply = shared.orders.drain_completed_history_replies().pop().unwrap();
         assert!(reply.result.is_ok());
         assert!(reply.lifecycle_reports.is_empty());
@@ -1207,7 +1213,7 @@ mod tests {
             leg_prices: prices,
         };
         project_report(
-            fields,
+            &crate::protocol::fix::field_view(fields),
             ReportProjection {
                 order_id: fields[&6121].parse().unwrap(),
                 parent_id: 0,
@@ -1234,8 +1240,8 @@ mod tests {
     ) -> Result<Vec<RichOrderInfo>, String> {
         let mut history = active();
         let shared = SharedState::new();
-        history.collect(fields, "DUXXXXXXX", known, known_combo, &Ok(None));
-        history.report(&capture()[2], &shared, "DUXXXXXXX");
+        history.collect(&crate::protocol::fix::field_view(fields), "DUXXXXXXX", known, known_combo, &Ok(None));
+        history.report(&crate::protocol::fix::field_view(&capture()[2]), &shared, "DUXXXXXXX");
         assert!(shared.orders.drain_fills().is_empty());
         assert!(shared.orders.drain_order_updates().is_empty());
         assert!(shared.orders.drain_open_orders().is_empty());
@@ -1677,7 +1683,7 @@ mod tests {
             fix::fix_build(&values, 1)
         };
         let raw = encode(&fields);
-        let parsed = parse_direct_combo_report(&raw, &fix::fix_parse(&raw)).unwrap().unwrap();
+        let parsed = parse_direct_combo_report(&raw, &crate::protocol::fix::field_view(&fix::fix_parse(&raw))).unwrap().unwrap();
         assert_eq!(parsed.contract.combo_legs.len(), 2);
         assert_eq!(parsed.contract.combo_legs[0].con_id, parsed.contract.combo_legs[1].con_id);
         assert_ne!(parsed.contract.combo_legs[0].action, parsed.contract.combo_legs[1].action);
@@ -1686,7 +1692,7 @@ mod tests {
         replace_tag(&mut fields, 6079, "1");
         fields.extend([(6080, "756733".into()), (6081, "2".into()), (6082, "1".into())]);
         let raw = encode(&fields);
-        let parsed = parse_direct_combo_report(&raw, &fix::fix_parse(&raw)).unwrap().unwrap();
+        let parsed = parse_direct_combo_report(&raw, &crate::protocol::fix::field_view(&fix::fix_parse(&raw))).unwrap().unwrap();
         assert_eq!(parsed.contract.combo_legs.len(), 1);
         assert_eq!(parsed.contract.combo_legs[0].ratio, 2);
     }
@@ -1846,6 +1852,7 @@ mod tests {
                                     sec_type: "STK".into(),
                                     currency: "USD".into(),
                                     multiplier: 1.0,
+                                    permission_key: String::new(),
                                 })
                                 .collect(),
                             multiplier: 1.0,
@@ -1901,7 +1908,7 @@ mod tests {
         working.order_state.status = "Submitted".into();
         let mut history = active();
         let shared = SharedState::new();
-        history.collect(&fields, "DUXXXXXXX", Some(&working), true, &Ok(None));
+        history.collect(&crate::protocol::fix::field_view(&fields), "DUXXXXXXX", Some(&working), true, &Ok(None));
         let cancel: HashMap<u32, String> = [
             (1, fields[&1].clone()),
             (11, fields[&11].clone()),
@@ -1916,8 +1923,8 @@ mod tests {
         cancelled.order_state.status = "Cancelled".into();
         cancelled.order_state.commission_and_fees = 0.25;
         cancelled.report_time = Some(cancel[&60].clone());
-        history.collect(&cancel, "DUXXXXXXX", Some(&cancelled), true, &Ok(None));
-        history.report(&capture()[2], &shared, "DUXXXXXXX");
+        history.collect(&crate::protocol::fix::field_view(&cancel), "DUXXXXXXX", Some(&cancelled), true, &Ok(None));
+        history.report(&crate::protocol::fix::field_view(&capture()[2]), &shared, "DUXXXXXXX");
         let rows = shared
             .orders
             .drain_completed_history_replies()
@@ -1941,7 +1948,7 @@ mod tests {
             let mut history = active();
             let shared = SharedState::new();
             history.collect(
-                &fields,
+                &crate::protocol::fix::field_view(&fields),
                 "DUXXXXXXX",
                 known_parent.then_some(&known),
                 known_parent,
@@ -1957,8 +1964,8 @@ mod tests {
             ] {
                 leg.insert(tag, value.into());
             }
-            history.report(&leg, &shared, "DUXXXXXXX");
-            history.report(&capture()[2], &shared, "DUXXXXXXX");
+            history.report(&crate::protocol::fix::field_view(&leg), &shared, "DUXXXXXXX");
+            history.report(&crate::protocol::fix::field_view(&capture()[2]), &shared, "DUXXXXXXX");
             let result = shared
                 .orders
                 .drain_completed_history_replies()
@@ -1981,11 +1988,11 @@ mod tests {
         let mut state = active();
         let shared = SharedState::new();
         assert_eq!(
-            state.report(&zero_quantity_oca_cancel(), &shared, "DU123456"),
+            state.report(&crate::protocol::fix::field_view(&zero_quantity_oca_cancel()), &shared, "DU123456"),
             HistoryReport::Row
         );
         assert_eq!(
-            state.report(&capture()[2], &shared, "DU123456"),
+            state.report(&crate::protocol::fix::field_view(&capture()[2]), &shared, "DU123456"),
             HistoryReport::End
         );
         let result = shared
@@ -2027,9 +2034,9 @@ mod tests {
             if let Some(reported_account) = reported_account {
                 lifecycle.insert(1, reported_account.into());
             }
-            state.reject_option_lifecycle(&lifecycle, "DU123456");
+            state.reject_option_lifecycle(&crate::protocol::fix::field_view(&lifecycle), "DU123456");
             assert_eq!(
-                state.report(&capture()[2], &shared, "DU123456"),
+                state.report(&crate::protocol::fix::field_view(&capture()[2]), &shared, "DU123456"),
                 HistoryReport::End
             );
             let reply = shared
@@ -2079,7 +2086,7 @@ mod tests {
                 row.insert(tag, value.into());
             }
             let mut reducer = Reducer::default();
-            reducer.push(&row, "DU123456");
+            reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
             assert!(reducer.finish(false).is_err(), "accepted {tag}={value:?}");
         }
     }
@@ -2503,22 +2510,22 @@ mod tests {
         let mut state = active();
         let rows = capture();
         assert_eq!(
-            state.report(&rows[0], &shared, "DU123456"),
+            state.report(&crate::protocol::fix::field_view(&rows[0]), &shared, "DU123456"),
             HistoryReport::Row
         );
         assert_eq!(
-            state.report(&rows[1], &shared, "DU123456"),
+            state.report(&crate::protocol::fix::field_view(&rows[1]), &shared, "DU123456"),
             HistoryReport::Row
         );
         let mut wrong = rows[2].clone();
         wrong.insert(6556, "today4".into());
         assert_eq!(
-            state.report(&wrong, &shared, "DU123456"),
+            state.report(&crate::protocol::fix::field_view(&wrong), &shared, "DU123456"),
             HistoryReport::Unrelated
         );
         assert!(shared.orders.drain_completed_history_replies().is_empty());
         assert_eq!(
-            state.report(&rows[2], &shared, "DU123456"),
+            state.report(&crate::protocol::fix::field_view(&rows[2]), &shared, "DU123456"),
             HistoryReport::End
         );
         let results = shared
@@ -2545,18 +2552,18 @@ mod tests {
         report.insert(20, "0".into());
         report.insert(32, "1".into());
         assert_eq!(
-            state.report(&report, &shared, "DU123456"),
+            state.report(&crate::protocol::fix::field_view(&report), &shared, "DU123456"),
             HistoryReport::Unrelated
         );
         report.insert(20, "3".into());
         report.insert(6556, "OtherQuery".into());
         assert_eq!(
-            state.report(&report, &shared, "DU123456"),
+            state.report(&crate::protocol::fix::field_view(&report), &shared, "DU123456"),
             HistoryReport::Unrelated
         );
         report.insert(6556, "PT.5".into());
         assert_eq!(
-            state.report(&report, &shared, "DU123456"),
+            state.report(&crate::protocol::fix::field_view(&report), &shared, "DU123456"),
             HistoryReport::Row
         );
     }
@@ -2577,7 +2584,7 @@ mod tests {
         assert!(state.active());
         for row in capture() {
             assert_ne!(
-                state.report(&row, &shared, "DU123456"),
+                state.report(&crate::protocol::fix::field_view(&row), &shared, "DU123456"),
                 HistoryReport::Unrelated
             );
         }
@@ -2608,7 +2615,7 @@ mod tests {
         rows[1].insert(6121, "7".into());
         let mut reducer = Reducer::default();
         for row in &rows[..2] {
-            reducer.push(row, "DU123456");
+            reducer.push(&crate::protocol::fix::field_view(row), "DU123456");
         }
         assert_eq!(reducer.finish(true).unwrap().len(), 2);
         for (id, expected) in [("0", 0), ("2147483647", 0), ("-1", 1), ("7", 1)] {
@@ -2616,7 +2623,7 @@ mod tests {
             row.remove(&6088);
             row.insert(6121, id.into());
             let mut reducer = Reducer::default();
-            reducer.push(&row, "DU123456");
+            reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
             assert_eq!(reducer.finish(true).unwrap().len(), expected, "{id}");
         }
     }
@@ -2636,7 +2643,7 @@ mod tests {
         cancel.insert(44, "1".into());
         let mut reducer = Reducer::default();
         for row in [current, earlier, cancel] {
-            reducer.push(&row, "DU123456");
+            reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
         }
         let result = reducer.finish(false).unwrap();
         assert_eq!(result.len(), 1);
@@ -2650,10 +2657,10 @@ mod tests {
         let mut row = capture()[0].clone();
         row.remove(&44);
         let mut reducer = Reducer::default();
-        reducer.push(&row, "DU123456");
+        reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
         assert!(reducer.finish(false).is_err());
         let mut reducer = Reducer::default();
-        reducer.push(&capture()[0], "DIFFERENT_ACCOUNT");
+        reducer.push(&crate::protocol::fix::field_view(&capture()[0]), "DIFFERENT_ACCOUNT");
         assert!(reducer.finish(false).is_err());
     }
 
@@ -2680,8 +2687,8 @@ mod tests {
                 (60, "20260102-12:40:00".into()),
             ]);
             let mut reducer = Reducer::default();
-            reducer.push(&row, "DU123456");
-            reducer.push(&cancel, "DU123456");
+            reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
+            reducer.push(&crate::protocol::fix::field_view(&cancel), "DU123456");
             let result = reducer.finish(false).unwrap().remove(0);
             assert_eq!(result.order.lmt_price, 2.0);
             assert_eq!(result.order_state.completed_time, "20260102-12:40:00");
@@ -2696,7 +2703,7 @@ mod tests {
         row.insert(59, "6".into());
         row.insert(126, "20261005-20:00:00".into());
         let mut reducer = Reducer::default();
-        reducer.push(&row, "DU123456");
+        reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
         let result = reducer.finish(false).unwrap().remove(0);
         assert_eq!(result.order.filled_quantity, 1.0);
         assert_eq!(result.order.good_till_date, "20261005 20:00:00 UTC");
@@ -2707,7 +2714,7 @@ mod tests {
                 row.insert(14, quantity.into());
             }
             let mut reducer = Reducer::default();
-            reducer.push(&row, "DU123456");
+            reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
             assert!(reducer.finish(false).is_err());
         }
     }
@@ -2717,7 +2724,7 @@ mod tests {
         use crate::types::CompletedOrder;
         let shared = SharedState::new();
         let mut reducer = Reducer::default();
-        reducer.push(&capture()[0], "DU123456");
+        reducer.push(&crate::protocol::fix::field_view(&capture()[0]), "DU123456");
         let mut rich = reducer.finish(false).unwrap().remove(0);
         shared.orders.push_order_info(1, rich.clone());
         rich.order_state.status = "Submitted".into();
@@ -2827,7 +2834,7 @@ mod tests {
             "DU123456",
         );
         assert!(sent(&mut peer).is_empty());
-        ccp.completed_history.status_reply(&capture()[0]);
+        ccp.completed_history.status_reply(&crate::protocol::fix::field_view(&capture()[0]));
         ccp.progress_completed_history(
             &mut conn,
             &mut context,
@@ -2840,7 +2847,7 @@ mod tests {
             sent(&mut peer).is_empty(),
             "second per-order H is still outstanding"
         );
-        ccp.completed_history.status_reply(&capture()[0]);
+        ccp.completed_history.status_reply(&crate::protocol::fix::field_view(&capture()[0]));
         ccp.progress_completed_history(
             &mut conn,
             &mut context,
@@ -2870,7 +2877,7 @@ mod tests {
         let mut end = capture()[2].clone();
         end.insert(6556, "IBX.Completed.1".into());
         assert_eq!(
-            ccp.completed_history.report(&end, &shared, "DU123456"),
+            ccp.completed_history.report(&crate::protocol::fix::field_view(&end), &shared, "DU123456"),
             HistoryReport::End
         );
         ccp.progress_completed_history(

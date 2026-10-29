@@ -12,37 +12,41 @@ impl EClient {
     /// Request P&L updates for the account.
     #[pyo3(signature = (req_id, account, model_code=""))]
     fn req_pnl(&self, py: Python<'_>, req_id: i64, account: &str, model_code: &str) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("req_pnl", &[req_id]) { return Ok(()); }
         // Several requests can run; an empty or unknown account gives 321, a
         // request id already running gives 102 (ibx#478).
+        // Nothing is sent to the server: the P&L quotes go from the next
+        // event loop pass, as for the Rust client (ibx#511).
         if let Err((code, message)) = self.core.request_pnl(req_id, account, &self.account()) {
             self.shared_state()?.orders.push_order_error(req_id, code, message);
-            return Ok(());
         }
-        let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::SubscribePnl { req_id, account: account.to_string() })?;
-        let _ = model_code;
+        let _ = (py, model_code);
         Ok(())
     }
 
     /// Cancel P&L subscription.
     fn cancel_pnl(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("cancel_pnl", &[req_id]) { return Ok(()); }
         // A request id not running gives 10185 (ibx#478).
+        // Nothing is sent: the reference keeps its P&L quotes (ibx#511).
         if let Some((code, message)) = self.core.cancel_pnl_request(req_id) {
             self.shared_state()?.orders.push_order_error(req_id, code, message);
-            return Ok(());
         }
-        let tx = self.tx()?;
-        let _ = send_cmd(py, &tx, ControlCommand::CancelPnl { req_id });
+        let _ = py;
         Ok(())
     }
 
     /// Request P&L for a single position.
     #[pyo3(signature = (req_id, account, model_code, con_id))]
     fn req_pnl_single(&self, req_id: i64, account: &str, model_code: &str, con_id: i64) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("req_pnl_single", &[req_id, con_id]) { return Ok(()); }
         // Same checks as req_pnl (ibx#478).
@@ -55,6 +59,8 @@ impl EClient {
 
     /// Cancel single-position P&L subscription.
     fn cancel_pnl_single(&self, req_id: i64) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("cancel_pnl_single", &[req_id]) { return Ok(()); }
         // A request id not running gives 10186 (ibx#478).
@@ -67,6 +73,8 @@ impl EClient {
     /// Request account summary.
     #[pyo3(signature = (req_id, group_name, tags))]
     fn req_account_summary(&self, py: Python<'_>, req_id: i64, group_name: &str, tags: &str) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#555).
+        let _one = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("req_account_summary", &[req_id]) { return Ok(()); }
         // A server subscription: the rows come as the server sends them, each
@@ -88,6 +96,8 @@ impl EClient {
 
     /// Cancel account summary.
     fn cancel_account_summary(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("cancel_account_summary", &[req_id]) { return Ok(()); }
         if let Some(sr_id) = self.core.unsubscribe_account_summary(req_id) {
@@ -98,6 +108,8 @@ impl EClient {
 
     /// Request all positions.
     fn req_positions(&self, py: Python<'_>) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         let shared = self.shared_state()?;
         // Accounts whose application is not approved (ibx#421).
@@ -111,13 +123,25 @@ impl EClient {
         }
         // A subscription, as the reference (ibx#477): the snapshot and
         // position_end once the data is in, then a row on each change.
+        // Made at its turn among the requests, as the Rust client: the
+        // session's state answers it only then (ibx#662).
+        // From the event loop, at its place among the answers (ibx#532).
+        if self.later(|this, py| {
+            this.core.subscribe_positions();
+            let shared = this.shared_state()?;
+            this.dispatch_positions(py, &shared)
+        }) { return Ok(()); }
         self.core.subscribe_positions();
         self.dispatch_positions(py, &shared)
     }
 
     /// Cancel positions.
     fn cancel_positions(&self) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
+        // After the request it follows, made at its turn (ibx#662).
+        if self.later(|this, _py| { this.core.unsubscribe_positions(); Ok(()) }) { return Ok(()); }
         self.core.unsubscribe_positions();
         Ok(())
     }
@@ -125,6 +149,8 @@ impl EClient {
     /// Request account updates.
     #[pyo3(signature = (subscribe, _acct_code=""))]
     fn req_account_updates(&self, subscribe: bool, _acct_code: &str) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         // An account whose application is not approved: a warning, the
         // request goes on (ibx#421).
@@ -142,7 +168,10 @@ impl EClient {
     /// Request managed accounts list: every account of the logon's
     /// account list, in logon order, comma separated (ibx#420).
     fn req_managed_accts(&self, py: Python<'_>) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
+        if self.later(move |this, py| this.req_managed_accts(py)) { return Ok(()); }
         self.wrapper.call_method1(py, "managed_accounts", (self.managed_accounts_text().as_str(),))?;
         Ok(())
     }
@@ -154,6 +183,8 @@ impl EClient {
     fn req_account_updates_multi(
         &self, py: Python<'_>, req_id: i64, account: &str, model_code: &str, ledger_and_nlv: bool,
     ) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(req_id) { return r; }
         if !crate::client_core::ClientCore::ids_fit("req_account_updates_multi", &[req_id]) { return Ok(()); }
         let shared = self.shared_state()?;
@@ -161,11 +192,15 @@ impl EClient {
             shared.orders.push_order_error(req_id, code, message);
             return Ok(());
         }
+        // From the event loop, at its place among the answers (ibx#532).
+        if self.later(|this, py| { let shared = this.shared_state()?; this.dispatch_multi(py, &shared) }) { return Ok(()); }
         self.dispatch_multi(py, &shared)
     }
 
     /// Cancel multi-account updates.
     fn cancel_account_updates_multi(&self, req_id: i64) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("cancel_account_updates_multi", &[req_id]) { return Ok(()); }
         self.core.unsubscribe_account_multi(req_id);
@@ -176,6 +211,8 @@ impl EClient {
     /// the reference (ibx#476).
     #[pyo3(signature = (req_id, account, model_code))]
     fn req_positions_multi(&self, py: Python<'_>, req_id: i64, account: &str, model_code: &str) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("req_positions_multi", &[req_id]) { return Ok(()); }
         let shared = self.shared_state()?;
@@ -185,11 +222,15 @@ impl EClient {
             return Ok(());
         }
         self.core.subscribe_positions_multi(req_id, account, model_code);
+        // From the event loop, at its place among the answers (ibx#532).
+        if self.later(|this, py| { let shared = this.shared_state()?; this.dispatch_multi(py, &shared) }) { return Ok(()); }
         self.dispatch_multi(py, &shared)
     }
 
     /// Cancel multi-account positions.
     fn cancel_positions_multi(&self, req_id: i64) -> PyResult<()> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("cancel_positions_multi", &[req_id]) { return Ok(()); }
         self.core.unsubscribe_positions_multi(req_id);

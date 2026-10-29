@@ -24,6 +24,7 @@ def stage(client, order_id):
     client._test_push_completed_order(
         order_id, 0, "Cancelled", 0, "AAPL", "BUY", 1.0, 1.0,
         "Cancelled", "20261003-12:00:00", "USD", "", 0.0,
+        fresh_history=True,
     )
 
 
@@ -32,7 +33,7 @@ def test_local_archive_is_not_a_fresh_completed_answer():
     client = EClient(reports)
     client._test_connect()
     stage(client, 1)
-    client.req_completed_orders()
+    client.req_completed_orders_range("20261003-00:00:00", "20261004-00:00:00")
     client._test_dispatch_once()
     assert reports.rows == []
     assert reports.ends == 0
@@ -47,7 +48,7 @@ def test_failed_query_and_changed_connection_never_publish_end():
     reports = Reports()
     client = EClient(reports)
     client._test_connect()
-    client.req_completed_orders()
+    client.req_completed_orders_range("20261003-00:00:00", "20261004-00:00:00")
     client._test_publish_completed_history("history timeout")
     client._test_dispatch_once()
     assert reports.errors[-1] == (10159, "history timeout")

@@ -72,7 +72,7 @@ fn a_new_order_reaches_the_server_as_the_reference_frame() {
     client.place_order(5, &contract, &order).unwrap();
 
     let is_order = |m: &Vec<u8>| parse_fields(m).iter().any(|(t, v)| *t == 35 && v == "D");
-    let sent = ccp.messages_until(Duration::from_secs(5), |ms| ms.iter().any(is_order));
+    let sent = ccp.messages_until_serving_presets(Duration::from_secs(5), |ms| ms.iter().any(is_order));
     stop_tx.send(ControlCommand::Shutdown).unwrap();
     handle.join().unwrap();
 
@@ -144,7 +144,7 @@ impl ibx::api::wrapper::Wrapper for Listing {
 }
 
 /// The engine on a signed in-memory auth link, with a Rust client on top.
-fn session(shared: &Arc<SharedState>) -> (EClient, Peer, crossbeam_channel::Sender<ControlCommand>, std::thread::JoinHandle<()>) {
+fn session(shared: &Arc<SharedState>) -> (EClient, Peer, ibx::engine::park::ControlSender, std::thread::JoinHandle<()>) {
     let (farm_conn, _farm) = Peer::pair();
     let (mut ccp_conn, mut ccp) = Peer::pair();
     let mac_key: Vec<u8> = (1..=20).collect();
@@ -161,11 +161,11 @@ fn session(shared: &Arc<SharedState>) -> (EClient, Peer, crossbeam_channel::Send
 // Paper 05/10/2026 (global_cancel_paper): an order a Rust client placed in
 // one session was not found among the open orders of the next session by
 // its order id, which was built from the clock, above the int range, so
-// the new order carried no API order id (6121). The order ids are now the
+// the new order carried no API order id. The order ids are now the
 // reference's (ibx#466): the next valid id is the highest order id the
 // client used + 1, 1 for a client with none; the new order goes out under
-// a server id of the order id generator, its API order id in 6121. The
-// next session's logon replay gives the order with its 6121: it is listed
+// a server id of the order id generator, its API order id in its own field. The
+// next session's logon replay gives the order with its API order id: it is listed
 // with that order id and its permId (the server id), and the next valid id
 // of that session is above it.
 #[test]
@@ -175,6 +175,7 @@ fn an_order_of_an_earlier_session_keeps_its_order_id() {
     let (client, mut ccp, stop_tx, handle) = session(&shared);
     let mut ids = NextIds::default();
     client.req_ids(&mut ids);
+    client.process_msgs(&mut ids);
     let id = client.next_order_id();
     assert_eq!((ids.0.as_slice(), id), ([1].as_slice(), 1), "a client with no orders starts at 1");
     let spy = Contract {
@@ -187,8 +188,9 @@ fn an_order_of_an_earlier_session_keeps_its_order_id() {
     };
     client.place_order(id, &spy, &order).unwrap();
     let is_order = |m: &Vec<u8>| parse_fields(m).iter().any(|(t, v)| *t == 35 && v == "D");
-    let sent = ccp.messages_until(Duration::from_secs(5), |ms| ms.iter().any(is_order));
+    let sent = ccp.messages_until_serving_presets(Duration::from_secs(5), |ms| ms.iter().any(is_order));
     client.req_ids(&mut ids);
+    client.process_msgs(&mut ids);
     assert_eq!(ids.0, [1, 2], "the placed id counts");
     stop_tx.send(ControlCommand::Shutdown).unwrap();
     handle.join().unwrap();
@@ -220,9 +222,11 @@ fn an_order_of_an_earlier_session_keeps_its_order_id() {
     assert_eq!(listing.open, [(id, perm)], "the replayed report: its order id and its permId");
     let mut ids = NextIds::default();
     client.req_ids(&mut ids);
+    client.process_msgs(&mut ids);
     assert_eq!((ids.0.as_slice(), client.next_order_id()), ([2].as_slice(), 2), "above the replayed order's id");
     listing.open.clear();
     client.req_all_open_orders(&mut listing);
+    client.process_msgs(&mut listing);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !listing.end && std::time::Instant::now() < deadline {
         client.process_msgs(&mut listing);

@@ -28,7 +28,7 @@ pub struct AuthResult {
     /// canonical big-endian wire form.
     pub session_token: BigUint,
     /// Token type discriminator: `"st"`, `"tst"`, or `"zenith"`. Matches the `stoken_type`
-    /// field expected by the SSO `Authenticate-TWS` body.
+    /// field expected by the SSO authentication body.
     pub token_type: String,
     pub session_id: String,
     pub features: Vec<String>,
@@ -40,7 +40,7 @@ impl AuthResult {
     /// stripped (single `0x00` retained when the value is zero).
     ///
     /// This is the exact representation used as the second SHA-1 input for soft-token
-    /// challenge/response and SSO `Authenticate-TWS` bodies. Round-trips through
+    /// challenge/response and SSO authentication bodies. Round-trips through
     /// `BigUint::from_bytes_be`.
     pub fn session_token_bytes(&self) -> Vec<u8> {
         let raw = self.session_token.to_bytes_be();
@@ -94,11 +94,11 @@ pub fn get_session_id() -> String {
     format!("{:x}.{:04x}", secs, ms)
 }
 
-/// Path of the persistent 8-hex machine_id file used in tag 6351.
+/// Path of the persistent 8-hex machine_id file used in the hardware info field.
 ///
-/// Per ib-agent#132: the Java client reads/creates `%USERPROFILE%\hwid`
+/// Per ib-agent#132: the reference reads/creates `%USERPROFILE%\hwid`
 /// on Windows or `$HOME/.hwid` elsewhere, persists 8 hex chars there, and
-/// reuses it across logons. IB binds that prefix to the IBKey enrollment
+/// reuses it across logons. The broker binds that prefix to the 2FA key enrollment
 /// at first-login time; live farms silent-drop logons whose prefix isn't
 /// in the registered set.
 ///
@@ -185,8 +185,8 @@ fn read_hwid(path: &std::path::Path) -> Option<String> {
 
 /// Generate hardware info string: `{machine_id}|{MAC}`.
 ///
-/// Live data farms validate the MAC field; an all-zero MAC causes the FIX
-/// 35=A logon to be silently rejected (paper farms don't validate).
+/// Live data farms validate the MAC field; an all-zero MAC causes the
+/// logon message to be silently rejected (paper farms don't validate).
 /// `machine_id` is the persistent 8-hex value from `~/hwid` (see #132).
 pub fn get_hw_info() -> String {
     let machine_id = read_or_create_hwid();
@@ -561,6 +561,23 @@ pub fn recv_secure<R: Read>(
 /// Second factor of the mobile-key kind, the one this crate drives
 /// (`XYZ_MSG_SWCR_TOKEN`).
 pub const SECOND_FACTOR_MOBILE_KEY: u32 = 5;
+/// A security code card (ibx#350).
+pub const SECOND_FACTOR_CARD: u32 = 3;
+/// An authenticator app, a code by email (sub-type 1), or a one-time
+/// passcode sent by SMS or voice (sub-type 2) (ibx#350).
+pub const SECOND_FACTOR_TYPED: u32 = 4;
+/// A temporary security code (ibx#350).
+pub const SECOND_FACTOR_TEMPORARY: u32 = 6;
+
+/// The second-factor step of a live login (ibx#350).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecondFactorStep {
+    /// The mobile key, with the token sub-type of its first message.
+    MobileKey(String),
+    /// A factor whose code the user types: a security code card, an
+    /// authenticator app or passcode, a temporary code.
+    TypedCode(SecondFactor),
+}
 
 /// One entry of the second-factor list of the auth start: a type with an
 /// optional sub-type and suffix (ibx#279).
@@ -572,6 +589,15 @@ pub struct SecondFactor {
 }
 
 impl SecondFactor {
+    /// The entry as the auth start lists it: "4.2", "5.2a", "3".
+    pub fn text(&self) -> String {
+        if self.subtype > 0 {
+            format!("{}.{}{}", self.kind, self.subtype, self.suffix)
+        } else {
+            self.kind.to_string()
+        }
+    }
+
     /// Parse one entry the way the reference does. `None` when the type or
     /// the sub-type is not a number.
     pub fn parse(entry: &str) -> Option<Self> {
@@ -601,6 +627,9 @@ pub struct AuthStart {
     pub second_factors: Vec<SecondFactor>,
     /// Non-zero selects the session-token step.
     pub soft_flag: u32,
+    /// The session can send a one-time passcode (ibx#350): a passcode
+    /// factor asks for it by SMS.
+    pub otp_way: bool,
 }
 
 /// Lowest auth start version whose first mobile-key message carries the
@@ -638,7 +667,31 @@ impl AuthStart {
             password_required: number(3) != 0,
             second_factors,
             soft_flag: number(5),
+            otp_way: fields.get(9).is_some_and(|f| f.split(',').any(|flag| flag.trim() == "OTPWAY")),
         })
+    }
+
+    /// The second-factor step of a live login (ibx#350): none for an empty
+    /// list, the mobile key when the list has one (with `override_sub_type`
+    /// used when not empty), else the first factor whose code is typed.
+    /// With several factors the reference preselects the one used last time
+    /// or asks the user; here the mobile key comes first, as it needs no
+    /// code. A list of other kinds only is refused.
+    pub fn second_factor_step(&self, override_sub_type: &str) -> io::Result<Option<SecondFactorStep>> {
+        if let Some(token) = self.mobile_key_token(override_sub_type).ok().flatten() {
+            return Ok(Some(SecondFactorStep::MobileKey(token)));
+        }
+        if self.second_factors.is_empty() {
+            return Ok(None);
+        }
+        self.second_factors.iter()
+            .find(|f| matches!(f.kind, SECOND_FACTOR_CARD | SECOND_FACTOR_TYPED | SECOND_FACTOR_TEMPORARY))
+            .map(|f| Some(SecondFactorStep::TypedCode(f.clone())))
+            .ok_or_else(|| {
+                let kinds: Vec<String> = self.second_factors.iter().map(SecondFactor::text).collect();
+                io::Error::new(io::ErrorKind::Unsupported,
+                    format!("second factor of type {} is not supported", kinds.join(", ")))
+            })
     }
 
     /// The first mobile-key entry of the list, if any.
@@ -977,7 +1030,7 @@ fn wrap_xyz_fix(xyz_payload: &[u8]) -> Vec<u8> {
 /// Maximum size for a farm auth message (prevents unbounded allocation).
 const MAX_FARM_MSG_SIZE: usize = 65536;
 
-/// Read one framed `8=1` message from a farm stream.
+/// Read one auth-framed message from a farm stream.
 ///
 /// `carry` holds bytes across calls: a read can return more than one message's
 /// worth of data, and a high-latency regional gateway can coalesce the last
@@ -1024,13 +1077,13 @@ fn recv_8eq1<S: Read>(stream: &mut S, carry: &mut Vec<u8>) -> io::Result<Vec<u8>
     }
 }
 
-/// Locate one complete `8=1`-framed message at the front of `buf`.
+/// Locate one complete auth-framed message at the front of `buf`.
 ///
 /// Returns the message's total byte length when a full message is present,
 /// `None` when more bytes are needed, or an error when the advertised body
 /// length is implausibly large.
 fn try_frame_8eq1(buf: &[u8]) -> io::Result<Option<usize>> {
-    // Needs "8=1\x01" and a body length "9=NNNN\x01".
+    // Needs the auth frame's begin string and a 4-digit body length field.
     if !buf.starts_with(b"8=1\x01") {
         return Ok(None);
     }
@@ -1083,7 +1136,7 @@ pub enum IbKeyOutcome {
         session_id: String,
         /// SOFT session token issued by `XYZ AUTH_FINISH(771) state=5 PASSED`,
         /// hex-encoded. This is the token that downstream farm logons must
-        /// hash for tag 8483 (NOT the SRP-derived `session_key`). Empty if the
+        /// hash for the token hash field (NOT the SRP-derived `session_key`). Empty if the
         /// AUTH_FINISH body didn't carry an extractable token.
         soft_token_hex: String,
     },
@@ -1105,6 +1158,16 @@ fn ib_key_err(kind: io::ErrorKind, msg: impl Into<String>) -> io::Error {
 pub struct IbKeyChallenge {
     pub display_id: String,
     pub avth_url: String,
+    /// The second factor, as the auth start lists it ("5.2a", "4", "4.2",
+    /// "3", "6"); empty for the mobile key's challenge (ibx#350).
+    pub kind: String,
+    /// The server's message with the challenge, when it sent one.
+    pub message: String,
+    /// A security code card: the image of the two card indexes to look up
+    /// (PNG); the code is the two values, typed one after the other.
+    pub image: Vec<u8>,
+    /// A one-time passcode: how the server sent it, as it says.
+    pub delivery: String,
 }
 
 /// 8-character Challenge/Response code provider callback.
@@ -1301,6 +1364,7 @@ pub fn do_ib_key_2fa<S: Read + Write>(
                         let challenge_info = IbKeyChallenge {
                             display_id: session_id.clone(),
                             avth_url: approval_url.clone(),
+                            ..Default::default()
                         };
                         let provider = provider.clone();
                         let (tx, rx) = std::sync::mpsc::channel();
@@ -1345,7 +1409,7 @@ pub fn do_ib_key_2fa<S: Read + Write>(
                     log::info!("2FA gate: approved");
                     // Per ib-agent#125: AUTH_FINISH carries no token — body is
                     // just `["", "PASSED"]`. The SOFT token used for downstream
-                    // farm logons (tag 8483) is the SRP-derived K_soft, which
+                    // farm logons (the token hash field) is the SRP-derived K_soft, which
                     // ibx already computes correctly via `srp_compute_k`
                     // (= SHA1(strip_leading_zeros(S))). No extraction needed.
                     if approval_url.is_empty() && session_id.is_empty()
@@ -1392,6 +1456,208 @@ pub fn do_ib_key_2fa<S: Read + Write>(
     }
 }
 
+/// The answer to a temporary security code's challenge (ibx#350, as the
+/// reference): the digest of the challenge's bytes then the code's, in
+/// hexadecimal without leading zeros.
+pub fn temporary_code_answer(challenge_hex: &str, code: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let challenge = BigUint::parse_bytes(challenge_hex.trim().as_bytes(), 16).unwrap_or_default();
+    let mut digest = Sha1::new();
+    digest.update(challenge.to_bytes_be());
+    digest.update(BigUint::from_bytes_be(code.as_bytes()).to_bytes_be());
+    BigUint::from_bytes_be(&digest.finalize()).to_str_radix(16)
+}
+
+/// The second factor of a live login whose code the user types (ibx#350):
+/// a security code card (773), an authenticator app, a code by email or a
+/// one-time passcode (774), a temporary security code (776). As the
+/// reference: the start, the server's challenge, the code asked from
+/// `code_provider` (on its own thread, the keepalives answered meanwhile),
+/// the code sent, then the server's verdict and the end of the login's
+/// authentication. A wrong code ends the login ("incorrect security code"),
+/// with no retry, as in the reference.
+///
+/// The start: a card or a temporary code sends state 1 and waits for the
+/// challenge; a passcode (4.2) asks the server to send one by SMS when the
+/// session allows it (`auth_version` 36 or above), then waits; an
+/// authenticator app or a code by email asks the code at once.
+pub fn do_typed_code_2fa<S: Read + Write>(
+    stream: &mut S,
+    factor: &SecondFactor,
+    auth_version: u32,
+    otp_way: bool,
+    deadline: impl Into<Option<std::time::Instant>>,
+    code_provider: &CodeProvider,
+) -> io::Result<IbKeyOutcome> {
+    use std::time::Instant;
+    let deadline: Option<Instant> = deadline.into();
+    let entry = factor.text();
+    let sub_type = factor.subtype.to_string();
+    let msg_id = match factor.kind {
+        SECOND_FACTOR_CARD => xyz::XYZ_MSG_CARD_CODE,
+        SECOND_FACTOR_TYPED => xyz::XYZ_MSG_TYPED_CODE,
+        SECOND_FACTOR_TEMPORARY => xyz::XYZ_MSG_TEMPORARY_CODE,
+        other => return Err(io::Error::new(io::ErrorKind::Unsupported,
+            format!("second factor of type {} is not supported", other))),
+    };
+    let mut code_rx: Option<std::sync::mpsc::Receiver<io::Result<String>>> = None;
+    let ask = |challenge: IbKeyChallenge| -> io::Result<std::sync::mpsc::Receiver<io::Result<String>>> {
+        let provider = code_provider.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("ibx-2fa-code".into())
+            .spawn(move || {
+                let _ = tx.send(provider(challenge));
+            })?;
+        Ok(rx)
+    };
+    let send = |stream: &mut S, inner: Vec<u8>| -> io::Result<()> {
+        stream.write_all(&xyz::xyz_wrap(&inner))
+    };
+    let start = match factor.kind {
+        SECOND_FACTOR_CARD => Some(xyz::xyz_build_card_code(1, "")),
+        SECOND_FACTOR_TEMPORARY => Some(xyz::xyz_build_temporary_code(1, "")),
+        _ if factor.subtype == 2 && auth_version >= 36 => Some(xyz::xyz_build_typed_code(
+            4, "", &sub_type, if otp_way { xyz::XYZ_DELIVERY_SMS } else { 0 })),
+        _ => None,
+    };
+    match start {
+        Some(inner) => {
+            send(stream, inner)?;
+            log::info!("2FA gate: second factor {}: started, waiting for the challenge", entry);
+        }
+        None => {
+            log::info!("2FA gate: second factor {}: asking the code", entry);
+            code_rx = Some(ask(IbKeyChallenge { kind: entry.clone(), ..Default::default() })?);
+        }
+    }
+    let mut challenge_hex = String::new();
+    let mut frames = NsFramePoller::default();
+    let refused = |message: &str, fallback: &str| -> io::Error {
+        let text = if message.is_empty() { fallback } else { message };
+        ib_key_err(io::ErrorKind::PermissionDenied, format!("2FA gate: {}", text))
+    };
+    loop {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(ib_key_err(io::ErrorKind::TimedOut, "2FA code timed out (client deadline)"));
+        }
+        if let Some(rx) = code_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(code)) => {
+                    code_rx = None;
+                    let inner = match factor.kind {
+                        SECOND_FACTOR_CARD => xyz::xyz_build_card_code(3, &code),
+                        SECOND_FACTOR_TEMPORARY => xyz::xyz_build_temporary_code(3, &temporary_code_answer(&challenge_hex, &code)),
+                        _ => xyz::xyz_build_typed_code(1, &code, &sub_type, 0),
+                    };
+                    send(stream, inner)?;
+                    log::info!("2FA gate: second factor {}: code sent", entry);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(ib_key_err(io::ErrorKind::Other, "2FA gate: the code provider ended without a code"));
+                }
+            }
+        }
+        let payload = match frames.poll(stream) {
+            Ok(None) => continue,
+            Ok(Some(payload)) => payload,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+                || e.kind() == io::ErrorKind::ConnectionReset
+                || e.kind() == io::ErrorKind::ConnectionAborted =>
+            {
+                return Err(ib_key_err(io::ErrorKind::ConnectionAborted,
+                    "2FA gate: the server closed the socket during the second factor"));
+            }
+            Err(e) => return Err(e),
+        };
+        if ns::is_ns_text(&payload) && is_backup_host_notice(&String::from_utf8_lossy(&payload)) {
+            continue;
+        }
+        let recv = classify_payload(&payload)?;
+        match recv {
+            RecvMsg::Xyz { msg_id: id, state, .. } if id == msg_id => {
+                let Some(mut items) = xyz::XyzItems::new(&payload) else { continue };
+                if factor.kind == SECOND_FACTOR_TYPED {
+                    // Message, sub-type, the delivery of state 5 (how, which
+                    // ways), the delivery asked in state 4, the verdict.
+                    let message = items.string();
+                    if items.version() >= 16 {
+                        items.string();
+                    }
+                    let mut delivery = String::new();
+                    if items.version() >= 18 && state == 5 {
+                        delivery = items.string();
+                        items.int();
+                    }
+                    if state == 4 {
+                        items.int();
+                    }
+                    let verdict = items.string();
+                    match state {
+                        5 if code_rx.is_none() => {
+                            log::info!("2FA gate: second factor {}: passcode sent ({})", entry, delivery);
+                            code_rx = Some(ask(IbKeyChallenge { kind: entry.clone(), message, delivery, ..Default::default() })?);
+                        }
+                        2 if verdict.eq_ignore_ascii_case("PASSED") => log::info!("2FA gate: second factor {}: code accepted", entry),
+                        2 => return Err(refused(&message, "incorrect security code")),
+                        _ => log::debug!("2FA gate: second factor {}: state {} (ignored)", entry, state),
+                    }
+                } else {
+                    // The challenge (an image for a card, hexadecimal for a
+                    // temporary code), the message, the verdict.
+                    let challenge = items.bytes().to_vec();
+                    let message = items.string();
+                    let verdict = items.string();
+                    match state {
+                        2 if code_rx.is_none() => {
+                            log::info!("2FA gate: second factor {}: challenge received", entry);
+                            let mut asked = IbKeyChallenge { kind: entry.clone(), message, ..Default::default() };
+                            if factor.kind == SECOND_FACTOR_CARD {
+                                asked.image = challenge;
+                            } else {
+                                challenge_hex = String::from_utf8_lossy(&challenge).into_owned();
+                            }
+                            code_rx = Some(ask(asked)?);
+                        }
+                        4 if verdict.eq_ignore_ascii_case("PASSED") => log::info!("2FA gate: second factor {}: code accepted", entry),
+                        4 => return Err(refused(&message, "incorrect security code")),
+                        5 => return Err(refused("", if factor.kind == SECOND_FACTOR_CARD {
+                            "secure code card has expired"
+                        } else {
+                            "temporary security code has expired"
+                        })),
+                        _ => log::debug!("2FA gate: second factor {}: state {} (ignored)", entry, state),
+                    }
+                }
+            }
+            RecvMsg::Xyz { msg_id, state, fields, .. } if msg_id == xyz::XYZ_MSG_TOKEN_AUTH && (state == 3 || state == 5) => {
+                if fields.iter().any(|f| f.eq_ignore_ascii_case("PASSED")) {
+                    log::info!("2FA gate: second factor {}: approved", entry);
+                    return Ok(IbKeyOutcome::Approved {
+                        approval_url: String::new(), session_id: String::new(), soft_token_hex: String::new(),
+                    });
+                }
+                let result = fields.iter().rev().find(|s| !s.is_empty()).map(|s| s.as_str()).unwrap_or("");
+                return Err(refused(result, "authentication refused"));
+            }
+            RecvMsg::Ns { msg_type, fields, .. } if msg_type == NS_TEST_REQUEST => {
+                let ts = fields.iter().find(|f| !f.is_empty()).cloned().unwrap_or_default();
+                stream.write_all(&ns_build_heart_beat(NS_VERSION, &ts))?;
+            }
+            RecvMsg::Ns { msg_type, fields, .. } if msg_type == NS_ERROR_RESPONSE || msg_type == NS_SECURE_ERROR => {
+                let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+                return Err(ns_error(msg_type, &fields));
+            }
+            RecvMsg::Xyz { msg_id, state, .. } =>
+                log::debug!("2FA gate: unexpected message id={} state={} (ignored)", msg_id, state),
+            RecvMsg::Ns { msg_type, .. } =>
+                log::debug!("2FA gate: unexpected message type={} (ignored)", msg_type),
+        }
+    }
+}
+
 /// Result of soft token authentication attempt.
 pub enum SoftTokenOutcome {
     /// Token accepted.
@@ -1407,11 +1673,11 @@ pub fn do_soft_token<S: Read + Write>(
 ) -> io::Result<SoftTokenOutcome> {
     use sha1::{Digest, Sha1};
 
-    // State 1: Send empty init (FIX-framed for farm)
+    // State 1: Send empty init (auth-framed for farm)
     let msg1 = xyz::xyz_build_soft_token(1, "", "", "");
     stream.write_all(&wrap_xyz_fix(&msg1))?;
 
-    // State 2: Receive challenge (FIX-framed)
+    // State 2: Receive challenge (auth-framed)
     let recv2 = recv_8eq1(stream, carry)?;
     let xyz2 = extract_xyz(&recv2);
     let (_, _, state2, fields2) = xyz::xyz_parse_response(xyz2)
@@ -1450,11 +1716,11 @@ pub fn do_soft_token<S: Read + Write>(
     let response_int = BigUint::from_bytes_be(&digest);
     let response_hex = format!("{:x}", response_int);
 
-    // State 3: Send hash response (FIX-framed)
+    // State 3: Send hash response (auth-framed)
     let msg3 = xyz::xyz_build_soft_token(3, "", &response_hex, "");
     stream.write_all(&wrap_xyz_fix(&msg3))?;
 
-    // State 4: Receive result (FIX-framed)
+    // State 4: Receive result (auth-framed)
     let recv4 = recv_8eq1(stream, carry)?;
     let xyz4 = extract_xyz(&recv4);
     let (_, _, _, fields4) = xyz::xyz_parse_response(xyz4)
@@ -1480,7 +1746,7 @@ pub fn do_soft_token<S: Read + Write>(
     }
 }
 
-/// SRP-6 authentication for farm connections using FIX framing (8=1).
+/// SRP-6 authentication for farm connections using the auth framing.
 /// Called as fallback when `do_soft_token` returns `SoftTokenOutcome::Unknown`.
 /// Same SRP math as `do_srp`, different wire framing.
 pub fn do_srp_farm<S: Read + Write>(
@@ -1492,11 +1758,11 @@ pub fn do_srp_farm<S: Read + Write>(
     let n = srp::srp_n();
     let g = BigUint::from(srp::SRP_G);
 
-    // State 1: Send AUTH_QUERY (FIX-framed)
+    // State 1: Send AUTH_QUERY (auth-framed)
     let msg1 = xyz::xyz_build_srp_v20(1, &[]);
     stream.write_all(&wrap_xyz_fix(&msg1))?;
 
-    // State 2: Receive AUTH_PARAMS (FIX-framed)
+    // State 2: Receive AUTH_PARAMS (auth-framed)
     let recv2 = recv_8eq1(stream, carry)?;
     let xyz2 = extract_xyz(&recv2);
     let (_, _, state2, fields2) = xyz::xyz_parse_response(xyz2)
@@ -1529,12 +1795,12 @@ pub fn do_srp_farm<S: Read + Write>(
     let a_priv = BigUint::from_bytes_be(&a_bytes);
     let a_pub = g.modpow(&a_priv, &n);
 
-    // State 3: Send client public key A (FIX-framed)
+    // State 3: Send client public key A (auth-framed)
     let a_hex = format!("{:x}", a_pub);
     let msg3 = xyz::xyz_build_srp_v20(3, &[("L", &a_hex)]);
     stream.write_all(&wrap_xyz_fix(&msg3))?;
 
-    // State 4: Receive salt + B (FIX-framed)
+    // State 4: Receive salt + B (auth-framed)
     let recv4 = recv_8eq1(stream, carry)?;
     let xyz4 = extract_xyz(&recv4);
     let (_, _, state4, fields4) = xyz::xyz_parse_response(xyz4)
@@ -1580,12 +1846,12 @@ pub fn do_srp_farm<S: Read + Write>(
     let salt_int = BigUint::parse_bytes(salt_hex.as_bytes(), 16).unwrap_or_default();
     let m1 = srp::srp_compute_m1(&n, &g, username, &salt_int, &a_pub, &b_pub, &k);
 
-    // State 5: Send client proof M1 (FIX-framed)
+    // State 5: Send client proof M1 (auth-framed)
     let m1_hex = format!("{:x}", m1);
     let msg5 = xyz::xyz_build_srp_v20(5, &[("N", &m1_hex)]);
     stream.write_all(&wrap_xyz_fix(&msg5))?;
 
-    // State 6: Receive AUTH_RESULT (FIX-framed)
+    // State 6: Receive AUTH_RESULT (auth-framed)
     let recv6 = recv_8eq1(stream, carry)?;
     let xyz6 = extract_xyz(&recv6);
     let (_, _, state6, fields6) = xyz::xyz_parse_response(xyz6)
@@ -1648,7 +1914,7 @@ mod tests {
 
     // ── recv_8eq1 framing / coalesced tail (ibx#237) ────────────────────────
 
-    /// Build a framed `8=1` message with the given inner payload.
+    /// Build an auth-framed message with the given inner payload.
     fn framed_8eq1(payload: &[u8]) -> Vec<u8> {
         let body = {
             let mut b = b"35=X\x01".to_vec();
@@ -1681,7 +1947,7 @@ mod tests {
 
     /// The exact ibx#237 regression: a gateway coalesces the final auth
     /// response and the farm logon ACK that follows it into one TCP read.
-    /// `recv_8eq1` must return only the framed `8=1` message and preserve the
+    /// `recv_8eq1` must return only the auth-framed message and preserve the
     /// trailing ACK bytes in the carry buffer, not discard them.
     #[test]
     fn recv_8eq1_preserves_coalesced_tail() {
@@ -1720,7 +1986,7 @@ mod tests {
         );
 
         // A second call returns the buffered ACK without touching the socket
-        // (it is not a valid 8=1 frame, so this would block on read if the tail
+        // (it is not a valid auth frame, so this would block on read if the tail
         // had been lost — proving the bytes are actually retained).
         assert_eq!(try_frame_8eq1(&carry).unwrap(), None);
 
@@ -2767,5 +3033,188 @@ mod tests {
         let mut tail = Vec::new();
         let _ = io::Read::read_to_end(&mut stream, &mut tail);
         assert_eq!(tail, b"next", "bytes after the frame stay unread");
+    }
+}
+
+// ibx#350: the second factors whose code the user types, against a
+// scripted server that answers each message of the client in turn.
+#[cfg(test)]
+mod typed_code_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    enum Item<'a> {
+        S(&'a str),
+        B(&'a [u8]),
+        I(u32),
+    }
+
+    /// A server frame: header, the string slot, then the items.
+    fn frame(id: u32, state: u32, items: &[Item]) -> Vec<u8> {
+        let mut msg: Vec<u8> = [20u32, id, 1, state].iter().flat_map(|v| v.to_be_bytes()).collect();
+        xyz::xyz_write_string(&mut msg, "");
+        for item in items {
+            match item {
+                Item::S(s) => xyz::xyz_write_string(&mut msg, s),
+                Item::B(b) => {
+                    msg.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                    msg.extend_from_slice(b);
+                    msg.resize(msg.len() + (4 - b.len() % 4) % 4, 0);
+                }
+                Item::I(v) => msg.extend_from_slice(&v.to_be_bytes()),
+            }
+        }
+        xyz::xyz_wrap(&msg)
+    }
+
+    /// Each step's bytes are read once the client wrote that many
+    /// messages; before, a read times out, as a socket with a read timeout.
+    struct Gated {
+        steps: Vec<(usize, Vec<u8>)>,
+        next: usize,
+        pending: Vec<u8>,
+        written: Vec<Vec<u8>>,
+    }
+
+    impl io::Read for Gated {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pending.is_empty() {
+                match self.steps.get(self.next) {
+                    Some((after, bytes)) if self.written.len() >= *after => {
+                        self.pending = bytes.clone();
+                        self.next += 1;
+                    }
+                    Some(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "no data yet"));
+                    }
+                    None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
+                }
+            }
+            let n = self.pending.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            Ok(n)
+        }
+    }
+
+    impl io::Write for Gated {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn gated(steps: Vec<(usize, Vec<u8>)>) -> Gated {
+        Gated { steps, next: 0, pending: Vec::new(), written: Vec::new() }
+    }
+
+    fn provider(code: &str) -> (CodeProvider, Arc<Mutex<Vec<IbKeyChallenge>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (code, kept) = (code.to_string(), seen.clone());
+        let p: CodeProvider = Arc::new(move |c: IbKeyChallenge| {
+            kept.lock().unwrap().push(c);
+            Ok(code.clone())
+        });
+        (p, seen)
+    }
+
+    fn deadline() -> Option<std::time::Instant> {
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(10))
+    }
+
+    fn factor(entry: &str) -> SecondFactor {
+        SecondFactor::parse(entry).unwrap()
+    }
+
+    #[test]
+    fn the_step_follows_the_list() {
+        let step = |s: &str| AuthStart::parse(s.as_bytes()).unwrap().second_factor_step("");
+        assert_eq!(step("50;520;1;1;4.2,5.2i;0;").unwrap(), Some(SecondFactorStep::MobileKey("2i".into())), "the mobile key first");
+        assert_eq!(step("50;520;1;1;6,3;0;").unwrap(), Some(SecondFactorStep::TypedCode(factor("6"))));
+        assert_eq!(step("50;520;1;1;4.1;0;").unwrap(), Some(SecondFactorStep::TypedCode(factor("4.1"))));
+        assert_eq!(step("50;520;1;1;;0;").unwrap(), None);
+        assert_eq!(step("50;520;1;1;7;0;").unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert!(AuthStart::parse(b"50;520;1;1;4.2;0;1;1;1;B2FRO,OTPWAY;;").unwrap().otp_way);
+        assert!(!AuthStart::parse(b"50;520;1;1;4.2;0;1;1;1;B2FRO;;").unwrap().otp_way);
+        assert_eq!(factor("4.2").text(), "4.2");
+        assert_eq!(factor("5.2a").text(), "5.2a");
+        assert_eq!(factor("3").text(), "3");
+    }
+
+    #[test]
+    fn a_temporary_code_answers_with_the_digest() {
+        // The challenge's bytes without a sign byte, then the code's.
+        assert_eq!(temporary_code_answer("00ff10", "1234"), "7541730dbc1c52c4ec681f5e75b06094ea6fa1c5");
+        assert_eq!(temporary_code_answer("0a0b", "1234"), "3d46ab0fc4afa0f299a516638cbd4002ced70d7e");
+    }
+
+    #[test]
+    fn a_security_code_card_sends_the_two_values() {
+        let image = [0x89u8, 0x50, 0x4e, 0x47, 1, 2];
+        let mut stream = gated(vec![
+            (1, frame(773, 2, &[Item::B(&image), Item::S(""), Item::S("")])),
+            (2, frame(773, 4, &[Item::B(&[]), Item::S(""), Item::S("PASSED")])),
+            (2, frame(771, 3, &[Item::S("PASSED")])),
+        ]);
+        let (p, seen) = provider("4711");
+        let out = do_typed_code_2fa(&mut stream, &factor("3"), 50, true, deadline(), &p).unwrap();
+        assert!(matches!(out, IbKeyOutcome::Approved { .. }));
+        assert_eq!(stream.written, [xyz::xyz_wrap(&xyz::xyz_build_card_code(1, "")), xyz::xyz_wrap(&xyz::xyz_build_card_code(3, "4711"))]);
+        let seen = seen.lock().unwrap();
+        assert_eq!((seen[0].kind.as_str(), seen[0].image.as_slice()), ("3", &image[..]));
+    }
+
+    #[test]
+    fn a_temporary_code_sends_the_answer_to_the_challenge() {
+        let mut stream = gated(vec![
+            (1, frame(776, 2, &[Item::S("0a0b"), Item::S(""), Item::S("")])),
+            (2, frame(776, 4, &[Item::S(""), Item::S(""), Item::S("PASSED")])),
+            (2, frame(771, 3, &[Item::S("PASSED")])),
+        ]);
+        let (p, _) = provider("1234");
+        do_typed_code_2fa(&mut stream, &factor("6"), 50, true, deadline(), &p).unwrap();
+        assert_eq!(stream.written[1], xyz::xyz_wrap(&xyz::xyz_build_temporary_code(3, "3d46ab0fc4afa0f299a516638cbd4002ced70d7e")));
+    }
+
+    #[test]
+    fn a_passcode_is_asked_by_sms_then_typed() {
+        let mut stream = gated(vec![
+            (1, frame(774, 5, &[Item::S("Code sent"), Item::S("2"), Item::S("SMS"), Item::I(1), Item::S("")])),
+            (2, frame(774, 2, &[Item::S(""), Item::S("2"), Item::S("PASSED")])),
+            (2, frame(771, 3, &[Item::S("PASSED")])),
+        ]);
+        let (p, seen) = provider("654321");
+        do_typed_code_2fa(&mut stream, &factor("4.2"), 50, true, deadline(), &p).unwrap();
+        assert_eq!(stream.written, [
+            xyz::xyz_wrap(&xyz::xyz_build_typed_code(4, "", "2", xyz::XYZ_DELIVERY_SMS)),
+            xyz::xyz_wrap(&xyz::xyz_build_typed_code(1, "654321", "2", 0)),
+        ]);
+        let seen = seen.lock().unwrap();
+        assert_eq!((seen[0].kind.as_str(), seen[0].delivery.as_str(), seen[0].message.as_str()), ("4.2", "SMS", "Code sent"));
+    }
+
+    #[test]
+    fn an_authenticator_code_is_asked_at_once_and_a_wrong_one_ends_the_login() {
+        let mut stream = gated(vec![
+            (1, frame(774, 2, &[Item::S(""), Item::S("0"), Item::S("FAILED")])),
+        ]);
+        let (p, seen) = provider("000000");
+        let err = do_typed_code_2fa(&mut stream, &factor("4"), 50, true, deadline(), &p).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("incorrect security code"), "{err}");
+        assert_eq!(stream.written, [xyz::xyz_wrap(&xyz::xyz_build_typed_code(1, "000000", "0", 0))]);
+        assert_eq!(seen.lock().unwrap()[0].kind, "4");
+    }
+
+    #[test]
+    fn an_expired_card_ends_the_login() {
+        let mut stream = gated(vec![(1, frame(773, 5, &[Item::B(&[]), Item::S(""), Item::S("EXPIRED")]))]);
+        let (p, _) = provider("1");
+        let err = do_typed_code_2fa(&mut stream, &factor("3"), 50, true, deadline(), &p).unwrap_err();
+        assert!(err.to_string().contains("secure code card has expired"), "{err}");
     }
 }

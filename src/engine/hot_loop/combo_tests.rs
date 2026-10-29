@@ -58,7 +58,7 @@ fn combo_frame(f: &[(u32, String)]) -> bool {
         Some("c") => tag(f, 320).is_some_and(|id| matches!(label(id),
             "SecDefReqMsgReqByConid" | "Query ICS typeReqByConid" | "EComboReqByConid"
             | "SmartComboEComboValidationProcessorReqByConid" | "FixSecDefReqBySymbol")),
-        Some("U") => matches!(tag(f, 6040), Some("36" | "7")),
+        Some("U") => matches!(tag(f, 6040), Some("36" | "7" | "193")),
         Some("D" | "G" | "F") => true,
         _ => false,
     }
@@ -79,7 +79,7 @@ fn assert_same(ours: &[(u32, String)], theirs: &[(u32, String)]) {
         let mut plain = Vec::new();
         let mut attrs = Vec::new();
         for (t, v) in session.apply(f) {
-            let v = if t == 320 { label(&v).to_string() } else { v };
+            let v = if matches!(t, 320 | 6556) { label(&v).to_string() } else { v };
             if is_attribute(t) { attrs.push((t, v)); } else { plain.push((t, v)); }
         }
         attrs.sort();
@@ -212,8 +212,10 @@ impl Session {
                 if !combo_frame(f) { continue; }
                 let ours = self.next_sent();
                 assert_same(&ours, f);
-                if let (Some(theirs), Some(mine)) = (tag(f, 320), tag(&ours, 320)) {
-                    self.ids.insert(theirs.to_string(), mine.to_string());
+                for t in [320, 6556] {
+                    if let (Some(theirs), Some(mine)) = (tag(f, t), tag(&ours, t)) {
+                        self.ids.insert(theirs.to_string(), mine.to_string());
+                    }
                 }
                 if let (Some(theirs), Some(mine)) = (tag(f, 11), tag(&ours, 11)) {
                     let base = |s: &str| s.split('.').next().unwrap().to_string();
@@ -225,6 +227,7 @@ impl Session {
                 Some("d") => tag(f, 320).is_some_and(|id| self.ids.contains_key(id)),
                 Some("U") => match tag(f, 6040) {
                     Some("36" | "7") => tag(f, 320).is_some_and(|id| self.ids.contains_key(id)),
+                    Some("194") => tag(f, 6556).is_some_and(|id| self.ids.contains_key(id)),
                     Some("60") => true,
                     _ => false,
                 },
@@ -235,7 +238,7 @@ impl Session {
             let mut fields = f.clone();
             for (t, v) in fields.iter_mut() {
                 match *t {
-                    320 => if let Some(mine) = self.ids.get(v.as_str()) { *v = mine.clone(); },
+                    320 | 6556 => if let Some(mine) = self.ids.get(v.as_str()) { *v = mine.clone(); },
                     11 | 41 => {
                         let (base, ver) = v.split_once('.').unwrap_or((v.as_str(), ""));
                         if let Some(mine) = self.ids.get(base) { *v = format!("{mine}.{ver}"); }
@@ -290,13 +293,14 @@ const COMBO_CONTRACT: &str = "28812380 QQQ,SPY BAG SMART USD QQQ,SPY COMB [75673
 
 // ibx#470 (captured 30/09/2026 in regular hours, i105_combo_fill): the
 // first combo order of a session sends the reference's set-up requests,
-// then its 35=D; the reports of its fill give the combo's execution, then
-// one execution per leg on the leg's contract, each with openOrder and
-// orderStatus at the combo's totals; each commission report after the
+// then its new order message; the reports of its fill give the combo's
+// execution, then one execution per leg on the leg's contract, each with
+// openOrder and orderStatus at the combo's totals; each commission report after the
 // order's openOrder and orderStatus once more (ibx#486). The opposite
 // combo on the same legs sends no set-up request.
 #[test]
 fn combo_fill_session_is_the_captured_one() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let frames = fixture("20260930/i105_combo_fill.jsonl");
     let mut s = Session::new();
     s.client.place_order(42, &spy_qqq("QQQ,SPY"), &combo_lmt("BUY", 23.84)).unwrap();
@@ -412,15 +416,18 @@ fn guarded_combo_authorizes_only_at_first_order_write_and_refusal_is_byte_zero()
 
 // ibx#470 (captured 26/09/2026, market closed, i105_combo_stock_smart of
 // both runs): with the BAG symbol SPY,QQQ the set-up runs and the order
-// is refused with 478, no 35=D; a second order on the same legs is
-// refused at once. In the same session, with the symbol QQQ,SPY: no
-// set-up request, the 35=D, the price change as a 35=G without the leg
-// block, the cancel as a 35=F with the BAG conId, and the same for a
-// second order.
+// is refused with 478, no new order message; a second order on the same
+// legs is refused at once. In the same session, with the symbol QQQ,SPY:
+// no set-up request, the new order message, the price change as a replace
+// message without the leg block, the cancel as a cancel message with the
+// BAG conId, and the same for a second order.
 #[test]
 fn combo_symbol_refusal_then_order_modify_and_cancel_are_the_captured_ones() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let first = fixture("20260926/i105_combo_stock_smart.jsonl");
     let mut s = Session::new();
+    // The session of the capture had the combo preset already (ibx#660).
+    s.engine.context.order_presets.insert("COMB".into(), None);
     s.client.place_order(23, &spy_qqq("SPY,QQQ"), &combo_lmt("BUY", -23.15)).unwrap();
     s.run();
     s.play(&first, is("c", "SecDefReqMsgReqByConid"), |_| false);
@@ -457,15 +464,20 @@ fn combo_symbol_refusal_then_order_modify_and_cancel_are_the_captured_ones() {
 }
 
 // ibx#470 (captured 26/09/2026, i105_combo_leg_prices): per-leg prices
-// and no limit price give the combo price (721.35 - 794.50) and one 6879
-// per leg after it; the price change of a leg keeps the placed prices on
-// the 35=G, with the leg block. openOrder shows the reported leg prices
-// and no limit price.
+// and no limit price give the combo price (721.35 - 794.50) and one leg
+// price field per leg after it; the price change of a leg keeps the placed
+// prices on the replace message of 10.40, with the leg block (10.51 sends
+// the new ones: tests/scenario_replay.rs `combo_orders_on_10_51`, ibx#604).
+// openOrder shows the reported leg prices and no limit price.
 #[test]
 fn combo_leg_prices_are_the_captured_ones() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let first = fixture("20260926/i105_combo_stock_smart.jsonl");
     let frames = fixture("20260926b/i105_combo_leg_prices.jsonl");
     let mut s = Session::new();
+    s.engine.shared.reference.set_form_10_40(true); // a capture of 10.40
+    // The session of the capture had the combo preset already (ibx#660).
+    s.engine.context.order_presets.insert("COMB".into(), None);
     // The session's set-up, as in the capture's session.
     s.client.place_order(23, &spy_qqq("SPY,QQQ"), &combo_lmt("BUY", -23.15)).unwrap();
     s.run();
@@ -498,6 +510,7 @@ fn combo_leg_prices_are_the_captured_ones() {
 // and nothing else is sent.
 #[test]
 fn directed_combo_without_definition_is_the_captured_one() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let frames = fixture("20260926b/i105_combo_directed.jsonl");
     let mut s = Session::new();
     let id = s.engine.context.market.register(0);
@@ -515,11 +528,114 @@ fn directed_combo_without_definition_is_the_captured_one() {
     assert_eq!(s.callbacks.0, ["error 32 200 No security definition has been found for the request"]);
 }
 
+/// A combo of the session built before, with its preset known: the next
+/// order on it goes through no set-up.
+fn seed_combo(s: &mut Session, legs: &[(i64, bool, &str, &str)]) {
+    use crate::engine::combo::{Combo, Leg};
+    s.engine.context.order_presets.insert("COMB".into(), None);
+    s.engine.context.combos.seed_built_for_test(Combo {
+        bag_con_id: SMART_COMBO, exchange: "SMART".into(), routed: "BEST".into(), currency: "USD".into(),
+        trading_class: "COMB".into(), multiplier: 1.0,
+        legs: legs.iter().map(|&(con_id, buy, sec_type, key)| Leg {
+            con_id, ratio: 1, buy, exchange: "SMART".into(), sec_type: sec_type.into(),
+            symbol: match con_id { QQQ => "QQQ", 4_242 => "DIA", _ => "SPY" }.into(),
+            currency: "USD".into(), multiplier: 1.0, permission_key: key.into(),
+        }).collect(),
+    });
+}
+
+// ibx#677 (the reference 10.51, paper 13/10/2026, whose logon lists
+// REJGNONAT): a SMART combo without any NonGuaranteed value gets 10043 with
+// two legs, 10045 with three; nothing is sent.
+#[test]
+fn combos_without_a_non_guaranteed_value() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let mut s = Session::new();
+    let place = |s: &mut Session, contract: &ApiContract, order: &ApiOrder| -> Vec<String> {
+        s.client.place_order(7, contract, order).unwrap();
+        s.run();
+        std::mem::take(&mut s.callbacks.0)
+    };
+    let bare = ApiOrder { smart_combo_routing_params: Vec::new(), ..combo_lmt("BUY", 1.0) };
+    s.engine.shared.reference.set_logon_features("REJGNONAT,PRICECHK");
+    seed_combo(&mut s, &[(SPY, true, "STK", ""), (QQQ, false, "STK", "")]);
+    assert_eq!(place(&mut s, &spy_qqq("QQQ,SPY"), &bare),
+        ["error 7 10043 Missing or invalid NonGuaranteed value. REL+MKT, LMT+MKT, and REL+LMT order of two legs can only be set as non-guaranteed."]);
+    s.assert_nothing_sent();
+    // A new session: the refused order stays pending under its id.
+    let mut s = Session::new();
+    s.engine.shared.reference.set_logon_features("REJGNONAT,PRICECHK");
+    seed_combo(&mut s, &[(SPY, true, "STK", ""), (QQQ, false, "STK", ""), (4_242, true, "STK", "")]);
+    let mut three = spy_qqq("DIA,QQQ,SPY");
+    three.combo_legs.push(leg(4_242, "BUY"));
+    assert_eq!(place(&mut s, &three, &bare), ["error 7 10045 This combo order is not supported."]);
+    s.assert_nothing_sent();
+}
+
+// ibx#510 (the reference 10.51, paper, regular hours 19/10/2026: an SPY
+// call vertical, the set-up and the preset, then 460 "No trading
+// permissions.", nothing sent; not 10043 though the logon lists
+// REJGNONAT): an option combo is checked against the trading permission
+// of its legs' class, asked once; with it, the NonGuaranteed check comes
+// next.
+#[test]
+fn option_combo_needs_the_permission_of_its_legs() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let vertical = ApiContract {
+        symbol: "SPY".into(), sec_type: "BAG".into(), exchange: "SMART".into(), currency: "USD".into(),
+        combo_legs: vec![leg(927880711, "BUY"), leg(927880746, "SELL")],
+        ..Default::default()
+    };
+    let order = ApiOrder { action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: 0.05, ..Default::default() };
+    let answer = |s: &mut Session, allowed: &str| {
+        let msg = crate::protocol::fix::fix_build(&[(35, "U"), (6040, "66"), (6410, "0"), (6411, "2/OPT/R"), (6412, "1"),
+            (6413, ACCOUNT), (6414, allowed)], 1);
+        s.engine.inject_ccp_message(&msg);
+        s.run();
+        s.run();
+    };
+    for (allowed, want) in [
+        ("0", "error 9 460 No trading permissions."),
+        ("1", "error 9 10043 Missing or invalid NonGuaranteed value. REL+MKT, LMT+MKT, and REL+LMT order of two legs can only be set as non-guaranteed."),
+    ] {
+        let mut s = Session::new();
+        s.engine.shared.reference.set_logon_features("REJGNONAT,PRICECHK");
+        seed_combo(&mut s, &[(927880711, true, "OPT", "2/OPT/R"), (927880746, false, "OPT", "2/OPT/R")]);
+        s.client.place_order(9, &vertical, &order).unwrap();
+        s.run();
+        let asked = s.next_sent();
+        assert_eq!((tag(&asked, 6040), tag(&asked, 6411)), (Some("65"), Some("2/OPT/R")), "the class asked once");
+        s.assert_nothing_sent();
+        assert!(s.callbacks.0.is_empty(), "{:?}", s.callbacks.0);
+        answer(&mut s, allowed);
+        assert_eq!(s.callbacks.0, [want]);
+        // Past the check, both legs' option models are started.
+        let started: Vec<i64> = s.engine.context.order_models.iter().map(|(_, c, _)| *c).collect();
+        assert_eq!(started, [927880711, 927880746]);
+        s.engine.context.order_models.clear();
+        s.assert_nothing_sent();
+        // Its cancel, nothing sent.
+        s.callbacks.0.clear();
+        s.client.cancel_order(9, "").unwrap();
+        s.run();
+        s.run();
+        let got: Vec<&str> = s.callbacks.0.iter().map(|c| c.split(" 0 1 ").next().unwrap_or(c)).map(|c| c.split(" Order permId").next().unwrap_or(c)).collect();
+        let want_cancel: &[&str] = if allowed == "0" {
+            &["orderStatus 9 Cancelled", "error 9 202 Order Canceled - reason:Order was discarded.",
+              "error 9 161 Cancel attempted when order is not in a cancellable state. "]
+        } else {
+            &["orderStatus 9 ApiCancelled"]
+        };
+        assert_eq!(got, want_cancel);
+        s.assert_nothing_sent();
+    }
+}
+
 // ibx#470: the reference's refusals while it reads and checks a combo
-// order (`jextend.bH.q(ee)`, `jextend.bH.S()`, `jextend.at.a(OrderCreator)`),
-// before anything is sent.
+// order, before anything is sent.
 #[test]
 fn combo_refusals_before_sending() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let mut s = Session::new();
     let place = |s: &mut Session, contract: &ApiContract, order: &ApiOrder| -> Vec<String> {
         s.client.place_order(7, contract, order).unwrap();
@@ -528,34 +644,42 @@ fn combo_refusals_before_sending() {
     };
     let lmt = combo_lmt("BUY", 1.0);
     let no_legs = ApiContract { combo_legs: Vec::new(), ..spy_qqq("QQQ,SPY") };
-    assert_eq!(place(&mut s, &no_legs, &lmt), ["error 7 321 Error validating request.-'bH' : cause - Security type 'BAG' requires combo leg details."]);
+    assert_eq!(place(&mut s, &no_legs, &lmt), ["error 7 321 Error validating request.-'PlaceOrder(3)' : cause - Security type 'BAG' requires combo leg details."]);
     let chf = ApiContract { currency: "CHF".into(), ..spy_qqq("QQQ,SPY") };
-    assert_eq!(place(&mut s, &chf, &lmt), ["error 7 321 Error validating request.-'bH' : cause - Currency CHF isn't supported for smart combo."]);
+    assert_eq!(place(&mut s, &chf, &lmt), ["error 7 321 Error validating request.-'PlaceOrder(3)' : cause - Currency CHF isn't supported for smart combo."]);
     let unknown = ApiOrder { smart_combo_routing_params: vec![TagValue { tag: "Foo".into(), value: "1".into() }], ..lmt.clone() };
-    assert!(place(&mut s, &spy_qqq("QQQ,SPY"), &unknown)[0].starts_with("error 7 320 Error reading request:Invalid combo routing tag."));
+    assert!(place(&mut s, &spy_qqq("QQQ,SPY"), &unknown)[0].starts_with("error 7 321 Error validating request.-'PlaceOrder(3)' : cause - Invalid combo routing tag."));
     let three_prices = ApiOrder { order_combo_legs: vec![1.0, 2.0, 3.0], lmt_price: f64::MAX, ..lmt.clone() };
     assert_eq!(place(&mut s, &spy_qqq("QQQ,SPY"), &three_prices),
         ["error 7 320 Error reading request:Mismatch per-leg price number with combo leg specification."]);
     let priced_mkt = ApiOrder { order_type: "MKT".into(), order_combo_legs: vec![1.0, 2.0], ..lmt.clone() };
     assert_eq!(place(&mut s, &spy_qqq("QQQ,SPY"), &priced_mkt),
-        ["error 7 321 Error validating request.-'bH' : cause - The combo details for leg '0' are invalid. - Only LMT or REL+LMT order allows using per-leg prices."]);
+        ["error 7 321 Error validating request.-'PlaceOrder(3)' : cause - The combo details for leg '0' are invalid. - Only LMT or REL+LMT order allows using per-leg prices."]);
     let one_price = ApiOrder { order_combo_legs: vec![1.0, f64::MAX], lmt_price: f64::MAX, ..lmt.clone() };
     assert_eq!(place(&mut s, &spy_qqq("QQQ,SPY"), &one_price),
-        ["error 7 321 Error validating request.-'bH' : cause - The combo details for leg '1' are invalid. - All leg prices are needed when specifying per-leg prices."]);
+        ["error 7 321 Error validating request.-'PlaceOrder(3)' : cause - The combo details for leg '1' are invalid. - All leg prices are needed when specifying per-leg prices."]);
     let both = ApiOrder { order_combo_legs: vec![1.0, 2.0], ..lmt.clone() };
     assert_eq!(place(&mut s, &spy_qqq("QQQ,SPY"), &both),
-        ["error 7 321 Error validating request.-'bH' : cause - Can't specify combo price when using per-leg prices."]);
+        ["error 7 321 Error validating request.-'PlaceOrder(3)' : cause - Can't specify combo price when using per-leg prices."]);
     let mut bad_leg = spy_qqq("QQQ,SPY");
     bad_leg.combo_legs[1].action = "HOLD".into();
     assert_eq!(place(&mut s, &bad_leg, &lmt),
-        ["error 7 321 Error validating request.-'bH' : cause - The combo details for leg '1' are invalid. -  conid, ratio, side: 320227571, 1, 0"]);
+        ["error 7 321 Error validating request.-'PlaceOrder(3)' : cause - The combo details for leg '1' are invalid. -  conid, ratio, side: 320227571, 1, 0"]);
     let mut short_leg = spy_qqq("QQQ,SPY");
     short_leg.combo_legs[1].action = "SSHORT".into();
     assert_eq!(place(&mut s, &short_leg, &lmt),
-        ["error 7 321 Error validating request.-'bH' : cause - The combo details for leg '1' are invalid. - Not an institutional account, or an away clearing order"]);
+        ["error 7 321 Error validating request.-'PlaceOrder(3)' : cause - The combo details for leg '1' are invalid. - Not an institutional account, or an away clearing order"]);
     let mut two_two = spy_qqq("QQQ,SPY");
     for l in two_two.combo_legs.iter_mut() { l.ratio = 2; }
-    assert_eq!(place(&mut s, &two_two, &lmt), ["error 7 321 Error validating request.-'bH' : cause - Invalid leg ratio."]);
+    assert_eq!(place(&mut s, &two_two, &lmt), ["error 7 321 Error validating request.-'PlaceOrder(3)' : cause - Invalid leg ratio."]);
+    // ibx#660, the reference 10.51 (13/10/2026): three legs.
+    let mut three = spy_qqq("DIA,QQQ,SPY");
+    three.combo_legs.push(leg(4_242, "BUY"));
+    assert_eq!(place(&mut s, &three, &lmt),
+        ["error 7 321 Error validating request.-'PlaceOrder(3)' : cause - Non-guaranteed combo order is only supported for 2-leg SMART combos."]);
+    let no_price = ApiOrder { lmt_price: f64::MAX, smart_combo_routing_params: Vec::new(), ..lmt.clone() };
+    assert_eq!(place(&mut s, &three, &no_price),
+        ["error 7 321 Error validating request.-'PlaceOrder(3)' : cause - Limit price is required for combo orders with more than 2 legs."]);
     s.assert_nothing_sent();
 }
 
@@ -568,6 +692,7 @@ fn combo_refusals_before_sending() {
 // has no combo permission: not part of this check.)
 #[test]
 fn option_vertical_set_up_is_the_captured_one() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let frames = fixture("20260928/rth_order_types.jsonl");
     let mut s = Session::new();
     let vertical = ApiContract {
@@ -586,14 +711,17 @@ fn option_vertical_set_up_is_the_captured_one() {
 
 // ibx#470 (paper 03/10/2026, combo_paper): the price change of the first
 // combo order of a session, made as soon as the order works, while the
-// server's first reports still come, goes out as a 35=G with the new
-// price and no leg block, and the server's replace report reaches
+// server's first reports still come, goes out as a replace message with
+// the new price and no leg block, and the server's replace report reaches
 // openOrder.
 #[test]
 fn modify_of_the_first_combo_order_of_a_session_goes_out() {
+    crate::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let first = fixture("20260926/i105_combo_stock_smart.jsonl");
     let reports = fixture("20260926b/i105_combo_stock_smart.jsonl");
     let mut s = Session::new();
+    // The session of the capture had the combo preset already (ibx#660).
+    s.engine.context.order_presets.insert("COMB".into(), None);
     let mut order = combo_lmt("BUY", -50.00);
     s.client.place_order(28, &spy_qqq("QQQ,SPY"), &order).unwrap();
     s.run();
@@ -604,7 +732,7 @@ fn modify_of_the_first_combo_order_of_a_session_goes_out() {
     // 6121 (ibx#466).
     let server = tag(&d, 11).and_then(|c| c.strip_suffix(".0")).unwrap().to_string();
     assert_eq!((tag(&d, 35), tag(&d, 6121), tag(&d, 44)), (Some("D"), Some("28"), Some("-50.00")), "{d:?}");
-    // The first report of the order (150=A), then the change at once.
+    // The first report of the order (pending new), then the change at once.
     s.ids.insert("1770530845".into(), server.clone());
     let first_report = std::cell::Cell::new(0);
     s.play(&reports, |f| tag(f, 35) == Some("8"), |f| {

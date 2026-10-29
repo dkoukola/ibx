@@ -391,6 +391,7 @@ def test_req_current_time_fires_callback():
     client = EClient(w)
     client._test_connect()
     client.req_current_time()
+    client._test_dispatch_once()
     assert len(w.events) == 1
     assert w.events[0][0] == "current_time"
     ts = w.events[0][1]
@@ -406,6 +407,7 @@ def test_req_current_time_reasonable_value():
     client._test_connect()
     before = int(time.time())
     client.req_current_time()
+    client._test_dispatch_once()
     after = int(time.time())
     ts = w.events[0][1]
     assert before <= ts <= after
@@ -417,8 +419,11 @@ def test_req_current_time_multiple_calls():
     client = EClient(w)
     client._test_connect()
     client.req_current_time()
+    client._test_dispatch_once()
     client.req_current_time()
+    client._test_dispatch_once()
     client.req_current_time()
+    client._test_dispatch_once()
     assert len(w.events) == 3
     assert all(e[0] == "current_time" for e in w.events)
 
@@ -597,7 +602,9 @@ def test_full_ibapi_app_pattern_with_tier1():
     # Answered from local data on a (test) connection
     app.client.req_market_data_type(3)
     app.client.req_current_time()
+    app.client._test_dispatch_once()
     app.client.req_open_orders()
+    app.client._test_dispatch_once()
     app.client.req_executions(1)
     app.client._test_dispatch_once()
 

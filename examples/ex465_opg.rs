@@ -2,7 +2,7 @@
 //! account only, US pre-market.
 //!
 //! A LOO order (LMT, TIF OPG) below the market (inside the price cap) gets the server's order
-//! message (6360=TIME, 6361=...), which ibx reports as warning 399; the order
+//! message (a timed notice with its text), which ibx reports as warning 399; the order
 //! stays PreSubmitted. It is cancelled at the end.
 //!
 //! Env: IB_USERNAME, IB_PASSWORD.
@@ -52,6 +52,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         username: env::var("IB_USERNAME")?, password: env::var("IB_PASSWORD")?,
         host: env::var("IB_HOST").unwrap_or_else(|_| "cdc1.ibllc.com".into()),
         paper: true, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     })?;
     if !client.account_id.starts_with("DU") { client.disconnect(); return Err("not a paper account".into()); }
     let aapl = Contract { con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() };

@@ -1,7 +1,7 @@
 //! ibx#463 / ibx#472 probe. Paper account only.
 //!
 //! A: far limit, user cancel, then a modify of the cancelled id (expect 104, nothing sent).
-//! B: far IOC limit cancelled by the server (expect 39=D PendingCancel, then 39=4 Cancelled).
+//! B: far IOC limit cancelled by the server (expect PendingCancel, then Cancelled).
 //! C: marketable limit that fills, a modify of the filled id (expect 104, no new order),
 //!    then a sell to flatten.
 //!
@@ -74,6 +74,9 @@ fn main() {
     let client = EClient::connect(&EClientConfig {
         username: env::var("IB_USERNAME").unwrap(), password: env::var("IB_PASSWORD").unwrap(),
         host: "cdc1.ibllc.com".into(), paper: true, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     }).unwrap();
     if !client.account_id.starts_with("DU") { client.disconnect(); panic!("not a paper account"); }
     let s = Arc::new(Mutex::new(S::default()));

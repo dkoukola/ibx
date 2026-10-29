@@ -64,6 +64,26 @@ const LISTED: [(i32, Option<i32>, &str, Legal); 29] = [
     (623, None, "EtfFrozenNavLast(fznavlast)", Legal::All),
 ];
 
+/// The odd-lot bid and ask quotes (ibx#616).
+pub const ODD_LOT: i32 = crate::control::generic_values::ODD_LOT;
+
+/// The odd-lot quotes' entry, last of the "Legal ones" at session level
+/// 225 (ibx#605; the reference 10.51, paper, 18/10/2026).
+pub const ODD_LOT_LEGAL: &str = "787(OddLotBidAskQuotesTickTag(mdbaodd))";
+
+/// The "Legal ones" of a security type at a session level: from the level
+/// of the odd-lot quotes they end with the odd-lot entry.
+pub fn legal_ones_at(sec_type: &str, odd_lot: bool) -> String {
+    let mut out = legal_ones(sec_type);
+    if odd_lot {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(ODD_LOT_LEGAL);
+    }
+    out
+}
+
 /// The tick an API id names, as the reference looks it up: by request code
 /// first, then by alias; 221 is the alias of Pl Price (232), its own code
 /// giving way to it, and 104 the alias of a tick (request code 512) that
@@ -76,6 +96,9 @@ fn lookup(id: i32) -> Option<(i32, Legal)> {
         47 => Some((258, Legal::All)),
         59 => Some((456, Legal::Dividends)),
         104 => Some((512, Legal::All)),
+        // Odd-lot bid and ask (ibx#616): legal for every type, last in the
+        // "Legal ones" from level 225 (ibx#605); refused below session level 225 (10367).
+        ODD_LOT => Some((ODD_LOT, Legal::All)),
         _ => LISTED.iter().find(|(code, ..)| *code == id).map(|(code, _, _, legal)| (*code, *legal)),
     }
 }
@@ -166,7 +189,7 @@ pub fn legal_ones(sec_type: &str) -> String {
 /// refuses, and gives that text to every later refusal whatever their type.
 pub fn refusal(list: &str, sec_type: &str, legal: &str) -> String {
     format!(
-        "Error validating request.-'bQ' : cause - Incorrect generic tick list of {}.  Legal ones for ({}) are: {}",
+        "Error validating request.-'ReqMktData(1)' : cause - Incorrect generic tick list of {}.  Legal ones for ({}) are: {}",
         list, sec_type_name(sec_type), legal,
     )
 }
@@ -178,7 +201,7 @@ mod tests {
     // The 321 the gateway gave for "mdoff,292:" on GOOGL (STK), 02/10/2026
     // (ibx#450, conn b1_458_news, req 9570); its protobuf client got the
     // letter of its own request class, 'E'.
-    const CAPTURED_STK: &str = "Error validating request.-'bQ' : cause - Incorrect generic tick list of mdoff,292:.  \
+    const CAPTURED_STK: &str = "Error validating request.-'ReqMktData(1)' : cause - Incorrect generic tick list of mdoff,292:.  \
         Legal ones for (STK) are: 100(Option Volume),101(Option Open Interest),105(Average Opt Volume),106(impvolat),\
         165(Misc. Stats),221/220(Creditman Mark Price),225(Auction),232/221(Pl Price),233(RTVolume),236(inventory),\
         258/47(Fundamentals),292(Wide_news),293(TradeCount),294(TradeRate),295(VolumeRate),318(LastRTHTrade),\

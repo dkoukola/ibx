@@ -29,10 +29,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host: env::var("IB_HOST").unwrap_or_else(|_| "cdc1.ibllc.com".into()),
         paper: false,
         core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     })?;
 
     let mut wrapper = LoginWrapper::default();
     client.req_ids(&mut wrapper);
+    client.process_msgs(&mut wrapper);
 
     let next_id = wrapper.next_id.ok_or("did not receive next_valid_id")?;
     println!("logged in LIVE. account = {}, next_valid_id = {next_id}", client.account_id);

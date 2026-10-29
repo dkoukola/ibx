@@ -71,14 +71,34 @@ pub(crate) struct OrderReplay {
 pub(crate) fn replay_orders(fx: &Fixture) -> OrderReplay {
     let recs = at_their_effect(&fx.recs);
     let fx = &Fixture { header: fx.header.clone(), recs };
-    let mut s = Session::new().in_zone(&fx.header);
+    let mut s = Session::new().as_recorded(&fx.header);
+    // A recording of 10.40 follows its order rules (ibx#660); one with no
+    // version is from before 10.51.
+    if fx.header.get("gateway_version").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|t| t.parse().ok())))
+        .is_none_or(|v| v < 10500) {
+        s.shared.reference.set_form_10_40(true);
+    } else {
+        // The reference 10.51 had the trading schedules of these US
+        // contracts before its recordings (none is asked in them): their
+        // zone, which an order with a time in another zone waits for
+        // (ibx#668), is taken as known (ibx#604).
+        for r in fx.recs.iter().filter(|r| r.is("fix_in", "CCP", "d")) {
+            if let Some(con_id) = tag(&r.fields(), 6008).and_then(|c| c.parse::<i64>().ok()) {
+                s.shared.reference.cache_time_zone_id(con_id, "US/Eastern");
+            }
+        }
+    }
     if let Some(start) = fx.recs.iter().find(|r| r.msg == "START_API") {
-        // The client id of the recorded session, on the wire (6119) and in
+        // The client id of the recorded session, on the wire and in
         // the callbacks, as a client connected with it.
         let id = start.request["clientId"].as_i64().unwrap_or(0);
         s.shared.reference.set_api_client_id(id);
         s.client.core.client_id.store(id, std::sync::atomic::Ordering::Relaxed);
     }
+    // The order fixtures hold the order messages and reports only: the
+    // stock order preset the reference asks at its first stock order
+    // (ibx#728) is not in them, taken as known with no time in force.
+    s.engine.mark_order_preset_known("STK");
     let mut unsent = Vec::new();
     let mut cb_theirs = Vec::new();
     // The definition replies, to answer ibx's own lookups.
@@ -165,6 +185,36 @@ pub(crate) fn replay_orders(fx: &Fixture) -> OrderReplay {
         }
     }
     s.settle();
+    // The reference's messages name another order (a child its parent, by
+    // the parent link and the group) by the reference's id of that order:
+    // read as ibx's id of the same order.
+    for (_, f) in theirs.iter_mut() {
+        for (t, v) in f.iter_mut() {
+            if matches!(t, 6107 | 583) && let Some(mine) = ids.get(base(v)) {
+                *v = v.replacen(base(v), mine, 1);
+            }
+        }
+    }
+    // The same in the callbacks: a child's OCA group is its parent's number.
+    for line in cb_theirs.iter_mut().filter(|l| l.starts_with("openOrder|")) {
+        for (theirs, mine) in &ids {
+            let group = format!(",ocaGroup={theirs},");
+            if line.contains(&group) {
+                *line = line.replace(&group, &format!(",ocaGroup={mine},"));
+            }
+        }
+    }
+    // A recording of 10.40 read in the 10.51 form: the conditions'
+    // overnight flag, which 10.51 writes after the first condition flag of
+    // a new order (ibx#726), until the recordings are made again on 10.51
+    // (ibx#604).
+    if s.shared.reference.form_10_40() {
+        for (_, f) in theirs.iter_mut() {
+            if !f.iter().any(|(t, _)| *t == 8612) && let Some(i) = f.iter().position(|(t, _)| *t == 6128) {
+                f.insert(i + 1, (8612, "0".to_string()));
+            }
+        }
+    }
     let their_frames: Vec<Fields> = theirs.iter().map(|(_, f)| f.clone()).collect();
     let (kt, ko) = (keys(&their_frames), keys(&ours));
     let mut pairs: Vec<Pair> = Vec::new();
@@ -207,6 +257,12 @@ struct Known {
 fn order_lines(lines: &[String], known: Known) -> Vec<String> {
     lines.iter().filter(|l| !l.starts_with("error|-1|")).map(|l| {
         let mut f: Vec<String> = l.split('|').map(str::to_string).collect();
+        // The recordings are of the reference 10.40; 10.51, which ibx
+        // copies, adds the order id to 103 (ibx#625). Until they are made
+        // again on 10.51 (ibx#604), their 103 is read in the 10.51 form.
+        if f[0] == "error" && f.len() > 3 && f[2] == "103" && f[3] == "Duplicate order id" {
+            f[3] = format!("Duplicate order id: {}", f[1]);
+        }
         if known.stp_lmt && f[0] == "openOrder" && f[5].contains("orderType=STP,") {
             f[5] = f[5].split(',').map(|kv| if kv.starts_with("lmtPrice=") { "lmtPrice=-" } else { kv })
                 .collect::<Vec<_>>().join(",");
@@ -275,15 +331,15 @@ fn lmt_order_before_the_open() {
     replay_and_compare("orders_lmt_cancel", all, KNOWN, &[]);
 }
 
-// A LMT order, its cancel and a modify after the cancel (26/09/2026,
-// modify_cancelled): no callback at the cancel itself; the working
-// reports after the cancel request give PendingCancel; the Cancelled
-// status keeps 1 remaining (151=0 on the wire), then 202. The answer to
-// the modify is not in the recording.
+// A LMT order, its cancel and a modify after the cancel (18/10/2026 on
+// 10.51, modify_cancelled, ibx#604; first recorded 26/09/2026): no
+// callback at the cancel itself; the working reports after the cancel
+// request give PendingCancel; the Cancelled status keeps 1 remaining
+// (leaves quantity 0 on the wire), then 202; the modify then gets 104.
 #[test]
 fn cancel_gives_pending_cancel_then_cancelled_then_202() {
-    let r = replay_and_compare("orders_modify_cancelled", |r| r.seq < 2441, KNOWN, &[]);
-    assert!(r.cb_theirs.iter().any(|l| l.starts_with("orderStatus|2|PendingCancel")));
+    let r = replay_and_compare("orders_modify_cancelled", all, KNOWN, &[]);
+    assert!(r.cb_theirs.iter().any(|l| l.starts_with("orderStatus|") && l.contains("|PendingCancel|")));
 }
 
 // Two orders in one OCA group (26/09/2026, oca_group): the 583 group and
@@ -312,36 +368,40 @@ fn time_conditions_near_dates() {
     replay_and_compare("orders_b1_416_time_near", all, KNOWN, &[]);
 }
 
-// Time conditions (02/10/2026, b1_416_time_condition): the server refuses
+// Time conditions (19/10/2026 on 10.51, b1_416_time_condition, ibx#604;
+// first recorded 02/10/2026): the server refuses
 // the far date with 201 "Invalid value in field # 6223": Inactive, 201,
 // Inactive again; 2174 for a time without a zone. Up to the Asia/Tokyo
 // one (see the ignored test below).
 #[test]
 fn time_conditions_refused_by_the_server() {
-    replay_and_compare("orders_b1_416_time_condition", |r| r.seq < 1530, KNOWN, &[]);
+    replay_and_compare("orders_b1_416_time_condition", |r| r.seq < 1552, KNOWN, &[]);
 }
 
 // OVERNIGHT time in force (28/09/2026, i196_overnight): the order and the
 // refused change of its price (462 for the time in force the modify
 // restates), Cancelled then 202. Up to the order on the OVERNIGHT
-// exchange (see `overnight_directed_order`).
+// exchange (see `overnight_directed_order`). In the 10.40 form: the 10.51
+// reference refuses that time in force with 10052 (ibx#660).
 #[test]
 fn overnight_time_in_force_on_smart() {
     replay_and_compare("orders_i196_overnight", |r| r.seq < 1237, KNOWN, &[]);
 }
 
-// The session's order types (28/09/2026, rth_order_types): TRAIL MIT by
+// The session's order types (19/10/2026 on 10.51, rth_order_types,
+// ibx#604; first recorded 28/09/2026): TRAIL MIT by
 // amount (filled at once) and by percent with its replace, TRAIL LIT,
 // PASSV REL and RPI refused with 387 (the SPY list has no key for them),
 // after the lookup of the contract's order types,
 // PEG BEST sent and rejected by the server (ibx#469); PEG BENCH, its
 // replace and cancel (openOrder auxPrice = the starting price);
-// OVERNIGHT, OVERNIGHT + DAY and includeOvernight in the session, the
-// directed OVERNIGHT order discarded (10). Left out here, in an ignored
-// test below: the option combos refused with 460 (13, 14).
+// OVERNIGHT and OVERNIGHT + DAY refused with 10052 (10.40 took them, the
+// directed OVERNIGHT order discarded), includeOvernight placed, changed and
+// cancelled. Left out here, in an ignored test below: the option combos
+// refused with 460 (27, 28).
 #[test]
 fn session_order_types() {
-    replay_and_compare("orders_rth_order_types", all, KNOWN, &[13, 14]);
+    replay_and_compare("orders_rth_order_types", all, KNOWN, &[27, 28]);
 }
 
 // What-if previews (02/10/2026, b1_462_whatif): LMT, MKT and a margin
@@ -349,14 +409,14 @@ fn session_order_types() {
 // order after them. The combo preview is in the ignored test below.
 #[test]
 fn what_if_previews() {
-    replay_and_compare("orders_b1_462_whatif", all, KNOWN, &[78]);
+    replay_and_compare("orders_b1_462_whatif", all, KNOWN, &[158431]);
 }
 
 // An algo order and the algo refusals (02/10/2026, b1_263_algo_refusals):
 // the STP order, its cancel; prices off the grid refused with 110.
 #[test]
 fn algo_scenario_orders() {
-    replay_and_compare("orders_b1_263_algo_refusals", all, KNOWN, &[80, 82, 83, 84]);
+    replay_and_compare("orders_b1_263_algo_refusals", all, KNOWN, &[158433, 158435, 158436, 158437]);
 }
 
 // ── Differences found by the replays, each its own test ──
@@ -366,12 +426,12 @@ fn algo_scenario_orders() {
 // conId; ibx too (ibx#486). Every order replay compares the 399 text.
 #[test]
 fn order_message_names_the_listing_exchange() {
-    let r = replay_and_compare("orders_modify_cancelled", |r| r.seq < 2441, KNOWN, &[]);
+    let r = replay_and_compare("orders_modify_cancelled", all, KNOWN, &[]);
     assert!(r.cb_ours.iter().any(|l| l.contains("|399|") && l.contains("BUY 1 AAPL NASDAQ.NMS")));
 }
 
 // orderStatus whyHeld "trigger" for a stop or trailing order before its
-// trigger (jclient.pe.iK(): "child", "locate", "trigger"). Every replay
+// trigger (the reference's values: "child", "locate", "trigger"). Every replay
 // compares whyHeld; this one has STP and TRAIL orders.
 #[test]
 fn why_held_is_trigger_for_a_stop() {
@@ -379,35 +439,29 @@ fn why_held_is_trigger_for_a_stop() {
 }
 
 // The first openOrder of a STP order shows lmtPrice 250.03 (SELL stop at
-// 250, no 44 on the wire), the next ones none.
+// 250, no 44 on the wire), the next ones none. Not reproduced on
+// 07/10/2026: four STP orders showed no limit price (ibx#510).
 #[test]
-#[ignore = "ibx#486: the first openOrder of a STP order has a limit price the wire does not carry"]
+#[ignore = "not reproduced (ibx#510): the first openOrder of a STP order had a limit price the wire does not carry"]
 fn stp_first_open_order_limit_price() {
     replay_and_compare("orders_premarket_order_types", all, Known { stp_lmt: false, ..KNOWN }, &[]);
 }
 
 // A bracket in the client library's form: parent and take-profit with
 // transmit off, the stop with transmit on; the reference holds the first
-// two and sends the three new orders together. ibx refuses transmit off
-// (ibx#226).
+// two and sends the three new orders together, the children naming their
+// parent, and so does ibx (ibx#509).
 #[test]
-#[ignore = "ibx#486, ibx#226: transmit=false orders are refused instead of held for the group"]
 fn bracket_with_transmit_off() {
     replay_and_compare("orders_bracket", all, KNOWN, &[]);
     replay_and_compare("orders_bracket_b", all, KNOWN, &[]);
-}
-
-#[test]
-#[ignore = "ibx#470: the option combos refused with 460 get no answer"]
-fn option_combos_refused_with_460() {
-    replay_and_compare("orders_rth_order_types", all, KNOWN, &[]);
 }
 
 // The reference gives a preview a ClOrdID of its own with version 0, and
 // the preview's openOrder the permId of that order (ibx#486).
 #[test]
 fn what_if_clord_id_and_perm_id() {
-    let r = replay_and_compare("orders_b1_462_whatif", all, KNOWN, &[78]);
+    let r = replay_and_compare("orders_b1_462_whatif", all, KNOWN, &[158431]);
     let previews: Vec<&str> = r.pairs.iter().filter_map(|(_, mine, _)| mine.as_ref())
         .filter(|f| tag(f, 6091) == Some("1")).filter_map(|f| tag(f, 11)).collect();
     assert_eq!(previews, ["{id}.0"; 3]);
@@ -416,20 +470,17 @@ fn what_if_clord_id_and_perm_id() {
 
 // A combo preview (QQQ,SPY BAG, conId 0 in the request).
 #[test]
-#[ignore = "ibx#486: the combo what-if of b1_462 is not sent by the replay"]
+#[ignore = "replay limit: the combo what-if of b1_462 is not sent by the replay"]
 fn what_if_of_a_combo() {
     replay_and_compare("orders_b1_462_whatif", all, KNOWN, &[]);
 }
 
 // A condition time in Asia/Tokyo on a US stock: the reference refuses it
-// with 10314 after the contract lookup (not the contract's zone). It read
-// the zone from a trading schedule it had before the recording (no
-// schedule request in it: `trader.order.ay.a(dy,OrderCreator,D)`, the
-// schedule from `jextend.dX.a(dy, Consumer)`, asked only when not
-// cached); ibx asks no schedule for an order, knows no zone, and sends the
-// order.
+// with 10314 after the contract lookup (not the contract's zone), and so
+// does ibx. The reference read the zone from a trading schedule it had
+// before the recording (none is asked in it); the replay takes that zone
+// as known (19/10/2026 on 10.51, ibx#604).
 #[test]
-#[ignore = "ibx#486: the contract's zone comes from a schedule the reference had before the recording"]
 fn condition_time_in_another_zone() {
     replay_and_compare("orders_b1_416_time_condition", all, KNOWN, &[]);
 }
@@ -438,33 +489,32 @@ fn condition_time_in_another_zone() {
 // "This order will be directly routed to OVERNIGHT." and discards it
 // (Cancelled, then 201 "Order was discarded."); the same id placed again
 // gets 103, its cancel 10147. It is the API precaution "Bypass Redirect
-// Order warning for Stock API Orders" (off by default,
-// `trader.order.confirm.OrderChecker$6.check(pe)`; ibx:
+// Order warning for Stock API Orders" (off by default; ibx:
 // `IBX_BYPASS_REDIRECT_ORDER_WARNING`). The Cancelled status has a permId
 // here and none in the ISLAND capture of 25/09/2026: ibx gives the id the
 // order would have gone out under.
 #[test]
 fn overnight_directed_order() {
     replay_and_compare("orders_i196_overnight", all, KNOWN, &[]);
-    replay_and_compare("orders_rth_order_types", all, KNOWN, &[1, 2, 3, 4, 5, 6, 7, 13, 14]);
+    replay_and_compare("orders_rth_order_types", all, KNOWN, &[15, 16, 17, 18, 19, 20, 21, 27, 28]);
 }
 
 // SPY option combos (a call spread, SMART and CBOE): the reference
-// refuses both with 460 "No trading permissions" before sending; ibx
-// gives no callback. The raise sites (`trader.order.proc.aN.a(pe,...)
-// @13670, @13743, @13933`) read positions, clearing and logon flags; no
-// tag of the logon or of the contract replies of the recording names the
-// option permission.
+// refuses both with 460 "No trading permissions" before sending, from the
+// permission of the legs' class, which it had asked before this recording.
+// ibx asks it (ibx#510): the recording has no answer to replay, so ibx's
+// order waits here. The rule is tested in
+// `combo_tests::option_combo_needs_the_permission_of_its_legs`.
 #[test]
-#[ignore = "ibx#486: the data behind 460 is not in the logon or the contract replies"]
+#[ignore = "ibx#510: the recording holds no answer to the permission question ibx asks"]
 fn option_combo_without_permission() {
-    replay_and_compare("orders_rth_order_types", all, KNOWN, &[1, 2, 3, 4, 5, 6, 7]);
+    replay_and_compare("orders_rth_order_types", all, KNOWN, &[15, 16, 17, 18, 19, 20, 21]);
 }
 
 // The algo refusals 441 / 443 need the algo definitions the reference
 // read from the server; this replay does not load them.
 #[test]
-#[ignore = "ibx#486: algo definitions are not part of the order replay"]
+#[ignore = "replay limit: algo definitions are not part of the order replay"]
 fn algo_refusals() {
     replay_and_compare("orders_b1_263_algo_refusals", all, KNOWN, &[]);
 }

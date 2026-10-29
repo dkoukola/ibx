@@ -25,7 +25,8 @@ pub fn contract_of(v: &Value) -> Contract {
         last_trade_date_or_contract_month: s("lastTradeDateOrContractMonth"),
         strike: v["strike"].as_f64().unwrap_or(0.0),
         right: s("right"),
-        multiplier: s("multiplier"),
+        // A number in the requests of the session level 225 (ibx#646).
+        multiplier: if v["multiplier"].is_number() { super::record::n(num(&v["multiplier"])) } else { s("multiplier") },
         local_symbol: s("localSymbol"),
         trading_class: s("tradingClass"),
         ..Default::default()
@@ -143,6 +144,7 @@ pub fn make(c: &EClient, r: &Rec, rec: &mut Recorder) -> bool {
         "REQ_GLOBAL_CANCEL" => { let _ = c.req_global_cancel(); }
         "REQ_OPEN_ORDERS" => c.req_open_orders(rec),
         "REQ_ALL_OPEN_ORDERS" => c.req_all_open_orders(rec),
+        "REQ_COMPLETED_ORDERS" => c.req_completed_orders(rec),
         "REQ_POSITIONS" => c.req_positions(rec),
         "CANCEL_POSITIONS" => c.cancel_positions(),
         "REQ_MKT_DATA" => {

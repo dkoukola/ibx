@@ -1,6 +1,6 @@
 //! ibapi-compatible EClient — Rust equivalent of C++ `EClientSocket`.
 //!
-//! Connects to IB, provides ibapi-matching method signatures, and dispatches
+//! Connects to the server, provides ibapi-matching method signatures, and dispatches
 //! events to a [`Wrapper`] via `process_msgs()`.
 //!
 //! ```no_run
@@ -20,6 +20,9 @@
 //!     host: "your_ib_host".into(),
 //!     paper: true,
 //!     core_id: None,
+//!     client_id: 0,
+//!     copied_waits: false,
+//!     code_provider: None,
 //! }).unwrap();
 //!
 //! client.req_mkt_data(1, &Contract { con_id: 756733, symbol: "SPY".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() },
@@ -45,6 +48,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::engine::park::ControlSender;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::api::types::{
@@ -63,7 +67,7 @@ pub type TagValue = ApiTagValue;
 // Re-export public items from submodules
 pub use orders::parse_algo_params;
 
-/// Configuration for connecting to IB via EClient.
+/// Configuration for connecting to the server via EClient.
 ///
 /// # Live logins block on second-factor approval
 ///
@@ -73,7 +77,7 @@ pub use orders::parse_algo_params;
 /// timeout by default. This is expected — it is a human
 /// approval gate, not a hang. Bound or avoid it by using `paper: true`, setting
 /// a timeout (via [`GatewayConfig::ib_key_timeout_secs`] when building through
-/// the lower-level API), or supplying a `code_provider`. Paper logins skip the
+/// the lower-level API), or supplying a [`code_provider`](EClientConfig::code_provider). Paper logins skip the
 /// gate entirely. An `info`-level log line is emitted when the wait begins
 /// (`RUST_LOG=info`). See ibx#203 / ibx#207.
 ///
@@ -95,7 +99,35 @@ pub struct EClientConfig {
     pub paper: bool,
     /// CPU core to pin this engine's hot loop to. `None` = no pinning. When
     /// running multiple engines, use a **distinct** core per engine.
+    ///
+    /// A pinned engine polls its connections and its commands without
+    /// pause and keeps that core busy. Without pinning the engine thread
+    /// rests while there is nothing to do and is woken by the first byte
+    /// received or the first command sent (ibx#530).
     pub core_id: Option<usize>,
+    /// The client id, as the official `connect(host, port, clientId)`
+    /// takes it: every order of this client reports it in `openOrder` and
+    /// `orderStatus`, and the order ids of its earlier sessions are kept
+    /// per client id. 0 by default (ibx#704).
+    pub client_id: i32,
+    /// Copy the reference's own waits, which change nothing the client
+    /// receives nor what the server answers: the market data messages sent
+    /// in passes, the scanner parameters delay and the gaps after it, the
+    /// gaps and the contract records a stock's first order waits for.
+    /// `false` (the default) leaves them out for the lowest latency; `true`
+    /// keeps a session's timing comparable with the reference's (ibx#564).
+    /// The pacing of requests is not one of them: it stays on.
+    pub copied_waits: bool,
+    /// Source of the code for the typed-code variant of the second factor
+    /// of a live login, as the Python `connect(code_provider=...)`: called
+    /// once, on its own thread, when the server sends the challenge, while
+    /// the login keeps answering the server's keepalives; an error it
+    /// returns ends the login. `None` (default): wait for the mobile push
+    /// approval (ibx#350). An account whose second factor is a security
+    /// code card, an authenticator app, a passcode or a temporary code needs
+    /// one: [`IbKeyChallenge::kind`](crate::auth::session::IbKeyChallenge)
+    /// names the factor, with the card's image or the passcode's delivery.
+    pub code_provider: Option<crate::auth::session::CodeProvider>,
 }
 
 /// Give the engine the caller's host and credentials for auto-reconnect. The
@@ -108,6 +140,20 @@ fn cache_reconnect_credentials(hot_loop: &mut crate::engine::hot_loop::HotLoop, 
         zeroize::Zeroizing::new(config.password.clone()),
         config.paper,
     );
+}
+
+/// The login settings of a client's config.
+fn gateway_config(config: &EClientConfig) -> GatewayConfig {
+    GatewayConfig {
+        username: config.username.clone(),
+        password: zeroize::Zeroizing::new(config.password.clone()),
+        host: config.host.clone(),
+        paper: config.paper,
+        accept_invalid_certs: false,
+        ib_key_timeout_secs: crate::auth::session::IB_KEY_DEFAULT_TIMEOUT_SECS,
+        ib_key_token_sub_type: crate::auth::session::IB_KEY_DEFAULT_TOKEN_SUB_TYPE.into(),
+        code_provider: config.code_provider.clone(),
+    }
 }
 
 /// ibapi-compatible EClient. Matches C++ `EClientSocket` method signatures.
@@ -138,7 +184,7 @@ fn cache_reconnect_credentials(hot_loop: &mut crate::engine::hot_loop::HotLoop, 
 /// with a log line and no error, as the reference drops it (ibx#285).
 pub struct EClient {
     pub(crate) shared: Arc<SharedState>,
-    pub(crate) control_tx: Sender<ControlCommand>,
+    pub(crate) control_tx: ControlSender,
     pub(crate) thread: Mutex<Option<thread::JoinHandle<()>>>,
     pub account_id: String,
     pub(crate) connected: AtomicBool,
@@ -150,7 +196,13 @@ pub struct EClient {
     pub(crate) token_type: String,
     /// Connection time, fixed when the session started (ibx#426).
     pub(crate) connection_time: String,
+    /// The answers this client makes itself, each with its place among
+    /// the session's answers; `process_msgs` gives them there (ibx#532).
+    pub(crate) local: Mutex<std::collections::VecDeque<(u64, LocalAnswer)>>,
 }
+
+/// An answer the client makes itself (ibx#532).
+pub(crate) type LocalAnswer = Box<dyn FnOnce(&EClient, &mut dyn crate::api::wrapper::Wrapper) + Send>;
 
 impl Drop for EClient {
     fn drop(&mut self) {
@@ -163,12 +215,12 @@ impl Drop for EClient {
 }
 
 impl EClient {
-    /// Connect to IB and start the engine.
+    /// Connect to the server and start the engine.
     pub fn connect(config: &EClientConfig) -> Result<Self, Box<dyn std::error::Error>> {
         Self::connect_inner(config, None)
     }
 
-    /// Connect to IB and start the engine with an [`Event`] channel attached.
+    /// Connect to the server and start the engine with an [`Event`] channel attached.
     ///
     /// Returns the client plus a receiver carrying every [`Event`] the engine
     /// produces. This is a second, optional delivery path that runs alongside
@@ -180,9 +232,15 @@ impl EClient {
     /// loop. Drain it from a thread that is not the one calling
     /// `process_msgs()`, or keep `capacity` generous.
     ///
+    /// The errors the client answers itself (a failed snapshot, smart
+    /// components that waited, positions not ready) are made by
+    /// `process_msgs()` and reach the channel then; a refused market data
+    /// subscription also comes from the engine at once, by instrument
+    /// (`Event::MarketDataError`, ibx#575).
+    ///
     /// Attaching a channel makes the engine build events it would otherwise
-    /// skip, which for bar batches and contract definitions means one deep copy
-    /// each. Use [`connect()`](EClient::connect) when you only need the wrapper
+    /// skip, which means one copy of each answer (bar batches, contract
+    /// definitions, option chains, scanner rows and the others, ibx#498). Use [`connect()`](EClient::connect) when you only need the wrapper
     /// callbacks (ibx#242).
     pub fn connect_with_events(
         config: &EClientConfig,
@@ -193,20 +251,28 @@ impl EClient {
         Ok((client, event_rx))
     }
 
+    /// An answer this client makes itself, given by `process_msgs` after
+    /// the answers written before it, as the reference's answers come
+    /// from its connection: never inside the request (ibx#532).
+    pub(crate) fn later(&self, answer: impl FnOnce(&EClient, &mut dyn crate::api::wrapper::Wrapper) + Send + 'static) {
+        let at = self.shared.answer_stamp();
+        self.local.lock().unwrap().push_back((at, Box::new(answer)));
+        self.shared.notify();
+    }
+
+    /// An error this client answers itself, with no queue behind it: to
+    /// the wrapper, and to the event channel when one is attached
+    /// (ibx#498).
+    pub(crate) fn local_error(&self, wrapper: &mut (impl crate::api::wrapper::Wrapper + ?Sized), req_id: i64, code: i64, text: &str) {
+        wrapper.error(req_id, code, text, "");
+        self.shared.emit_error(req_id, code, text);
+    }
+
     fn connect_inner(
         config: &EClientConfig,
         event_tx: Option<Sender<Event>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let gw_config = GatewayConfig {
-            username: config.username.clone(),
-            password: zeroize::Zeroizing::new(config.password.clone()),
-            host: config.host.clone(),
-            paper: config.paper,
-            accept_invalid_certs: false,
-            ib_key_timeout_secs: crate::auth::session::IB_KEY_DEFAULT_TIMEOUT_SECS,
-            ib_key_token_sub_type: crate::auth::session::IB_KEY_DEFAULT_TOKEN_SUB_TYPE.into(),
-            code_provider: None,
-        };
+        let gw_config = gateway_config(config);
 
         let (gw, farm_conn, ccp_conn, hmds_conn) = Gateway::connect(&gw_config)?;
         let account_id = gw.account_id.clone();
@@ -221,10 +287,20 @@ impl EClient {
             shared.clone(), event_tx, farm_conn, ccp_conn, hmds_conn, config.core_id,
         );
         cache_reconnect_credentials(&mut hot_loop, config);
+        hot_loop.set_copied_waits(config.copied_waits);
 
         let handle = thread::Builder::new()
             .name("ib-engine-hotloop".into())
+            .stack_size(crate::engine::hot_loop::ENGINE_STACK)
             .spawn(move || { hot_loop.run_with_panic_recovery(); })?;
+
+        // The client id of this client's orders and executions (ibx#704,
+        // as the Python client: ibx#466, ibx#474), then the highest order id
+        // of this client id's earlier sessions (ibx#518).
+        let core = ClientCore::new();
+        core.client_id.store(i64::from(config.client_id), std::sync::atomic::Ordering::Relaxed);
+        shared.reference.set_api_client_id(i64::from(config.client_id));
+        core.keep_order_ids(&account_id);
 
         Ok(Self {
             shared,
@@ -233,10 +309,11 @@ impl EClient {
             account_id,
             connected: AtomicBool::new(true),
             close_notified: AtomicBool::new(false),
-            core: ClientCore::new(),
+            core,
             session_token_bytes,
             token_type,
             connection_time: crate::client_core::connection_time_now(),
+            local: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -244,13 +321,13 @@ impl EClient {
     #[doc(hidden)]
     pub fn from_parts(
         shared: Arc<SharedState>,
-        control_tx: Sender<ControlCommand>,
+        control_tx: impl Into<ControlSender>,
         handle: thread::JoinHandle<()>,
         account_id: String,
     ) -> Self {
         Self {
             shared,
-            control_tx,
+            control_tx: control_tx.into(),
             thread: Mutex::new(Some(handle)),
             account_id,
             connected: AtomicBool::new(true),
@@ -259,6 +336,7 @@ impl EClient {
             session_token_bytes: Vec::new(),
             token_type: String::new(),
             connection_time: crate::client_core::connection_time_now(),
+            local: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -285,10 +363,27 @@ impl EClient {
         self.core.track_order(order_id, contract, order, instrument);
     }
 
+    /// Mark a tracked order as answered by the server (for testing
+    /// without a server answer): placed again, it is a modify (ibx#688).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn order_answered_for_test(&self, order_id: OrderId) {
+        self.core.update_order_status(order_id, "Submitted", 0.0, 1.0);
+    }
+
     /// Pre-seed a con_id → InstrumentId mapping (for testing without a live engine).
     #[doc(hidden)]
     pub fn seed_instrument(&self, con_id: i64, instrument: InstrumentId) {
         self.core.con_id_to_instrument.lock().unwrap().insert(con_id, instrument);
+    }
+
+    /// The P&L computed again at the next read, as one second later
+    /// (ibx#511; for tests).
+    #[doc(hidden)]
+    pub fn pnl_second_later_for_test(&self) {
+        if let Some(at) = self.core.pnl_quotes.lock().unwrap().computed_at_mut() {
+            *at -= std::time::Duration::from_secs(1);
+        }
     }
 
     /// Send a control command to the engine. Returns `Err` if the engine has shut down.
@@ -298,11 +393,11 @@ impl EClient {
 
     // ── Connection ──
 
-    /// API level the session follows: 214, the level the reference gives a
+    /// API level the session follows: 225, the level the reference gives a
     /// current client (ibx#426). Matches `serverVersion()` in C++, for code
     /// that tests it before using a feature.
     pub fn server_version(&self) -> i32 {
-        crate::client_core::SERVER_VERSION
+        crate::client_core::session_level()
     }
 
     /// Time the session started, as `yyyyMMdd HH:mm:ss {zone}` in the
@@ -318,7 +413,7 @@ impl EClient {
         self.connected.load(Ordering::Relaxed)
     }
 
-    /// Disconnect from IB.  Sends `Shutdown` to the hot loop, waits for the
+    /// Disconnect from the server.  Sends `Shutdown` to the hot loop, waits for the
     /// background thread to exit, and marks the client as disconnected.
     pub fn disconnect(&self) {
         self.shared.portfolio.invalidate_position_snapshot();
@@ -330,6 +425,7 @@ impl EClient {
             let _ = h.join();
         }
         self.connected.store(false, Ordering::Release);
+        self.core.stop_keeping_order_ids();
         self.core.reset();
     }
 }
@@ -348,7 +444,7 @@ impl EClient {
 
     /// Canonical big-endian session-token bytes (leading zeros stripped) captured
     /// at connect. Round-trips through `BigUint::from_bytes_be` to the SRP shared
-    /// secret K and is the second SHA-1 input for SSO `Authenticate-TWS` bodies.
+    /// secret K and is the second SHA-1 input for SSO authenticate bodies.
     pub fn session_token_bytes(&self) -> &[u8] {
         &self.session_token_bytes
     }

@@ -36,6 +36,11 @@ impl Clock {
 /// Most finished orders kept for `Context::finished_status`.
 pub const FINISHED_ORDERS_MAX: usize = 65_536;
 
+/// What an order gave of its contract when looked up by symbol: the
+/// symbol, its type and route, its exchange, its currency and its terms
+/// (ibx#718).
+pub(crate) type OrderContractKey = (String, (String, String), String, String, SecDefFilters);
+
 /// What a server-reported status did to an order (ibx#212 ibx#473).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusChange {
@@ -50,7 +55,7 @@ pub enum StatusChange {
 }
 
 /// What the reference's order book holds for an order beyond the order
-/// itself, for its global cancel (`trader.order.ay.c(List, bs, bE)`): the
+/// itself, for its global cancel: the
 /// place the order took in the book, its parent and OCA group, and the API
 /// client of an order of another session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -62,9 +67,43 @@ pub(crate) struct BookEntry {
     /// The OCA group, empty for none.
     pub oca_group: String,
     /// The API client of an order the server reported from another
-    /// session (6119); None for an order of this client.
+    /// session; None for an order of this client.
     pub owner: Option<i64>,
 }
+
+/// An order that ended and that the reference's book still holds
+/// (ibx#545). A global cancel walks them with the working orders and
+/// answers 161 for each:
+/// - a cancelled order stays [`CANCELLED_ORDER_KEPT`] after the report
+///   that ended it, then a timer takes it out (paper 10/10/2026: 161 at 3,
+///   6 and 9 s, none at 10.2 s and later), whether its own cancel, its
+///   parent's or a global cancel ended it;
+/// - an order the server refused (201) stays as long (paper 10/10/2026:
+///   161 at 9 s, none at 14 and 16 s, and its cancel at 19 s finds no
+///   order); a global cancel that answers for it does not take it out
+///   (paper 11/10/2026: 161 at 3 s and again at 6 s, none at 12 s;
+///   ibx#551);
+/// - a filled order stays [`FILLED_ORDER_KEPT`] (paper 12/10/2026, regular
+///   hours, reference 10.51: 161 at 3, 8, 12 and 20 s after the fill, none
+///   at 35 and 65 s; ibx#551);
+/// - an order that was never sent (refused before the send, or held and
+///   cancelled) gets no report, so nothing takes it out: 161 at every
+///   global cancel of the session (paper 09/10/2026, three runs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EndedOrder {
+    pub order_id: OrderId,
+    /// The id the reference's book holds it under (its permId).
+    pub server_id: OrderId,
+    pub entry: BookEntry,
+    /// When the reference takes it out of its book; None for never.
+    pub until: Option<Instant>,
+}
+
+/// How long the reference keeps a cancelled order in its book.
+pub(crate) const CANCELLED_ORDER_KEPT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the reference keeps a filled order in its book (ibx#551).
+pub(crate) const FILLED_ORDER_KEPT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The table size of a `java.util.HashMap` that held `peak` entries: 16,
 /// doubled each time the entries pass three quarters of it; it never
@@ -77,23 +116,23 @@ pub(crate) fn book_table_size(peak: usize) -> usize {
     size
 }
 
-/// The bucket of a permId in the reference's book, a `java.util.HashMap`
-/// keyed by a `Long` (`jclient.jv.l`): the key's hash, spread, masked by
-/// the table size. The book is walked bucket by bucket, each in insertion
-/// order (`jclient.jv.w()`).
+/// The bucket of a permId in the reference's book, a Java hash map keyed
+/// by a 64-bit integer: the key's hash,
+/// spread, masked by the table size. The book is walked bucket by bucket,
+/// each in insertion order.
 pub(crate) fn book_bucket(perm_id: OrderId, table: usize) -> usize {
     let v = perm_id as u64;
     let h = (v ^ (v >> 32)) as u32;
     ((h ^ (h >> 16)) as usize) & (table - 1)
 }
 
-/// The reference's order id generator (`jclient.jv.b(String)`): the
+/// The reference's order id generator: the
 /// server's order id of each new order and preview, the id part of its
 /// ClOrdID and the permId the client sees. The API order id goes in 6121
 /// and is not this id. The first id has random high bits and the seconds
-/// of the clock in its low 20 bits (`jfix.cy.a(String)`); then it counts
-/// up, and starts again from a new first id at an id the reference does
-/// not take (0 and the int bounds, `twslaunch.jutils.av.c(int)`).
+/// of the clock in its low 20 bits; then it counts up, and starts again
+/// from a new first id at an id the reference does not take (0 and the
+/// int bounds).
 pub(crate) struct OrderIdGenerator {
     next: i32,
     rng: u64,
@@ -141,12 +180,35 @@ impl OrderIdGenerator {
 /// show in openOrder (ib-agent#194, ib-agent#195, ibx#491). 0 = not reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TrailLimitReported {
-    /// Limit offset (6370).
+    /// Limit offset.
     pub offset: Price,
-    /// Limit price (44).
+    /// Limit price.
     pub limit: Price,
-    /// Stop price (6117), which the server moves as the market moves.
+    /// Stop price, which the server moves as the market moves.
     pub stop: Price,
+}
+
+/// What a future's or an index's definition names (ibx#727): its
+/// underlying, the index it names as its reference, the exchange and API
+/// security type of its record.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct DefLink {
+    pub(crate) under_con_id: i64,
+    pub(crate) index_con_id: i64,
+    pub(crate) exchange: String,
+    pub(crate) sec_type: String,
+    /// The key of the trading hours of its class (ibx#730).
+    pub(crate) join_key: String,
+    pub(crate) currency: String,
+}
+
+/// The kinds of request that ask their contract's definition each time
+/// they are given by a conId alone (ibx#732).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DefAsk {
+    Historical,
+    RealTimeBars,
+    Depth,
 }
 
 pub struct Context {
@@ -163,6 +225,9 @@ pub struct Context {
     /// it appeared on the wire. Used as the OrigClOrdID on cancel/modify so that
     /// legacy orders recorded without a `.{ver}` suffix still match — see ibx#179.
     pub(crate) last_clord: HashMap<OrderId, String>,
+    /// Orders gone for good since the order connection last looked: the
+    /// records it keeps for them are dropped there (ibx#700).
+    pub(crate) purged_orders: Vec<OrderId>,
     /// The server's order id (the id part of the ClOrdID) of each order
     /// held under another key, to that key: the orders of this session,
     /// kept under their API order id (ibx#466), and the orders of an
@@ -170,6 +235,10 @@ pub struct Context {
     pub(crate) recovered_keys: HashMap<OrderId, OrderId>,
     /// The other way: the key of an order to its server's order id.
     pub(crate) server_ids: HashMap<OrderId, OrderId>,
+    /// The keys of the orders of earlier sessions held under their API
+    /// order id (ibx#538): a new order of this session with that id is not
+    /// that order.
+    pub(crate) recovered: std::collections::HashSet<OrderId>,
     /// The reference's order id generator: the server's order id of each
     /// new order and preview.
     pub(crate) order_ids: OrderIdGenerator,
@@ -183,12 +252,24 @@ pub struct Context {
     /// The last limit offset, limit price and stop price the server
     /// reported for a TRAIL LIMIT order (ib-agent#194, ibx#491).
     pub(crate) trail_limit_reported: HashMap<OrderId, TrailLimitReported>,
-    /// The last stop price (6117) the server reported for an order, the
+    /// The scale orders whose auto-reset a report gave (ibx#751).
+    pub(crate) scale_reset_reported: std::collections::HashSet<OrderId>,
+    /// Orders sent with the price management flag: a report that leaves
+    /// it out before any other (a refusal) shows the order as sent
+    /// (ibx#605).
+    pub(crate) price_mgmt_sent: std::collections::HashSet<OrderId>,
+    /// Orders a report gave as held: their compete values show
+    /// unset from then on (ibx#605).
+    pub(crate) compete_cleared: std::collections::HashSet<OrderId>,
+    /// The last stop price the server reported for an order, the
     /// reference's last known value a trailing replace compares with
-    /// (`jclient.pe.dz().e()`, ibx#263). A replace does not change it.
+    /// (ibx#263). A replace does not change it.
     pub(crate) reported_stop: HashMap<OrderId, crate::types::Price>,
     /// What decides outside-RTH, by conId and order exchange (ibx#465).
     pub(crate) rth_types: HashMap<(i64, String), crate::engine::outside_rth::RthTypes>,
+    /// The minimum order size of a contract whose definition gives one, in
+    /// whole units (ibx#688: 100 for a Tokyo stock).
+    pub(crate) min_sizes: HashMap<i64, u64>,
     /// Definition lookups in flight for `rth_types`: (320 id, key, deadline).
     pub(crate) rth_lookups: Vec<(String, (i64, String), std::time::Instant)>,
     /// What-if previews waiting for their answer, by the ClOrdID each was
@@ -204,9 +285,37 @@ pub struct Context {
     /// The API precaution "Bypass Redirect Order warning for Stock API
     /// Orders" (`IBX_BYPASS_REDIRECT_ORDER_WARNING`, off by default as the
     /// reference's, ibx#486).
+    /// The precaution bypass of routeMarketableToBbo (ibx#608).
+    pub(crate) bypass_route_bbo_warning: bool,
     pub(crate) bypass_redirect_warning: bool,
     /// Sequence of those lookups.
     pub(crate) next_order_lookup: u32,
+    /// The records of contracts the session has, by conId and the exchange
+    /// the answer named (ibx#706): an order needs the one of its exchange
+    /// (the primary exchange for SMART) and asks it when missing.
+    pub(crate) order_records: std::collections::HashSet<(i64, String)>,
+    /// Contracts whose records are taken as known on every exchange (a
+    /// replay that starts after the reference had them).
+    pub(crate) order_records_any: std::collections::HashSet<i64>,
+    /// The record lookups of orders on their way: internal name, conId,
+    /// the exchange asked.
+    pub(crate) order_record_lookups: Vec<(String, i64, String)>,
+    /// Orders whose record lookup was answered: they go on.
+    pub(crate) order_records_cleared: std::collections::HashSet<crate::types::OrderId>,
+    /// The orders held with transmit off whose placeOrder's lookups have
+    /// not all answered (ibx#718), with whether the record lookup was sent
+    /// for them.
+    pub(crate) held_lookups: Vec<(crate::types::OrderId, bool)>,
+    /// The contracts the order lookups of the session named, by what the
+    /// order gave of them (ibx#718): a later held order of one of them is
+    /// known at once.
+    pub(crate) order_contracts_named: Vec<(OrderContractKey, i64)>,
+    /// The clearing rule lookups to send, and those on their way, and how
+    /// many the session made (ibx#709).
+    pub(crate) order_clearing_to_send: Vec<(i64, String)>,
+    pub(crate) order_clearing_lookups: Vec<String>,
+    pub(crate) next_clearing_rule: u32,
+
     /// Set while a short-side order is encoded: its short-sale fields
     /// (ibx#417).
     pub(crate) short_sale_send: Option<crate::types::ShortSale>,
@@ -215,11 +324,17 @@ pub struct Context {
     /// Set while a combo order is encoded: what it writes besides the
     /// order's own fields (ibx#470).
     pub(crate) combo_send: Option<crate::engine::combo::ComboSend>,
+    /// The scale fields of the order being sent (ibx#751).
+    pub(crate) scale_send: Option<Box<crate::types::Scale>>,
     /// The API client id the new orders carry (ibx#466).
     pub(crate) api_client_id: i64,
     /// Requests with outside-RTH waiting for their lookup, in order; later
     /// requests of the same order wait behind them.
     pub(crate) rth_parked: Vec<OrderRequest>,
+    /// The orders of each group transmitted together that still waits for
+    /// a contract (ibx#547): order id and instrument. No order of a group
+    /// goes out before the contract of each is known.
+    pub(crate) order_groups: Vec<Vec<(OrderId, InstrumentId)>>,
     pub(crate) next_rth_lookup: u32,
     /// The session counts US stock sizes in round lots (ibx#287).
     pub(crate) scale_us_lots: bool,
@@ -239,20 +354,192 @@ pub struct Context {
     /// Set while an order is encoded: it carries the price management flag
     /// unless its order type is one the flag never goes with (ibx#492).
     pub(crate) price_mgmt_send: bool,
+    /// MiFID on the session (ibx#500): the logon's MIFID2 feature on a
+    /// session that is not a super user's; the account's MiFID config id
+    /// and covered groups.
+    pub(crate) mifid_manager: bool,
+    pub(crate) mifid_config_id: String,
+    pub(crate) mifid_groups: Vec<String>,
+    /// An FA session (ibx#507): orders carry their allocation.
+    pub(crate) fa_session: bool,
+    /// The FA exchange with the server and the groups of the orders
+    /// (ibx#507).
+    pub(crate) fa: crate::engine::hot_loop::fa::FaState,
+    /// The logon's soft dollar tiers (name, value) by key, the contract's
+    /// market type (ibx#506).
+    pub(crate) soft_dollar_tiers: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// The soft dollar tier tags of the request being encoded, and each
+    /// order's, for its modifications (ibx#506).
+    pub(crate) soft_dollar_send: Vec<(u32, String)>,
+    pub(crate) soft_dollar_orders: std::collections::HashMap<OrderId, Vec<(u32, String)>>,
+    /// The MiFID tags of the request being encoded (ibx#500).
+    pub(crate) mifid_send: Vec<(u32, String)>,
+    /// The MiFID values each order went out with and whether it is
+    /// covered, for its modifications (ibx#500).
+    pub(crate) mifid_orders: std::collections::HashMap<OrderId, ([String; 4], bool)>,
     /// Round lot by conId, once its definition was read (ibx#287).
+    /// The terms an order's contract is looked up with, by the order's
+    /// slot, for a contract other than a stock (ibx#666).
+    pub(crate) order_lookup_filters: HashMap<crate::types::InstrumentId, crate::types::SecDefFilters>,
     pub(crate) round_lots: HashMap<i64, i64>,
+    /// The size and price increments of each definition read, by conId,
+    /// packed (`md_events::Increment`), kept from session level 222, whose
+    /// last size and price are given in their steps (ibx#613).
+    pub(crate) def_increments: HashMap<i64, (u64, u64)>,
+    /// The conIds whose increments came since the last publication to
+    /// their market data slots (ibx#613).
+    pub(crate) increments_due: Vec<i64>,
+    /// The conIds of US stocks and warrants among the definitions read
+    /// (ibx#648).
+    pub(crate) us_lots: std::collections::HashSet<i64>,
     /// Requests waiting for their contract's definition, by conId, and the
     /// ones whose definition came, to be handled again (ibx#404).
     pub(crate) def_parked: Vec<(i64, crate::types::ControlCommand)>,
+    /// The regulatory snapshots whose contract's definition was asked for
+    /// them, by conId: handled again once it came, without asking it again
+    /// (ibx#645).
+    pub(crate) snapshot_def_asked: std::collections::HashSet<i64>,
     pub(crate) def_ready: Vec<crate::types::ControlCommand>,
+    /// The client's requests given by a conId alone whose definition was
+    /// asked for them, by kind of request and request id: handled again
+    /// once it came, they go on without asking it again (ibx#732).
+    pub(crate) def_asked: std::collections::HashSet<(crate::engine::context::DefAsk, crate::types::ReqId)>,
+    /// The client's requests waiting for the company lookup of their
+    /// option's underlying, by the underlying's conId; handled again once
+    /// it answered (ibx#733).
+    pub(crate) company_parked: Vec<(i64, crate::types::ControlCommand)>,
     /// Listing exchange by conId, once its definition was read (#452).
     pub(crate) listing_exchanges: HashMap<i64, String>,
+    /// The terms of the options whose definition was read, for the option
+    /// model of their market data (ibx#502).
+    pub(crate) option_terms: HashMap<i64, crate::control::optcalc::OptionTerms>,
+    /// Option and futures option orders past their permission check, whose
+    /// option's market data the engine starts for itself (ibx#693):
+    /// (instrument, conId, the order's exchange).
+    pub(crate) order_models: Vec<(crate::types::InstrumentId, i64, String)>,
+    /// What the definitions of futures and indexes name, by conId, for the
+    /// index part of a futures option order's model (ibx#727).
+    pub(crate) def_links: HashMap<i64, DefLink>,
+    /// Contracts whose definition was asked and answered without them: an
+    /// option model waiting for their terms gives up (ibx#727).
+    pub(crate) no_definition: std::collections::HashSet<i64>,
+    /// API security type and symbol by conId, once its definition was
+    /// read: a market data request that gives the conId alone takes them
+    /// from it (ibx#643).
+    pub(crate) def_kinds: HashMap<i64, (String, String)>,
+    /// A stock's type (COMMON, ETF, ...) by conId, from its definition: the
+    /// ETF ticks are asked for an ETF only (ibx#641).
+    pub(crate) stock_types: HashMap<i64, String>,
+    /// Stocks whose definition is not a US stock's, by conId (ibx#674).
+    pub(crate) foreign_stocks: std::collections::HashSet<i64>,
+    /// Contracts refused for want of an API subscription with delayed data
+    /// available: a later request in delayed mode is asked delayed at once
+    /// (ibx#674).
+    pub(crate) delayed_contracts: std::collections::HashSet<i64>,
+    /// The logon's algo providers (ibx#505).
+    pub(crate) algo_providers: Vec<String>,
+    /// The account's order presets by security type: the time in force
+    /// they set, None when they set none (ibx#660). A type asked and not
+    /// answered yet is in `presets_asked`.
+    pub(crate) order_presets: HashMap<String, Option<String>>,
+    pub(crate) presets_asked: std::collections::HashSet<String>,
+    pub(crate) next_preset_request: u32,
+    /// The order preset kinds the account has stored on the server, from
+    /// the list asked at the logon (ibx#729); None until it answered. A kind
+    /// stored is asked at the first order of its type and waited for; a kind
+    /// not stored is saved after that order's message.
+    pub(crate) presets_stored: Option<std::collections::HashSet<String>>,
+    /// The order preset kinds to save once the order being written is out
+    /// (ibx#729).
+    pub(crate) preset_saves_due: Vec<String>,
+    /// The copied waits of a stock's first order (ibx#729): off by default,
+    /// on with the copied waits setting (ibx#564).
+    pub(crate) order_gaps: bool,
+    /// A transmitted stock order waits for the records of its contract
+    /// (ibx#706) before it goes: on for an engine built by hand (the
+    /// replays of the reference's recordings); a session opened by a logon
+    /// asks them only with the copied waits setting (ibx#564). A held order
+    /// asks them always: a hedge under it waits for them (ibx#718).
+    pub(crate) order_records_wait: bool,
+    /// The time those waits go by when a test sets it (the replays' clock).
+    pub(crate) gap_clock: Option<std::time::Instant>,
+    /// When the answer of each order preset kind came, for those waits
+    /// (a stock's, a forex pair's, the presets an order waits for before
+    /// its refusal).
+    pub(crate) preset_answered: HashMap<String, std::time::Instant>,
+    /// When the symbol lookup of an order's contract answered, by conId,
+    /// for the wait before its first step (ibx#729).
+    pub(crate) lookup_answered: HashMap<i64, std::time::Instant>,
+    /// The contracts an order gave by their conId alone, named by their
+    /// definition: their first order keeps shorter waits (ibx#729).
+    pub(crate) by_con_id_contracts: std::collections::HashSet<i64>,
+    /// When the record an order asked of its contract came, by conId.
+    pub(crate) record_answered: HashMap<i64, std::time::Instant>,
+    /// The orders that waited for the stock order preset.
+    pub(crate) preset_waiters: std::collections::HashSet<crate::types::OrderId>,
+    /// The earliest time an order held by one of those waits goes on.
+    pub(crate) order_wake: Option<std::time::Instant>,
+    /// The account's trading permission by permission class, as the
+    /// server answered (ibx#666); a class asked and not answered yet is in
+    /// `permissions_asked`, with the time the order stops waiting.
+    pub(crate) trading_permissions: HashMap<String, bool>,
+    pub(crate) permissions_asked: HashMap<String, std::time::Instant>,
+    /// The trading permission class each contract's definition names, by
+    /// conId, once read (ibx#734).
+    pub(crate) permission_keys: HashMap<i64, String>,
+    /// The permission classes of derivatives asked once the company lookup
+    /// of their underlying answered: (underlying's conId, class), in the
+    /// order they came (ibx#734).
+    pub(crate) classes_after_company: Vec<(i64, String)>,
+    /// The cash amount of a fund order bought by cash, in quantity units:
+    /// the reference reports it as the order's remaining quantity (ibx#666;
+    /// paper, 16/10/2026: Cancelled with 100 remaining for a VFIAX buy of
+    /// 100.00).
+    pub(crate) cash_orders: HashMap<crate::types::OrderId, i64>,
+    pub(crate) next_permission_request: u32,
+    /// The CFD checks a refused volatility option order starts (ibx#729):
+    /// the underlying symbols checked in the session, and the requests on
+    /// their way, by the name ibx gave them (the symbol lookup, then the
+    /// definition by conId on SMART).
+    pub(crate) cfd_checked: std::collections::HashSet<String>,
+    pub(crate) cfd_requests: Vec<String>,
+    /// The underlyings the derivative orders of the session looked up
+    /// (ibx#730): by conId, while the lookup is on its way the time its
+    /// order stops waiting for it, None once answered; and the requests on
+    /// their way, by the name ibx gave them, with the underlying's conId.
+    /// The order's underlying first (its company lookup, which its order
+    /// waits for), then its preferred definition past its permission check
+    /// (which the order's option model waits for).
+    pub(crate) order_underlyings: HashMap<i64, Option<std::time::Instant>>,
+    pub(crate) under_preferred: HashMap<i64, Option<std::time::Instant>>,
+    /// The stocks an option order asked as the underlying of index
+    /// options (ibx#730): once per underlying.
+    pub(crate) index_option_unders: std::collections::HashSet<i64>,
+    pub(crate) underlying_requests: Vec<(String, i64)>,
+    /// The lookups of the indexes a futures option order's model makes
+    /// once its index is known (ibx#730), and the number of the model's
+    /// next lookup.
+    pub(crate) index_walks: Vec<crate::engine::hot_loop::farm::IndexWalk>,
+    pub(crate) next_model_lookup: u32,
+    /// The key of the trading hours of a contract's class, by conId, once
+    /// its definition was read (ibx#730).
+    pub(crate) join_keys: HashMap<i64, String>,
+    /// Contracts whose trading hours were asked for an order and have not
+    /// come: an order with a zone to check waits for them (ibx#668).
+    pub(crate) zone_pending: std::collections::HashSet<i64>,
+    /// The trading hours an order's contract answer calls for, not sent
+    /// yet (ibx#728): conId, schedule key and request name. The order sends
+    /// them at its turn, after its permission question when it has one.
+    pub(crate) order_hours_due: Vec<(i64, String, String)>,
+    /// Depth requests refused with 10092: their cancel answers nothing
+    /// (ibx#678).
+    pub(crate) depth_unsupported: std::collections::HashSet<ReqId>,
     /// Aggregate group by conId, once its definition was read (#445).
     pub(crate) agg_groups: HashMap<i64, i32>,
     /// SMART component exchanges by conId, once its definition was read
     /// (#452).
     pub(crate) smart_components: HashMap<i64, Vec<String>>,
-    /// Valid exchanges by conId (tag 6046, BEST as SMART), once its
+    /// Valid exchanges by conId (BEST as SMART), once its
     /// definition was read: the components of its SmartDepth (#452).
     pub(crate) valid_exchanges: HashMap<i64, Vec<String>>,
     /// The contract as a depth refusal names it, by conId (#452).
@@ -260,28 +547,46 @@ pub struct Context {
     /// SmartDepth requests waiting for their components' definitions
     /// (#452).
     pub(crate) depth_gathers: Vec<crate::engine::hot_loop::farm::DepthGather>,
-    /// Definition lookups in flight for a round lot: (request id, conId,
-    /// deadline).
+    /// Definition lookups by conId in flight for what a request or a model
+    /// needs (round lot, aggregate group, security type): (request id,
+    /// conId, deadline).
     pub(crate) lot_lookups: Vec<(String, i64, std::time::Instant)>,
     /// Market data subscriptions waiting for their round lot, in order.
     pub(crate) lot_parked: Vec<crate::engine::hot_loop::farm::MdSubscribe>,
     /// Subscriptions whose round lot is known, to be sent.
     pub(crate) lot_ready: Vec<crate::engine::hot_loop::farm::MdSubscribe>,
+    /// The next number of those lookups' range (ibx#731).
     pub(crate) next_lot_lookup: u32,
     /// Market data subscriptions given without a conId, waiting for the
     /// lookup that resolves it: (request number, subscription, deadline)
     /// (ibx#278).
     pub(crate) md_lookups: Vec<(u32, crate::engine::hot_loop::farm::MdSubscribe, std::time::Instant)>,
+    /// The instruments of `md_lookups` whose request was cancelled while
+    /// the lookup was on its way (ibx#662).
+    pub(crate) md_lookup_cancelled: std::collections::HashSet<crate::types::InstrumentId>,
     /// Subscriptions whose conId was resolved, to be sent.
     pub(crate) md_resolved: Vec<crate::engine::hot_loop::farm::MdSubscribe>,
+    /// Slots of those subscriptions asked with every API line taken
+    /// (ibx#501).
+    pub(crate) md_over_limit: Vec<InstrumentId>,
     pub(crate) next_md_lookup: u32,
     /// Final status of orders that left the engine filled, cancelled or
     /// rejected, for the reference's refusal of a later cancel (ibx#464).
     /// Bounded: the oldest are dropped past `FINISHED_ORDERS_MAX`.
     finished_orders: HashMap<OrderId, OrderStatus>,
     finished_order_ids: std::collections::VecDeque<OrderId>,
+    /// Orders refused with 387 before anything was sent, with their
+    /// instrument, quantity and parent (ibx#542): the reference keeps such
+    /// an order, unlisted, until its cancel ends it.
+    pub(crate) unsent: HashMap<OrderId, (InstrumentId, Qty, i64)>,
+    /// The book entry of each order held with transmit off (ibx#595): the
+    /// reference keeps it in its book under its permId from its placing,
+    /// with its parent and OCA group.
+    pub(crate) held_book: HashMap<OrderId, BookEntry>,
     /// The book entry of each order held (see [`BookEntry`]).
     pub(crate) book: HashMap<OrderId, BookEntry>,
+    /// The ended orders the reference's book still holds (ibx#545).
+    pub(crate) ended: Vec<EndedOrder>,
     /// Orders of this client the reference keeps in its API pending map
     /// with no order made: a combo refused with 200 at its contract
     /// lookup. A cancel or a global cancel ends them as ApiCancelled.
@@ -305,26 +610,45 @@ impl Context {
             pending_orders: OrderBuffer::new(),
             modify_versions: HashMap::new(),
             last_clord: HashMap::new(),
+            purged_orders: Vec::new(),
             recovered_keys: HashMap::new(),
             server_ids: HashMap::new(),
+            recovered: std::collections::HashSet::new(),
             order_ids: OrderIdGenerator::new(),
             cancel_clord: HashMap::new(),
             status_queries: std::collections::HashSet::new(),
             trail_limit_reported: HashMap::new(),
+            scale_reset_reported: std::collections::HashSet::new(),
+            price_mgmt_sent: std::collections::HashSet::new(),
+            compete_cleared: std::collections::HashSet::new(),
             reported_stop: HashMap::new(),
             rth_types: HashMap::new(),
+            min_sizes: HashMap::new(),
             rth_lookups: Vec::new(),
             rth_parked: Vec::new(),
+            order_groups: Vec::new(),
             next_rth_lookup: 0,
             what_ifs: HashMap::new(),
             what_if_send: None,
             what_if_option_terms: None,
             order_lookups: Vec::new(),
             bypass_redirect_warning: crate::config::bypass_redirect_order_warning(),
+            bypass_route_bbo_warning: crate::config::bypass_route_marketable_to_bbo_warning(),
             next_order_lookup: 0,
+            order_records: std::collections::HashSet::new(),
+            order_records_any: std::collections::HashSet::new(),
+            order_record_lookups: Vec::new(),
+            order_records_cleared: std::collections::HashSet::new(),
+            held_lookups: Vec::new(),
+            order_contracts_named: Vec::new(),
+            order_clearing_to_send: Vec::new(),
+            order_clearing_lookups: Vec::new(),
+            next_clearing_rule: 0,
+
             short_sale_send: None,
             combos: Default::default(),
             combo_send: None,
+            scale_send: None,
             api_client_id: 0,
             scale_us_lots: false,
             bracket_keys: HashMap::new(),
@@ -334,11 +658,69 @@ impl Context {
             price_mgmt_feature: false,
             price_mgmt_exclusions: None,
             price_mgmt_send: false,
+            mifid_manager: false,
+            mifid_config_id: String::new(),
+            mifid_groups: Vec::new(),
+            mifid_send: Vec::new(),
+            fa_session: false,
+            fa: Default::default(),
+            soft_dollar_tiers: std::collections::HashMap::new(),
+            soft_dollar_send: Vec::new(),
+            soft_dollar_orders: std::collections::HashMap::new(),
+            mifid_orders: std::collections::HashMap::new(),
             round_lots: HashMap::new(),
+            def_increments: HashMap::new(),
+            increments_due: Vec::new(),
+            order_lookup_filters: HashMap::new(),
+            us_lots: std::collections::HashSet::new(),
             agg_groups: HashMap::new(),
             listing_exchanges: HashMap::new(),
+            option_terms: HashMap::new(),
+            order_models: Vec::new(),
+            def_links: HashMap::new(),
+            no_definition: std::collections::HashSet::new(),
+            def_kinds: HashMap::new(),
+            stock_types: HashMap::new(),
+            foreign_stocks: std::collections::HashSet::new(),
+            delayed_contracts: std::collections::HashSet::new(),
+            algo_providers: Vec::new(),
+            order_presets: HashMap::new(),
+            presets_asked: std::collections::HashSet::new(),
+            next_preset_request: 3,
+            presets_stored: None,
+            preset_saves_due: Vec::new(),
+            order_gaps: false,
+            order_records_wait: true,
+            gap_clock: None,
+            preset_answered: HashMap::new(),
+            lookup_answered: HashMap::new(),
+            by_con_id_contracts: std::collections::HashSet::new(),
+            record_answered: HashMap::new(),
+            preset_waiters: std::collections::HashSet::new(),
+            order_wake: None,
+            trading_permissions: HashMap::new(),
+            permissions_asked: HashMap::new(),
+            permission_keys: HashMap::new(),
+            classes_after_company: Vec::new(),
+            cash_orders: HashMap::new(),
+            next_permission_request: 0,
+            cfd_checked: std::collections::HashSet::new(),
+            cfd_requests: Vec::new(),
+            order_underlyings: HashMap::new(),
+            under_preferred: HashMap::new(),
+            index_option_unders: std::collections::HashSet::new(),
+            underlying_requests: Vec::new(),
+            index_walks: Vec::new(),
+            next_model_lookup: 0,
+            join_keys: HashMap::new(),
+            zone_pending: std::collections::HashSet::new(),
+            order_hours_due: Vec::new(),
+            depth_unsupported: std::collections::HashSet::new(),
             def_parked: Vec::new(),
+            snapshot_def_asked: std::collections::HashSet::new(),
             def_ready: Vec::new(),
+            def_asked: std::collections::HashSet::new(),
+            company_parked: Vec::new(),
             smart_components: HashMap::new(),
             valid_exchanges: HashMap::new(),
             depth_descriptions: HashMap::new(),
@@ -348,13 +730,18 @@ impl Context {
             lot_ready: Vec::new(),
             next_lot_lookup: 0,
             md_lookups: Vec::new(),
+            md_lookup_cancelled: std::collections::HashSet::new(),
             md_resolved: Vec::new(),
+            md_over_limit: Vec::new(),
             next_md_lookup: 0,
             finished_orders: HashMap::new(),
+            unsent: HashMap::new(),
+            held_book: HashMap::new(),
             finished_order_ids: std::collections::VecDeque::new(),
             book: HashMap::new(),
             api_pending: HashMap::new(),
             next_book_seq: 0,
+            ended: Vec::new(),
             book_peak: 0,
             account: AccountState::default(),
             clock: Clock::new(),
@@ -431,6 +818,14 @@ impl Context {
                 OrderStatus::PendingCancel | OrderStatus::PendingReplace |
                 OrderStatus::PartiallyFilled))
             .collect()
+    }
+
+    /// Set the quantity an order is held with (ibx#751: a scale order with
+    /// an initial position).
+    pub(crate) fn set_order_qty(&mut self, order_id: OrderId, qty_fixed: crate::types::Qty) {
+        if let Some(o) = self.open_orders.get_mut(&order_id) {
+            o.qty_fixed = qty_fixed;
+        }
     }
 
     pub fn order(&self, order_id: OrderId) -> Option<&Order> {
@@ -1223,6 +1618,12 @@ impl Context {
         self.clock.now_utc()
     }
 
+    /// The time the copied waits of the orders go by (ibx#729): the test's
+    /// clock when one is set, else now.
+    pub(crate) fn gap_now(&self) -> std::time::Instant {
+        self.gap_clock.unwrap_or_else(std::time::Instant::now)
+    }
+
     /// Timestamp when the last farm socket recv returned data.
     #[inline(always)]
     pub fn recv_timestamp(&self) -> Instant {
@@ -1294,7 +1695,12 @@ impl Context {
             self.book.insert(oid, BookEntry { seq: self.next_book_seq, ..Default::default() });
             self.next_book_seq += 1;
         }
-        self.book_peak = self.book_peak.max(self.open_orders.len());
+        // The ended orders the reference still holds are in its book too.
+        if !self.ended.is_empty() {
+            let now = Instant::now();
+            self.ended.retain(|e| e.until.is_none_or(|until| now < until));
+        }
+        self.book_peak = self.book_peak.max(self.open_orders.len() + self.ended.len());
     }
 
     /// The server's id of an order, the id part of its ClOrdID: the id
@@ -1317,10 +1723,56 @@ impl Context {
         self.server_ids.insert(key, server);
     }
 
+    /// Hold an order of an earlier session, of server id `server`, under its
+    /// API order id `key` (ibx#466), and remember that it is not an order
+    /// of this session (ibx#538).
+    pub(crate) fn hold_recovered(&mut self, key: OrderId, server: OrderId) {
+        self.bind_server_id(key, server);
+        if key != server {
+            self.recovered.insert(key);
+        }
+    }
+
+    /// A working order of an earlier session held under `key`: whether it
+    /// is this client's (same client id). None for any other key.
+    pub(crate) fn earlier_session_order(&self, key: OrderId) -> Option<bool> {
+        (self.recovered.contains(&key) && self.open_orders.contains_key(&key)).then(|| self.owned(key))
+    }
+
+    /// Put the order of an earlier session held under `key` back under its
+    /// server id, so the key is free for an order of this session
+    /// (ibx#538: the reference keeps the orders of each client id apart).
+    /// The server id it is now held under.
+    pub(crate) fn release_recovered_key(&mut self, key: OrderId) -> Option<OrderId> {
+        self.recovered.remove(&key);
+        let server = self.server_ids.remove(&key)?;
+        self.recovered_keys.remove(&server);
+        if let Some(mut order) = self.open_orders.remove(&key) {
+            order.order_id = server;
+            self.open_orders.insert(server, order);
+        }
+        if let Some(v) = self.book.remove(&key) { self.book.insert(server, v); }
+        if let Some(v) = self.modify_versions.remove(&key) { self.modify_versions.insert(server, v); }
+        if let Some(v) = self.last_clord.remove(&key) { self.last_clord.insert(server, v); }
+        if let Some(v) = self.cancel_clord.remove(&key) { self.cancel_clord.insert(server, v); }
+        if let Some(v) = self.trail_limit_reported.remove(&key) { self.trail_limit_reported.insert(server, v); }
+        if let Some(v) = self.reported_stop.remove(&key) { self.reported_stop.insert(server, v); }
+        Some(server)
+    }
+
     /// A new order goes out under a server id of its own, from the
-    /// reference's order id generator (`jclient.jv.l()`); its API order id
+    /// reference's order id generator; its API order id
     /// stays its key. An order already held, or already given a server id,
     /// keeps its id.
+    /// Keep an order refused before it was sent, for its cancel, with the
+    /// id it is given now, as the reference numbers an order when it is
+    /// placed: its permId (ibx#748; the reference 10.51, paper, 18/10/2026:
+    /// a kept hedge's permId right after its parent's).
+    pub(crate) fn keep_unsent(&mut self, order_id: OrderId, entry: (crate::types::InstrumentId, crate::types::Qty, i64)) {
+        self.assign_server_id(order_id);
+        self.unsent.insert(order_id, entry);
+    }
+
     pub(crate) fn assign_server_id(&mut self, key: OrderId) {
         if self.open_orders.contains_key(&key) || self.server_ids.contains_key(&key) {
             return;
@@ -1330,7 +1782,7 @@ impl Context {
     }
 
     /// The next id of the generator that names no order held: the
-    /// reference skips the ids it gave (`jclient.jv.b(String)@34-59`).
+    /// reference skips the ids it gave.
     pub(crate) fn new_server_id(&mut self) -> OrderId {
         loop {
             let id = OrderId::from(self.order_ids.next());
@@ -1338,6 +1790,28 @@ impl Context {
                 return id;
             }
         }
+    }
+
+    /// The book entry of an order held with transmit off (ibx#595): it
+    /// takes its place in the book when first held; held again, it keeps
+    /// that place with its new links.
+    pub(crate) fn hold_entry(&mut self, order_id: OrderId, parent: OrderId, oca_group: &str) {
+        let seq = match self.held_book.get(&order_id) {
+            Some(e) => e.seq,
+            None => {
+                self.next_book_seq += 1;
+                self.next_book_seq - 1
+            }
+        };
+        self.held_book.insert(order_id, BookEntry { seq, parent, oca_group: oca_group.to_string(), owner: None });
+        self.book_peak = self.book_peak.max(self.open_orders.len() + self.ended.len() + self.unsent.len());
+    }
+
+    /// An order held with transmit off ended (ibx#595): the book keeps it
+    /// for the session in the place it had.
+    pub(crate) fn keep_held_ended(&mut self, order_id: OrderId, server_id: OrderId, entry: BookEntry) {
+        self.ended.retain(|e| e.order_id != order_id);
+        self.ended.push(EndedOrder { order_id, server_id, entry, until: None });
     }
 
     /// The parent and OCA group of a held order, when known.
@@ -1351,9 +1825,8 @@ impl Context {
     /// Whether this client gets the reports of an order (openOrder,
     /// orderStatus, executions, commissions): those of its own orders, and
     /// as client 0 those of a client that is not connected
-    /// (`jextend.ba.d(dK)`: the order's client, else client 0; no master
-    /// client, `ApiSettings.m_masterClientID` -1 by default). ibx is the
-    /// only client of its engine.
+    /// (the order's client, else client 0; no master client, its master
+    /// client id -1 by default). ibx is the only client of its engine.
     pub(crate) fn delivered(&self, order_id: OrderId) -> bool {
         self.api_client_id == 0 || self.owned(order_id)
     }
@@ -1361,7 +1834,7 @@ impl Context {
     /// Whether this client may act on an order by its id: an order of
     /// this client, or one the server reported for this client's id. The
     /// reference finds an API order by (client id, order id)
-    /// (`jclient.jv.b(int, int)`).
+    ///.
     pub(crate) fn owned(&self, order_id: OrderId) -> bool {
         self.book.get(&order_id).and_then(|e| e.owner).is_none_or(|owner| owner == self.api_client_id)
     }
@@ -1448,20 +1921,89 @@ impl Context {
     /// Remove an order that ended with `status`, and keep that status for a
     /// later cancel of the same id (ibx#464).
     pub fn finish_order(&mut self, order_id: OrderId, status: OrderStatus) {
+        let keep = match status {
+            OrderStatus::Cancelled | OrderStatus::Rejected => Some(CANCELLED_ORDER_KEPT),
+            OrderStatus::Filled => Some(FILLED_ORDER_KEPT),
+            _ => None,
+        };
+        let kept = keep.and_then(|d| self.book.get(&order_id).cloned().map(|e| (e, d)));
         if !self.forget_order(order_id) {
             return;
         }
+        if let Some((entry, keep)) = kept {
+            self.keep_ended(order_id, self.server_id(order_id), entry, Some(Instant::now() + keep));
+        }
         if self.finished_orders.insert(order_id, status).is_none() {
             self.finished_order_ids.push_back(order_id);
-            while self.finished_order_ids.len() > FINISHED_ORDERS_MAX {
-                if let Some(old) = self.finished_order_ids.pop_front() {
-                    self.finished_orders.remove(&old);
-                    if let Some(server) = self.server_ids.remove(&old) {
-                        self.recovered_keys.remove(&server);
-                    }
-                }
-            }
+            self.trim_finished();
         }
+    }
+
+    /// Keep `status` as the end of an order that was never held (refused
+    /// before it was sent, ibx#542), for a later cancel of the same id.
+    pub(crate) fn finish_unsent(&mut self, order_id: OrderId, status: OrderStatus) {
+        if self.finished_orders.insert(order_id, status).is_none() {
+            self.finished_order_ids.push_back(order_id);
+            self.trim_finished();
+        }
+    }
+
+    /// The oldest ended orders past the last `FINISHED_ORDERS_MAX` are gone
+    /// for good, with everything kept for them (ibx#700). An ended order's
+    /// last ClOrdID stays until then: a child's report can name a parent
+    /// that has ended (`parent_order_id`).
+    fn trim_finished(&mut self) {
+        while self.finished_order_ids.len() > FINISHED_ORDERS_MAX {
+            let Some(old) = self.finished_order_ids.pop_front() else { break };
+            self.finished_orders.remove(&old);
+            if let Some(server) = self.server_ids.remove(&old) {
+                self.recovered_keys.remove(&server);
+            }
+            self.purge_order_records(old);
+        }
+    }
+
+    /// Drop what is kept for an order no report names again: its modify
+    /// version and last ClOrdID here, and (through `purged_orders`) what
+    /// the order connection keeps for it (ibx#700).
+    fn purge_order_records(&mut self, order_id: OrderId) {
+        self.modify_versions.remove(&order_id);
+        self.last_clord.remove(&order_id);
+        self.purged_orders.push(order_id);
+    }
+
+    /// An order that failed to send: removed with everything kept for it;
+    /// it never reached the server, so no report names it (ibx#116,
+    /// ibx#700).
+    pub(crate) fn drop_unsent_order(&mut self, order_id: OrderId) {
+        self.forget_order(order_id);
+        self.purge_order_records(order_id);
+    }
+
+    /// Keep an ended order as the reference's book does (ibx#545), in the
+    /// place a new entry of the book takes.
+    pub(crate) fn keep_ended(&mut self, order_id: OrderId, server_id: OrderId, mut entry: BookEntry, until: Option<Instant>) {
+        self.ended.retain(|e| e.order_id != order_id);
+        if until.is_none() {
+            entry.seq = self.next_book_seq;
+            self.next_book_seq += 1;
+        }
+        self.ended.push(EndedOrder { order_id, server_id, entry, until });
+        self.book_peak = self.book_peak.max(self.open_orders.len() + self.ended.len());
+    }
+
+    /// The ended orders the reference's book holds at `now`, for a global
+    /// cancel; those whose time is over are dropped.
+    pub(crate) fn ended_orders(&mut self, now: Instant) -> Vec<EndedOrder> {
+        self.ended.retain(|e| e.until.is_none_or(|until| now < until));
+        self.ended.clone()
+    }
+
+    /// True while the reference's book still holds this ended order
+    /// (ibx#551): its cancel is then answered with the order's state, and
+    /// finds no order afterwards.
+    pub(crate) fn ended_is_kept(&self, order_id: OrderId, now: Instant) -> bool {
+        self.ended.iter().any(|e| e.order_id == order_id && e.until.is_none_or(|until| now < until))
     }
 
     /// Remove an order and what is kept for it, without keeping a final
@@ -2002,10 +2544,9 @@ mod tests {
         ctx.update_order_status(999, OrderStatus::Cancelled);
     }
 
-    // ibx#466: the reference's order id generator (`jfix.cy.a(String)`,
-    // `jclient.jv.b(String)`): a positive first id, then one up per id; at
-    // an id the reference does not take (0, the int bounds) it starts
-    // again from a new first id.
+    // ibx#466: the reference's order id generator: a positive first id,
+    // then one up per id; at an id the reference does not take (0, the int
+    // bounds) it starts again from a new first id.
     #[test]
     fn order_ids_count_up_from_a_positive_first_id() {
         let mut ids = OrderIdGenerator::new();
@@ -2017,6 +2558,46 @@ mod tests {
             let again = ids.next();
             assert!(again > 0 && again != i32::MAX, "{bound}: {again}");
         }
+    }
+
+    // ibx#538: a working order of an earlier session held under its API
+    // order id. Another client's gives the id back to a new order of this
+    // session and goes on under its server id; this client's own is the
+    // order with that id.
+    #[test]
+    fn an_order_of_an_earlier_session_gives_its_key_back_to_a_new_order_of_another_client() {
+        let mut ctx = Context::new();
+        ctx.api_client_id = 93;
+        ctx.order_ids.start_at(1_000_000_001);
+        ctx.hold_recovered(21, 1_459_034_036);
+        ctx.insert_order(Order::new(21, 0, Side::Buy, 1, 100, b'2', b'1', 0));
+        ctx.book.get_mut(&21).unwrap().owner = Some(0);
+        ctx.modify_versions.insert(21, 2);
+        assert_eq!(ctx.earlier_session_order(21), Some(false), "an order of client 0");
+        assert_eq!(ctx.earlier_session_order(22), None);
+
+        assert_eq!(ctx.release_recovered_key(21), Some(1_459_034_036));
+        assert!(ctx.order(21).is_none(), "the key is free");
+        assert_eq!(ctx.order(1_459_034_036).map(|o| o.order_id), Some(1_459_034_036));
+        assert_eq!((ctx.key_of(1_459_034_036), ctx.server_id(1_459_034_036)), (1_459_034_036, 1_459_034_036));
+        assert_eq!(ctx.modify_versions.get(&1_459_034_036), Some(&2), "its version goes with it");
+        assert_eq!(ctx.book.get(&1_459_034_036).and_then(|e| e.owner), Some(0));
+        assert_eq!(ctx.earlier_session_order(21), None);
+
+        ctx.assign_server_id(21);
+        assert_eq!(ctx.server_id(21), 1_000_000_001, "the new order has an identity of its own");
+    }
+
+    #[test]
+    fn an_order_of_an_earlier_session_of_this_client_is_the_order_with_that_id() {
+        let mut ctx = Context::new();
+        ctx.hold_recovered(21, 1_459_034_036);
+        ctx.insert_order(Order::new(21, 0, Side::Buy, 1, 100, b'2', b'1', 0));
+        ctx.book.get_mut(&21).unwrap().owner = Some(0);
+        assert_eq!(ctx.earlier_session_order(21), Some(true), "client 0, its own order");
+        // Once it is finished the id is an id like any other.
+        ctx.finish_order(21, OrderStatus::Cancelled);
+        assert_eq!(ctx.earlier_session_order(21), None);
     }
 
     // ibx#466: a new order is held under its API order id and gets a
@@ -2219,7 +2800,7 @@ mod tests {
                 assert_eq!(*order_id, id);
                 assert_eq!(*instrument, 0);
                 assert_eq!(*side, Side::Buy);
-                assert_eq!(*qty, 5000);
+                assert_eq!(*qty, crate::types::QTY_SCALE / 2);
                 assert_eq!(*price, 150 * PRICE_SCALE);
             }
             _ => panic!("expected SubmitLimitFractional"),

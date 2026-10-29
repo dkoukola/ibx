@@ -1,9 +1,11 @@
-//! The gateway 1040 catalogs of `tests/fixtures/gw1040/catalog/` (see its
-//! README): error codes, order local refusals, order writers, order
+//! The gateway catalogs of `tests/fixtures/<version>/catalog/` (see their
+//! READMEs): error codes, order local refusals, order writers, order
 //! attributes. Every expected value of the layer A tests comes from them.
+//! Each file is read from the reference ibx copies, 10.51 (ibx#604), when
+//! its 10.51 table exists, else from 10.40 (see [`version_of`]).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The fields of one CSV line (quotes and doubled quotes handled).
 pub fn csv_fields(line: &str) -> Vec<String> {
@@ -26,9 +28,25 @@ pub fn csv_fields(line: &str) -> Vec<String> {
     out
 }
 
+fn catalog_path(version: &str, name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(version).join("catalog").join(name)
+}
+
+/// The reference version a catalog file is read from: 10.51 when its 10.51
+/// table is made, else 10.40. The four catalogs have a 10.51 table since
+/// 17/10/2026 (the order writers last, ibx#604).
+pub fn version_of(name: &str) -> &'static str {
+    if catalog_path("gw1051", name).exists() { "gw1051" } else { "gw1040" }
+}
+
 /// The rows of a catalog file as maps column name to value.
 pub fn rows(name: &str) -> Vec<HashMap<String, String>> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gw1040/catalog").join(name);
+    rows_of(version_of(name), name)
+}
+
+/// The rows of a catalog of one reference version.
+pub fn rows_of(version: &str, name: &str) -> Vec<HashMap<String, String>> {
+    let path = catalog_path(version, name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let header = csv_fields(lines.next().unwrap());
@@ -91,8 +109,22 @@ pub fn local_rules() -> Vec<LocalRule> {
         id: r["id"].clone(),
         code: r["code"].parse().unwrap(),
         api_code: r["api_code"].parse().unwrap(),
-        text: r["text"].replace("\\n", "\n"),
+        text: as_a_current_client_gets_it(&r["text"].replace("\\n", "\n")),
     }).collect()
+}
+
+/// The text of a rule as a client of the current official library gets
+/// it (ibx#548, paper 11/10/2026, sixteen rules run on the reference):
+/// the 10.40 table names the handler of the older message form; 10.51
+/// names it `PlaceOrder(3)` at every session level (seen on 10.51 at
+/// levels 214 and 225, ibx#591), and its text for an order without an
+/// exchange ends with a period.
+fn as_a_current_client_gets_it(text: &str) -> String {
+    let text = text.replace("Error validating request.-'bH' :", "Error validating request.-'PlaceOrder(3)' :");
+    match text.strip_suffix("cause - Missing order exchange") {
+        Some(_) => text + ".",
+        None => text,
+    }
 }
 
 pub fn local_rule(id: &str) -> LocalRule {

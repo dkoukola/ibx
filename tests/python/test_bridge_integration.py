@@ -122,6 +122,8 @@ class RecordingWrapper(EWrapper):
             "maint_margin_after": s.maint_margin_after,
             "equity_with_loan_after": s.equity_with_loan_after,
             "commission_and_fees": s.commission_and_fees,
+            "completed_status": s.completed_status,
+            "completed_time": s.completed_time,
             # ibapi-iso extension fields
             "margin_currency": s.margin_currency,
             "init_margin_after_outside_rth": s.init_margin_after_outside_rth,
@@ -616,6 +618,106 @@ class TestReqOpenOrdersOrderState:
         assert state["commission_and_fees"] == sys.float_info.max
 
 
+class TestTransmitOff:
+    """ibx#509: an order placed with transmit off is held, with no answer, and goes out with its tree (the
+    bracket recordings of 26/09/2026 and the paper run of the reference of 09/10/2026)."""
+
+    def _order(self, action, price, transmit, parent_id=0):
+        from ibx import Order
+        order = Order()
+        order.action, order.total_quantity, order.order_type, order.lmt_price, order.tif = action, 1, "LMT", price, "DAY"
+        order.transmit, order.parent_id = transmit, parent_id
+        return order
+
+    def _client(self):
+        from ibx import Contract
+        w, c = make_test_client()
+        c._test_seed_instrument(756733, 0)
+        c._test_set_instrument_count(1)
+        contract = Contract()
+        contract.con_id, contract.symbol, contract.sec_type, contract.exchange, contract.currency = 756733, "SPY", "STK", "SMART", "USD"
+        return w, c, contract
+
+    def test_a_held_order_is_not_refused_and_is_listed_nowhere(self):
+        w, c, contract = self._client()
+        c.place_order(3, contract, self._order("BUY", 10.0, False))
+        c.place_order(4, contract, self._order("SELL", 20.0, False, 3))
+        c._test_dispatch_once()
+        c.req_open_orders()
+        c._test_dispatch_once()
+        assert [e[0] for e in w.events if e[0] in ("open_order", "order_status", "error")] == []
+        assert [e[0] for e in w.events if e[0] == "open_order_end"] == ["open_order_end"]
+
+    def test_the_last_order_of_a_bracket_sends_the_held_ones(self):
+        w, c, contract = self._client()
+        c.place_order(3, contract, self._order("BUY", 10.0, False))
+        c.place_order(4, contract, self._order("SELL", 20.0, False, 3))
+        c.place_order(5, contract, self._order("SELL", 5.0, True, 3))
+        for order_id in (3, 4, 5):
+            c._test_push_order_update(order_id, 0, "PreSubmitted", 0, 1)
+        c._test_dispatch_once()
+        shown = [(e[1], e[3].transmit) for e in w.events if e[0] == "open_order"]
+        assert shown == [(3, True), (4, True), (5, True)]
+
+
+class TestOpenOrderValues:
+    """ibx#543: values of the order callbacks read on the reference and on ibx in the order scenarios of
+    09/10/2026."""
+
+    def _placed(self, conditions=None, order_type="LMT", **more):
+        from ibx import Contract, Order
+        w, c = make_test_client()
+        c._test_seed_instrument(756733, 0)
+        contract = Contract()
+        contract.con_id, contract.symbol, contract.sec_type, contract.exchange, contract.currency = 756733, "SPY", "STK", "SMART", "USD"
+        order = Order()
+        order.action, order.total_quantity, order.order_type, order.lmt_price, order.tif = "BUY", 100, order_type, 10.0, "GTC"
+        for k, v in more.items():
+            setattr(order, k, v)
+        if conditions is not None:
+            order.conditions = conditions
+        c.place_order(42, contract, order)
+        return w, c
+
+    def _last_open_order(self, w):
+        return [e for e in w.events if e[0] == "open_order"][-1]
+
+    def test_a_filled_order_shows_what_was_filled_and_its_filled_size(self):
+        w, c = self._placed()
+        c._test_set_instrument_count(1)
+        c._test_push_fill(0, order_id=42, side="BUY", price=10.0, qty=40, remaining=60)
+        c._test_dispatch_once()
+        _, _, _, order, state = self._last_open_order(w)
+        assert float(order.filled_quantity) == 40.0
+        # The whole order in one fill (the helper gives each fill as the order's total so far).
+        w, c = self._placed()
+        c._test_set_instrument_count(1)
+        c._test_push_fill(0, order_id=42, side="BUY", price=10.0, qty=100, remaining=0)
+        c._test_dispatch_once()
+        _, _, contract, order, state = self._last_open_order(w)
+        assert state["status"] == "Filled" and float(order.filled_quantity) == 100.0
+        # On 10.51 a filled order's openOrder carries its filled size (ibx#605).
+        assert state["completed_status"] == "Filled Size: 100"
+        assert order.cash_qty == sys.float_info.max
+
+    def test_no_commission_is_unset_in_open_order(self):
+        w, c = self._placed()
+        c._test_push_order_update(42, 0, "Submitted", 0, 100)
+        c._test_dispatch_once()
+        state = self._last_open_order(w)[4]
+        assert state["commission_and_fees"] == sys.float_info.max
+
+    def test_open_order_shows_the_conditions_of_the_order(self):
+        w, c = self._placed(conditions=[TimeCondition(True, "20991231-23:59:59"), PriceCondition()])
+        c.req_open_orders()
+        c._test_dispatch_once()
+        order = self._last_open_order(w)[3]
+        first, second = order.conditions
+        assert (type(first).__name__, first.isMore, first.time, first.condType) == ("TimeCondition", True, "20991231-23:59:59", 3)
+        assert first.isConjunctionConnection is True
+        assert type(second).__name__ == "PriceCondition"
+
+
 class TestReqCompletedOrdersOrderState:
     """Regression: req_completed_orders must deliver an OrderState with
     completed_status, completed_time, commission_and_fees_currency, warning_text — iso ibapi."""
@@ -630,8 +732,6 @@ class TestReqCompletedOrdersOrderState:
             commission_and_fees=2.50,
         )
         c.req_completed_orders(False)
-        assert not any(e[0].startswith("completed_order") for e in w.events)
-        c._test_publish_completed_history(None)
         c._test_dispatch_once()
 
         completed_events = [e for e in w.events if e[0] == "completed_order"]
@@ -650,6 +750,46 @@ class TestReqCompletedOrdersOrderState:
         # completed_orders_end must fire after the per-order callbacks.
         end_events = [e for e in w.events if e[0] == "completed_orders_end"]
         assert len(end_events) == 1
+
+    def test_a_callback_that_lets_go_of_the_interpreter_lock_does_not_stop_the_program(self):
+        """With the event loop running, a completed_order callback that sleeps (as one that writes a file or
+        takes a lock does) used to stop the whole interpreter: the request held a lock of the client across the
+        callback, and the event loop waited for that lock with the interpreter lock held. Run in its own process:
+        a stopped interpreter cannot fail a test."""
+        import subprocess
+        import sys
+        import textwrap
+        script = textwrap.dedent('''
+            import threading, time
+            from ibx import EClient, EWrapper
+
+            class W(EWrapper):
+                seen = []
+                def completed_order(self, contract, order, order_state):
+                    time.sleep(0.2)
+                    self.seen.append("completed_order")
+                def completed_orders_end(self):
+                    self.seen.append("end")
+
+            w = W()
+            c = EClient(w)
+            c._test_connect("TEST123")
+            c._test_push_completed_order(
+                order_id=99, instrument=0, status="Filled", filled_qty=100, symbol="SPY", action="BUY",
+                total_quantity=100.0, lmt_price=400.0, completed_status="Filled",
+                completed_time="20260430-15:30:00", commission_and_fees_currency="USD", warning_text="",
+                commission_and_fees=2.50)
+            threading.Thread(target=c.run, daemon=True).start()
+            time.sleep(0.05)
+            c.req_completed_orders(False)
+            # The answer comes through the event loop (ibx#695): wait for its end.
+            deadline = time.time() + 5
+            while "end" not in w.seen and time.time() < deadline:
+                time.sleep(0.01)
+            print(",".join(w.seen))
+        ''')
+        done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+        assert done.stdout.strip() == "completed_order,end", (done.stdout, done.stderr[-400:])
 
 
 class TestOrderAllocation:
@@ -876,16 +1016,16 @@ class TestAccountDispatch:
         assert "BuyingPower" in tags
         assert tags["NetLiquidation"] == "100000.00"
 
-        # Each frame twice, as the reference (ibx#486: its listener is
-        # registered twice).
         end_events = [e for e in w.events if e[0] == "account_summary_end"]
-        assert len(end_events) == 2
+        # Each frame once at session level 225 (twice at 214, ibx#662, ibx#602).
+        assert len(end_events) == 1
 
     def test_positions(self):
         w, c = make_test_client("DU12345")
         c._test_set_position(265598, 100, 150.50)
         c._test_account_download_complete()  # positions answer then (ibx#477)
         c.req_positions()
+        c._test_dispatch_once()  # from the event loop (ibx#532)
 
         pos_events = [e for e in w.events if e[0] == "position"]
         end_events = [e for e in w.events if e[0] == "position_end"]

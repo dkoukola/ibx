@@ -384,6 +384,9 @@ fn get_config() -> Option<EClientConfig> {
         host,
         paper: true,
         core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     })
 }
 
@@ -600,6 +603,7 @@ fn api_gt_suite() {
         print!("  req_positions... ");
         wrapper.drain();
         client.req_positions(&mut wrapper);
+        client.process_msgs(&mut wrapper);
         let cbs = wrapper.drain();
 
         let has_end = cbs.iter().any(|c| matches!(c, Cb::PositionEnd));
@@ -691,6 +695,7 @@ fn api_gt_suite() {
         for _ in 0..5 {
             poll(&client, &mut wrapper, Duration::from_millis(500));
             client.req_completed_orders(&mut wrapper);
+            client.process_msgs(&mut wrapper);
             if wrapper.events.lock().unwrap().iter().any(|c| matches!(c, Cb::CompletedOrder { .. })) {
                 break;
             }
@@ -1312,8 +1317,8 @@ fn api_gt_suite() {
             order_type: "LMT".into(),
             lmt_price: 1.0,
             tif: "GTC".into(),
-            // The server refuses outside-RTH for algo orders ("Only RTH orders
-            // are allowed for IB algorithmic orders"). This case passed before
+            // The server refuses outside-RTH for algo orders (only RTH orders
+            // are allowed for algorithmic orders). This case passed before
             // only because ibx dropped the flag on adaptive orders (ibx#318).
             outside_rth: false,
             algo_strategy: "Adaptive".into(),
@@ -1361,9 +1366,10 @@ fn api_gt_suite() {
         print!("  req_smart_components... ");
         wrapper.drain();
         client.req_smart_components(900, "XYZ", &mut wrapper);
+        client.process_msgs(&mut wrapper);
         let cbs = wrapper.drain();
         let refused = cbs.iter().any(|c| matches!(c, Cb::Error { req_id: 900, code: 321, msg }
-            if msg == "Error validating request.-'V' : cause - Invalid BBO exchange/security type code"));
+            if msg == "Error validating request.-'ReqExchangeMapping(83)' : cause - Invalid BBO exchange/security type code"));
         if !refused {
             println!("FAIL (no 321 for an unknown code: {:?})", cbs.len());
             fail_count += 1;
@@ -1378,6 +1384,7 @@ fn api_gt_suite() {
         print!("  req_news_providers... ");
         wrapper.drain();
         client.req_news_providers(&mut wrapper);
+        client.process_msgs(&mut wrapper);
         let cbs = wrapper.drain();
         let np: Vec<_> = cbs.iter().filter_map(|c| if let Cb::NewsProviders { count, .. } = c { Some(*count) } else { None }).collect();
         if np.is_empty() || np[0] == 0 {
@@ -1394,6 +1401,7 @@ fn api_gt_suite() {
         print!("  req_current_time... ");
         wrapper.drain();
         client.req_current_time(&mut wrapper);
+        client.process_msgs(&mut wrapper);
         let cbs = wrapper.drain();
         let ct: Vec<_> = cbs.iter().filter_map(|c| if let Cb::CurrentTime { time, .. } = c { Some(*time) } else { None }).collect();
         if ct.is_empty() {
@@ -1419,6 +1427,7 @@ fn api_gt_suite() {
         print!("  req_soft_dollar_tiers... ");
         wrapper.drain();
         client.req_soft_dollar_tiers(901, &mut wrapper);
+        client.process_msgs(&mut wrapper);
         let cbs = wrapper.drain();
         let sdt: Vec<_> = cbs.iter().filter_map(|c| if let Cb::SoftDollarTiers { count, .. } = c { Some(*count) } else { None }).collect();
         if sdt.is_empty() || sdt[0] == 0 {
@@ -1435,6 +1444,7 @@ fn api_gt_suite() {
         print!("  req_family_codes... ");
         wrapper.drain();
         client.req_family_codes(&mut wrapper);
+        client.process_msgs(&mut wrapper);
         let cbs = wrapper.drain();
         let fc: Vec<_> = cbs.iter().filter_map(|c| if let Cb::FamilyCodes { count, .. } = c { Some(*count) } else { None }).collect();
         if fc.is_empty() {
@@ -1452,6 +1462,7 @@ fn api_gt_suite() {
         print!("  req_user_info... ");
         wrapper.drain();
         client.req_user_info(902, &mut wrapper);
+        client.process_msgs(&mut wrapper);
         let cbs = wrapper.drain();
         let ui: Vec<_> = cbs.iter().filter_map(|c| if let Cb::UserInfo { req_id, white_branding_id, .. } = c { Some((*req_id, white_branding_id.clone())) } else { None }).collect();
         if ui.is_empty() {
@@ -1570,7 +1581,7 @@ fn api_snapshot_live() {
     }
     client.disconnect();
 
-    let refusal = "error 704 321 Error validating request.-'bQ' : cause - Snapshot market data subscription is not applicable to generic ticks";
+    let refusal = "error 704 321 Error validating request.-'ReqMktData(1)' : cause - Snapshot market data subscription is not applicable to generic ticks";
     assert!(w.events.iter().any(|(_, e)| e == refusal), "no generic tick refusal");
     for req in [701, 702, 703] {
         let end = w.events.iter().find(|(_, e)| *e == format!("end {req}")).map(|(ms, _)| *ms);
@@ -1849,7 +1860,7 @@ fn api_smart_components_live() {
     for (req, comps) in &w.components {
         println!("  smart components {req}: {comps:?}");
     }
-    assert!(w.events.iter().any(|e| e == "error 9490 321 Error validating request.-'V' : cause - Invalid BBO exchange/security type code"));
+    assert!(w.events.iter().any(|e| e == "error 9490 321 Error validating request.-'ReqExchangeMapping(83)' : cause - Invalid BBO exchange/security type code"));
     assert!(bbo.ends_with("0001"), "AAPL bboExchange {bbo:?}");
     for req in [9492, 9493] {
         let comps = w.components.iter().find(|(r, _)| *r == req).map(|(_, c)| c.clone()).unwrap_or_default();
@@ -2212,7 +2223,7 @@ fn api_historical_b1_live() {
     let has = |p: &str| w.events.iter().any(|e| e.starts_with(p));
     assert!(has("last 9510 ") && w.events.iter().any(|e| e.starts_with("last 9510 ") && e.ends_with(" true")), "trade ticks with the end");
     assert!(has("bidask 9512 "), "bid/ask ticks");
-    assert!(has("error 9519 321 Error validating request.-'bP' : cause - Number of ticks must be > 0"));
+    assert!(has("error 9519 321 Error validating request.-'ReqHistoricalTicks(96)' : cause - Number of ticks must be > 0"));
     assert!(has("mid 9522 "), "EUR.USD trades come as midpoints");
     assert!(w.events.iter().any(|e| e.starts_with("end 9531 ") && e.ends_with(" US/Eastern")), "end strings");
     let updates = w.events.iter().filter(|e| e.starts_with("update 9531 ")).count();
@@ -2338,7 +2349,7 @@ fn api_logon_values_live() {
     let cbs = wrapper.drain();
     client.disconnect();
     assert_eq!(errors(&cbs, 120), vec![(321,
-        "Error validating request.-'bM' : cause - Historical data request for 200 year(s) rejected. Max API Backfill Years=199".to_string())]);
+        "Error validating request.-'ReqHistoricalData(20)' : cause - Historical data request for 200 year(s) rejected. Max API Backfill Years=199".to_string())]);
     assert!(cbs.iter().any(|c| matches!(c, Cb::HistoricalData { req_id: 121, .. })), "bars through the historical farm");
 }
 
@@ -2349,7 +2360,7 @@ fn api_logon_values_live() {
 /// read is refused with 10314 and none is sent, one with no zone gets the
 /// warning 2174 and is sent; a LMT with all-or-none on SPY SMART (AON in
 /// the list) is sent, not refused with 10257; 199 years of bars ending
-/// 01/01/1978 (the earliest end date the reference reads, `jutils.U.c(String)`;
+/// 01/01/1978 (the earliest end date the reference reads;
 /// an earlier one is 10314) start before now minus 199 years and one day,
 /// and are refused with the second years rule (199 years on paper) and no
 /// query.
@@ -2429,7 +2440,7 @@ fn api_accounts_algo_times_aon_live() {
     let hist = errors(&cbs, 130);
     println!("1978 bars: {:?}", hist);
     assert_eq!(hist.len(), 1);
-    assert!(hist[0].1.starts_with("Error validating request.-'bM' : cause - Historical data queries on this contract requesting any data earlier than 199 year(s) back from now which is "), "{:?}", hist);
+    assert!(hist[0].1.starts_with("Error validating request.-'ReqHistoricalData(20)' : cause - Historical data queries on this contract requesting any data earlier than 199 year(s) back from now which is "), "{:?}", hist);
 }
 
 // ── Depth books (ibx#451), focused ──
@@ -2660,8 +2671,8 @@ fn api_shared_requests_live() {
         assert!(w.events.iter().any(|(_, e)| e.starts_with(&format!("params {req} "))), "params of {req}");
     }
     let legal = ibx::control::generic_tick::legal_ones("STK");
-    assert!(has(&format!("error 836 321 Error validating request.-'bQ' : cause - Incorrect generic tick list of 999.  Legal ones for (STK) are: {legal}")));
-    assert!(has(&format!("error 837 321 Error validating request.-'bQ' : cause - Incorrect generic tick list of mdoff,292:.  Legal ones for (STK) are: {legal}")));
+    assert!(has(&format!("error 836 321 Error validating request.-'ReqMktData(1)' : cause - Incorrect generic tick list of 999.  Legal ones for (STK) are: {legal}")));
+    assert!(has(&format!("error 837 321 Error validating request.-'ReqMktData(1)' : cause - Incorrect generic tick list of mdoff,292:.  Legal ones for (STK) are: {legal}")));
 }
 
 // ── Option chain parameters (ibx#440), focused ──
@@ -2699,8 +2710,9 @@ impl Wrapper for ChainWrapper {
 /// 2AAPL when listed), then the end; the same request again gives the same
 /// rows in the same order without a new query; OPT gives 321; an ES future
 /// on CME gives futures option groups on CME, then the end. Works with the
-/// market closed. The log shows the 6040=5, 35=c and 6040=138 queries for
-/// AAPL, none for the second AAPL request, and one 6040=138 with 6995=CME
+/// market closed. The log shows the underlying query, the contract lookup
+/// by symbol and the option chain query for AAPL, none for the second AAPL
+/// request, and one option chain query on CME
 /// for ES.
 /// Run with: cargo test --test rust_api_gt api_option_chains_live -- --ignored --nocapture
 #[test]
@@ -2758,7 +2770,7 @@ fn api_option_chains_live() {
     assert!(aapl.iter().all(|r| r.2 == 265598 && r.4 == "100" && r.5 > 0 && r.6 > 0), "{aapl:?}");
     let again: Vec<_> = of(9421).into_iter().map(|r| (r.1, r.3, r.5, r.6)).collect();
     assert_eq!(again, aapl.iter().map(|r| (r.1.clone(), r.3.clone(), r.5, r.6)).collect::<Vec<_>>(), "same rows, same order");
-    assert!(w.events.contains(&"error 9422 321 Error validating request.-'cp' : cause - Invalid security type - OPT".to_string()), "{:?}", w.events);
+    assert!(w.events.contains(&"error 9422 321 Error validating request.-'ReqSecDefOptParams(78)' : cause - Invalid security type - OPT".to_string()), "{:?}", w.events);
     let es_rows = of(9424);
     assert!(front.is_some(), "ES front month");
     assert!(w.ends.contains(&9424), "end of 9424: {:?}", w.events);
@@ -2904,6 +2916,72 @@ impl Wrapper for B2Wrapper {
         self.at(format!("open {order_id} {} {} {} {}", c.con_id, o.order_type, o.trail_stop_price, s.status));
     }
     fn contract_details(&mut self, req_id: i64, d: &ContractDetails) { self.details.push((req_id, d.contract.con_id)); }
+    fn tick_option_computation(
+        &mut self, req_id: i64, tt: i32, _: i32, iv: f64, delta: f64, price: f64, pv: f64, _: f64, _: f64, _: f64, und: f64,
+    ) {
+        let v = |x: f64| if x == f64::MAX { "-".to_string() } else { x.to_string() };
+        self.at(format!("option {req_id} {tt} {} {} {} {} {}", v(iv), v(delta), v(price), v(pv), v(und)));
+    }
+    fn tick_snapshot_end(&mut self, req_id: i64) { self.at(format!("end {req_id}")); }
+}
+
+/// ibx#502, in regular hours, on paper: an AAPL call of December 2026,
+/// strike 340, given by its full description, as the reference 10.51 gave
+/// it on 12/10/2026: a 12 s stream gets the option computations 13, then 10,
+/// 11, 12, and 10 to 12 again with a volatility; a plain snapshot gets the
+/// four and its end well before 11 s.
+/// Run with: cargo test --test rust_api_gt api_option_computations_live -- --ignored --nocapture
+#[test]
+#[ignore]
+fn api_option_computations_live() {
+    let _ = env_logger::try_init();
+    let config = match get_config() {
+        Some(c) => c,
+        None => panic!("IB_USERNAME / IB_PASSWORD not set: a live test fails without credentials"),
+    };
+    let client = EClient::connect(&config).expect("EClient::connect failed");
+    if !client.account_id.starts_with("DU") {
+        client.disconnect();
+        panic!("refusing to run: not a paper account");
+    }
+    let mut w = B2Wrapper::default();
+    let pump = |client: &EClient, w: &mut B2Wrapper, secs: u64| {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(secs) {
+            client.process_msgs(w);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    pump(&client, &mut w, 3);
+    w.events.clear();
+    w.start = Some(Instant::now());
+    let option = Contract {
+        symbol: "AAPL".into(), sec_type: "OPT".into(), exchange: "SMART".into(), currency: "USD".into(),
+        last_trade_date_or_contract_month: "20261218".into(), strike: 340.0, right: "C".into(), multiplier: "100".into(),
+        ..Default::default()
+    };
+    client.req_mkt_data(9801, &option, "", false, false).unwrap();
+    pump(&client, &mut w, 12);
+    client.cancel_mkt_data(9801).unwrap();
+    pump(&client, &mut w, 1);
+    let snap_at = w.start.map(|s| s.elapsed().as_millis()).unwrap_or(0);
+    client.req_mkt_data(9802, &option, "", true, false).unwrap();
+    pump(&client, &mut w, 13);
+    client.disconnect();
+    for (ms, e) in &w.events {
+        println!("  {ms:>6} ms  {e}");
+    }
+    let first = |prefix: &str| w.events.iter().position(|(_, e)| e.starts_with(prefix));
+    let (m, b) = (first("option 9801 13 "), first("option 9801 10 "));
+    assert!(m.is_some() && b.is_some() && m < b, "tick 13 first, then 10");
+    assert!(first("option 9801 11 ").is_some() && first("option 9801 12 ").is_some());
+    assert!(w.events.iter().any(|(_, e)| e.starts_with("option 9801 10 ") && !e.starts_with("option 9801 10 - ")),
+        "a bid computation with a volatility");
+    for tt in [10, 11, 12, 13] {
+        assert_eq!(w.events.iter().filter(|(_, e)| e.starts_with(&format!("option 9802 {tt} "))).count(), 1, "snapshot tick {tt} once");
+    }
+    let end = w.events.iter().find(|(_, e)| e == "end 9802").map(|(ms, _)| *ms).expect("snapshot end");
+    assert!(end - snap_at < 6_000, "the snapshot ends on its computations, not at 11 s ({} ms)", end - snap_at);
 }
 
 /// In regular hours, on paper, as the gateway in its captures of

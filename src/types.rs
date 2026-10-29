@@ -1,4 +1,4 @@
-/// Internal instrument identifier. Mapped from IB's conId at subscription time.
+/// Internal instrument identifier. Mapped from the broker's conId at subscription time.
 /// Used as an index into pre-allocated arrays, so values are dense and small.
 pub type InstrumentId = u32;
 
@@ -15,24 +15,26 @@ pub type ReqId = i64;
 /// Example: $150.25 = 15_025_000_000
 pub type Price = i64;
 
-/// Fixed-point quantity: value * 10^4. Matches IB's 0.0001 minimum increment.
-/// Example: 100 shares = 1_000_000
+/// Fixed-point quantity: value * 10^8, so that the sizes of contracts traded
+/// in steps of 0.00000001 (crypto pairs) are kept exactly (ibx#655).
+/// Example: 100 shares = 10_000_000_000
 pub type Qty = i64;
 
 pub const PRICE_SCALE: i64 = 100_000_000; // 10^8
-pub const QTY_SCALE: i64 = 10_000; // 10^4
+pub const QTY_SCALE: i64 = 100_000_000; // 10^8
+/// The decimals of [`QTY_SCALE`].
+pub const QTY_DIGITS: usize = 8;
 
 /// Whether a price the reference checks is off the contract's price grid
 /// (ibx#263, reversing the snapping of ibx#216): negative where the rule
 /// does not allow it (ib-agent#192 B5, a REL offset of -0.50 refused with
 /// 110), or not a multiple of `tick` when the tick is known (a
 /// non-positive tick: unknown, not checked). The rule allows a price at or
-/// below 0 only when it says so (`jmarketrules.o.o(double)`: above 0, or
-/// its flag `ak`): a combo's rule does (`jclient.dy.cP()`, captured BAG
+/// below 0 only when it says so (the reference's check: above 0, or the
+/// rule's flag set): a combo's rule does (captured BAG
 /// limit prices of -73.15 and -50.10, ibx#470), a stock's does not.
 /// The reference refuses such an order with 110 and sends nothing
-/// (`jextend.dx.a(dy, boolean)@1886-1961`, `trader.common.b9.a(OrderCreator,
-/// o)`); it does not round it.
+///; it does not round it.
 pub fn off_grid(price: Price, tick: i64, signed: bool) -> bool {
     (price < 0 && !signed) || (tick > 0 && price % tick != 0)
 }
@@ -47,7 +49,7 @@ const MAX_PENDING_ORDERS: usize = 64;
 pub enum Side {
     Buy,
     Sell,
-    /// Short sell (FIX tag 54 = "5"). Used for short-selling stocks.
+    /// Short sell (its own side code on the wire). Used for short-selling stocks.
     ShortSell,
 }
 
@@ -55,19 +57,19 @@ pub enum Side {
 pub enum OrderStatus {
     /// Locally queued, not yet acknowledged by server.
     PendingSubmit,
-    /// Received by server, not yet accepted by exchange (FIX 39=A).
+    /// Received by server, not yet accepted by exchange (order status pending new).
     PreSubmitted,
-    /// Accepted and working on exchange (FIX 39=0 or 39=5).
+    /// Accepted and working on exchange (order status new or replaced).
     Submitted,
-    /// Cancel request sent, awaiting confirmation (FIX 39=6).
+    /// Cancel request sent, awaiting confirmation (order status pending cancel).
     PendingCancel,
-    /// Modify request sent, awaiting confirmation (FIX 39=E).
+    /// Modify request sent, awaiting confirmation (order status pending replace).
     PendingReplace,
     Filled,
     PartiallyFilled,
     Cancelled,
     Rejected,
-    /// Server reports order inactive (FIX 39=I).
+    /// Server reports order inactive (the server's inactive order status).
     Inactive,
     /// An order the client placed that never left: a global cancel came
     /// while it waited (the reference's `ApiCancelled`).
@@ -165,6 +167,8 @@ pub struct Quote {
     /// Hypothesis pending wire-format confirmation; see deepentropy/ib-agent#120.
     pub bid_exch_mask: i64,
     pub ask_exch_mask: i64,
+    /// The last trade's exchange: one exchange, its bit number in the
+    /// exchange map (not a mask, ibx#604).
     pub last_exch_mask: i64,
 }
 
@@ -204,6 +208,7 @@ impl QuoteMarks {
     const HALTED_KNOWN: u64 = 1 << 4;
     const HALTED_SHIFT: u32 = 5;
     const SEEN_SHIFT: u32 = 8;
+    const PRE_OPEN: u32 = 12;
 
     fn flag(self, shift: u32) -> Option<bool> {
         match (self.0 >> shift) & 3 {
@@ -230,10 +235,16 @@ impl QuoteMarks {
         self.set_ask_auto(bits & 8 != 0);
     }
 
-    /// Both auto-execution flags as one byte (0: the farm said nothing).
-    pub fn auto_word(self) -> u8 { (self.0 & 0xF) as u8 }
+    /// Whether the quote is in its pre-open state; `None` before the farm
+    /// said (ibx#692).
+    pub fn pre_open(self) -> Option<bool> { self.flag(Self::PRE_OPEN) }
+    pub fn set_pre_open(&mut self, on: bool) { self.set_flag(Self::PRE_OPEN, on) }
+
+    /// Both auto-execution flags and the pre-open state as one byte (0:
+    /// the farm said nothing).
+    pub fn auto_word(self) -> u8 { ((self.0 & 0xF) | (((self.0 >> Self::PRE_OPEN) & 3) << 4)) as u8 }
     /// The flags of an `auto_word`.
-    pub fn from_auto_word(word: u8) -> Self { Self(word as u64 & 0xF) }
+    pub fn from_auto_word(word: u8) -> Self { Self((word as u64 & 0xF) | (((word as u64 >> 4) & 3) << Self::PRE_OPEN)) }
 
     /// The trading status of the last trade, as its two low bits (1 halted,
     /// 2 volatility halted); `None` before a trade gave one.
@@ -326,31 +337,31 @@ pub struct OrderUpdate {
 pub struct CancelReject {
     pub order_id: OrderId,
     pub instrument: InstrumentId,
-    /// 1 = cancel rejected, 2 = modify rejected (FIX tag 434 CxlRejResponseTo).
+    /// 1 = cancel rejected, 2 = modify rejected (the reject's response-to field).
     pub reject_type: u8,
-    /// Numeric reason code (FIX tag 102 CxlRejReason). 0=TooLate, 1=UnknownOrder, etc.
+    /// Numeric reason code (the reject's reason field). 0 = too late, 1 = unknown order, etc.
     pub reason_code: i32,
     pub timestamp_ns: u64,
 }
 
-/// Multi-char OrdType discriminants (values < 32 to avoid collision with ASCII single-char types).
-/// Used in `Order.ord_type` for order types whose FIX tag 40 value is more than one character.
-pub const ORD_STP_PRT: u8 = 1;   // FIX "SP"  — Stop with Protection
-pub const ORD_MIDPX: u8 = 2;     // FIX "MIDPX" — Mid-Price
-pub const ORD_SNAP_MKT: u8 = 3;  // FIX "SMKT" — Snap to Market
-pub const ORD_SNAP_MID: u8 = 4;  // FIX "SMID" — Snap to Midpoint
-pub const ORD_SNAP_PRI: u8 = 5;  // FIX "SREL" — Snap to Primary
-pub const ORD_PEG_MKT: u8 = 6;   // FIX "P" + ExecInst "P" — Pegged to Market
-pub const ORD_PEG_MID: u8 = 7;   // FIX "P" + ExecInst "M" — Pegged to Midpoint
-pub const ORD_PEG_BENCH: u8 = 8; // FIX "PB" — Pegged to Benchmark
-pub const ORD_WHAT_IF: u8 = 9;   // Not a real OrdType — marker for what-if orders
-pub const ORD_TRAIL_MIT: u8 = 10; // FIX "TMIT" — Trailing Market if Touched
-pub const ORD_TRAIL_LIT: u8 = 11; // FIX "TLIT" — Trailing Limit if Touched
-pub const ORD_PEG_BEST: u8 = 12;  // FIX "E2M" — Pegged to Best
-pub const ORD_RPI: u8 = 13;       // FIX "RPI" — Retail Price Improvement
-pub const ORD_PASSV_REL: u8 = 14; // FIX "PSVR" — Passive Relative
+/// Multi-char order type discriminants (values < 32 to avoid collision with ASCII single-char types).
+/// Used in `Order.ord_type` for order types whose wire order type code is more than one character.
+pub const ORD_STP_PRT: u8 = 1;   // code "SP"  — Stop with Protection
+pub const ORD_MIDPX: u8 = 2;     // code "MIDPX" — Mid-Price
+pub const ORD_SNAP_MKT: u8 = 3;  // code "SMKT" — Snap to Market
+pub const ORD_SNAP_MID: u8 = 4;  // code "SMID" — Snap to Midpoint
+pub const ORD_SNAP_PRI: u8 = 5;  // code "SREL" — Snap to Primary
+pub const ORD_PEG_MKT: u8 = 6;   // code "P" + market peg instruction — Pegged to Market
+pub const ORD_PEG_MID: u8 = 7;   // code "P" + midpoint peg instruction — Pegged to Midpoint
+pub const ORD_PEG_BENCH: u8 = 8; // code "PB" — Pegged to Benchmark
+pub const ORD_WHAT_IF: u8 = 9;   // Not a real order type — marker for what-if orders
+pub const ORD_TRAIL_MIT: u8 = 10; // code "TMIT" — Trailing Market if Touched
+pub const ORD_TRAIL_LIT: u8 = 11; // code "TLIT" — Trailing Limit if Touched
+pub const ORD_PEG_BEST: u8 = 12;  // code "E2M" — Pegged to Best
+pub const ORD_RPI: u8 = 13;       // code "RPI" — Retail Price Improvement
+pub const ORD_PASSV_REL: u8 = 14; // code "PSVR" — Passive Relative
 
-/// Convert an `ord_type` discriminant to the FIX tag 40 string.
+/// Convert an `ord_type` discriminant to the wire order type code.
 /// Single-char types (ASCII >= 32) are stored as-is; multi-char types use constants above.
 pub fn ord_type_fix_str(t: u8) -> &'static str {
     match t {
@@ -373,7 +384,7 @@ pub fn ord_type_fix_str(t: u8) -> &'static str {
     }
 }
 
-/// What-If margin/commission preview response (execution report with tag 6091=1).
+/// What-If margin/commission preview response (execution report with the what-if flag set).
 /// Returned when a what-if order is submitted — the order is NOT placed.
 #[derive(Debug, Clone, Default)]
 pub struct WhatIfResponse {
@@ -397,7 +408,7 @@ pub struct WhatIfResponse {
 /// came, unset when absent or not a number.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WhatIfState {
-    /// The API status of the reply's order status (39=A is PreSubmitted).
+    /// The API status of the reply's order status (pending new is PreSubmitted).
     pub status: String,
     pub init_margin_before: Option<f64>,
     pub maint_margin_before: Option<f64>,
@@ -415,14 +426,18 @@ pub struct WhatIfState {
     /// The server's reason when it refuses the order (error 201 after the
     /// open order).
     pub reject_reason: String,
-    /// The permId of the preview's order (37 of the reply); 0 without one.
+    /// The permId of the preview's order (the order id of the reply); 0 without one.
     pub perm_id: i64,
-    /// The conId of the reply (6008), for a preview placed without one: the
+    /// The conId of the reply (its contract id), for a preview placed without one: the
     /// reference shows the contract it looked up (ibx#486).
     pub con_id: i64,
+    /// The price management flag the reply echoes: the preview's
+    /// openOrder shows it, 1 or 0 (the reference 10.51, paper, 19/10/2026,
+    /// ibx#605).
+    pub price_mgmt: bool,
 }
 
-/// Adjusted order type for adjustable stops (FIX tag 6261).
+/// Adjusted order type for adjustable stops (the adjusted order type field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdjustedOrderType {
     Stop,       // 3
@@ -458,12 +473,12 @@ pub struct Order {
     /// Filled so far, fixed-point (QTY_SCALE).
     pub filled_fixed: Qty,
     pub status: OrderStatus,
-    /// FIX tag 40 OrdType: b'1'=MKT, b'2'=LMT, b'3'=STP, b'4'=STPLMT, b'P'=TRAIL, etc.
-    /// For multi-char OrdTypes (MIDPX, SP, SMKT, etc.), uses ORD_* constants (values < 32).
+    /// Order type code: b'1'=MKT, b'2'=LMT, b'3'=STP, b'4'=STPLMT, b'P'=TRAIL, etc.
+    /// For multi-char order types (MIDPX, SP, SMKT, etc.), uses ORD_* constants (values < 32).
     pub ord_type: u8,
-    /// FIX tag 59 TimeInForce: b'0'=DAY, b'1'=GTC, b'3'=IOC, b'4'=FOK
+    /// Time in force code: b'0'=DAY, b'1'=GTC, b'3'=IOC, b'4'=FOK
     pub tif: u8,
-    /// FIX tag 99 stop price (for Stop/StopLimit/MIT/LIT orders)
+    /// Stop price (for Stop/StopLimit/MIT/LIT orders)
     pub stop_price: Price,
 }
 
@@ -475,7 +490,7 @@ impl Order {
     }
 }
 
-/// Adaptive algo priority level (IB's "adaptivePriority" parameter).
+/// Adaptive algo priority level (the API's "adaptivePriority" parameter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdaptivePriority {
     Patient,
@@ -501,60 +516,90 @@ pub const TIF_DTC: u8 = b'r';
 /// All fields default to "not set" (0/false).
 #[derive(Debug, Clone, Default)]
 pub struct OrderAttrs {
-    /// The caller's orderRef, sent in tag 6010 on the order and every
+    /// The caller's orderRef, sent in the order reference field on the order and every
     /// replace (ibx#466).
     pub order_ref: String,
-    /// Show on book as this many shares (tag 111). 0 = not set (show full qty).
+    /// The order quantity as the caller wrote it, when the fixed-point
+    /// quantity cannot hold it (more decimals or digits): sent as given
+    /// (ibx#655). Empty otherwise.
+    pub qty_text: String,
+    /// Show on book as this many shares (display size). 0 = not set (show full qty).
     pub display_size: u32,
-    /// Minimum fill quantity (FIX tag 110). 0 = not set.
+    /// Minimum fill quantity. 0 = not set.
     pub min_qty: u32,
-    /// Hidden order — not displayed on book (IB tag 6135).
+    /// Hidden order — not displayed on book (the hidden flag).
     pub hidden: bool,
-    /// Customer account (tag 6207) and professional customer (tag 6636),
+    /// Placed with no time in force: it takes the account's order preset
+    /// for its security type (ibx#660).
+    pub tif_preset: bool,
+    /// What the reference answers once the order's contract is known,
+    /// for an order whose contract is looked up first (ibx#665): the
+    /// warnings and, when `after_lookup_refused`, the refusal last.
+    pub after_lookup: Vec<(i64, String)>,
+    pub after_lookup_refused: bool,
+    /// The time zone checks the client could not make, the contract's
+    /// zone not known yet (ibx#668): each refuses with its code and text
+    /// when one of its zones is not the contract's.
+    pub zone_checks: Vec<(Vec<String>, i64, String)>,
+    /// Customer account and professional customer (a field each),
     /// sent only on an account whose config allows them (ibx#425).
     pub customer_account: String,
     pub professional_customer: bool,
-    /// Allow trading outside regular hours (IB tag 6433).
+    /// The MiFID values of the order: Decision Maker, Decision Algo,
+    /// Execution Trader, Execution Algo; sent only on a session with MiFID
+    /// (ibx#500).
+    pub mifid: [String; 4],
+    /// The order's soft dollar tier (name, value); empty when not set
+    /// (ibx#506).
+    pub soft_dollar_tier: (String, String),
+    /// The order's FA allocation: group, method, percentage, model code
+    /// and account; sent only on an FA session (ibx#507).
+    pub fa: [String; 5],
+    /// Allow trading outside regular hours (the outside-RTH flag).
     pub outside_rth: bool,
-    /// Delay order activation until this time (FIX tag 168). 0 = not set. Unix seconds.
+    /// Delay order activation until this time (the effective time). 0 = not set. Unix seconds.
     pub good_after: i64,
-    /// Auto-expire order at this instant (FIX tag 126, time-precise GTD).
+    /// Auto-expire order at this instant (the expire time, time-precise GTD).
     /// 0 = not set. Unix seconds in UTC. Mutually exclusive with `good_till_date_ymd`.
-    /// When set, TIF should be GTD (but IB infers it from the tag).
+    /// When set, TIF should be GTD (but the broker infers it from the field).
     pub good_till: i64,
-    /// Auto-expire order on this calendar date (FIX tag 432, date-only GTD).
+    /// Auto-expire order on this calendar date (the expire date, date-only GTD).
     /// 0 = not set. Packed `YYYYMMDD`. Mutually exclusive with `good_till`.
     pub good_till_date_ymd: u32,
-    /// OCA group ID (FIX tag 583). 0 = not set. Links orders so one cancels others.
+    /// OCA group ID (the OCA group field). 0 = not set. Links orders so one cancels others.
     /// Orders sharing the same non-zero oca_group are in the same OCA group.
     pub oca_group: u64,
-    /// OCA group as a string (FIX tag 583). Used by Python compat for user-specified OCA names.
+    /// OCA group as a string (the same field). Used by Python compat for user-specified OCA names.
     /// When non-empty, takes precedence over numeric `oca_group`.
     pub oca_group_str: String,
-    /// Parent order ID (IB tag 6107). 0 = no parent. Links child orders to parent in brackets.
+    /// Parent order ID (parent id field). 0 = no parent. Links child orders to parent in brackets.
     pub parent_id: OrderId,
-    /// Discretionary amount (IB tag 9813). 0 = not set. Fixed-point Price value.
+    /// Discretionary amount (its own field). 0 = not set. Fixed-point Price value.
     /// The amount above the limit price that the order may trade at.
     pub discretionary_amt: Price,
-    /// Sweep to fill (IB tag 6102). Routes aggressively across exchanges.
+    /// Sweep to fill (its own flag). Routes aggressively across exchanges.
     pub sweep_to_fill: bool,
-    /// All or none (FIX tag 18=G ExecInst). Fill entire qty or nothing.
+    /// A block order and an imbalance-only order, checked against the
+    /// contract's list (ibx#688); not written on the order message.
+    pub block_order: bool,
+    pub imbalance_only: bool,
+    /// All or none (an execution instruction). Fill entire qty or nothing.
     pub all_or_none: bool,
-    /// Trigger method for stop/MIT/LIT orders (IB tag 6115).
+    /// Trigger method for stop/MIT/LIT orders (its own field).
     /// 0=default, 1=double-bid-ask, 2=last, 3=double-last, 4=bid-ask,
     /// 7=last-or-bid-ask, 8=mid-point.
     pub trigger_method: u8,
-    /// Cash quantity — order by dollar amount instead of shares (tag 152,
+    /// Cash quantity — order by dollar amount instead of shares (its own field,
     /// ibx#263). 0 = not set.
     /// Fixed-point Price value (e.g., $1000 = 1000 * PRICE_SCALE).
     pub cash_qty: Price,
-    /// Conditions that must be met before the order activates (IB tag 6136+).
+    /// Conditions that must be met before the order activates (the condition fields).
     pub conditions: Vec<OrderCondition>,
-    /// Cancel order if conditions are no longer met (IB tag 6128). Default false.
+    /// Cancel order if conditions are no longer met (its own flag). Default false.
     pub conditions_cancel_order: bool,
-    /// Evaluate conditions outside regular trading hours (IB tag 6151). Default false.
+    /// Evaluate conditions outside regular trading hours (its own flag). Default false.
     pub conditions_ignore_rth: bool,
-    /// OCA cancellation semantics (IB tag 6209), 1..=4. 0 = not set, which
+    /// OCA cancellation semantics (the OCA type field), 1..=4. 0 = not set, which
     /// emits the gateway default 3 (ReduceOnFillNonBlock). Only emitted when
     /// an OCA group is present. See ibx#215.
     pub oca_type: u8,
@@ -564,7 +609,31 @@ pub struct OrderAttrs {
     /// Work the order in the overnight session too (API includeOvernight),
     /// sent as an order attribute (ibx#467).
     pub include_overnight: bool,
-    /// The API clearingIntent: empty, IB, Away or PTA (ibx#417). A
+    /// The API duration in seconds of a GTD order, sent as an order
+    /// attribute (ibx#688); None when not set.
+    pub duration: Option<i32>,
+    /// A refusal the client decided for a new order (ibx#688): the engine
+    /// gives it once the contract is known and keeps the order for its
+    /// cancel, as one never sent.
+    pub kept_refusal: Option<(i64, String)>,
+    /// The hedge-size precaution of the order's tree (ibx#602): `Some(true)`
+    /// on the parent it discards (2185, Cancelled, 201), `Some(false)` on
+    /// the hedge kept unsent without a message, for its cancel.
+    pub hedge_precaution: Option<bool>,
+    /// The API postOnly, allowPreOpen, ignoreOpenAuction and deactivate,
+    /// sent as order attributes where they apply (ibx#607).
+    pub post_only: bool,
+    pub allow_pre_open: bool,
+    pub ignore_open_auction: bool,
+    pub deactivate: bool,
+    /// The API routeMarketableToBbo and seekPriceImprovement, order
+    /// attributes sent only when on (ibx#608).
+    pub route_marketable_to_bbo: bool,
+    pub seek_price_improvement: bool,
+    /// The API notHeld, sent where the reference sends it: an order for
+    /// the broker's ATS venue (ibx#690).
+    pub not_held: bool,
+    /// The API clearingIntent: empty, the broker itself, Away or PTA (ibx#417). A
     /// clearing away from the broker lets a short-side order pass the
     /// reference's side check.
     pub clearing_intent: String,
@@ -572,11 +641,55 @@ pub struct OrderAttrs {
     pub short_sale: ShortSale,
     /// The API usePriceMgmtAlgo: None when unset (ibx#492).
     pub use_price_mgmt_algo: Option<bool>,
+    /// The attached orders asked from the order preset (ibx#609): the
+    /// profit-taker leg, then the stop-loss leg.
+    pub attached_from_preset: (bool, bool),
+    /// A hedge order's hedge (ibx#614), None for any other order.
+    pub hedge: Option<Hedge>,
     /// The order's algo, None for none. The reference writes it on top of
     /// the order's own type and price fields, whatever the type (ibx#263).
     pub algo: Option<OrderAlgo>,
     /// The combo of a BAG order, None for any other order (ibx#470).
     pub combo: Option<Box<ComboSpec>>,
+    /// The scale fields of a scale order, None for any other (ibx#751).
+    pub scale: Option<Box<Scale>>,
+}
+
+/// The scale fields of a scale order (ibx#751), as given by the caller:
+/// `None` for an unset value. With a profit offset the order has a profit
+/// taker, the reference's own child order: its API order id
+/// (`profit_child_id`, negative), the opposite side, the order's price
+/// moved by the offset.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Scale {
+    pub init_level_size: i32,
+    pub subs_level_size: Option<i32>,
+    pub price_increment: Option<Price>,
+    pub price_adjust_value: Option<Price>,
+    pub price_adjust_interval: Option<i32>,
+    pub profit_offset: Option<Price>,
+    pub auto_reset: bool,
+    pub init_position: Option<i32>,
+    pub init_fill_qty: Option<i32>,
+    pub random_percent: bool,
+    /// The order's whole quantity (the caller's total quantity).
+    pub total_qty: Qty,
+    pub profit_child_id: Option<OrderId>,
+}
+
+/// The hedge of a hedge order (ibx#614), as the reference sends it: its
+/// kind's number (F 1, D 2, P 3, B 4, S 5), the beta of a beta hedge, the
+/// ratio of a pair hedge, and the largest hedge of a beta hedge whose
+/// hedge sells (sent then only).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Hedge {
+    pub kind: u8,
+    pub beta: Option<f64>,
+    pub ratio: Option<f64>,
+    pub max_size: Option<i32>,
+    /// A beta hedge whose hedge sells, without its max size: refused once
+    /// its contract is known (10364), and kept for its cancel.
+    pub max_size_missing: bool,
 }
 
 /// A combo (BAG) order as the caller gave it (ibx#470): the engine builds
@@ -589,7 +702,7 @@ pub struct ComboSpec {
     pub currency: String,
     /// The BAG symbol as given, checked against the legs (478).
     pub symbol: String,
-    /// The conId of the smart combo of the currency (logon tag 6611), 0
+    /// The conId of the smart combo of the currency (a logon field), 0
     /// for a directed combo.
     pub smart_con_id: i64,
     /// The legs in the caller's order.
@@ -652,7 +765,7 @@ impl ShortSale {
 }
 
 /// A condition that must be met before an order activates.
-/// IB evaluates conditions server-side; order stays PreSubmitted until triggered.
+/// The broker evaluates conditions server-side; order stays PreSubmitted until triggered.
 #[derive(Debug, Clone)]
 pub enum OrderCondition {
     /// Trigger when an instrument's price crosses a threshold.
@@ -718,14 +831,14 @@ impl RiskAversion {
     }
 }
 
-/// Parameters for IB algorithmic order strategies.
-/// Each variant maps to a specific tag 847 algoStrategy with its required params.
+/// Parameters for the broker's algorithmic order strategies.
+/// Each variant maps to a specific algoStrategy with its required params.
 #[derive(Debug, Clone)]
 pub enum AlgoParams {
     /// VWAP: Volume-weighted average price.
-    /// Tag 847=Vwap, 849=max_pct_vol.
+    /// Strategy Vwap, with max_pct_vol.
     Vwap {
-        /// Maximum participation rate (0.0-1.0). Sent as tag 849.
+        /// Maximum participation rate (0.0-1.0). Sent as its own parameter field.
         max_pct_vol: f64,
         /// Don't take liquidity (0 or 1).
         no_take_liq: bool,
@@ -737,14 +850,14 @@ pub enum AlgoParams {
         end_time: String,
     },
     /// TWAP: Time-weighted average price.
-    /// Tag 847=Twap.
+    /// Strategy Twap.
     Twap {
         allow_past_end_time: bool,
         start_time: String,
         end_time: String,
     },
     /// Arrival Price: Minimize arrival price impact.
-    /// Tag 847=ArrivalPx, 849=max_pct_vol.
+    /// Strategy ArrivalPx, with max_pct_vol.
     ArrivalPx {
         max_pct_vol: f64,
         risk_aversion: RiskAversion,
@@ -754,7 +867,7 @@ pub enum AlgoParams {
         end_time: String,
     },
     /// Close Price: Target closing price.
-    /// Tag 847=ClosePx, 849=max_pct_vol.
+    /// Strategy ClosePx, with max_pct_vol.
     ClosePx {
         max_pct_vol: f64,
         risk_aversion: RiskAversion,
@@ -762,7 +875,7 @@ pub enum AlgoParams {
         start_time: String,
     },
     /// Dark Ice: Hidden iceberg algo.
-    /// Tag 847=DarkIce.
+    /// Strategy DarkIce.
     DarkIce {
         allow_past_end_time: bool,
         display_size: u32,
@@ -770,7 +883,7 @@ pub enum AlgoParams {
         end_time: String,
     },
     /// Percentage of Volume: Participate at % of volume.
-    /// Tag 847=PctVol.
+    /// Strategy PctVol.
     PctVol {
         /// Target participation rate (0.0-1.0). Sent as param pctVol.
         pct_vol: f64,
@@ -778,6 +891,29 @@ pub enum AlgoParams {
         start_time: String,
         end_time: String,
     },
+    /// Any other strategy (AccuDistr, ...), sent with its parameters as
+    /// given (ibx#622): the server's algo definitions check them first.
+    /// The pairs are kept in the order the reference writes them
+    /// (`reference_param_order`), the ones with no value left out.
+    Other {
+        strategy: String,
+        params: Vec<(String, String)>,
+    },
+}
+
+/// The order in which the reference writes an algo's parameters (ibx#622):
+/// it keeps them in a concurrent hash map of 32 bins (64 from 24 entries
+/// on), so they come by bin, the bin taken from the low bits of the
+/// spread string hash, and in the given order within a bin. Fits every
+/// algo block of the reference's recordings (Vwap, Twap, ArrivalPx,
+/// ClosePx, DarkIce, PctVol, AccuDistr; paper, 12/10/2026 and earlier).
+pub fn reference_param_order(params: &mut [(String, String)]) {
+    let mask: u32 = if params.len() >= 24 { 63 } else { 31 };
+    // A stable sort: the given order stays within a bin.
+    params.sort_by_cached_key(|(key, _)| {
+        let h = key.encode_utf16().fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(c as u32));
+        (h ^ (h >> 16)) & mask
+    });
 }
 
 /// The order-type-specific part of an extended order submission: which
@@ -792,15 +928,15 @@ pub enum OrderKind {
     Stop { stop_price: Price },
     StopLimit { price: Price, stop_price: Price },
     /// Trailing stop by absolute amount. `trail_stop_price` is the optional
-    /// initial stop trigger (tag 6117); 0 = not set.
+    /// initial stop trigger (its own field); 0 = not set.
     TrailingStop { trail_amt: Price, trail_stop_price: Price },
-    /// Trailing stop limit; `lmt_offset` is the limit-vs-trail offset (tag 6370).
-    /// `trail_stop_price` is the optional initial stop trigger (tag 6117); 0 = not set.
-    /// `lmt_price`: the absolute limit price, sent in 44 with no 6370;
-    /// else `lmt_offset` in 6370 (ib-agent#194).
+    /// Trailing stop limit; `lmt_offset` is the limit-vs-trail offset (the limit offset field).
+    /// `trail_stop_price` is the optional initial stop trigger (its own field); 0 = not set.
+    /// `lmt_price`: the absolute limit price, sent as the limit price with no
+    /// limit offset; else `lmt_offset` in the limit offset field (ib-agent#194).
     TrailingStopLimit { lmt_offset: Price, lmt_price: Option<Price>, trail_amt: Price, trail_stop_price: Price },
     /// Trailing stop by percentage. Basis points: 100 = 1%.
-    /// `trail_stop_price` is the optional initial stop trigger (tag 6117); 0 = not set.
+    /// `trail_stop_price` is the optional initial stop trigger (its own field); 0 = not set.
     /// The percent as the API gives it, in the price fixed point (1% =
     /// PRICE_SCALE): the reference writes it with its price formatter, so
     /// 1.239 goes out as 1.239 (ibx#263; basis points kept two decimals).
@@ -852,10 +988,22 @@ pub enum OrderKind {
     /// (the API auxPrice, 0 when unset) in both offset fields.
     Rpi { price: Price, offset: Price },
     /// Passive relative (ibx#469): the limit price (0 = unset) and the
-    /// offset (the API auxPrice, 0 when unset) in both offset fields. Read
-    /// from the reference's code, not captured: no contract of the test
-    /// account lists the type.
+    /// offset (the API auxPrice, 0 when unset) in both offset fields. Not
+    /// observed yet: no contract of the test account lists the type.
     PassvRel { price: Price, offset: Price },
+    /// Volatility order (VOL, ibx#673): the volatility in percent and its
+    /// type (1 daily, 2 annual). Checked for the option's permission; its
+    /// message is not written yet.
+    Volatility { volatility: Price, vol_type: u8 },
+    /// Pegged to stock (PEG STK, ibx#745): refused before anything is
+    /// sent, with 387 on a stock as the reference; its message is not
+    /// written yet. `delta`: the order's delta as given (`f64::MAX` unset).
+    PegStk { delta: f64 },
+    /// Request for quote (QUOTE, ibx#688): refused before anything is sent
+    /// with 416 once the contract is known, as the reference 10.51 refuses
+    /// it on the contracts seen (paper, 19/10/2026: an AAPL option and the
+    /// stock); its message is not written.
+    Quote,
     /// Adjustable stop, same fields as `OrderRequest::SubmitAdjustableStop`.
     /// On this path it also carries parent, OCA and tif, so it can be a
     /// bracket child (ibx#240).
@@ -872,9 +1020,9 @@ pub enum OrderKind {
 
 impl OrderKind {
     /// The prices of this kind the reference checks against the price grid
-    /// (`trader.common.b9.a(OrderCreator, o)`, ibx#263): the limit price of
+    /// (ibx#263): the limit price of
     /// every type, and the stop or offset price (the API auxPrice) of the
-    /// types that have one (`jibtypes.s.s()`), for a trailing type its
+    /// types that have one, for a trailing type its
     /// amount, never a percent. Not checked: the trailing stop price, the
     /// TRAIL LIMIT offset, the adjusted prices, the benchmark changes.
     /// Unset prices are 0 and pass.
@@ -901,6 +1049,7 @@ impl OrderKind {
             OrderKind::TrailLit { price, trail, percent, .. } => [price, if percent { 0 } else { trail }],
             OrderKind::PegBest { price } => [price, 0],
             OrderKind::Rpi { price, offset } | OrderKind::PassvRel { price, offset } => [price, offset],
+            OrderKind::Volatility { .. } | OrderKind::PegStk { .. } | OrderKind::Quote => [0, 0],
         }
     }
 }
@@ -998,7 +1147,7 @@ pub enum OrderRequest {
         side: Side,
         qty: u32,
         trail_amt: Price,
-        /// Optional initial stop trigger (tag 6117); 0 = not set.
+        /// Optional initial stop trigger (its own field); 0 = not set.
         trail_stop_price: Price,
     },
     SubmitTrailingStopLimit {
@@ -1006,13 +1155,13 @@ pub enum OrderRequest {
         instrument: InstrumentId,
         side: Side,
         qty: u32,
-        /// Limit offset from the trail-stop price (wire tag 6370 LimitPriceOffset).
+        /// Limit offset from the trail-stop price (the limit offset field on the wire).
         /// The gateway derives the absolute limit price; do not pass an absolute price here.
         lmt_offset: Price,
-        /// Absolute limit price (44, no 6370) instead of the offset (ib-agent#194).
+        /// Absolute limit price (sent as limit price, no offset) instead of the offset (ib-agent#194).
         lmt_price: Option<Price>,
         trail_amt: Price,
-        /// Optional initial stop trigger (tag 6117); 0 = not set.
+        /// Optional initial stop trigger (its own field); 0 = not set.
         trail_stop_price: Price,
     },
     /// Trailing stop by percentage. `trail_percent` is the percent in the
@@ -1025,7 +1174,7 @@ pub enum OrderRequest {
         side: Side,
         qty: u32,
         trail_percent: Price, // 1% = PRICE_SCALE, 2.5% = 2.5 * PRICE_SCALE
-        /// Optional initial stop trigger (tag 6117); 0 = not set.
+        /// Optional initial stop trigger (its own field); 0 = not set.
         trail_stop_price: Price,
     },
     SubmitTrailingStopPctEx {
@@ -1036,7 +1185,7 @@ pub enum OrderRequest {
         trail_percent: Price,
         tif: u8,
         attrs: OrderAttrs,
-        /// Optional initial stop trigger (tag 6117); 0 = not set.
+        /// Optional initial stop trigger (its own field); 0 = not set.
         trail_stop_price: Price,
     },
     SubmitMoc {
@@ -1068,7 +1217,8 @@ pub enum OrderRequest {
         stop_price: Price,
     },
     /// Bracket order: parent entry + take-profit + stop-loss, linked via OCA.
-    /// Generates 3 FIX messages: parent (35=D), TP child (35=D with 6107+583), SL child (35=D with 6107+583).
+    /// Generates 3 new order messages: parent, TP child and SL child, each child with
+    /// the parent id and OCA group fields.
     SubmitBracket {
         parent_id: OrderId,
         tp_id: OrderId,
@@ -1126,7 +1276,7 @@ pub enum OrderRequest {
         instrument: InstrumentId,
         side: Side,
         qty: u32,
-        offset: Price, // peg offset in tag 99
+        offset: Price, // peg offset in the stop price field
     },
     /// Limit order for opening auction (TIF=OPG).
     SubmitLimitOpg {
@@ -1136,7 +1286,7 @@ pub enum OrderRequest {
         qty: u32,
         price: Price,
     },
-    /// Adaptive algo limit order: LMT with IB Adaptive algorithm overlay.
+    /// Adaptive algo limit order: LMT with the broker's Adaptive algorithm overlay.
     SubmitAdaptive {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1149,21 +1299,21 @@ pub enum OrderRequest {
         tif: u8,
         attrs: OrderAttrs,
     },
-    /// Market to Limit: fills at market, remainder converts to limit at fill price. OrdType K.
+    /// Market to Limit: fills at market, remainder converts to limit at fill price. Order type K.
     SubmitMtl {
         order_id: OrderId,
         instrument: InstrumentId,
         side: Side,
         qty: u32,
     },
-    /// Market with Protection: market order with price protection for futures. OrdType U.
+    /// Market with Protection: market order with price protection for futures. Order type code U.
     SubmitMktPrt {
         order_id: OrderId,
         instrument: InstrumentId,
         side: Side,
         qty: u32,
     },
-    /// Stop with Protection: stop order with price protection. OrdType SP.
+    /// Stop with Protection: stop order with price protection. Order type code SP.
     SubmitStpPrt {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1171,7 +1321,7 @@ pub enum OrderRequest {
         qty: u32,
         stop_price: Price,
     },
-    /// Mid-Price: pegs to midpoint with optional price cap. OrdType MIDPX.
+    /// Mid-Price: pegs to midpoint with optional price cap. Order type code MIDPX.
     SubmitMidPrice {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1179,7 +1329,7 @@ pub enum OrderRequest {
         qty: u32,
         price_cap: Price, // 0 = no cap
     },
-    /// Snap to Market: snaps to market price. OrdType SMKT.
+    /// Snap to Market: snaps to market price. Order type code SMKT.
     SubmitSnapMkt {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1187,7 +1337,7 @@ pub enum OrderRequest {
         qty: u32,
         offset: Price, // the API auxPrice, 0 = unset
     },
-    /// Snap to Midpoint: snaps to midpoint. OrdType SMID.
+    /// Snap to Midpoint: snaps to midpoint. Order type code SMID.
     SubmitSnapMid {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1195,7 +1345,7 @@ pub enum OrderRequest {
         qty: u32,
         offset: Price, // the API auxPrice, 0 = unset
     },
-    /// Snap to Primary: snaps to primary (NBBO). OrdType SREL.
+    /// Snap to Primary: snaps to primary (NBBO). Order type code SREL.
     SubmitSnapPri {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1222,7 +1372,7 @@ pub enum OrderRequest {
         price: Price,  // limit price, 0 = unset
         offset: Price,
     },
-    /// Algorithmic order: limit order with IB algo strategy overlay (VWAP, TWAP, etc.).
+    /// Algorithmic order: limit order with the broker's algo strategy overlay (VWAP, TWAP, etc.).
     SubmitAlgo {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1253,7 +1403,7 @@ pub enum OrderRequest {
         /// The reference contract's exchange, empty = not sent.
         ref_exchange: String,
     },
-    /// Limit order for auction (TIF=AUC, tag 59=8). Participates in exchange opening/closing auction.
+    /// Limit order for auction (TIF=AUC, auction time in force). Participates in exchange opening/closing auction.
     SubmitLimitAuc {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1261,7 +1411,7 @@ pub enum OrderRequest {
         qty: u32,
         price: Price,
     },
-    /// Market-to-Limit for auction (TIF=AUC, tag 59=8). MTL + auction participation.
+    /// Market-to-Limit for auction (TIF=AUC, auction time in force). MTL + auction participation.
     SubmitMtlAuc {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1270,7 +1420,7 @@ pub enum OrderRequest {
     },
     /// What-If preview of a new order (ibx#462): `request` is the order as
     /// it would be placed, written by its own encoder with the preview flag,
-    /// under a ClOrdID of its own. It is NOT placed and never modifies a
+    /// under a client order id of its own. It is NOT placed and never modifies a
     /// working order; the answer is an `Event::WhatIf`.
     SubmitWhatIf {
         request: Box<OrderRequest>,
@@ -1279,7 +1429,7 @@ pub enum OrderRequest {
         option_terms: Option<crate::engine::market_state::OptionTerms>,
     },
     /// Fractional shares limit order. Qty is fixed-point (QTY_SCALE = 10^4).
-    /// E.g., 0.5 shares = 5000. Tag 38 sent as decimal string.
+    /// E.g., 0.5 shares = 5000. Order quantity sent as decimal string.
     SubmitLimitFractional {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1288,7 +1438,8 @@ pub enum OrderRequest {
         price: Price,
     },
     /// Adjustable stop: a stop order that adjusts to a different order type when trigger_price is hit.
-    /// Tags: 6257=1, 6261=adjusted type, 6258=trigger, 6259=adjusted stop, 6262=adjusted limit.
+    /// Sent with the adjustable flag set and the adjusted type, trigger, adjusted stop and
+    /// adjusted limit fields.
     SubmitAdjustableStop {
         order_id: OrderId,
         instrument: InstrumentId,
@@ -1300,11 +1451,11 @@ pub enum OrderRequest {
         adjusted_stop_price: Price,
         /// Only used when adjusted_order_type is StopLimit or TrailLimit. 0 = not set.
         adjusted_stop_limit_price: Price,
-        /// Trailing amount for a Trail/TrailLimit conversion (tag 6260). When the
+        /// Trailing amount for a Trail/TrailLimit conversion (its own field). When the
         /// unit is amount it is a price offset (scaled); when percent it is the
         /// percent value scaled (1.00% = PRICE_SCALE). 0 = not set.
         adjusted_trailing_amount: Price,
-        /// Unit of `adjusted_trailing_amount` on the wire (tag 6269): 0 = amount,
+        /// Unit of `adjusted_trailing_amount` on the wire (its own field): 0 = amount,
         /// 100 = percent. Other values are rejected by the gateway.
         adjustable_trailing_unit: i32,
     },
@@ -1564,6 +1715,51 @@ impl OrderRequest {
         }
     }
 
+    /// The attributes of a new order that carries them (ibx#665). None
+    /// for any other request.
+    /// A plain new order (a DAY order with no attributes) as the same order
+    /// in its form with attributes, so that it can carry one; any other
+    /// request as it is.
+    pub fn with_attrs(self) -> Self {
+        let ex = |order_id, instrument, side, qty, kind| Self::SubmitEx { order_id, instrument, side, qty, kind, tif: b'0', attrs: OrderAttrs::default() };
+        match self {
+            Self::SubmitLimit { order_id, instrument, side, qty, price } =>
+                Self::SubmitLimitEx { order_id, instrument, side, qty, price, tif: b'0', attrs: OrderAttrs::default() },
+            Self::SubmitMarket { order_id, instrument, side, qty } => ex(order_id, instrument, side, qty, OrderKind::Market),
+            Self::SubmitStop { order_id, instrument, side, qty, stop_price } => ex(order_id, instrument, side, qty, OrderKind::Stop { stop_price }),
+            Self::SubmitStopLimit { order_id, instrument, side, qty, price, stop_price } =>
+                ex(order_id, instrument, side, qty, OrderKind::StopLimit { price, stop_price }),
+            other => other,
+        }
+    }
+
+    pub fn new_order_attrs_mut(&mut self) -> Option<&mut OrderAttrs> {
+        match self {
+            Self::SubmitWhatIf { request, .. } => request.new_order_attrs_mut(),
+            Self::SubmitTrailingStopPctEx { attrs, .. }
+            | Self::SubmitLimitEx { attrs, .. }
+            | Self::SubmitEx { attrs, .. }
+            | Self::SubmitAdaptive { attrs, .. }
+            | Self::SubmitAlgo { attrs, .. } => Some(attrs),
+            _ => None,
+        }
+    }
+
+    /// The time in force of a new order placed with none, which the
+    /// account's order preset sets (ibx#660). None for any other request.
+    pub fn preset_tif_mut(&mut self) -> Option<&mut u8> {
+        match self {
+            Self::SubmitWhatIf { request, .. } => request.preset_tif_mut(),
+            Self::SubmitTrailingStopPctEx { tif, attrs, .. }
+            | Self::SubmitLimitEx { tif, attrs, .. }
+            | Self::SubmitEx { tif, attrs, .. }
+            | Self::SubmitAdaptive { tif, attrs, .. }
+            | Self::SubmitAlgo { tif, attrs, .. }
+                if attrs.tif_preset => Some(tif),
+            _ => None,
+        }
+    }
+
     /// The side of a new order and its attributes when it carries them.
     /// None for a cancel or a replace. A bracket gives its parent's side.
     pub fn new_order_side(&self) -> Option<(Side, Option<&OrderAttrs>)> {
@@ -1804,7 +2000,7 @@ impl TbtType {
     }
 }
 
-/// A single tick-by-tick trade (Last or AllLast) from 35=E, for one
+/// A single tick-by-tick trade (Last or AllLast) from the tick-by-tick message, for one
 /// request of the stream (ibx#455).
 #[derive(Debug, Clone)]
 pub struct TbtTrade {
@@ -1813,7 +2009,9 @@ pub struct TbtTrade {
     /// Last or AllLast: the tickType the request reports.
     pub tbt_type: TbtType,
     pub price: Price,
-    pub size: i64,
+    /// The trade's size: a whole number below session level 222, with its
+    /// fractional part from 222 (ibx#613).
+    pub size: f64,
     pub timestamp: u64,
     pub exchange: String,
     pub conditions: String,
@@ -1822,7 +2020,7 @@ pub struct TbtTrade {
     pub unreported: bool,
 }
 
-/// A single tick-by-tick bid/ask quote from 35=E, for one request of the
+/// A single tick-by-tick bid/ask quote from the tick-by-tick message, for one request of the
 /// stream (ibx#455).
 #[derive(Debug, Clone, Copy)]
 pub struct TbtQuote {
@@ -1838,7 +2036,7 @@ pub struct TbtQuote {
     pub ask_past_high: bool,
 }
 
-/// A single tick-by-tick midpoint from 35=E, for one request of the
+/// A single tick-by-tick midpoint from the tick-by-tick message, for one request of the
 /// stream (ibx#404).
 #[derive(Debug, Clone, Copy)]
 pub struct TbtMidPoint {
@@ -1848,7 +2046,7 @@ pub struct TbtMidPoint {
     pub timestamp: u64,
 }
 
-/// An IB news bulletin from auth server news bulletin message.
+/// A broker news bulletin from auth server news bulletin message.
 #[derive(Debug, Clone)]
 pub struct NewsBulletin {
     /// Message id given by the server (ibx#461).
@@ -2040,7 +2238,7 @@ pub struct CompletedOrder {
 
 /// Optional request-side filters for a by-symbol contract-details lookup.
 /// Empty/zero fields are omitted from the request (ib-agent#171, ibx#229).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SecDefFilters {
     pub primary_exchange: String,
     pub local_symbol: String,
@@ -2081,6 +2279,16 @@ pub struct ContractLookup {
 mod registration;
 pub use registration::RegistrationReply;
 pub use registration::RegistrationReceiver;
+
+/// The queue an error written by the client belongs to (ibx#561).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorQueue {
+    Order,
+    OrderNotice,
+    Historical,
+    TickByTick,
+    Connection,
+}
 
 /// Commands sent from the control plane to the hot loop via SPSC channel.
 #[derive(Debug, Clone)]
@@ -2146,10 +2354,12 @@ pub enum ControlCommand {
     /// reference does, then subscribes with the conId found. The reply
     /// gives the instrument at once; a lookup that finds no single contract
     /// ends the subscription with error 200.
+    /// `over_limit`: every API line was taken when it was asked; a stream
+    /// that does not join a running contract ends with 101 (ibx#501).
     SubscribeBySymbol {
         symbol: String, sec_type: String, exchange: String, currency: String,
         filters: SecDefFilters,
-        mode_9887: i32, snapshot: bool,
+        mode_9887: i32, snapshot: bool, over_limit: bool,
         reply_tx: Option<RegistrationReply>,
     },
     /// Unsubscribe from market data for an instrument.
@@ -2200,15 +2410,20 @@ pub enum ControlCommand {
     /// A request with generic ticks left an instrument other requests still
     /// use (ibx#450): the entries no request needs any more are cancelled.
     UnsubscribeGeneric { instrument: InstrumentId, codes: Vec<i32> },
-    /// Subscribe to whole-account P&L via CCP (6040=142).
+    /// Subscribe to whole-account P&L via CCP (its own message sub-type).
     SubscribePnl { req_id: i64, account: String },
+    /// The P&L quotes of position contracts (ibx#511): asked by the P&L
+    /// requests, as the reference's own P&L does; the second price kind
+    /// for a reqPnL. The first one of the session also starts the P&L
+    /// partition's account request.
+    PnlQuotes { con_ids: Vec<i64>, second_price: bool },
     /// Cancel P&L subscription.
     CancelPnl { req_id: i64 },
     /// The currency of a contract, for the orders on its instrument
-    /// (tag 15, ibx#466). Sent before an order when the engine does not have
+    /// (the currency field, ibx#466). Sent before an order when the engine does not have
     /// it yet.
     SetInstrumentCurrency { con_id: i64, currency: String },
-    /// Subscribe to an account summary (6040=55, ibx#479): `sr_id` is the
+    /// Subscribe to an account summary (its own message sub-type, ibx#479): `sr_id` is the
     /// subscription id the server echoes on the rows (`SR.Socket.{n}`).
     SubscribeAccountSummary { sr_id: String, tags: String, group: String },
     /// Cancel an account summary subscription.
@@ -2217,6 +2432,21 @@ pub enum ControlCommand {
     UpdateParam { key: String, value: String },
     /// Submit an order from external caller (bridge mode).
     Order(OrderRequest),
+    /// The new orders one placeOrder transmits together (ibx#547): a held
+    /// parent and its children with the order that transmits them. The
+    /// engine sends them in this order in one write, once the contract of
+    /// each is known.
+    OrderGroup(Vec<OrderRequest>),
+    /// An order placed with transmit off (ibx#509): nothing is sent for
+    /// it but the lookup of a contract given without a conId; the engine
+    /// keeps it, unlisted, for its cancel. The client sends it as a new
+    /// order when its group is transmitted.
+    HoldOrder { order_id: OrderId, instrument: InstrumentId, qty: Qty, parent_id: i64, oca_group: String },
+    /// A slot of its own for an order given by its conId on another
+    /// exchange than the one the conId's slot was registered with: the
+    /// order goes to its own exchange (ibx#743). The slot keeps the
+    /// conId's currency.
+    RegisterOrderSlot { con_id: i64, symbol: String, sec_type: String, exchange: String, reply_tx: Option<RegistrationReply> },
     /// Register an instrument from external caller (bridge mode).
     RegisterInstrument { con_id: i64, symbol: String, sec_type: String, exchange: String, reply_tx: Option<RegistrationReply> },
     /// Atomically register an exact option contract with the native terms
@@ -2231,7 +2461,9 @@ pub enum ControlCommand {
     /// A slot of its own for the contract of an order given without a
     /// conId: the engine looks the contract up before the order goes out,
     /// as the reference does for each API order (ibx#486).
-    RegisterOrderContract { symbol: String, sec_type: String, exchange: String, currency: String, reply_tx: Option<RegistrationReply> },
+    /// `filters`: the contract's terms for the lookup of a contract other
+    /// than a stock (ibx#666).
+    RegisterOrderContract { symbol: String, sec_type: String, exchange: String, currency: String, filters: Box<SecDefFilters>, reply_tx: Option<RegistrationReply> },
     /// Request historical bar data via historical data connection.
     FetchHistorical {
         req_id: ReqId,
@@ -2349,6 +2581,9 @@ pub enum ControlCommand {
     CalcOption {
         req_id: ReqId,
         con_id: i64,
+        /// The contract's exchange as the caller gave it: the definition
+        /// of an option is asked on it (ibx#589).
+        exchange: String,
         kind: crate::control::optcalc::CalcKind,
         under_price: f64,
     },
@@ -2427,10 +2662,45 @@ pub enum ControlCommand {
     FetchSmartComponents { req_id: ReqId, bbo_exchange: String },
     /// Request soft dollar tiers.
     FetchSoftDollarTiers { req_id: ReqId },
+    /// reqCompletedOrders (ibx#695): the server's finished orders of the
+    /// trading day, asked once per session.
+    CompletedOrders { api_only: bool },
     /// Request user info.
     FetchUserInfo { req_id: ReqId },
+    /// A calendar data request (ibx#443): the meta data (`meta`) or the
+    /// events, with its body, sent on the contract data farm.
+    WshRequest { req_id: i64, meta: bool, body: String },
+    /// The saves of a replace of FA data (ibx#507): for each batch, the
+    /// deletes of the old objects, then the saves of the new ones. The
+    /// replace is answered when every save of a batch is answered.
+    FaSave { req_id: i64, batches: Vec<crate::control::fa::SaveBatch> },
     /// Graceful shutdown.
     Shutdown,
+    /// The slot a market data request of this contract will use, told at
+    /// once so that the call does not wait for the turn of its request
+    /// (ibx#561). The `Subscribe` that follows takes that slot.
+    MarketDataSlot {
+        con_id: i64,
+        symbol: String,
+        sec_type: String,
+        exchange: String,
+        mode_9887: i32,
+        snapshot: bool,
+        /// The slot of the conId itself, never the one of a running top of
+        /// book (a regulatory snapshot).
+        plain: bool,
+        reply_tx: RegistrationReply,
+    },
+    /// The answer to a request refused by the client itself, written to
+    /// its queue when the turn of the request comes (ibx#561).
+    LocalError { queue: ErrorQueue, req_id: i64, code: i64, message: String },
+    /// A request answered by the client itself waits for its turn: the
+    /// engine tells it here (ibx#561).
+    Turn { reply_tx: crossbeam_channel::Sender<()> },
+    /// A command that is not an API request of its own (ibx#555): a
+    /// further command of a request already counted, or the client's own
+    /// housekeeping. It is taken in its turn, without pacing.
+    Unpaced(Box<ControlCommand>),
 }
 
 /// Account-level state.
@@ -2463,7 +2733,9 @@ pub struct PositionInfo {
     pub con_id: i64,
     /// Fixed-point (QTY_SCALE).
     pub position_fixed: Qty,
-    pub avg_cost: Price,      // per-share avg cost * PRICE_SCALE
+    /// Per-share average cost, a double with all its digits as the
+    /// reference keeps it (ibx#708: 775.4916963075 after a commission).
+    pub avg_cost: f64,
     pub symbol: String,
     pub sec_type: String,
     pub currency: String,
@@ -2479,7 +2751,7 @@ pub struct PositionInfo {
     pub portfolio_seq: u64,
 }
 
-/// Per-position midnight seed from 6040=143 P&L subscription.
+/// Per-position midnight seed from the per-position P&L subscription (its own message sub-type).
 /// Used for client-side daily P&L computation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MidnightSeed {
@@ -2561,14 +2833,14 @@ mod tests {
     #[test]
     fn qty_100_shares() {
         let q: Qty = 100 * QTY_SCALE;
-        assert_eq!(q, 1_000_000);
+        assert_eq!(q, 10_000_000_000);
     }
 
     #[test]
     fn qty_fractional() {
         // 0.5 shares (fractional shares)
         let q: Qty = QTY_SCALE / 2;
-        assert_eq!(q, 5_000);
+        assert_eq!(q, 50_000_000);
     }
 
     // --- OrderBuffer ---
@@ -2739,14 +3011,16 @@ mod tests {
     #[test]
     fn qty_negative() {
         let q: Qty = -100 * QTY_SCALE;
-        assert_eq!(q, -1_000_000);
+        assert_eq!(q, -10_000_000_000);
     }
 
     #[test]
     fn qty_one_ten_thousandth() {
-        let q: Qty = 1; // smallest representable: 0.0001 shares
+        // 0.0001 shares, and the smallest step: 0.00000001 (ibx#655).
+        let q: Qty = QTY_SCALE / 10_000;
         let f = q as f64 / QTY_SCALE as f64;
-        assert!((f - 0.0001).abs() < 1e-10);
+        assert!((f - 0.0001).abs() < 1e-12);
+        assert!((1 as f64 / QTY_SCALE as f64 - 1e-8).abs() < 1e-20);
     }
 
     // --- OrderBuffer edge cases ---
@@ -2810,8 +3084,8 @@ mod tests {
         assert!(!off_grid(15_012_345_678, 0, false));
         assert!(off_grid(-50_000_000, 0, false));
         assert!(off_grid(-50_000_000, TICK_CENT, false));
-        // A combo's rule allows a price at or below 0 (`jclient.dy.cP()`;
-        // captured BAG limits -73.15 and -50.10, ibx#470), on its tick.
+        // A combo's rule allows a price at or below 0 (captured BAG limits
+        // -73.15 and -50.10, ibx#470), on its tick.
         assert!(!off_grid(-7_315_000_000, 0, true));
         assert!(!off_grid(-5_010_000_000, TICK_CENT, true));
         assert!(off_grid(-5_010_500_000, TICK_CENT, true));

@@ -130,14 +130,15 @@ impl EClient {
             return Err("place_combo_order_guarded requires a new order id".into());
         }
 
-        let order = &*ClientCore::with_canonical_order_type(order);
+        let order = &*ClientCore::with_canonical_order_type(order, self.shared.reference.form_10_40());
         ClientCore::validate_order(order)?;
         let contract_zone = self.shared.reference.time_zone_id(contract.con_id);
         let account_pending =
             ClientCore::order_account_pending(order, &self.shared.reference, &self.account_id);
         let mut algo_warnings = Vec::new();
         let refusal =
-            ClientCore::refusal_before_sending_for(order, &contract.exchange, account_pending)
+            ClientCore::refusal_before_sending_for(order, &contract.exchange,
+                &contract.last_trade_date_or_contract_month, account_pending, self.shared.reference.form_10_40())
                 .or_else(|| {
                     ClientCore::algo_definition_refusal(
                         order,
@@ -186,6 +187,12 @@ impl EClient {
             &contract.exchange,
             &contract.sec_type,
             &contract.currency,
+            crate::types::SecDefFilters {
+                primary_exchange: contract.primary_exchange.clone(), local_symbol: contract.local_symbol.clone(),
+                last_trade_date_or_contract_month: contract.last_trade_date_or_contract_month.clone(),
+                strike: contract.strike, right: contract.right.clone(), multiplier: contract.multiplier.clone(),
+                trading_class: contract.trading_class.clone(), ..Default::default()
+            },
         )?;
         self.core
             .note_currency(&self.control_tx, con_id, &contract.currency);
@@ -199,37 +206,118 @@ impl EClient {
 
     /// Place an order. Matches `placeOrder` in C++.
     pub fn place_order(&self, order_id: i64, contract: &Contract, order: &Order) -> Result<(), String> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return Ok(()); }
         if !ClientCore::ids_fit("place_order", &[order_id, contract.con_id]) { return Ok(()); }
         // The reference's other names for an order type, under ibx's name
         // for every check and for the tracked order (ibx#469).
-        let order = &*ClientCore::with_canonical_order_type(order);
+        let order = &*ClientCore::with_canonical_order_type(order, self.shared.reference.form_10_40());
         // Validate order params and contract before registering instrument (fail fast).
         ClientCore::validate_order(order)?;
-        let option_terms = ClientCore::option_preview_terms(contract, order.what_if, &self.shared.reference)?;
+        // The refusals of the contract's security type (ibx#666).
+        if let Some((code, message)) = ClientCore::order_contract_refusal(contract) {
+            self.shared.orders.push_order_error(order_id, code, message);
+            return Ok(());
+        }
+        // Transmit off: the order is held (ibx#509). A what-if with
+        // transmit off is refused with 321 below.
+        if !order.transmit && !order.what_if {
+            return self.hold_order(order_id, contract, order);
+        }
+        let mut built = Vec::new();
+        if order.what_if {
+            self.send_order(order_id, contract, order, false, &mut built)?;
+            let result = self.send_built(built);
+            if result.is_err() { self.core.untrack_latest_what_if(order_id); }
+            return result;
+        }
+        // Transmit on: the order goes out with the held orders of its tree,
+        // together (ibx#547). An order that fails ends the list; the ones
+        // before it go.
+        let mut result = Ok(());
+        for (id, contract, order, was_held) in self.core.orders_to_transmit_checked(order_id, contract, order, &self.shared, &self.account_id) {
+            result = self.send_order(id, &contract, &order, was_held, &mut built);
+            if result.is_err() { break; }
+        }
+        self.send_built(built)?;
+        result
+    }
 
+    /// Send the commands of one placeOrder: one as it is, several new
+    /// orders as a group the engine sends together (ibx#547).
+    fn send_built(&self, mut built: Vec<ControlCommand>) -> Result<(), String> {
+        if built.len() < 2 {
+            return built.pop().map_or(Ok(()), |cmd| self.send(cmd));
+        }
+        self.send(ClientCore::order_group(built))
+    }
+
+    /// An order placed with transmit off (ibx#509): nothing is sent but the
+    /// lookup of a contract given without a conId, and nothing is answered.
+    /// A working order placed again with transmit off stays as it is
+    /// (paper 09/10/2026).
+    fn hold_order(&self, oid: i64, contract: &Contract, order: &Order) -> Result<(), String> {
+        if self.core.working_order(&self.shared, oid).is_some() {
+            return Ok(());
+        }
+        // The order is read and checked now, as the reference does; one
+        // that is refused is not held (ibx#547).
+        let (notices, refusal, _) = self.core.order_read_checks(
+            oid, contract.con_id, &contract.sec_type, &contract.exchange, &contract.last_trade_date_or_contract_month, order,
+            &self.shared, &self.account_id, false);
+        let combo = ClientCore::combo_order(contract, order, &self.shared.reference, &self.account_id);
+        for (code, message) in notices {
+            self.shared.orders.push_order_error(oid, code, message);
+        }
+        if let Some((code, message)) = refusal.or(combo.err()) {
+            self.shared.orders.push_order_error(oid, code, message);
+            return Ok(());
+        }
+        let instrument = if contract.sec_type.eq_ignore_ascii_case("BAG") { 0 } else {
+            self.core.order_instrument(
+                &self.control_tx, oid, false,
+                contract.con_id, &contract.symbol, &contract.exchange, &contract.sec_type, &contract.currency,
+                crate::types::SecDefFilters {
+                    // The primary exchange goes into the order's lookup (ibx#710).
+                    primary_exchange: contract.primary_exchange.clone(), local_symbol: contract.local_symbol.clone(),
+                    last_trade_date_or_contract_month: contract.last_trade_date_or_contract_month.clone(),
+                    strike: contract.strike, right: contract.right.clone(), multiplier: contract.multiplier.clone(),
+                    trading_class: contract.trading_class.clone(), ..Default::default()
+                },
+            )?
+        };
+        // Not known as a parent until the engine has its lookups' answers
+        // (ibx#718): noted before the engine can answer.
+        self.core.note_held_placed(&self.shared, oid);
+        self.send(ControlCommand::HoldOrder {
+            order_id: oid, instrument,
+            qty: (order.total_quantity * crate::types::QTY_SCALE as f64).round() as crate::types::Qty,
+            parent_id: order.parent_id, oca_group: order.oca_group.clone(),
+        })?;
+        self.core.hold_order(oid, contract.clone(), order.clone(), instrument);
+        Ok(())
+    }
+
+    /// Send one order: a new order, or the change of a working one.
+    fn send_order(&self, order_id: i64, contract: &Contract, order: &Order, was_held: bool, built: &mut Vec<ControlCommand>) -> Result<(), String> {
+        let option_terms = ClientCore::option_preview_terms(contract, order.what_if, &self.shared.reference)?;
         // The id as given: the reference refuses 0 with 10149 below.
         let oid = order_id;
 
-        // Warnings the reference sends while it reads the order (ibx#416).
-        for (code, message) in ClientCore::implied_zone_warnings(order) {
-            self.shared.orders.push_order_error(oid, code, message);
-        }
-        // Refused before sending, like the reference: error() only.
-        let contract_zone = self.shared.reference.time_zone_id(contract.con_id);
-        let account_pending = ClientCore::order_account_pending(order, &self.shared.reference, &self.account_id);
-        // The algo check's warnings come before its refusal (ibx#263).
-        let mut algo_warnings = Vec::new();
-        let refusal = ClientCore::refusal_before_sending_for(order, &contract.exchange, account_pending)
-            .or_else(|| ClientCore::algo_definition_refusal(order, &contract.exchange, &self.shared.reference, &mut algo_warnings))
-            .or_else(|| ClientCore::account_config_refusal(
-                order, self.shared.reference.account_features().as_deref(), &self.account_id))
-            .or_else(|| ClientCore::good_till_date_refusal(order, contract_zone.as_deref()))
-            .or_else(|| ClientCore::condition_time_zone_refusal(order, contract_zone.as_deref()))
-            .or_else(|| ClientCore::price_refusal(order))
-            .or_else(|| ClientCore::order_id_refusal(oid))
-            .or_else(|| self.core.refusal_for_order_id(oid, order, &self.shared));
-        for (code, message) in algo_warnings {
-            self.shared.orders.push_order_error(oid, code, message);
+        // The warnings and the refusal of the order as it is read; the
+        // warnings of an order that was held were given when it was placed
+        // with transmit off (ibx#547).
+        // A contract without a conId is looked up first; what the reference
+        // checks once it is known comes after (ibx#665).
+        let looked_up = contract.con_id == 0 && !contract.sec_type.eq_ignore_ascii_case("BAG");
+        let (notices, refusal, deferred) = self.core.order_read_checks(
+            oid, contract.con_id, &contract.sec_type, &contract.exchange, &contract.last_trade_date_or_contract_month, order,
+            &self.shared, &self.account_id, looked_up);
+        if !was_held {
+            for (code, message) in notices {
+                self.shared.orders.push_order_error(oid, code, message);
+            }
         }
         if let Some((code, message)) = refusal {
             self.shared.orders.push_order_error(oid, code, message);
@@ -246,30 +334,40 @@ impl EClient {
         };
         // The condition times as the reference sends them (ibx#416); the
         // order is tracked as the caller placed it.
-        let sent = ClientCore::with_condition_times(order);
+        let sent = self.core.hedge_sent(ClientCore::with_condition_times(order));
 
         // A smart combo goes out on its currency's smart combo conId.
         let con_id = combo.as_ref().map(|c| c.smart_con_id).filter(|&c| c > 0).unwrap_or(contract.con_id);
         let instrument = self.core.order_instrument(
             &self.control_tx, oid, order.what_if,
             con_id, &contract.symbol, &contract.exchange, &contract.sec_type, &contract.currency,
+            crate::types::SecDefFilters {
+                    primary_exchange: String::new(), local_symbol: contract.local_symbol.clone(),
+                    last_trade_date_or_contract_month: contract.last_trade_date_or_contract_month.clone(),
+                    strike: contract.strike, right: contract.right.clone(), multiplier: contract.multiplier.clone(),
+                    trading_class: contract.trading_class.clone(), ..Default::default()
+                },
         )?;
         self.core.note_currency(&self.control_tx, con_id, &contract.currency);
 
         // If orderId is already tracked, this is a modification: replace it
         // with the full wanted state (ibx#247). A what-if never modifies:
         // it previews a new order (ibx#462).
-        let working = if order.what_if { None } else { self.core.tracked_order(oid) };
+        let working = if order.what_if { None } else { self.core.working_order(&self.shared, oid) };
         if working.is_some() {
             let refusal = self.core.tracked_contract(oid)
-                .and_then(|placed| ClientCore::combo_modify_refusal(contract, &placed));
+                .and_then(|placed| ClientCore::combo_modify_refusal(contract, &placed)
+                    .or_else(|| ClientCore::algo_destination_modify_refusal(contract, &placed,
+                        |e| self.shared.reference.is_algo_provider(e))))
+                // A beta hedge's max size below what it filled (ibx#602).
+                .or_else(|| self.core.hedge_filled_refusal(oid, order));
             if let Some((code, message)) = refusal {
                 self.shared.orders.push_order_error(oid, code, message);
                 return Ok(());
             }
         }
-        let mut cmd = if let Some(working) = working {
-            match ClientCore::build_modify_request(&sent, oid, &working)? {
+        let cmd = if let Some(working) = working {
+            match ClientCore::build_modify_request(&sent, oid, &working, self.shared.reference.form_10_40())? {
                 ModifyPlan::Send(cmd) => cmd,
                 ModifyPlan::Refused { code, message } => {
                     // Refused before sending, like the reference: the caller
@@ -283,23 +381,29 @@ impl EClient {
         } else {
             ClientCore::build_order_request(&sent, oid, instrument)?
         };
+        let mut cmd = cmd;
+        if let ControlCommand::Order(OrderRequest::SubmitWhatIf { option_terms: terms, .. }) = &mut cmd {
+            *terms = option_terms;
+        }
+        if !self.core.carry_deferred_checks(oid, &mut cmd, deferred, &self.shared) {
+            return Ok(());
+        }
+        // A rule checked once the contract is known that keeps the order
+        // for its cancel (ibx#688).
+        self.core.carry_kept_refusal(&mut cmd, order);
+        // A scale order's profit taker (ibx#751).
+        if !order.what_if {
+            self.core.scale_profit_child(&mut cmd, contract, order, oid, instrument);
+        }
+        self.core.cache_contract(contract.con_id, contract.clone());
         if order.what_if {
-            if let ControlCommand::Order(OrderRequest::SubmitWhatIf { option_terms: terms, .. }) = &mut cmd {
-                *terms = option_terms;
-            }
             // A callback thread can consume the reply as soon as the engine
             // receives this command. Publish its identity before enqueueing.
-            self.core.cache_contract(contract.con_id, contract.clone());
             self.core.track_what_if(oid, contract.clone(), order.clone());
-            if let Err(error) = self.send(cmd) {
-                self.core.untrack_latest_what_if(oid);
-                return Err(error);
-            }
         } else {
-            self.send(cmd)?;
-            self.core.cache_contract(contract.con_id, contract.clone());
             self.core.track_order(oid, contract.clone(), order.clone(), instrument);
         }
+        built.push(cmd);
         Ok(())
     }
 
@@ -315,7 +419,11 @@ impl EClient {
 
     /// Cancel an order. Matches `cancelOrder` in C++.
     pub fn cancel_order(&self, order_id: i64, _manual_order_cancel_time: &str) -> Result<(), String> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return Ok(()); }
         if !ClientCore::ids_fit("cancel_order", &[order_id]) { return Ok(()); }
+        self.core.drop_held_order(order_id);
         self.send(ControlCommand::Order(OrderRequest::Cancel {
             order_id,
         }))
@@ -332,6 +440,9 @@ impl EClient {
     /// `place_order` callbacks or by the CCP session-recovery push hydrated in
     /// `handle_exec_report`). Fails if `perm_id` is not currently tracked.
     pub fn cancel_order_by_perm_id(&self, perm_id: i64) -> Result<(), String> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return Ok(()); }
         if perm_id == 0 {
             return Err("cancel_order_by_perm_id: perm_id must be non-zero".into());
         }
@@ -347,6 +458,10 @@ impl EClient {
     /// the account the session knows, those of other clients and of
     /// earlier sessions too, as the reference cancels them.
     pub fn req_global_cancel(&self) -> Result<(), String> {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return Ok(()); }
+        self.core.drop_held_orders();
         self.send(ControlCommand::Order(OrderRequest::GlobalCancel))
     }
 
@@ -356,9 +471,16 @@ impl EClient {
     /// sessions count as far as the server's replays of the logon show them
     /// (orders with the client's id); right after the connect the answer
     /// waits for the order replay of the logon. Nothing is reserved.
-    pub fn req_ids(&self, wrapper: &mut impl Wrapper) {
+    pub fn req_ids(&self, _wrapper: &mut impl Wrapper) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return; }
+        // Answered here: after the requests made before it (ibx#561).
+        self.shared.command_clock().take_turn();
         ClientCore::wait_order_replay(&self.shared);
-        wrapper.next_valid_id(self.core.next_valid_id(&self.shared));
+        let id = self.core.next_valid_id(&self.shared);
+        // Given by `process_msgs` at its place among the answers (ibx#532).
+        self.later(move |_, wrapper| wrapper.next_valid_id(id));
     }
 
     /// The next order id for a new order: the next valid id (see
@@ -376,6 +498,9 @@ impl EClient {
     /// Answered from `process_msgs` after the initial/reconnect replay and
     /// queued status updates. Interrupted replies can repeat order IDs.
     pub fn req_open_orders(&self, _wrapper: &mut impl Wrapper) {
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return; }
+        self.shared.command_clock().take_turn();
         self.core
             .queue_open_orders(crate::client_core::OpenOrdersRequest::Open);
         self.shared.notify();
@@ -385,6 +510,9 @@ impl EClient {
     ///
     /// Queued like [`req_open_orders`](Self::req_open_orders).
     pub fn req_all_open_orders(&self, _wrapper: &mut impl Wrapper) {
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return; }
+        self.shared.command_clock().take_turn();
         self.core
             .queue_open_orders(crate::client_core::OpenOrdersRequest::All);
         self.shared.notify();
@@ -393,9 +521,9 @@ impl EClient {
     /// The open orders, then the end of the list.
     pub(crate) fn answer_open_orders(
         &self,
+        wrapper: &mut (impl Wrapper + ?Sized),
         request: crate::client_core::OpenOrdersRequest,
         history: Option<&str>,
-        wrapper: &mut impl Wrapper,
     ) {
         let Some(orders) = self.core.prepare_open_orders_listing(&self.shared, request) else {
             if self.is_connected() {
@@ -414,7 +542,11 @@ impl EClient {
                 status: tracked.status.clone(),
                 ..Default::default()
             };
-            wrapper.open_order(order_id, &tracked.contract, &tracked.order, &state);
+            // An order kept pending after a refusal: its status only
+            // (ibx#682).
+            if tracked.status != "ApiPending" {
+                wrapper.open_order(order_id, &tracked.contract, &tracked.order, &state);
+            }
             let why_held = self.core.why_held(&tracked.status, &tracked.order.order_type, tracked.order.parent_id);
             wrapper.order_status(
                 order_id, &tracked.status, tracked.filled, tracked.remaining, 0.0,
@@ -439,10 +571,10 @@ impl EClient {
 
     // ── Completed Orders ──
 
-    /// Request today's completed orders from the broker, asynchronously.
-    /// Results arrive through `process_msgs`; failure never emits a successful end.
-    pub fn req_completed_orders(&self, wrapper: &mut impl Wrapper) {
-        self.req_completed_orders_filtered(false, wrapper);
+    /// Reference-compatible current-day completed orders, delivered asynchronously.
+    /// Use the explicit range APIs when fresh broker history is required.
+    pub fn req_completed_orders(&self, _wrapper: &mut impl Wrapper) {
+        self.req_completed_orders_only(false);
     }
 
     /// Like `req_completed_orders`, optionally restricted to API-origin orders.
@@ -523,10 +655,21 @@ impl EClient {
         }
     }
 
+    /// Reference-compatible current-day request; explicit range APIs above
+    /// always fetch fresh broker history rather than the session's day cache.
+    pub fn req_completed_orders_only(&self, api_only: bool) {
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return; }
+        let _ = self.send(ControlCommand::CompletedOrders { api_only });
+    }
+
     // ── Executions ──
 
     /// Automatically bind future orders to this client. Matches `reqAutoOpenOrders` in C++.
     pub fn req_auto_open_orders(&self, _b_auto_bind: bool) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return; }
         // No-op: single-client engine, all orders are auto-bound.
     }
 
@@ -540,6 +683,9 @@ impl EClient {
         filter: &ExecutionFilter,
         _wrapper: &mut impl Wrapper,
     ) {
+        let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return; }
+        self.shared.command_clock().take_turn();
         if !crate::client_core::ClientCore::ids_fit("req_executions", &[req_id]) { return; }
         self.core.queue_execution_request(req_id, filter);
         self.shared.notify();
@@ -723,6 +869,17 @@ pub fn parse_algo_params(strategy: &str, params: &[TagValue]) -> Result<AlgoPara
             start_time: get("startTime"),
             end_time: get("endTime"),
         }),
-        _ => Err(format!("Unsupported algo strategy: '{}'", strategy)),
+        // Another strategy goes out as given, as the reference sends it
+        // (ibx#622, AccuDistr accepted on paper 12/10/2026); the
+        // definitions check refused it before if the server does not
+        // know it (439) or one of its parameters (443).
+        _ => {
+            let mut pairs: Vec<(String, String)> = params.iter()
+                .filter(|tv| !tv.value.is_empty())
+                .map(|tv| (tv.tag.clone(), tv.value.clone()))
+                .collect();
+            crate::types::reference_param_order(&mut pairs);
+            Ok(AlgoParams::Other { strategy: strategy.to_string(), params: pairs })
+        }
     }
 }

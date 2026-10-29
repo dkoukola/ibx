@@ -7,7 +7,7 @@ use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver};
 
 use ibx::bridge::{Event, SharedState};
 use ibx::gateway::{Gateway, GatewayConfig};
@@ -64,10 +64,13 @@ impl BenchConfig {
 
 // ─── Connection ───
 
+/// The client id the benchmarks place their orders with.
+const BENCH_CLIENT_ID: i64 = 0;
+
 pub struct BenchSession {
     pub shared: Arc<SharedState>,
     pub event_rx: Receiver<Event>,
-    pub control_tx: Sender<ControlCommand>,
+    pub control_tx: ibx::engine::park::ControlSender,
     pub connect_time: Duration,
     pub account_id: String,
     _join: Option<std::thread::JoinHandle<()>>,
@@ -96,6 +99,12 @@ impl BenchSession {
         let (event_tx, event_rx) = bounded::<Event>(65536);
         let (mut hot_loop, control_tx) =
             gw.into_hot_loop(shared.clone(), Some(event_tx), farm_conn, ccp_conn, hmds_conn, None);
+        // BENCH_COPIED_WAITS=1: the reference's own waits copied;
+        // BENCH_REQUEST_PACING=0: the requests taken at once (ibx#564).
+        hot_loop.set_copied_waits(BenchConfig::env_bool("BENCH_COPIED_WAITS"));
+        if env::var("BENCH_REQUEST_PACING").is_ok_and(|v| v == "0") {
+            hot_loop.set_request_pacing(false);
+        }
 
         let join = std::thread::spawn(move || {
             hot_loop.run();
@@ -161,12 +170,62 @@ impl BenchSession {
         let _ = self.control_tx.send(ControlCommand::Order(req));
     }
 
+    /// The first order id of a run: above the ids the earlier runs kept
+    /// and above the orders of this client the server showed at the
+    /// logon. An id that is still working, or that the server has seen,
+    /// is refused as a duplicate.
+    pub fn first_order_id(&self) -> i64 {
+        let kept = ibx::order_ids::default_path()
+            .map_or(0, |path| ibx::order_ids::load(&path, &self.account_id, BENCH_CLIENT_ID));
+        kept.max(self.shared.orders.reported_order_id(BENCH_CLIENT_ID)) + 1
+    }
+
+    /// Wait for the cancel of an order to be confirmed (a reject ends it
+    /// too). False when the time runs out.
+    pub fn wait_cancelled(&self, order_id: i64, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match self.event_rx.recv_timeout(left) {
+                Ok(Event::OrderUpdate(update)) if update.order_id == order_id
+                    && matches!(update.status, OrderStatus::Cancelled | OrderStatus::Rejected) => return true,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        false
+    }
+
+    /// Cancel the orders of `ids` that may still work and wait for each
+    /// confirmation; the ids not confirmed are returned (ibx#570).
+    pub fn cancel_all(&self, ids: &[i64], limit_each: Duration) -> Vec<i64> {
+        ids.iter().copied().filter(|&id| {
+            self.send_order(OrderRequest::Cancel { order_id: id });
+            !self.wait_cancelled(id, limit_each)
+        }).collect()
+    }
+
+    /// Keep the highest order id of this run for the next one.
+    pub fn keep_order_id(&self, highest: i64) {
+        if let Some(path) = ibx::order_ids::default_path() {
+            if let Err(e) = ibx::order_ids::save(&path, &self.account_id, BENCH_CLIENT_ID, highest) {
+                println!("  Order ids not kept for the next run: {e}");
+            }
+        }
+    }
+
     pub fn shutdown(self) {
         let _ = self.control_tx.send(ControlCommand::Shutdown);
         if let Some(join) = self._join {
             let _ = join.join();
         }
     }
+}
+
+/// The acknowledgement of an order is its first status: before the open
+/// the server gives `PreSubmitted` and may hold the routed status back
+/// (ibx#539).
+pub fn is_ack(status: OrderStatus) -> bool {
+    matches!(status, OrderStatus::PendingSubmit | OrderStatus::PreSubmitted | OrderStatus::Submitted)
 }
 
 // ─── Stats ───

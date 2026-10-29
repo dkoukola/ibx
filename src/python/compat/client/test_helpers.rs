@@ -28,13 +28,15 @@ impl EClient {
         shared
             .orders
             .complete_execution_history("python-test-history");
+        // No logon: the client's copied waits are off (ibx#723).
+        shared.portfolio.set_pnl_first_wait_off();
         let (tx, rx) = match control_capacity {
             Some(n) => crossbeam_channel::bounded(n),
             None => crossbeam_channel::unbounded(),
         };
         let (event_tx, event_rx) = crossbeam_channel::bounded(256);
         *self.shared.lock().unwrap() = Some(shared);
-        *self.control_tx.lock().unwrap() = Some(tx);
+        *self.control_tx.lock().unwrap() = Some(tx.into());
         *self.event_rx.lock().unwrap() = Some(event_rx);
         *self.account_id.lock().unwrap() = Some(account_id);
         // Store event_tx so _test_push_disconnect_event can use it.
@@ -108,7 +110,7 @@ impl EClient {
             })).collect::<PyResult<Vec<MdStep>>>()?),
             None => None,
         };
-        let message = TestMessage { steps: steps.as_deref(), halted, auto_bits, sizes_seen };
+        let message = TestMessage { steps: steps.as_deref(), halted, auto_bits, sizes_seen, pre_open: None };
         shared.market.push_test_message(instrument, &q, &message);
         Ok(())
     }
@@ -247,10 +249,14 @@ impl EClient {
     /// Run the second-factor code provider built from `callable` the way the
     /// login runs it: on its own thread, with the interpreter lock released
     /// by the caller (ibx#208).
+    /// The factor's details too (ibx#350).
     #[doc(hidden)]
-    fn _test_code_provider(&self, py: Python<'_>, callable: Py<PyAny>, display_id: String, avth_url: String) -> PyResult<String> {
+    #[pyo3(signature = (callable, display_id, avth_url, kind=String::new(), message=String::new(), image=Vec::new(), delivery=String::new()))]
+    #[allow(clippy::too_many_arguments)]
+    fn _test_code_provider(&self, py: Python<'_>, callable: Py<PyAny>, display_id: String, avth_url: String,
+        kind: String, message: String, image: Vec<u8>, delivery: String) -> PyResult<String> {
         let provider = super::python_code_provider(callable);
-        let challenge = crate::auth::session::IbKeyChallenge { display_id, avth_url };
+        let challenge = crate::auth::session::IbKeyChallenge { display_id, avth_url, kind, message, image, delivery };
         py.detach(|| std::thread::spawn(move || provider(challenge)).join())
             .map_err(|_| PyRuntimeError::new_err("code provider thread panicked"))?
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -321,14 +327,14 @@ impl EClient {
     #[pyo3(signature = (
         order_id, instrument, status, filled_qty,
         symbol, action, total_quantity, lmt_price,
-        completed_status, completed_time, commission_and_fees_currency, warning_text, commission_and_fees,
+        completed_status, completed_time, commission_and_fees_currency, warning_text, commission_and_fees, fresh_history=false,
     ))]
     fn _test_push_completed_order(
         &self,
         order_id: OrderId, instrument: u32, status: &str, filled_qty: i64,
         symbol: &str, action: &str, total_quantity: f64, lmt_price: f64,
         completed_status: &str, completed_time: &str, commission_and_fees_currency: &str,
-        warning_text: &str, commission_and_fees: f64,
+        warning_text: &str, commission_and_fees: f64, fresh_history: bool,
     ) -> PyResult<()> {
         use crate::api::types::{Contract as ApiContract, Order as ApiOrder, Execution as ApiExecution, OrderState as ApiOrderState};
         let shared = self.shared_state()?;
@@ -338,10 +344,9 @@ impl EClient {
             "Rejected" => OrderStatus::Rejected,
             _ => return Err(PyRuntimeError::new_err(format!("Invalid status: {}", status))),
         };
-        shared.orders.push_completed_order(crate::types::CompletedOrder {
-            order_id, instrument, status: st, filled_qty_fixed: filled_qty * QTY_SCALE, timestamp_ns: 100,
-        });
-        shared.orders.push_order_info(order_id, crate::bridge::RichOrderInfo {
+        // A row of the server's answer to reqCompletedOrders, then its end,
+        // as the engine writes them (ibx#695).
+        let info = crate::bridge::RichOrderInfo {
             parent_id_known: true,
             report_revision: None,
             report_time: None,
@@ -370,7 +375,17 @@ impl EClient {
                 ..Default::default()
             },
             last_exec: ApiExecution::default(),
-        });
+        };
+        if fresh_history {
+            shared.orders.push_completed_order(crate::types::CompletedOrder {
+                order_id, instrument, status: st, filled_qty_fixed: filled_qty * QTY_SCALE, timestamp_ns: 100,
+            });
+            shared.orders.push_order_info(order_id, info);
+        } else {
+            shared.orders.push_completed_row(Some(Box::new((info.contract, info.order, info.order_state))));
+            shared.orders.push_completed_row(None);
+        }
+        shared.notify();
         Ok(())
     }
 
@@ -389,7 +404,7 @@ impl EClient {
         Ok(())
     }
 
-    /// Set the smart combo conIds of the logon, tag 6611 (ibx#470,
+    /// Set the smart combo conIds the logon gives (ibx#470,
     /// test-only).
     #[doc(hidden)]
     fn _test_set_smart_combo_con_ids(&self, raw: &str) -> PyResult<()> {
@@ -419,6 +434,25 @@ impl EClient {
             }
         }
         Ok(None)
+    }
+
+    /// The conditions of the first order sent since the last call, as the
+    /// engine got them (ibx#541, test-only); None when no order was sent.
+    /// The queued commands are taken.
+    #[doc(hidden)]
+    fn _test_take_order_conditions(&self) -> PyResult<Option<Vec<String>>> {
+        let rx = self._test_control_rx.lock().unwrap().clone()
+            .ok_or_else(|| PyRuntimeError::new_err("No test command channel"))?;
+        let mut found = None;
+        while let Ok(cmd) = rx.try_recv() {
+            if let ControlCommand::Order(req) = cmd
+                && found.is_none()
+                && let Some((_, attrs)) = req.new_order_side()
+            {
+                found = Some(attrs.map(|a| a.conditions.iter().map(|c| format!("{c:?}")).collect()).unwrap_or_default());
+            }
+        }
+        Ok(found)
     }
 
     /// Set the combo openOrder shows for an order, as the engine does when
@@ -520,7 +554,7 @@ impl EClient {
     /// Push a TBT trade into SharedState.
     #[doc(hidden)]
     fn _test_push_tbt_trade(
-        &self, instrument: u32, price: f64, size: i64, exchange: &str,
+        &self, instrument: u32, price: f64, size: f64, exchange: &str,
     ) -> PyResult<()> {
         let shared = self.shared_state()?;
         let ps = PRICE_SCALE as f64;
@@ -545,6 +579,32 @@ impl EClient {
             bid: (bid * ps) as i64, ask: (ask * ps) as i64,
             bid_size, ask_size, timestamp: 12345,
             bid_past_low: false, ask_past_high: false,
+        });
+        Ok(())
+    }
+
+    /// Push a depth update (ibx#592).
+    #[doc(hidden)]
+    fn _test_push_depth(&self, req_id: ReqId, position: i32, side: i32, price: f64, size: f64, l2: bool) -> PyResult<()> {
+        self.shared_state()?.market.push_depth_update(DepthUpdate {
+            req_id, position, market_maker: String::new(), operation: 0, side, price, size, is_smart_depth: false, l2,
+        });
+        Ok(())
+    }
+
+    /// Push a histogram: (price, count) pairs (ibx#592).
+    #[doc(hidden)]
+    fn _test_push_histogram(&self, req_id: ReqId, entries: Vec<(f64, i64)>) -> PyResult<()> {
+        let entries = entries.into_iter().map(|(price, count)| crate::control::histogram::HistogramEntry { price, count }).collect();
+        self.shared_state()?.reference.push_histogram_data(req_id, entries);
+        Ok(())
+    }
+
+    /// Push a five-second bar (ibx#592).
+    #[doc(hidden)]
+    fn _test_push_real_time_bar(&self, req_id: ReqId, volume: f64, wap: f64, count: i32) -> PyResult<()> {
+        self.shared_state()?.market.push_real_time_bar(req_id, RealTimeBar {
+            timestamp: 1_760_000_000, open: 1.0, high: 2.0, low: 0.5, close: 1.5, volume, wap, count,
         });
         Ok(())
     }
@@ -764,9 +824,10 @@ impl EClient {
     #[doc(hidden)]
     fn _test_set_position(&self, con_id: i64, position: i64, avg_cost: f64) -> PyResult<()> {
         let shared = self.shared_state()?;
-        let ps = PRICE_SCALE as f64;
+        // With a symbol, as a portfolio row carries one: a row known by its
+        // conId alone waits a little for its contract (ibx#742).
         shared.portfolio.set_position_info(PositionInfo {
-            con_id, position_fixed: position * QTY_SCALE, avg_cost: (avg_cost * ps) as i64, ..Default::default()
+            con_id, position_fixed: position * QTY_SCALE, avg_cost, symbol: con_id.to_string(), ..Default::default()
         });
         Ok(())
     }
@@ -813,6 +874,53 @@ impl EClient {
         };
         shared.orders.push_execution_range_reply(crate::bridge::ExecutionHistoryReply { connection, req_id, result, lifecycle_reports: Vec::new() });
         Ok(())
+    }
+
+    /// Pace the requests of this test connection, with no engine: the
+    /// test grants the turns with `_test_grant_turns` (ibx#563).
+    #[doc(hidden)]
+    fn _test_pace(&self) -> PyResult<()> {
+        self.shared_state()?.command_clock().pace_for_test();
+        Ok(())
+    }
+
+    /// Play the engine for what the client gave it to answer at its turn:
+    /// up to `count` turns are granted and errors written, oldest first.
+    /// Returns how many were taken.
+    #[doc(hidden)]
+    #[pyo3(signature = (count=usize::MAX))]
+    fn _test_grant_turns(&self, count: usize) -> PyResult<usize> {
+        let shared = self.shared_state()?;
+        let clock = shared.command_clock();
+        let mut taken = 0;
+        // What is not taken stays for the next call.
+        let mut rest = Vec::new();
+        clock.set_engine_thread(true);
+        for (after, cmd) in clock.take_deferred() {
+            if taken >= count {
+                rest.push((after, cmd));
+                continue;
+            }
+            taken += 1;
+            let cmd = match cmd {
+                ControlCommand::Unpaced(inner) => *inner,
+                cmd => cmd,
+            };
+            match cmd {
+                ControlCommand::Turn { reply_tx } => { let _ = reply_tx.send(()); }
+                ControlCommand::LocalError { queue, req_id, code, message } => match queue {
+                    crate::types::ErrorQueue::Order => shared.orders.push_order_error(req_id, code, message),
+                    crate::types::ErrorQueue::OrderNotice => shared.orders.push_order_notice(req_id, code, message),
+                    crate::types::ErrorQueue::Historical => shared.reference.push_historical_error(req_id, code as i32, message),
+                    crate::types::ErrorQueue::TickByTick => shared.market.push_tbt_error(req_id, code as i32, message),
+                    crate::types::ErrorQueue::Connection => shared.push_connection_notice(code, message),
+                },
+                _ => {}
+            }
+        }
+        clock.set_engine_thread(false);
+        clock.give_back_deferred(rest);
+        Ok(taken)
     }
 
     /// Run ONE iteration of the event dispatch loop.
@@ -864,6 +972,14 @@ impl EClient {
         Ok(())
     }
 
+    /// The server's answer to a calendar data request, as the engine gives
+    /// it (test-only, ibx#443).
+    #[doc(hidden)]
+    fn _test_push_wsh_answer(&self, req_id: i64, meta: bool, ok: bool, text: String) -> PyResult<()> {
+        self.shared_state()?.reference.push_wsh_answer(crate::bridge::WshAnswer { req_id, meta, ok, text });
+        Ok(())
+    }
+
     /// Queue a link status notice, as the engine does (test-only).
     #[doc(hidden)]
     fn _test_push_connection_notice(&self, code: i64, message: &str) -> PyResult<()> {
@@ -886,5 +1002,49 @@ impl EClient {
         let logon = crate::gateway::LogonValues { clock_offset_ms, features: Some(features.to_string()), ..Default::default() };
         crate::gateway::apply_first_logon(&logon, version_cutoff, version_cutoff_date, max_backfill_years, &*self.shared_state()?);
         Ok(())
+    }
+
+    /// The request read from an `updateConfigProtoBuf` argument, in the
+    /// form of the Rust client (ibx#612, test-only).
+    #[doc(hidden)]
+    fn _test_update_config_request(&self, request: Bound<'_, PyAny>) -> PyResult<String> {
+        Ok(format!("{:?}", super::super::config::update_config_request(&request)?))
+    }
+
+    /// Give an update answer to the wrapper, as the official library builds
+    /// it (ibx#612, test-only). `warnings`: (message id, title, text).
+    #[doc(hidden)]
+    #[pyo3(signature = (req_id, status, message, changed_fields, errors, warnings))]
+    fn _test_update_config_response(
+        &self, py: Python<'_>, req_id: Option<i32>, status: Option<String>, message: Option<String>,
+        changed_fields: Vec<String>, errors: Vec<String>, warnings: Vec<(i32, String, String)>,
+    ) -> PyResult<()> {
+        let response = crate::api::config::UpdateConfigResponse {
+            req_id, status, message, changed_fields, errors,
+            warnings: warnings.into_iter()
+                .map(|(id, title, text)| crate::api::config::UpdateConfigWarning {
+                    message_id: Some(id), title: Some(title), message: Some(text),
+                })
+                .collect(),
+        };
+        let object = super::super::config::update_config_response(py, &response)?;
+        self.wrapper.call_method1(py, "update_config_response_proto_buf", (object,))?;
+        Ok(())
+    }
+
+    /// `req_config_proto_buf` on a session of level `level` (ibx#610,
+    /// test-only).
+    #[doc(hidden)]
+    fn _test_req_config_at(&self, py: Python<'_>, level: i32, request: Bound<'_, PyAny>) -> PyResult<()> {
+        let request = super::super::config::config_request(&request)?;
+        self.req_config_at(py, level, &request)
+    }
+
+    /// `update_config_proto_buf` on a session of level `level` (ibx#612,
+    /// test-only).
+    #[doc(hidden)]
+    fn _test_update_config_at(&self, py: Python<'_>, level: i32, request: Bound<'_, PyAny>) -> PyResult<()> {
+        let request = super::super::config::update_config_request(&request)?;
+        self.update_config_at(py, level, &request)
     }
 }

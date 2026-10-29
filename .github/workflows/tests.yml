@@ -1,12 +1,12 @@
 name: Tests
 
-# Offline tests on every push and pull request: no secret, no network to the
-# servers. The tests that log in are #[ignore] (Rust) or skipped without
-# credentials (Python), so they show as ignored / skipped, never as passed.
+# Offline tests, started by hand (Actions tab or `gh workflow run Tests`):
+# no secret, no network to the servers. The tests that log in are #[ignore]
+# (Rust) or skipped without credentials (Python), so they show as ignored /
+# skipped, never as passed.
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -62,7 +62,11 @@ jobs:
           python -m venv .venv
           . .venv/bin/activate
           pip install --quiet maturin pytest
-          maturin develop --locked
+          # The official client library: the comparison report takes its
+          # argument names and unset values. Same release as the recordings.
+          pip install --quiet "ibapi @ git+https://github.com/deepentropy/ibapi.git@v10.47.01"
+          # With the test helpers, so the scenario replays run (ibx#515).
+          maturin develop --locked --features python,test-support
 
       - name: Run the Python tests (live tests skipped)
         run: |

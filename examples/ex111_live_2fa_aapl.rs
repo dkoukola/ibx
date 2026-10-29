@@ -86,6 +86,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let client = EClient::connect(&EClientConfig {
         username, password, host, paper: false, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     })?;
     println!("== Connected in {:.1}s", t0.elapsed().as_secs_f64());
 

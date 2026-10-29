@@ -1,9 +1,9 @@
-//! FIX message framing.
+//! Message framing of the server protocol.
 //!
-//! IB's FIX format (from decompiled a8.java):
+//! The format, as the reference writes it:
 //! - Body length: 4-digit zero-padded (e.g. "0199")
-//! - MsgSeqNum: 6-digit zero-padded (e.g. "000001")
-//! - No SenderCompID (49) or TargetCompID (56) — set at session level
+//! - Sequence number: 6-digit zero-padded (e.g. "000001")
+//! - No sender or target id: set at session level
 //! - SOH (0x01) delimiter
 
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ use sha1::Sha1;
 
 pub const SOH: u8 = 0x01;
 
-// Standard FIX tags
+// Standard fields of the wire format
 pub const TAG_BEGIN_STRING: u32 = 8;
 pub const TAG_BODY_LENGTH: u32 = 9;
 pub const TAG_CHECKSUM: u32 = 10;
@@ -32,7 +32,7 @@ pub const TAG_RESET_SEQ_NUM: u32 = 141;
 pub const TAG_HEADLINE: u32 = 148;
 pub const TAG_SECURITY_EXCHANGE: u32 = 207;
 
-// IB custom tags
+// Gateway-specific fields
 pub const TAG_IB_BUILD: u32 = 6034;
 pub const TAG_IB_COMM_TYPE: u32 = 6040;
 pub const TAG_IB_COMP_VERSION: u32 = 6143;
@@ -54,7 +54,7 @@ pub const MSG_ORDER_CANCEL: &str = "F";
 pub const MSG_ORDER_REPLACE: &str = "G";
 pub const MSG_MARKET_DATA_REQ: &str = "V";
 
-/// Render a FIX byte buffer with SOH (0x01) shown as `|` and any other
+/// Render a wire-format byte buffer with SOH (0x01) shown as `|` and any other
 /// non-printable bytes escaped as `\xNN`. For trace-level wire diagnostics
 /// (ibx#179 capture); not used on hot paths.
 pub fn fmt_pipe(bytes: &[u8]) -> String {
@@ -69,11 +69,11 @@ pub fn fmt_pipe(bytes: &[u8]) -> String {
     s
 }
 
-/// An XML payload (tag 6118) in the layout of the reference's XML writer
-/// (`jxmlable.XmlGenerator`): the declaration and each element on a line
+/// An XML payload (the XML payload field) in the layout of the reference's XML writer
+///: the declaration and each element on a line
 /// of its own, a new line after each, a tab per level before each
-/// element; an element with text only stays on one line (every 35=W,
-/// 35=Z and 35=U the reference sent to the historical farm, captured
+/// element; an element with text only stays on one line (every market data
+/// snapshot, depth and custom message the reference sent to the historical farm, captured
 /// 26/09 to 02/10/2026, ibx#486). The input may be on one line or laid
 /// out already; text that is only blanks between elements is dropped.
 pub fn xml_layout(xml: &str) -> String {
@@ -147,9 +147,10 @@ pub fn fix_checksum(data: &[u8]) -> String {
     format!("{:03}", sum % 256)
 }
 
-/// Build a complete FIX message matching IB Gateway format.
+/// Build a complete wire message matching the gateway's format.
 ///
-/// `fields` should NOT include tags 8, 9, 34, or 10 (auto-generated).
+/// `fields` should NOT include the begin string, body length, sequence number
+/// or checksum fields (auto-generated).
 /// Body length is 4-digit zero-padded, MsgSeqNum is 6-digit zero-padded.
 pub fn fix_build(fields: &[(u32, &str)], seq: u32) -> Vec<u8> {
     // Build body directly into bytes (no intermediate String, no format! per field)
@@ -171,7 +172,7 @@ pub fn fix_build(fields: &[(u32, &str)], seq: u32) -> Vec<u8> {
         body.push(SOH);
     }
 
-    // Header: 8=FIX.4.1 SOH 9=NNNN SOH
+    // Header: the begin string (protocol version) SOH, the body length SOH
     let mut msg = Vec::with_capacity(body.len() + 30);
     msg.extend_from_slice(b"8=FIX.4.1\x019=");
     push_u32_padded::<4>(&mut msg, body.len() as u32);
@@ -213,21 +214,76 @@ fn push_u32_padded<const N: usize>(buf: &mut Vec<u8>, val: u32) {
     buf.extend_from_slice(&digits);
 }
 
-/// Parse a SOH-delimited FIX message into {tag: value}.
+/// Parse a SOH-delimited wire message into {tag: value}. A repeated field
+/// keeps its last value. The map is sized once from the field count and
+/// only the values are copied (ibx#701).
 pub fn fix_parse(data: &[u8]) -> HashMap<u32, String> {
-    let mut result = HashMap::new();
+    let mut result = HashMap::with_capacity(data.iter().filter(|&&b| b == SOH).count() + 1);
     for part in data.split(|&b| b == SOH) {
-        if part.is_empty() {
-            continue;
-        }
-        let text = String::from_utf8_lossy(part);
-        if let Some((tag_str, val)) = text.split_once('=') {
-            if let Ok(tag) = tag_str.parse::<u32>() {
-                result.insert(tag, val.to_string());
-            }
-        }
+        let Some(eq) = part.iter().position(|&b| b == b'=') else { continue };
+        let Some(tag) = parse_tag(&part[..eq]) else { continue };
+        let raw = &part[eq + 1..];
+        let val = match std::str::from_utf8(raw) {
+            Ok(v) => v.to_owned(),
+            Err(_) => String::from_utf8_lossy(raw).into_owned(),
+        };
+        result.insert(tag, val);
     }
     result
+}
+
+/// The fields of a message, each value borrowed from the message bytes.
+pub type FieldMap<'a> = HashMap<u32, &'a str>;
+
+/// The fields of a message with no copy of their values: the same rules as
+/// [`fix_parse`] (field numbers read from the bytes, what is not a number
+/// skipped, a repeated field keeps its last value, the map sized once).
+/// A value that is not UTF-8 cannot be borrowed as text, so the whole
+/// message gives `None` and the caller reads it with [`fix_parse`], which
+/// keeps such a value with replacements; [`fix_fields`] does both
+/// (ibx#701).
+pub fn fix_parse_borrowed(data: &[u8]) -> Option<FieldMap<'_>> {
+    let mut result = HashMap::with_capacity(data.iter().filter(|&&b| b == SOH).count() + 1);
+    for part in data.split(|&b| b == SOH) {
+        let Some(eq) = part.iter().position(|&b| b == b'=') else { continue };
+        let Some(tag) = parse_tag(&part[..eq]) else { continue };
+        result.insert(tag, std::str::from_utf8(&part[eq + 1..]).ok()?);
+    }
+    Some(result)
+}
+
+/// The fields of a message, borrowed from its bytes. A message with a value
+/// that is not UTF-8 (rare) is read with [`fix_parse`] into `lossy`, and
+/// the map borrows from there: the values are those of [`fix_parse`] in
+/// both cases (ibx#701).
+pub fn fix_fields<'a>(data: &'a [u8], lossy: &'a mut Option<HashMap<u32, String>>) -> FieldMap<'a> {
+    if let Some(fields) = fix_parse_borrowed(data) {
+        return fields;
+    }
+    lossy.insert(fix_parse(data)).iter().map(|(tag, val)| (*tag, val.as_str())).collect()
+}
+
+/// A view of an owned map of fields, for the tests that build one by hand
+/// (ibx#701).
+#[cfg(test)]
+pub(crate) fn field_view(owned: &HashMap<u32, String>) -> FieldMap<'_> {
+    owned.iter().map(|(tag, val)| (*tag, val.as_str())).collect()
+}
+
+/// A field number: ASCII digits only, within `u32`.
+#[inline]
+fn parse_tag(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() {
+        return None;
+    }
+    let mut tag: u32 = 0;
+    for &d in digits {
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        tag = tag.checked_mul(10)?.checked_add(u32::from(d - b'0'))?;
+    }
+    Some(tag)
 }
 
 /// Fold 20-byte HMAC digest to 4 bytes → 8-char uppercase hex.
@@ -312,10 +368,11 @@ pub fn fix_sign(msg: &[u8], mac_key: &[u8], iv: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let is_fixcomp = msg.starts_with(b"8=FIXCOMP");
     let is_fix41 = msg.starts_with(b"8=FIX.4.1");
 
-    // 1. Extract body (after tag 9 SOH)
+    // 1. Extract body (after the body length field and its SOH)
     let after9 = find_after_tag(msg, 9).unwrap();
     let body_end = if is_fix41 {
-        // FIX.4.1: body ends before tag 10 (include the SOH before "10=")
+        // Plain text frame: body ends before the checksum field (include the
+        // SOH before it)
         msg.windows(4)
             .rposition(|w| w == b"\x0110=")
             .map(|p| p + 1)
@@ -336,12 +393,12 @@ pub fn fix_sign(msg: &[u8], mac_key: &[u8], iv: &[u8]) -> (Vec<u8>, Vec<u8>) {
 
 
     // 4. Rebuild message with signature (pre-allocate)
-    let sig_tag_len = 5 + 8 + 1; // "8349=" + 8 hex chars + SOH
+    let sig_tag_len = 5 + 8 + 1; // signature field name and "=" + 8 hex chars + SOH
     let signed_body_len = body.len() + sig_tag_len;
     let hdr_end = msg.iter().position(|&b| b == SOH).unwrap() + 1;
     let header = &msg[..hdr_end];
 
-    // Estimate: header + "9=NNNN\x01" + signed_body + "10=NNN\x01"
+    // Estimate: header + body length field + signed_body + checksum field
     let mut new_msg = Vec::with_capacity(hdr_end + 8 + signed_body_len + 8);
     new_msg.extend_from_slice(header);
     new_msg.extend_from_slice(b"9=");
@@ -353,7 +410,7 @@ pub fn fix_sign(msg: &[u8], mac_key: &[u8], iv: &[u8]) -> (Vec<u8>, Vec<u8>) {
     new_msg.push(SOH);
 
     if is_fix41 {
-        // Add tag 10 checksum
+        // Add the checksum field
         let cksum: u32 = new_msg.iter().map(|&b| b as u32).sum();
         new_msg.extend_from_slice(b"10=");
         push_u32_padded::<3>(&mut new_msg, cksum % 256);
@@ -366,10 +423,10 @@ pub fn fix_sign(msg: &[u8], mac_key: &[u8], iv: &[u8]) -> (Vec<u8>, Vec<u8>) {
     } else {
         find_after_tag(&new_msg, 35).unwrap()
     };
-    // End offset: skip trailing 8349=XXXXXXXX SOH (14 bytes) + SOH (1 byte)
+    // End offset: skip the trailing signature field and SOH (14 bytes) + SOH (1 byte)
     let mut end = new_msg.len() as isize - 14 - 2;
     if is_fix41 {
-        end -= 7; // also skip 10=XXX SOH
+        end -= 7; // also skip the checksum field and its SOH
     }
     if end >= start as isize {
         let rng = end as usize - start + 1;
@@ -400,7 +457,7 @@ pub fn is_signed(msg: &[u8]) -> bool {
     trailer[0] == SOH && &trailer[1..6] == b"8349=" && trailer[14] == SOH
 }
 
-/// Un-distort and verify a signed FIX message.
+/// Un-distort and verify a signed wire message.
 ///
 /// Returns (undistorted_msg, new_iv, signature_valid).
 pub fn fix_unsign(msg: &[u8], mac_key: &[u8], iv: &[u8]) -> (Vec<u8>, Vec<u8>, bool) {
@@ -468,9 +525,9 @@ pub fn fix_unsign(msg: &[u8], mac_key: &[u8], iv: &[u8]) -> (Vec<u8>, Vec<u8>, b
     (msg_bytes, new_iv.to_vec(), sig_valid)
 }
 
-/// Read one complete FIX message from a reader.
+/// Read one complete wire message from a reader.
 ///
-/// Scans for `10=XXX\x01` (checksum tag) to detect message boundary.
+/// Scans for the checksum field and its closing SOH to detect message boundary.
 pub fn fix_read<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
@@ -483,7 +540,7 @@ pub fn fix_read<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
             ));
         }
         buf.extend_from_slice(&tmp[..n]);
-        // Look for checksum tag ending: \x0110=XXX\x01
+        // Look for the checksum field: SOH, the field, 3 digits, SOH
         if let Some(idx) = buf.windows(4).position(|w| w == b"\x0110=") {
             if let Some(end) = buf[idx + 4..].iter().position(|&b| b == SOH) {
                 let total = idx + 4 + end + 1;
@@ -493,7 +550,7 @@ pub fn fix_read<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Read one complete FIX message, tolerating transient read timeouts.
+/// Read one complete wire message, tolerating transient read timeouts.
 ///
 /// Identical to [`fix_read`] on the happy path, but a `WouldBlock`/`TimedOut`
 /// read (a poll-timeout expiry on a slow, high-latency gateway) is retried
@@ -676,7 +733,7 @@ mod tests {
     }
 
     // ibx#275: a frame is signed only when it ends with the signature
-    // trailer (before the checksum of a FIX.4.1 message).
+    // trailer (before the checksum field of a plain text message).
     #[test]
     fn is_signed_needs_the_trailer() {
         let mac_key: Vec<u8> = (0..20).collect();
@@ -720,7 +777,7 @@ mod tests {
 
     #[test]
     fn fix_parse_empty_value_raw() {
-        // "35=\x01" should parse tag 35 with empty string
+        // A message type field with no value should parse as an empty string
         let data = b"35=\x01";
         let parsed = fix_parse(data);
         assert_eq!(parsed.get(&35), Some(&String::new()));
@@ -733,6 +790,54 @@ mod tests {
         let parsed = fix_parse(data);
         assert_eq!(parsed.get(&55), Some(&"AAPL".to_string()));
         assert_eq!(parsed.get(&54), Some(&"1".to_string()));
+    }
+
+    // ibx#701: the field number is read from the bytes. What is not a
+    // number is skipped, a repeated field keeps its last value, a value
+    // keeps its '=' and a value that is not UTF-8 is kept with replacements.
+    #[test]
+    fn fix_parse_reads_field_numbers_from_the_bytes() {
+        let data = b"8=X\x01x5=1\x01=2\x0199999999999=3\x0158=a=b\x0158=c\x01 7=4\x01207=\xFFQ\x01";
+        let parsed = fix_parse(data);
+        assert_eq!(parsed.len(), 3, "{parsed:?}");
+        assert_eq!(parsed.get(&8).map(String::as_str), Some("X"));
+        assert_eq!(parsed.get(&58).map(String::as_str), Some("c"));
+        assert_eq!(parsed.get(&207).map(String::as_str), Some("\u{FFFD}Q"));
+        assert_eq!(fix_parse(b"58=a=b").get(&58).map(String::as_str), Some("a=b"));
+    }
+
+    // ibx#701: the borrowed map follows the same rules as the owned one;
+    // a value that is not UTF-8 makes the whole message fall back to the
+    // owned reading, with the same values.
+    #[test]
+    fn fix_parse_borrowed_reads_field_numbers_from_the_bytes() {
+        let data = b"8=X\x01x5=1\x01=2\x0199999999999=3\x0158=a=b\x0158=c\x01 7=4\x01207=Q\x01";
+        let parsed = fix_parse_borrowed(data).unwrap();
+        assert_eq!(parsed.len(), 3, "{parsed:?}");
+        assert_eq!(parsed.get(&8).copied(), Some("X"));
+        assert_eq!(parsed.get(&58).copied(), Some("c"));
+        assert_eq!(parsed.get(&207).copied(), Some("Q"));
+        assert_eq!(fix_parse_borrowed(b"58=a=b").unwrap().get(&58).copied(), Some("a=b"));
+        assert_eq!(fix_parse_borrowed(b"35=\x01").unwrap().get(&35).copied(), Some(""));
+        let owned = fix_parse(data);
+        assert!(parsed.iter().all(|(tag, val)| owned.get(tag).map(String::as_str) == Some(*val)));
+        assert_eq!(parsed.len(), owned.len());
+    }
+
+    #[test]
+    fn fix_fields_falls_back_to_the_owned_reading_on_a_value_not_utf8() {
+        let data = b"8=X\x01207=\xFFQ\x01\xDE\xAD=1\x0155=AAPL\x01";
+        assert!(fix_parse_borrowed(data).is_none());
+        let mut lossy = None;
+        let fields = fix_fields(data, &mut lossy);
+        assert_eq!(fields.len(), 3, "{fields:?}");
+        assert_eq!(fields.get(&207).copied(), Some("\u{FFFD}Q"));
+        assert_eq!(fields.get(&55).copied(), Some("AAPL"));
+        assert_eq!(fields.get(&8).copied(), Some("X"));
+        // A message in UTF-8 is borrowed: nothing goes to the owned map.
+        let mut unused = None;
+        assert_eq!(fix_fields(b"55=AAPL\x01", &mut unused).get(&55).copied(), Some("AAPL"));
+        assert!(unused.is_none());
     }
 
     #[test]

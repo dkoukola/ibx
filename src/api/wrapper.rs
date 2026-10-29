@@ -19,6 +19,14 @@ pub trait Wrapper {
     fn managed_accounts(&mut self, accounts_list: &str) {}
     fn error(&mut self, req_id: i64, error_code: i64, error_string: &str, advanced_order_reject_json: &str) {}
     fn current_time(&mut self, time: i64) {}
+    fn current_time_in_millis(&mut self, time_in_millis: i64) {}
+    /// The verification callbacks of the official client library. A
+    /// session opened without the intent to verify never gets them
+    /// (ibx#516).
+    fn verify_message_api(&mut self, api_data: &str) {}
+    fn verify_completed(&mut self, is_successful: bool, error_text: &str) {}
+    fn verify_and_auth_message_api(&mut self, api_data: &str, xyz_challange: &str) {}
+    fn verify_and_auth_completed(&mut self, is_successful: bool, error_text: &str) {}
 
     // ── Market Data ──
 
@@ -252,6 +260,17 @@ pub trait Wrapper {
 
     /// WSH event data, as `wshEventData` (ibx#443).
     fn wsh_event_data(&mut self, req_id: i64, data_json: &str) {}
+
+    // ── Configuration ──
+
+    /// The configuration, as `configResponseProtoBuf` (ibx#610). It comes
+    /// from session level 219.
+    fn config_response(&mut self, response: &crate::api::config::ConfigResponse) {}
+
+    /// The answer to an update of the configuration, as
+    /// `updateConfigResponseProtoBuf` (ibx#612). It comes from session
+    /// level 221.
+    fn update_config_response(&mut self, response: &crate::api::config::UpdateConfigResponse) {}
 }
 
 /// Test helpers for Wrapper-based testing. Hidden from docs; built only
@@ -270,6 +289,12 @@ pub mod tests {
     impl Wrapper for RecordingWrapper {
         fn connect_ack(&mut self) {
             self.events.push("connect_ack".into());
+        }
+        fn wsh_meta_data(&mut self, req_id: i64, data_json: &str) {
+            self.events.push(format!("wsh_meta_data:{req_id}:{data_json}"));
+        }
+        fn wsh_event_data(&mut self, req_id: i64, data_json: &str) {
+            self.events.push(format!("wsh_event_data:{req_id}:{data_json}"));
         }
         fn market_data_type(&mut self, req_id: i64, market_data_type: i32) {
             self.events.push(format!("market_data_type:{req_id}:{market_data_type}"));
@@ -477,6 +502,12 @@ pub mod tests {
         }
         fn soft_dollar_tiers(&mut self, req_id: i64, tiers: &[crate::types::SoftDollarTier]) {
             self.events.push(format!("soft_dollar_tiers:{req_id}:{}", tiers.len()));
+        }
+        fn receive_fa(&mut self, fa_data_type: i32, xml: &str) {
+            self.events.push(format!("receive_fa:{fa_data_type}:{xml}"));
+        }
+        fn replace_fa_end(&mut self, req_id: i64, text: &str) {
+            self.events.push(format!("replace_fa_end:{req_id}:{text}"));
         }
         fn display_group_list(&mut self, req_id: i64, groups: &str) {
             self.events.push(format!("display_group_list:{req_id}:{groups}"));

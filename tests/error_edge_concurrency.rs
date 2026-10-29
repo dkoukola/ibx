@@ -30,9 +30,10 @@ fn test_client() -> (EClient, crossbeam_channel::Receiver<ControlCommand>, Arc<S
 /// slot) at once. Without it each market data request waits for the
 /// registration timeout (5 s). Send `Shutdown` to end it; it returns the
 /// number of commands it got before.
-fn test_client_with_engine() -> (EClient, crossbeam_channel::Sender<ControlCommand>, thread::JoinHandle<usize>, Arc<SharedState>) {
+fn test_client_with_engine() -> (EClient, ibx::engine::park::ControlSender, thread::JoinHandle<usize>, Arc<SharedState>) {
     let shared = Arc::new(SharedState::new());
     let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = ibx::engine::park::ControlSender::from(tx);
     let engine = thread::spawn(move || {
         let mut count = 0;
         while let Ok(cmd) = rx.recv() {
@@ -77,7 +78,7 @@ fn place_order_invalid_action_is_refused_by_callback() {
     client.place_order(1, &spy(), &order).unwrap();
     assert!(rx.try_recv().is_err(), "nothing sent");
     let errors = shared.orders.drain_order_errors();
-    assert_eq!(errors, [(1, 321, "Error validating request.-'bH' : cause - Invalid side field was entered".to_string())]);
+    assert_eq!(errors, [(1, 321, "Error validating request.-'PlaceOrder(3)' : cause - Invalid side field was entered".to_string())]);
 }
 
 #[test]
@@ -91,25 +92,34 @@ fn place_order_empty_action_is_refused_by_callback() {
     client.place_order(1, &spy(), &order).unwrap();
     assert!(rx.try_recv().is_err(), "nothing sent");
     let errors = shared.orders.drain_order_errors();
-    assert_eq!(errors, [(1, 321, "Error validating request.-'bH' : cause - Invalid side field was entered".to_string())]);
+    assert_eq!(errors, [(1, 321, "Error validating request.-'PlaceOrder(3)' : cause - Invalid side field was entered".to_string())]);
 }
 
+// ibx#688: a name that is no order type is the reference's 321 callback
+// (observed on paper, 17/10/2026), not an error of the call; a documented
+// type ibx does not send still fails in the call.
 #[test]
-fn place_order_unsupported_order_type_returns_error() {
-    let (client, _rx, shared) = test_client();
+fn place_order_unknown_order_type_is_refused_by_callback() {
+    let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
         action: "BUY".into(), total_quantity: 100.0,
         order_type: "NONSENSE".into(), ..Default::default()
     };
-    let result = client.place_order(1, &spy(), &order);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("Unsupported order type"));
+    client.place_order(1, &spy(), &order).unwrap();
+    assert!(rx.try_recv().is_err(), "nothing sent");
+    let errors = shared.orders.drain_order_errors();
+    assert_eq!(errors, [(1, 321, "Error validating request.-'PlaceOrder(3)' : cause - Invalid order type was entered".to_string())]);
+    let not_sent = Order { order_type: "VWAP".into(), ..order };
+    assert!(client.place_order(2, &spy(), &not_sent).unwrap_err().contains("Unsupported order type"));
 }
 
+// Since ibx#622 an algo outside ibx's list is sent with its parameters as
+// given, as the reference sends it.
 #[test]
-fn place_order_unsupported_algo_returns_error() {
-    let (client, _rx, shared) = test_client();
+fn place_order_unknown_algo_is_sent() {
+    ibx::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
+    let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let order = Order {
         action: "BUY".into(), total_quantity: 100.0,
@@ -117,15 +127,15 @@ fn place_order_unsupported_algo_returns_error() {
         algo_strategy: "unknown_algo".into(),
         ..Default::default()
     };
-    let result = client.place_order(1, &spy(), &order);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("Unsupported algo"));
+    client.place_order(1, &spy(), &order).unwrap();
+    assert!(rx.try_iter().next().is_some(), "the order goes to the engine");
 }
 
 // A contract without a conId gets a slot of its own for the order, which
 // the engine looks up before the order goes out (ibx#486).
 #[test]
 fn place_order_zero_con_id_still_sends() {
+    ibx::client_core::set_session_level_for_test(Some(214)); // a capture at level 214 (ibx#602)
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
     let contract = Contract { con_id: 0, symbol: "TEST".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() };
@@ -739,7 +749,7 @@ fn shared_state_all_drains_empty_after_first_call() {
     ss.orders.push_cancel_reject(CancelReject { order_id: 1, instrument: 0,
         reject_type: 1, reason_code: 0, timestamp_ns: 0 });
     ss.market.push_tbt_trade(TbtTrade { instrument: 0, req_id: 1, tbt_type: TbtType::AllLast, price: PRICE_SCALE,
-        size: 1, timestamp: 0, exchange: String::new(), conditions: String::new(), past_limit: false, unreported: false });
+        size: 1.0, timestamp: 0, exchange: String::new(), conditions: String::new(), past_limit: false, unreported: false });
     ss.market.push_tbt_quote(TbtQuote { instrument: 0, req_id: 1, bid: PRICE_SCALE, ask: PRICE_SCALE,
         bid_size: 1, ask_size: 1, timestamp: 0, bid_past_low: false, ask_past_high: false });
 

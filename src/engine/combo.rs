@@ -5,10 +5,12 @@
 //! 28/09/2026, 30/09/2026 and 02/10/2026, ib-agent#105).
 //!
 //! - Smart combo: the BAG definition by the currency's smart combo conId
-//!   (logon tag 6611), the ICS definition the BAG record names (6346), the
-//!   definition of each leg, one after the other, the smart combo
-//!   validation of every leg at once, the combo multiplier (35=U 6040=36)
-//!   and the leg confirmation (35=U 6040=7).
+//!   (from the logon's smart combo field), the ICS definition the BAG
+//!   record names, the definition of each leg, one after the other, the
+//!   smart combo validation of every leg at once, the combo multiplier (a
+//!   gateway-specific message of the multiplier sub-type) and the leg
+//!   confirmation (a gateway-specific message of the leg confirmation
+//!   sub-type).
 //! - Directed combo: the BAG by symbol on its exchange, the ICS and leg
 //!   definitions on that exchange, the leg confirmation.
 //!
@@ -24,7 +26,7 @@ use crate::types::{ComboSpec, OrderId, Price, PRICE_SCALE};
 pub(crate) type Fields = Vec<(u32, String)>;
 
 /// Error 200, the reference's answer when a definition of the combo or of
-/// a leg is not found (`jextend.av.a(jsecdef.f, boolean)@24/@132/@395`).
+/// a leg is not found.
 pub(crate) const NO_DEFINITION: (i64, &str) = (200, "No security definition has been found for the request");
 
 /// One leg of a built combo.
@@ -41,6 +43,8 @@ pub(crate) struct Leg {
     pub currency: String,
     /// The leg's multiplier, 1 when its definition has none.
     pub multiplier: f64,
+    /// The trading permission class its definition names (ibx#510).
+    pub permission_key: String,
 }
 
 /// A combo built by the set-up requests.
@@ -55,27 +59,28 @@ pub(crate) struct Combo {
     pub currency: String,
     /// The BAG record's trading class (COMB).
     pub trading_class: String,
-    /// The legs in the contract's order: ascending conId (`jcomb.a9.C()`).
+    /// The legs in the contract's order: ascending conId.
     pub legs: Vec<Leg>,
-    /// The combo multiplier the server gave (6040=36), 1 when not asked.
+    /// The combo multiplier the server gave (multiplier answer), 1 when not asked.
     pub multiplier: f64,
 }
 
 impl Combo {
     /// The combo's symbol: the leg symbols, sorted, each once, comma
-    /// separated (`jcomb.a9.aI()`, `jclient.dy.R()`).
+    /// separated, as the reference writes it.
     pub(crate) fn symbol(&self) -> String {
         let symbols: std::collections::BTreeSet<&str> = self.legs.iter().map(|l| l.symbol.as_str()).collect();
         symbols.into_iter().collect::<Vec<_>>().join(",")
     }
 
-    /// The leg category of the combo (`jcomb.b2.g(List)`), tag 6134.
+    /// The leg category of the combo, as the reference reckons it (the leg
+    /// category field).
     pub(crate) fn category(&self) -> i32 {
         category(self.legs.iter().map(|l| l.sec_type.as_str()))
     }
 
     /// The legs sub-blocks: the leg count, then per leg its conId, ratio
-    /// and side (1 buy, 0 sell) (`jcomb.bk.a(StringBuffer, int, boolean)`).
+    /// and side (1 buy, 0 sell), as the reference writes them.
     fn legs_fields(&self) -> Fields {
         let mut f = vec![(6079, self.legs.len().to_string())];
         for leg in &self.legs {
@@ -86,11 +91,12 @@ impl Combo {
         f
     }
 
-    /// The combo block of a new order, after its conId (`pe.c@1767`,
-    /// `jcomb.bk.a(StringBuffer, boolean)`): the multiplier for the leg
+    /// The combo block of a new order, after its conId, as the reference
+    /// writes it: the multiplier for the leg
     /// categories that carry it, the legs, the combo type (0) and the leg
-    /// category. Captured 26/09/2026: `6079=2|6080=756733|6081=1|6082=1|
-    /// 6080=320227571|6081=1|6082=0|6175=0|6134=9`.
+    /// category. Captured 26/09/2026: a leg count of 2, then each leg as
+    /// conId, ratio and buy flag (756733 x1 buy, 320227571 x1 sell), combo
+    /// type 0, leg category 9.
     pub(crate) fn order_block(&self) -> Fields {
         let mut f = Fields::new();
         let category = self.category();
@@ -106,7 +112,7 @@ impl Combo {
     /// The combo key the reference shows as comboLegsDescrip: per leg in
     /// contract order its conId and its ratio, negative for a selling leg,
     /// the ratios divided by their greatest common divisor
-    /// (`jextend.protobuf.outgoing.a.b(jclient.pe)`). Captured:
+    ///. Captured:
     /// `756733|1,320227571|-1`.
     pub(crate) fn legs_descrip(&self) -> String {
         let divisor = self.legs.iter().fold(0, |g, l| gcd(g, l.ratio.unsigned_abs())).max(1) as i32;
@@ -156,7 +162,7 @@ impl Combo {
         }).collect()
     }
 
-    /// The combo price of per-leg prices (`jcomb.a9.a(double, o, double...)`):
+    /// The combo price of per-leg prices, as the reference reckons it:
     /// each leg price times its ratio and multiplier, added for a buying
     /// leg and taken off for a selling one, over the combo multiplier.
     /// Captured: 721.35 - 794.50 = -73.15.
@@ -199,7 +205,7 @@ fn format_number(v: f64) -> String {
 }
 
 /// The leg category of a combo by its legs' security types
-/// (`jcomb.b2.g(List)`): 0 for options, 9 for stocks, 1 for options and
+///: 0 for options, 9 for stocks, 1 for options and
 /// stocks, 2 futures, 3 stocks and futures, 4 options and futures, 5 all
 /// three, 7 futures options, 8 futures options and futures, 11 options and
 /// cash, 12 with a warrant, 13 with a commodity, 14 with a CFD, -1 else.
@@ -261,7 +267,8 @@ impl ComboKey {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Bag {
     pub con_id: i64,
-    /// conId of the ICS definition the record names (6346), 0 for none.
+    /// conId of the ICS definition the record names (its underlying conId
+    /// field), 0 for none.
     pub ics_con_id: i64,
     pub trading_class: String,
     /// What the outside-RTH rule reads from the BAG record (ibx#465).
@@ -440,9 +447,10 @@ impl ComboBook {
     }
 
     /// The BAG definition request: by the smart combo conId on BEST, or
-    /// by symbol on a directed exchange (captured 26/09/2026:
-    /// `35=c|320=SecDefReqMsgReqByConid81|321=2|146=1|6008=28812380|6004=BEST`,
-    /// `35=c|320=FixSecDefReqBySymbol102|321=2|55=QQQ,SPY|167=BAG|100=ARCA`).
+    /// by symbol on a directed exchange (captured 26/09/2026: a security
+    /// definition request by conId, contract id 28812380 on BEST, and one by
+    /// symbol, `FixSecDefReqBySymbol`, symbol QQQ,SPY, security type BAG,
+    /// exchange ARCA).
     fn bag_request(&mut self, setup: &mut Setup, ts: &str) -> Fields {
         setup.step = Step::Bag;
         if is_smart(&setup.spec.exchange) {
@@ -482,8 +490,9 @@ impl ComboBook {
         }
     }
 
-    /// The combo multiplier request (captured: `35=U|6040=36|
-    /// 320=FixIMCMultReq79|207=BEST|6134=9|6079=2|...|6175=0`).
+    /// The combo multiplier request (captured: a gateway-specific message of
+    /// the multiplier sub-type, with the request id, security exchange BEST,
+    /// the leg category, the legs and combo type 0).
     fn multiplier_request(&mut self, setup: &mut Setup, ts: &str) -> Fields {
         setup.step = Step::Multiplier;
         setup.req_id = self.next_req("FixIMCMultReq");
@@ -497,10 +506,11 @@ impl ComboBook {
         f
     }
 
-    /// The leg confirmation (`jcomb.fJ.a(StringBuffer)`; captured:
-    /// `35=U|6040=7|320=FixComboLegConfirmRequest80|207=BEST|6134=9|6248=1|
-    /// 6079=2|...|6175=0`), with the non-guaranteed flag when the order has
-    /// it.
+    /// The leg confirmation (as the reference writes it; captured:
+    /// a gateway-specific message of the leg confirmation sub-type, with the
+    /// request id, security exchange BEST, the leg category, the
+    /// non-guaranteed flag, the legs and combo type 0), with the
+    /// non-guaranteed flag when the order has it.
     fn confirm_request(&mut self, setup: &mut Setup, ts: &str) -> Fields {
         setup.step = Step::Confirm;
         setup.req_id = self.next_req("FixComboLegConfirmRequest");
@@ -517,7 +527,7 @@ impl ComboBook {
         f
     }
 
-    /// A definition reply (35=d) for a set-up request. None when the reply
+    /// A definition reply (security definition answer) for a set-up request. None when the reply
     /// is not for one.
     pub(crate) fn secdef_reply(&mut self, req_id: &str, msg: &[u8], ts: &str) -> Option<Progress> {
         let idx = self.setups.iter().position(|s| match &s.step {
@@ -557,7 +567,7 @@ impl ComboBook {
                     Some(def) => {
                         let sec_type = api_sec_type(first_tag(msg, 167).unwrap_or(""));
                         if sec_type == "STK" && !is_smart(&setup.spec.exchange) {
-                            // `jextend.av.a(jsecdef.f, boolean)@219-280`.
+                            // The reference's rule.
                             Err((10125, format!(
                                 "Combos with STK legs are only supported on SMART. Please change the exchange for your BAG contract from '{}' to 'SMART'.",
                                 setup.spec.exchange)))
@@ -571,6 +581,7 @@ impl ComboBook {
                                 sec_type,
                                 currency: def.currency.clone(),
                                 multiplier: if def.multiplier > 0.0 { def.multiplier } else { 1.0 },
+                                permission_key: first_tag(msg, 6411).unwrap_or("").to_string(),
                             });
                             Ok(self.leg_request(&mut setup, i + 1, ts))
                         }
@@ -596,9 +607,9 @@ impl ComboBook {
         Some(self.advance(setup, result))
     }
 
-    /// A 35=U answer (6040=36, 6040=7) for a set-up request. None when the
-    /// answer is not for one.
-    pub(crate) fn user_reply(&mut self, parsed: &HashMap<u32, String>, ts: &str) -> Option<Progress> {
+    /// A gateway-specific answer (multiplier or leg confirmation) for a
+    /// set-up request. None when the answer is not for one.
+    pub(crate) fn user_reply(&mut self, parsed: &crate::protocol::fix::FieldMap<'_>, ts: &str) -> Option<Progress> {
         let req_id = parsed.get(&320)?;
         let idx = self.setups.iter().position(|s| &s.req_id == req_id
             && matches!(s.step, Step::Multiplier | Step::Confirm))?;
@@ -610,7 +621,7 @@ impl ComboBook {
                 Ok(vec![self.confirm_request(&mut setup, ts)])
             }
             _ => {
-                // The combo key (6085) gives the legs; the order keeps
+                // The combo key field gives the legs; the order keeps
                 // them by conId.
                 let combo = setup_combo(&setup);
                 log::info!("Combo {} built: BAG conId {}, key {:?}", combo.symbol(), combo.bag_con_id, parsed.get(&6085));
@@ -646,6 +657,15 @@ impl ComboBook {
         self.built.values().next().cloned()
     }
 
+    /// A combo built before, for a test.
+    #[cfg(test)]
+    pub(crate) fn seed_built_for_test(&mut self, combo: Combo) {
+        let mut legs: Vec<(i64, i32, bool)> = combo.legs.iter().map(|l| (l.con_id, l.ratio, l.buy)).collect();
+        legs.sort_unstable();
+        let key = ComboKey { exchange: combo.exchange.to_uppercase(), currency: combo.currency.clone(), legs };
+        self.built.insert(key, combo);
+    }
+
     /// The BAG definition of a built combo, for the outside-RTH rule.
     pub(crate) fn bag_types(&self, combo: &Combo) -> Option<&RthTypes> {
         self.bags.values().find(|b| b.con_id == combo.bag_con_id).map(|b| &b.types)
@@ -677,9 +697,8 @@ impl ComboBook {
     }
 }
 
-/// A definition request by conId (`jfix.bf.a(StringBuffer,
-/// ArConidExchangePair, int, int)`): `35=c|320={id}|321=2|146=1|6008=
-/// {conId}|6004={exchange}`.
+/// A definition request by conId on an exchange, as the reference
+/// writes it.
 fn by_con_id(ts: &str, req_id: &str, con_id: i64, exchange: &str) -> Fields {
     vec![
         (35, "c".to_string()), (52, ts.to_string()), (320, req_id.to_string()), (321, "2".to_string()),
@@ -704,8 +723,8 @@ fn setup_combo(setup: &Setup) -> Combo {
 }
 
 /// The reference's checks of a built combo before the order goes out, in
-/// its order, with the code itself (`jextend.dC.a(jclient.dy)`,
-/// `trader.order.proc.aN`): legs in more than one currency (10000), a BAG
+/// its order and with its error codes: legs
+/// in more than one currency (10000), a BAG
 /// symbol that is not among the legs' (478), a non-guaranteed smart combo
 /// without exactly two legs (10002).
 pub(crate) fn order_refusal(combo: &Combo, spec: &ComboSpec) -> Option<(i64, String)> {
@@ -769,9 +788,9 @@ mod tests {
             trading_class: "COMB".into(), multiplier: 1.0,
             legs: vec![
                 Leg { con_id: 756733, ratio: 1, buy: true, exchange: "SMART".into(), symbol: "SPY".into(),
-                    sec_type: "STK".into(), currency: "USD".into(), multiplier: 1.0 },
+                    sec_type: "STK".into(), currency: "USD".into(), multiplier: 1.0, permission_key: String::new() },
                 Leg { con_id: 320227571, ratio: 1, buy: false, exchange: "SMART".into(), symbol: "QQQ".into(),
-                    sec_type: "STK".into(), currency: "USD".into(), multiplier: 1.0 },
+                    sec_type: "STK".into(), currency: "USD".into(), multiplier: 1.0, permission_key: String::new() },
             ],
         };
         let px = |v: f64| (v * PRICE_SCALE as f64).round() as Price;
@@ -832,6 +851,7 @@ mod tests {
                     sec_type: "OPT".into(),
                     currency: "USD".into(),
                     multiplier: 100.0,
+                    permission_key: String::new(),
                 },
                 Leg {
                     con_id: 6,
@@ -842,6 +862,7 @@ mod tests {
                     sec_type: "OPT".into(),
                     currency: "USD".into(),
                     multiplier: 50.0,
+                    permission_key: String::new(),
                 },
             ],
             // Directed combos never make the server multiplier request.
@@ -942,11 +963,11 @@ mod tests {
         assert_eq!(p.send.iter().map(text).collect::<Vec<_>>(),
             ["35=U|6040=36|320=FixIMCMultReq7|207=BEST|6134=9|6079=2|6080=756733|6081=1|6082=1|6080=320227571|6081=1|6082=0|6175=0"]);
         let mult: HashMap<u32, String> = [(320, "FixIMCMultReq7".to_string()), (231, "1".to_string())].into();
-        let p = book.user_reply(&mult, "T").unwrap();
+        let p = book.user_reply(&crate::protocol::fix::field_view(&mult), "T").unwrap();
         assert_eq!(p.send.iter().map(text).collect::<Vec<_>>(),
             ["35=U|6040=7|320=FixComboLegConfirmRequest8|207=BEST|6134=9|6248=1|6079=2|6080=756733|6081=1|6082=1|6080=320227571|6081=1|6082=0|6175=0"]);
         let confirm: HashMap<u32, String> = [(320, "FixComboLegConfirmRequest8".to_string()), (6085, "756733/1,320227571/-1".to_string())].into();
-        let p = book.user_reply(&confirm, "T").unwrap();
+        let p = book.user_reply(&crate::protocol::fix::field_view(&confirm), "T").unwrap();
         assert!(p.release && p.send.is_empty());
 
         let Ready::Built(combo) = book.ready(1, &spec, "T") else { panic!() };
@@ -996,7 +1017,8 @@ mod tests {
     #[test]
     fn non_guaranteed_needs_two_legs_and_one_currency() {
         let leg = |con_id: i64, currency: &str| Leg { con_id, ratio: 1, buy: true, exchange: "SMART".into(),
-            symbol: format!("S{con_id}"), sec_type: "STK".into(), currency: currency.into(), multiplier: 1.0 };
+            symbol: format!("S{con_id}"), sec_type: "STK".into(), currency: currency.into(), multiplier: 1.0,
+            permission_key: String::new() };
         let combo = |legs: Vec<Leg>| Combo { bag_con_id: 1, exchange: "SMART".into(), routed: "BEST".into(),
             currency: "USD".into(), trading_class: "COMB".into(), legs, multiplier: 1.0 };
         let spec = spy_qqq("");

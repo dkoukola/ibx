@@ -1,4 +1,4 @@
-//! Endpoint coverage manifest and gap reporting for IB compatibility suite.
+//! Endpoint coverage manifest and gap reporting for the compatibility suite.
 //!
 //! This phase enforces that every `ControlCommand` variant is either:
 //! - covered by an integration phase in this suite, or
@@ -22,6 +22,9 @@ const TESTED_CONTROL_COMMANDS: &[&str] = &[
     "Order",
     "RegisterInstrument",
     "RegisterOrderContract", // order_paths_paper order_by_symbol (ibx#486)
+    "RegisterOrderSlot", // order_paths_paper refusals_of_10_51 (ibx#743)
+    "HoldOrder", // order_paths_paper bracket_with_transmit_off (ibx#509)
+    "OrderGroup", // order_paths_paper bracket_with_transmit_off (ibx#547)
     "FetchHistorical",
     "CancelHistorical",
     "FetchHeadTimestamp",
@@ -51,6 +54,22 @@ const TESTED_CONTROL_COMMANDS: &[&str] = &[
 
 const KNOWN_CONTROL_COMMAND_GAPS: &[(&str, &str)] = &[
     (
+        "MarketDataSlot",
+        "The slot of a market data request, told ahead of the request (ibx#561); part of req_mkt_data, covered by the client and engine unit tests and the market data phases",
+    ),
+    (
+        "LocalError",
+        "An error of the client itself, given to the engine for its turn (ibx#561), not a request; covered by the engine unit tests",
+    ),
+    (
+        "Turn",
+        "The turn of a request the client answers itself (ibx#561), not a request of its own; covered by the engine unit tests",
+    ),
+    (
+        "Unpaced",
+        "A wrapper around another command for the pacing of requests (ibx#555), not a request; covered by the engine and sender unit tests",
+    ),
+    (
         "DisplayGroupLookup",
         "Checked on the paper account by examples/ex424_display_groups (ibx#424), not by a phase of this suite",
     ),
@@ -63,12 +82,24 @@ const KNOWN_CONTROL_COMMAND_GAPS: &[(&str, &str)] = &[
         "Gateway-local response path, no CCP round-trip in hot loop yet",
     ),
     (
+        "CompletedOrders",
+        "reqCompletedOrders: the server's finished orders of the day (ibx#695); replayed in tests/scenario_replay.rs",
+    ),
+    (
         "FetchSoftDollarTiers",
         "Gateway-local response path, no CCP round-trip in hot loop yet",
     ),
     (
         "FetchUserInfo",
         "Gateway-local response path, no CCP round-trip in hot loop yet",
+    ),
+    (
+        "WshRequest",
+        "Sent only with the calendar data permission (ibx#443); the paper account has none and gets 10276. Exercised by unit tests",
+    ),
+    (
+        "FaSave",
+        "Sent only by replace_fa on an FA session (ibx#507); the paper account is not FA. Exercised by unit tests",
     ),
     (
         "FetchMktDepthExchanges",
@@ -79,6 +110,10 @@ const KNOWN_CONTROL_COMMAND_GAPS: &[(&str, &str)] = &[
     (
         "DropSnapshot",
         "Sent only by the regulatory snapshot fetcher of the clients (req_mkt_data with          regulatory_snapshot) when a fetch ends; the regulatory snapshot is billed on live          accounts, so no phase sends it. Exercised by unit tests",
+    ),
+    (
+        "PnlQuotes",
+        "Sent only by the clients' P&L requests (req_pnl, req_pnl_single, ibx#511); no phase of this          suite sends them. Exercised by the paper P&L tests and by unit tests",
     ),
     (
         "SubscribeAccountSummary",

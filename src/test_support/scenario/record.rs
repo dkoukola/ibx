@@ -20,6 +20,8 @@ pub struct Rec {
     pub leg: String,
     /// `api:<port>`, `CCP`, `usfarm`, ...
     pub conn: String,
+    /// When it was recorded, in ns of the recording's clock.
+    pub nanos: u64,
     /// The frame's message type, or the API message's name.
     pub msg: String,
     pub raw: Vec<u8>,
@@ -63,6 +65,12 @@ pub fn load_codec(name: &str) -> Scenario {
 /// A four-leg scenario by its path under tests/fixtures/gw1040/scenarios/
 /// (`20260926/lmt_cancel`), with its decoded API side.
 pub fn load_scenario(rel: &str) -> Scenario {
+    // A scenario of the reference 10.51 recorded with the client at level
+    // 214: `gw1051/<date>/<name>` (ibx#515).
+    if let Some(rest) = rel.strip_prefix("gw1051/") {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gw1051/scenarios");
+        return load_path(&dir.join(format!("{rest}.jsonl")));
+    }
     load_path(&fixtures_dir().join("scenarios").join(format!("{rel}.jsonl")))
 }
 
@@ -105,6 +113,7 @@ pub fn load_path(path: &Path) -> Scenario {
             seq,
             leg: s("leg"),
             conn: s("conn"),
+            nanos: v["nanos"].as_u64().unwrap_or(0),
             msg: if v["msg_type"].is_string() { s("msg_type") } else { s("msg_name") },
             raw: v["raw_b64"].as_str().map(|b| base64::engine::general_purpose::STANDARD.decode(b).unwrap()).unwrap_or_default(),
             request: decoded["request"].clone(),
@@ -114,10 +123,17 @@ pub fn load_path(path: &Path) -> Scenario {
     Scenario { header, recs }
 }
 
+/// The client library's unset Decimal, as its text.
+const UNSET_DECIMAL: &str = "170141183460469231731687303715884105727";
+
 /// A number of the client library as text: `"80"` (a decimal) or `80.0`.
 pub fn num(v: &Value) -> f64 {
     match v {
         Value::String(s) if s == "MAX" => f64::MAX,
+        // The client library's unset Decimal (2**127 - 1), given from level
+        // 225 where 214 gave the unset double: unset either way, which is
+        // f64::MAX in ibx (ibx#604).
+        Value::String(s) if s == UNSET_DECIMAL => f64::MAX,
         Value::String(s) => s.parse().unwrap_or_else(|_| panic!("number {s}")),
         Value::Number(n) => n.as_f64().unwrap(),
         Value::Bool(b) => *b as u8 as f64,
@@ -158,6 +174,16 @@ pub fn canonical(cb: &Value) -> Option<String> {
         "marketDataType" => format!("marketDataType|{}|{}", i(1), i(2)),
         "tickReqParams" => format!("tickReqParams|{}|{}|{}|{}", i(1), n(num(&a[2])), s(3), i(4)),
         "tickSnapshotEnd" => format!("tickSnapshotEnd|{}", i(1)),
+        // Option computations (ibx#646): each value, "-" when not computed.
+        "tickOptionComputation" => {
+            let v = |k: usize| if a[k].is_null() { "-".to_string() } else { n(num(&a[k])) };
+            format!("tickOptionComputation|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                i(1), i(2), i(3), v(4), v(5), v(6), v(7), v(8), v(9), v(10), v(11))
+        }
+        // The recordings are of the reference 10.40; 10.51, which ibx
+        // copies, adds the order id to 103 (ibx#625): read in that form
+        // until they are made again on 10.51 (ibx#604).
+        "error" if i(3) == 103 && s(4) == "Duplicate order id" => format!("error|{}|103|Duplicate order id: {}", i(1), i(1)),
         "error" => format!("error|{}|{}|{}", i(1), i(3), s(4)),
         "orderStatus" => format!(
             "orderStatus|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
@@ -165,6 +191,21 @@ pub fn canonical(cb: &Value) -> Option<String> {
         ),
         "openOrder" => open_order_line(i(1), &a[2], &a[3], &a[4]),
         "openOrderEnd" => "openOrderEnd".into(),
+        // reqCompletedOrders (ibx#515): the contract, the order's main
+        // fields, its filled quantity and its final status.
+        "completedOrder" => {
+            let (c, o) = (&a[1], &a[2]);
+            let os = |k: &str| o[k].as_str().unwrap_or("").to_string();
+            let price = |k: &str| if o[k].is_null() { "-".to_string() } else { order_price(num(&o[k])) };
+            format!(
+                "completedOrder|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                c["conId"].as_i64().unwrap_or(0), c["symbol"].as_str().unwrap_or(""), os("action"), n(num(&o["totalQuantity"])),
+                os("orderType"), price("lmtPrice"), price("auxPrice"), os("tif"), os("orderRef"),
+                perm(if o["permId"].is_null() { 0 } else { num(&o["permId"]) as i64 }),
+                n(num(&o["filledQuantity"])), a[3]["status"].as_str().unwrap_or(""),
+            )
+        }
+        "completedOrdersEnd" => "completedOrdersEnd".into(),
         "execDetails" => {
             let (c, e) = (&a[2], &a[3]);
             let es = |k: &str| e[k].as_str().unwrap_or("").to_string();
@@ -269,21 +310,32 @@ pub fn perm(v: i64) -> &'static str {
     if v == 0 { "0" } else { "{perm}" }
 }
 
-/// The fields of an openOrder the comparison covers. trailStopPrice only
-/// for a plain TRAIL order, whose stop is the one the server reports
-/// (6117, captured 05/10/2026); the reference shows one for other orders
-/// too that is not read yet (a LMT at 272.86 shows 273.86, ibx#491): see
-/// [`compared_field`].
+/// The fields of an openOrder the comparison covers; the exchange and the
+/// primary exchange of its contract follow them. trailStopPrice for the
+/// order types whose value is read: see [`compared_field`].
 pub const OPEN_ORDER_FIELDS: &[&str] = &[
     "action", "totalQuantity", "orderType", "lmtPrice", "auxPrice", "tif", "ocaGroup", "orderRef",
     "parentId", "outsideRth", "goodAfterTime", "goodTillDate", "account", "trailingPercent",
     "trailStopPrice", "whatIf", "permId", "clientId",
+    "ocaType", "clearingIntent", "shareholder", "deltaNeutralOrderType", "adjustedOrderType", "submitter",
 ];
+
+/// The submitter of an order as the comparison shows it: the user name is
+/// masked in the recordings, so only whether there is one.
+pub fn submitter(name: &str) -> &'static str {
+    if name.is_empty() { "" } else { "{user}" }
+}
 
 /// Whether a field of [`OPEN_ORDER_FIELDS`] is compared for an order of
 /// this type.
-pub fn compared_field(field: &str, order_type: &str) -> bool {
-    field != "trailStopPrice" || order_type == "TRAIL"
+pub fn compared_field(field: &str, order_type: &str, sec_type: &str) -> bool {
+    // A plain TRAIL shows the stop the server reports (captured
+    // 05/10/2026); a LMT, PEG BEST or STP the value the reference derives
+    // (ibx#519, ibx#521), a combo too; TRAIL MIT, TRAIL LIT and TRAIL
+    // LIMIT the one the order was placed with.
+    let _ = sec_type;
+    field != "trailStopPrice"
+        || matches!(order_type, "TRAIL" | "LMT" | "PEG BEST" | "STP" | "TRAIL MIT" | "TRAIL LIT" | "TRAIL LIMIT")
 }
 
 /// A price field of an openOrder: unset (the client library's MAX, ibx's
@@ -299,8 +351,10 @@ pub fn open_order_line(id: i64, contract: &Value, order: &Value, state: &Value) 
     let field = |k: &str| -> String {
         let v = &order[k];
         match k {
-            "action" | "orderType" | "tif" | "ocaGroup" | "orderRef" | "goodAfterTime" | "goodTillDate" | "account" =>
+            "action" | "orderType" | "tif" | "ocaGroup" | "orderRef" | "goodAfterTime" | "goodTillDate" | "account"
+            | "clearingIntent" | "shareholder" | "deltaNeutralOrderType" | "adjustedOrderType" =>
                 v.as_str().unwrap_or("").to_string(),
+            "submitter" => submitter(v.as_str().unwrap_or("")).to_string(),
             "outsideRth" | "whatIf" => v.as_bool().unwrap_or(false).to_string(),
             "lmtPrice" | "auxPrice" | "trailingPercent" | "trailStopPrice" =>
                 if v.is_null() { "-".into() } else { order_price(num(v)) },
@@ -309,8 +363,12 @@ pub fn open_order_line(id: i64, contract: &Value, order: &Value, state: &Value) 
         }
     };
     let order_type = order["orderType"].as_str().unwrap_or("");
-    let fields: Vec<String> = OPEN_ORDER_FIELDS.iter().filter(|k| compared_field(k, order_type))
+    let sec_type = contract["secType"].as_str().unwrap_or("");
+    let mut fields: Vec<String> = OPEN_ORDER_FIELDS.iter().filter(|k| compared_field(k, order_type, sec_type))
         .map(|k| format!("{k}={}", field(k))).collect();
+    let primary = contract["primaryExchange"].as_str().or(contract["primaryExch"].as_str()).unwrap_or("");
+    fields.push(format!("exchange={}", contract["exchange"].as_str().unwrap_or("")));
+    fields.push(format!("primaryExchange={primary}"));
     format!(
         "openOrder|{id}|{}|{}|{}|{}|{}",
         contract["conId"].as_i64().unwrap_or(0), contract["symbol"].as_str().unwrap_or(""),
@@ -318,7 +376,7 @@ pub fn open_order_line(id: i64, contract: &Value, order: &Value, state: &Value) 
     )
 }
 
-/// Rebuild a text frame (`8=FIX...`) with changed fields: the body length
+/// Rebuild a text frame with changed fields: the body length
 /// and the checksum computed again; the other fields kept in their order.
 pub fn rebuild_text(fields: &[(u32, String)]) -> Vec<u8> {
     let begin = fields.iter().find(|(t, _)| *t == 8).map_or("FIX.4.1", |(_, v)| v.as_str());
@@ -333,7 +391,7 @@ pub fn rebuild_text(fields: &[(u32, String)]) -> Vec<u8> {
     msg
 }
 
-/// Rebuild a farm frame with a text body (`8=O|9=|35=Q|<body>|8349=..`)
+/// Rebuild a farm binary frame with a text body (header, body, signature)
 /// with another body; the length counts the signature, as on the wire.
 pub fn rebuild_binary(raw: &[u8], new_body: &str) -> Vec<u8> {
     let text = String::from_utf8_lossy(raw);
@@ -343,7 +401,7 @@ pub fn rebuild_binary(raw: &[u8], new_body: &str) -> Vec<u8> {
     format!("8=O\x019={:04}\x01{body}", body.len()).into_bytes()
 }
 
-/// The text body of a farm frame (the part after `35=X`).
+/// The text body of a farm frame (the part after the message type field).
 pub fn binary_body(raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);
     let after = text.split_once("\x0135=").unwrap().1;

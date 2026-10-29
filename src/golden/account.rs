@@ -1,4 +1,4 @@
-//! Account summary (35=U|6040=55 request, 35=UM / 35=RL / 35=EB answer):
+//! Account summary (its request; the update frames and end marker answering it):
 //! the request against the reference's, the rows against the callbacks
 //! the reference gave.
 
@@ -12,7 +12,7 @@ fn tag(f: &Fields, t: u32) -> Option<&str> {
 }
 
 /// An account summary request as compared: the framing dropped, the
-/// subscription id (6529) masked.
+/// subscription id masked.
 fn request_message(f: &Fields) -> String {
     let out: Fields = Normaliser::framing().apply(f).into_iter()
         .map(|(t, v)| if t == 6529 { (t, "{id}".to_string()) } else { (t, v) }).collect();
@@ -29,7 +29,10 @@ struct AccountReplay {
 /// Replay the account summary requests of a fixture: the server's frames
 /// with ibx's subscription id in place of the reference's.
 fn replay_account_summary(fx: &Fixture) -> AccountReplay {
-    let mut s = Session::new().in_zone(&fx.header);
+    let mut s = Session::new().as_recorded(&fx.header);
+    // The recording's gateway process had served account updates in an
+    // earlier session: its frames come twice (ibx#752).
+    s.call(|c| { let _ = c.core.subscribe_account_updates(true); });
     let mut theirs = Vec::new();
     let mut requests_theirs = Vec::new();
     // The reference's subscription id and ibx's, in request order.
@@ -79,22 +82,26 @@ fn replay_account_summary(fx: &Fixture) -> AccountReplay {
 }
 
 // reqAccountSummary of four tags and $LEDGER:ALL, then its cancel
-// (26/09/2026, account_summary, market closed): the subscription and its
-// cancel (with the group) as the reference's; the four tag rows of the
-// 35=UM frame.
+// (18/10/2026 on 10.51 at level 225, account_summary, market closed,
+// ibx#604): the subscription as the reference's; the cancel changes nothing
+// at this level (ibx#602): the reference cancels the server subscription
+// only when the client's session ends, which the replay has not; the four
+// tag rows of the account update frame.
 #[test]
 fn account_summary_request_and_tag_rows() {
     let r = replay_account_summary(&load("account_summary"));
-    assert_eq!(r.requests_ours, r.requests_theirs);
+    // The reference's requests: the subscription, then its cancel at the
+    // session's end.
     assert_eq!(r.requests_theirs.len(), 2);
+    assert_eq!(r.requests_ours, r.requests_theirs[..1]);
     assert_same_callbacks(&r.ours[..4], &r.theirs[..4]);
 }
 
 // The rest of the answer: the reference gives the tag rows twice, and the
 // $LEDGER:ALL rows per currency (USD, then BASE) for the account "All"
 // written as its account values (933115.0500 gives 933115.05), then the
-// end, twice (ACCOUNT-SUMMARY 1.3 and 1.5: the ALL sum of ef.a(); the
-// listener registered twice by b2.o()).
+// end, twice: the recording's process had served account updates in an
+// earlier session (ibx#752; recorded again on 10.51, 18/10/2026).
 #[test]
 fn account_summary_ledger_all_rows() {
     let r = replay_account_summary(&load("account_summary"));

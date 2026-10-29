@@ -19,7 +19,7 @@ pip install git+https://github.com/deepentropy/ibx
 
 ## Credentials
 
-IBX connects directly to IB servers — there is no separate gateway process. Set your account credentials via environment variables:
+IBX connects directly to the broker's servers — there is no separate gateway process. Set your account credentials via environment variables:
 
 ```bash
 export IB_USERNAME="your_username"
@@ -52,6 +52,9 @@ fn main() {
         host: "cdc1.ibllc.com".into(),
         paper: true,
         core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     }).unwrap();
 
     let spy = Contract { con_id: 756733, symbol: "SPY".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() };

@@ -3,7 +3,7 @@
 //! An order left open by an earlier session is listed by the server at
 //! connect (the logon replay). `req_global_cancel` cancels every order of
 //! the book, as the reference: those of this session, of other clients and
-//! of earlier sessions. An order the replay gave as not routed yet (39=A)
+//! of earlier sessions. An order the replay gave as not routed yet (PreSubmitted)
 //! was not in the book, so the global cancel sent nothing for it (paper
 //! 04/10/2026).
 //!
@@ -13,7 +13,7 @@
 //!
 //! The order ids are the reference's (ibx#466): 32-bit, the next valid id
 //! the highest order id the client used + 1. The new order carries its API
-//! order id (6121), so session 2 lists it with the order id of session 1,
+//! order id, so session 2 lists it with the order id of session 1,
 //! and its next valid id is above it. Its permId is the server id it went
 //! out under, of the order id generator; the orders are told apart by
 //! permId too.
@@ -81,7 +81,7 @@ fn get_config() -> Option<EClientConfig> {
     let username = env::var("IB_USERNAME").ok()?;
     let password = env::var("IB_PASSWORD").ok()?;
     let host = env::var("IB_HOST").unwrap_or_else(|_| "cdc1.ibllc.com".to_string());
-    Some(EClientConfig { username, password, host, paper: true, core_id: None })
+    Some(EClientConfig { username, password, host, paper: true, core_id: None, client_id: 0, copied_waits: false, code_provider: None })
 }
 
 /// Connect, and refuse to go on unless this is a paper account (id starts with DU).
@@ -133,6 +133,7 @@ fn global_cancel_reaches_orders_from_an_earlier_session() {
     // The listing only (the replay's reports gave openOrder already).
     probe.state.lock().unwrap().open.clear();
     client.req_all_open_orders(&mut probe);
+    client.process_msgs(&mut probe);
     let open = probe.state.lock().unwrap().open.clone();
     println!("  session 2: {} open order(s) listed: {:?}", open.len(), open);
     let listed: Vec<i64> = open.iter().map(|&(_, p)| p).collect();

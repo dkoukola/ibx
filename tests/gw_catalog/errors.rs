@@ -18,6 +18,27 @@ use super::catalog::{self, matches_template};
 /// raises them itself.
 const CLIENT_CODES: &[(i64, &str)] = &[
     (504, "the API client's 'Not connected' (the client library's own code, not a gateway code)"),
+    (503, "the API client's refusal of a request the session's version does not have (ibx#516)"),
+    (544, "the API client's refusal of a verify request made without the intent to verify (ibx#516)"),
+    (551, "the API client's refusal of a verify and auth request made without the intent to verify (ibx#516)"),
+    (588, "the API client's failure to encode an order whose margin condition has a float percent (ibx#722)"),
+];
+
+/// Texts seen on the reference under a code whose text in the table is
+/// another one.
+const OBSERVED_TEXTS: &[(i64, &str, &str)] = &[
+    (391, "%s: The date, time, or time-zone entered is invalid.",
+        "a goodTillDate that cannot be read (ibx#548, paper 11/10/2026)"),
+    (200, "The contract description specified for %s is ambiguous.",
+        "a tick-by-tick request with no exchange whose contract is listed on several exchanges (ibx#702, paper 15/10/2026)"),
+    (148, "Conditional submission of orders is supported for Limit, Market, MidPrice, Relative and Snap order types only. Conditional cancellation of orders is supported for Limit, MidPrice, IBAlgo - Limit order types only.",
+        "the two sentences joined by one space (ibx#688, paper 17/10/2026)"),
+    (401, "OCA Group", "an OCA group name longer than 64 characters (ibx#688, paper 17/10/2026)"),
+    (2181, "Warning: The 'OptOutFromSmartRouting' order attribute is not supported.",
+        "opting out of smart routing, with \"Warning: \" before the text (ibx#688, paper 17/10/2026)"),
+    (2185, "Max Hedging Size Warning
+Restriction is specified in Precautionary Settings of Global Configuration/Presets.",
+        "the hedge-size precaution: its title and the presets' precaution line (ibx#602, paper 16/10/2026, regular hours)"),
 ];
 
 /// One place where ibx raises an error.
@@ -360,9 +381,12 @@ fn differences(raises: &[Raise], codes: &BTreeMap<i64, catalog::ErrorCode>) -> V
         };
         let Some(text) = &r.text else { continue };
         let ibx = sample(text);
-        // Only the values, or a code whose texts are written in the
-        // gateway's code (no message in its table): nothing to compare.
+        // Only the values, or a code with no message in the gateway's
+        // table: nothing to compare.
         if ibx.chars().all(|c| c == '\u{1}') || gw.texts().is_empty() {
+            continue;
+        }
+        if OBSERVED_TEXTS.iter().any(|(code, t, _)| *code == r.code && matches_template(t, &ibx, true)) {
             continue;
         }
         if !gw.texts().iter().any(|t| matches_template(t, &ibx, true)) {
@@ -415,7 +439,7 @@ fn the_error_check_finds_each_kind_of_difference() {
     let ok = [
         raise(201, "Order rejected - reason:%s"),
         raise(10147, "OrderId %s that needs to be cancelled is not found."),
-        raise(321, "Error validating request.-'bH' : cause - Invalid trigger method"),
+        raise(321, "Error validating request.-'PlaceOrder(3)' : cause - Invalid trigger method"),
         raise(104, "Cannot modify a filled order."),
     ];
     assert_eq!(differences(&ok, &codes), Vec::<String>::new());
@@ -425,7 +449,7 @@ fn the_error_check_finds_each_kind_of_difference() {
     assert!(text[0].contains("is not the gateway's text"), "{text:?}");
     let wrapped = differences(&[raise(146, "Invalid trigger method")], &codes);
     assert!(wrapped[0].contains("as the cause of 321"), "{wrapped:?}");
-    let own = differences(&[raise(321, "Error validating request.-'bH' : cause - Duplicate order id")], &codes);
+    let own = differences(&[raise(321, "Error validating request.-'PlaceOrder(3)' : cause - Duplicate order id")], &codes);
     assert!(own[0].contains("itself"), "{own:?}");
 }
 

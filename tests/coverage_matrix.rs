@@ -4,12 +4,12 @@
 //! Rows (`kind,id,description,test`):
 //! - `rule`: a numbered section of the gateway translation specs;
 //! - `error`: an API error code of the gateway catalog;
-//! - `writer`: a field of the new order (35=D), replace (35=G) and cancel
-//!   (35=F) messages, as the gateway's writers emit them;
+//! - `writer`: a field of the new order, replace and cancel
+//!   messages, as the gateway's writers emit them;
 //! - `order_request`: a variant of `OrderRequest`;
 //! - `eclient`: a public `EClient` method;
 //! - `local_rule`: a local order refusal of the gateway catalog
-//!   (`tests/fixtures/gw1040/catalog/order_local_rules.csv`, ibx#485);
+//!   (`order_local_rules.csv` of 10.51, ibx#485, ibx#659);
 //! - `attribute`: an order attribute of the gateway catalog
 //!   (`order_attributes.csv`, ibx#485).
 //! - `decoder`: a decoder of network input, with its property test
@@ -188,10 +188,13 @@ fn every_public_client_method_has_a_row() {
     assert!(missing.is_empty(), "EClient methods with no row in matrix.csv: {missing:?}");
 }
 
-/// The rows of a gateway catalog file (`tests/fixtures/gw1040/catalog/`)
-/// as maps of column name to value.
+/// The rows of a gateway catalog file as maps of column name to value: the
+/// 10.51 table where it is made, else the 10.40 one (ibx#604), as the
+/// table tests read them.
 fn catalog(name: &str) -> Vec<std::collections::HashMap<String, String>> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gw1040/catalog").join(name);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let path = ["gw1051", "gw1040"].iter().map(|v| root.join(v).join("catalog").join(name))
+        .find(|p| p.exists()).unwrap();
     let text = std::fs::read_to_string(path).unwrap();
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let header = csv_fields(lines.next().unwrap());
@@ -229,10 +232,11 @@ const NOT_DECODERS: &[&str] = &[
     "connection::new", "connection::new_raw", "connection::new_mem", "connection::set_mem_read_timeout",
     "connection::set_keys", "connection::seed_buffer", "connection::has_buffered_data", "connection::try_recv",
     "connection::shutdown", "connection::set_queued_writes", "connection::has_queued_output",
+    "connection::hold", "connection::release",
     "connection::write_error", "connection::flush_queued", "connection::send_fix", "connection::send_fix_unsequenced",
     "connection::send_fixcomp", "connection::send_raw", "connection::buffered", "connection::inject_buf",
     "connection::mem_pair", "connection::set_read_timeout", "connection::set_nonblocking",
-    "connection::set_write_capacity", "connection::unread_output",
+    "connection::set_write_capacity", "connection::unread_output", "connection::internal_name",
     "depth_decoder::api", "depth_decoder::book_side",
     "fix::fmt_pipe", "fix::fix_checksum", "fix::fix_build", "fix::xml_layout", "fix::xor_fold", "fix::fix_sign",
     "fixcomp::fixcomp_build",
@@ -240,6 +244,7 @@ const NOT_DECODERS: &[&str] = &[
     "tick_decoder::new", "tick_decoder::remaining", "tick_decoder::tbt_field_count",
     "xyz::xyz_build", "xyz::xyz_wrap", "xyz::xyz_build_srp_v20", "xyz::xyz_build_soft_token",
     "xyz::xyz_build_swcr_token_init", "xyz::xyz_build_swcr_token_code_submission", "xyz::xyz_write_string",
+    "xyz::xyz_build_card_code", "xyz::xyz_build_temporary_code", "xyz::xyz_build_typed_code",
 ];
 
 /// Every public function of src/protocol is a decoder with its row (and so
