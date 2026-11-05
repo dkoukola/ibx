@@ -412,7 +412,7 @@ fn push_completed_rows(rows: &[CompletedOrderRow], api_only: bool, shared: &Shar
 /// local symbol; the permanent id, no API order id or client; the status,
 /// "Cancelled by Trader" for a cancel, and the time of the report in
 /// US/Eastern).
-fn completed_row(parsed: &fix::FieldMap<'_>, account_id: &str) -> CompletedOrderRow {
+fn completed_row(parsed: &fix::FieldMap<'_>, account_id: &str, form_10_40: bool) -> CompletedOrderRow {
     let get = |t: u32| parsed.get(&t).map(|s| s.to_string()).unwrap_or_default();
     let num = |t: u32| parsed.get(&t).and_then(|s| s.parse::<f64>().ok());
     let flag = |t: u32| parsed.get(&t).is_some_and(|s| *s == "1");
@@ -447,7 +447,8 @@ fn completed_row(parsed: &fix::FieldMap<'_>, account_id: &str) -> CompletedOrder
         account: { let a = get(1); if a.is_empty() { account_id.to_string() } else { a } },
         perm_id: perm_id_of(parsed),
         filled_quantity: num(14).unwrap_or(0.0),
-        outside_rth: flag(6433),
+        outside_rth: flag(6433) || (flag(8534) && !form_10_40),
+        include_overnight: flag(8534),
         post_only: flag(6605),
         deactivate: flag(6521),
         clearing_intent: get(6419),
@@ -2227,7 +2228,7 @@ impl CcpState {
                 return;
             }
             if parsed.get(&97).copied() == Some("Y") {
-                let row = completed_row(parsed, account_id);
+                let row = completed_row(parsed, account_id, shared.reference.form_10_40());
                 // A contract not known yet is looked up at its first
                 // report, as the reference (07/10/2026: IBM's definition
                 // asked before the end of the answer).
@@ -3053,6 +3054,7 @@ impl CcpState {
             let mut info = super::report::project_report(
                 parsed,
                 super::report::ReportProjection {
+                    form_10_40: shared.reference.form_10_40(),
                     order_id: clord_id,
                     parent_id,
                     status,
@@ -3082,6 +3084,17 @@ impl CcpState {
                 info.order.lmt_price = f64::MAX;
             }
             info.order.outside_rth |= shared.orders.get_order_info(clord_id).is_some_and(|i| i.order.outside_rth);
+            // Sparse working/modify reports omit 8534 even for an overnight
+            // order (10.51 i196: 2079 -> 2085 and 2102 -> 2108). Keep only
+            // the same order's server-confirmed flag. A full status, explicit
+            // flag or changed TIF remains authoritative.
+            if !is_status_report && !parsed.contains_key(&8534)
+                && info.order.tif == "DAY"
+                && previous.as_ref().is_some_and(|old| old.order.include_overnight)
+            {
+                info.order.include_overnight = true;
+                info.order.tif = "OVERNIGHT + DAY".into();
+            }
             // Keep the live order's stateful display fields across sparse
             // reports. The pure history projector has no session state.
             let reported_date = parsed.get(&6596).map(|date| (*date).to_owned());
@@ -13137,6 +13150,54 @@ BUY 1 QQQ,SPY Combo
     // ibx#307: the report's time in force as the reference reads it: DAY
     // when 59 is absent, DTC with the DTC flag, the overnight values, and
     // an unknown code kept as "???" (not DAY).
+    #[test]
+    fn overnight_capture_preserves_flags_on_untracked_and_completed_orders() {
+        let capture = include_str!("../../../tests/fixtures/gw1051/scenarios/20261019ov/i196_day_include_overnight.jsonl");
+        let rows: Vec<std::collections::HashMap<u32, String>> = capture.lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["leg"] == "fix_in" && row["msg_type"] == "8")
+            .map(|row| row["fields"].as_array().unwrap().iter()
+                .map(|field| (field[0].as_str().unwrap().parse().unwrap(), field[1].as_str().unwrap().to_string()))
+                .collect())
+            .collect();
+        let fields = &rows[0];
+        assert_eq!(fields.get(&8534).map(String::as_str), Some("1"));
+        assert!(!fields.contains_key(&6433));
+        assert_eq!(rows.len(), 5);
+        // The paired official API capture (seq2081) reports both flags true.
+        for form_10_40 in [false, true] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            shared.reference.set_form_10_40(form_10_40);
+            let core = crate::client_core::ClientCore::new();
+            for fields in &rows {
+                ccp.handle_exec_report(&fix::field_view(fields), &mut context, &shared, &None, "DUXXXXXXX");
+                let view = core.order_view(context.key_of(1586847597), &shared, "Submitted").unwrap();
+                assert_eq!(view.order.tif, "OVERNIGHT + DAY", "{fields:?}");
+                assert!(view.order.include_overnight);
+                assert_eq!(view.order.outside_rth, !form_10_40);
+            }
+            let (_, completed, _, _) = completed_row(&fix::field_view(fields), "DUXXXXXXX", form_10_40);
+            assert_eq!(completed.tif, "OVERNIGHT + DAY");
+            assert!(completed.include_overnight);
+            assert_eq!(completed.outside_rth, !form_10_40);
+        }
+        for (full_status, flag) in [(false, Some("0")), (true, None), (true, Some("0"))] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            ccp.handle_exec_report(&fix::field_view(fields), &mut context, &shared, &None, "DUXXXXXXX");
+            let mut changed = rows[1].clone();
+            changed.insert(20, if full_status { "3" } else { "0" }.into());
+            if let Some(flag) = flag { changed.insert(8534, flag.into()); }
+            ccp.handle_exec_report(&fix::field_view(&changed), &mut context, &shared, &None, "DUXXXXXXX");
+            let order = shared.orders.get_order_info(context.key_of(1586847597)).unwrap().order;
+            assert!(!order.include_overnight);
+            assert_eq!(order.tif, "DAY");
+        }
+    }
+
     #[test]
     fn the_report_time_in_force_is_read_as_the_reference() {
         let tif = |fields: &[(u32, &str)]| {

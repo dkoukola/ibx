@@ -335,6 +335,7 @@ fn project_execution(
     let projected = project_report(
         fields,
         ReportProjection {
+            form_10_40: shared.reference.form_10_40(),
             order_id,
             parent_id: 0,
             status: OrderStatus::Filled,

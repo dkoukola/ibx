@@ -107,6 +107,7 @@ pub(super) fn project(
     let projected = project_report(
         fields,
         ReportProjection {
+            form_10_40: shared.reference.form_10_40(),
             order_id: observation
                 .api_order_id
                 .filter(|id| *id > 0 && *id != i64::from(i32::MAX))

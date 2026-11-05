@@ -393,7 +393,7 @@ impl HistoryRequests {
         {
             let active = self.active.take().unwrap();
             if !active.timed_out {
-                let result = active.rows.finish(active.request.api_only);
+                let result = active.rows.finish(active.request.api_only, shared.reference.form_10_40());
                 let lifecycle_reports = if result.is_ok() {
                     active.lifecycle_rows.into_values().map(|(_, row)| row).collect()
                 } else { Vec::new() };
@@ -702,7 +702,7 @@ impl Reducer {
         Ok(())
     }
 
-    fn finish(self, api_only: bool) -> Result<Vec<RichOrderInfo>, String> {
+    fn finish(self, api_only: bool, form_10_40: bool) -> Result<Vec<RichOrderInfo>, String> {
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -822,6 +822,7 @@ impl Reducer {
                 project_report(
                     fields,
                     ReportProjection {
+                        form_10_40,
                         order_id: api_id(*base, &row.fields),
                         parent_id,
                         status: row.status,
@@ -1215,6 +1216,7 @@ mod tests {
         project_report(
             &crate::protocol::fix::field_view(fields),
             ReportProjection {
+                form_10_40: false,
                 order_id: fields[&6121].parse().unwrap(),
                 parent_id: 0,
                 status: if fields[&39] == "2" {
@@ -2087,7 +2089,7 @@ mod tests {
             }
             let mut reducer = Reducer::default();
             reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
-            assert!(reducer.finish(false).is_err(), "accepted {tag}={value:?}");
+            assert!(reducer.finish(false, false).is_err(), "accepted {tag}={value:?}");
         }
     }
 
@@ -2617,14 +2619,14 @@ mod tests {
         for row in &rows[..2] {
             reducer.push(&crate::protocol::fix::field_view(row), "DU123456");
         }
-        assert_eq!(reducer.finish(true).unwrap().len(), 2);
+        assert_eq!(reducer.finish(true, false).unwrap().len(), 2);
         for (id, expected) in [("0", 0), ("2147483647", 0), ("-1", 1), ("7", 1)] {
             let mut row = rows[0].clone();
             row.remove(&6088);
             row.insert(6121, id.into());
             let mut reducer = Reducer::default();
             reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
-            assert_eq!(reducer.finish(true).unwrap().len(), expected, "{id}");
+            assert_eq!(reducer.finish(true, false).unwrap().len(), expected, "{id}");
         }
     }
 
@@ -2645,7 +2647,7 @@ mod tests {
         for row in [current, earlier, cancel] {
             reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
         }
-        let result = reducer.finish(false).unwrap();
+        let result = reducer.finish(false, false).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].order.lmt_price, 2.0);
         assert_eq!(result[0].order_state.completed_time, "20260102-12:40:00");
@@ -2658,10 +2660,10 @@ mod tests {
         row.remove(&44);
         let mut reducer = Reducer::default();
         reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
-        assert!(reducer.finish(false).is_err());
+        assert!(reducer.finish(false, false).is_err());
         let mut reducer = Reducer::default();
         reducer.push(&crate::protocol::fix::field_view(&capture()[0]), "DIFFERENT_ACCOUNT");
-        assert!(reducer.finish(false).is_err());
+        assert!(reducer.finish(false, false).is_err());
     }
 
     #[test]
@@ -2689,9 +2691,40 @@ mod tests {
             let mut reducer = Reducer::default();
             reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
             reducer.push(&crate::protocol::fix::field_view(&cancel), "DU123456");
-            let result = reducer.finish(false).unwrap().remove(0);
+            let result = reducer.finish(false, false).unwrap().remove(0);
             assert_eq!(result.order.lmt_price, 2.0);
             assert_eq!(result.order_state.completed_time, "20260102-12:40:00");
+        }
+    }
+
+    #[test]
+    fn overnight_cold_history_preserves_native_session_flags() {
+        for form_10_40 in [false, true] {
+            let mut row = capture()[1].clone();
+            row.insert(59, "0".into());
+            row.insert(8534, "1".into());
+            row.remove(&6433);
+            let mut reducer = Reducer::default();
+            reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
+            let result = reducer.finish(false, form_10_40).unwrap().remove(0);
+            assert_eq!(result.order.tif, "OVERNIGHT + DAY");
+            assert!(result.order.include_overnight);
+            assert_eq!(result.order.outside_rth, !form_10_40);
+
+            // A sparse cancellation changes state, not previously confirmed
+            // native session terms, including during a cold history query.
+            let mut cancel = row.clone();
+            cancel.insert(39, "4".into());
+            cancel.remove(&8534);
+            row.insert(39, "0".into());
+            let mut reducer = Reducer::default();
+            reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
+            reducer.push(&crate::protocol::fix::field_view(&cancel), "DU123456");
+            let result = reducer.finish(false, form_10_40).unwrap().remove(0);
+            assert_eq!(result.order_state.status, "Cancelled");
+            assert_eq!(result.order.tif, "OVERNIGHT + DAY");
+            assert!(result.order.include_overnight);
+            assert_eq!(result.order.outside_rth, !form_10_40);
         }
     }
 
@@ -2704,7 +2737,7 @@ mod tests {
         row.insert(126, "20261005-20:00:00".into());
         let mut reducer = Reducer::default();
         reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
-        let result = reducer.finish(false).unwrap().remove(0);
+        let result = reducer.finish(false, false).unwrap().remove(0);
         assert_eq!(result.order.filled_quantity, 1.0);
         assert_eq!(result.order.good_till_date, "20261005 20:00:00 UTC");
         assert_eq!(result.order.tif, "GTD");
@@ -2715,7 +2748,7 @@ mod tests {
             }
             let mut reducer = Reducer::default();
             reducer.push(&crate::protocol::fix::field_view(&row), "DU123456");
-            assert!(reducer.finish(false).is_err());
+            assert!(reducer.finish(false, false).is_err());
         }
     }
 
@@ -2725,7 +2758,7 @@ mod tests {
         let shared = SharedState::new();
         let mut reducer = Reducer::default();
         reducer.push(&crate::protocol::fix::field_view(&capture()[0]), "DU123456");
-        let mut rich = reducer.finish(false).unwrap().remove(0);
+        let mut rich = reducer.finish(false, false).unwrap().remove(0);
         shared.orders.push_order_info(1, rich.clone());
         rich.order_state.status = "Submitted".into();
         shared.orders.push_order_info(2, rich);

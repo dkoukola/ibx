@@ -28,6 +28,7 @@ pub(super) fn stale_report(
 }
 
 pub(super) struct ReportProjection<'a> {
+    pub form_10_40: bool,
     pub order_id: i64,
     pub parent_id: i64,
     pub status: OrderStatus,
@@ -44,6 +45,7 @@ pub(super) fn project_report(
     input: ReportProjection<'_>,
 ) -> RichOrderInfo {
     let ReportProjection {
+        form_10_40,
         order_id: clord_id,
         parent_id,
         status,
@@ -84,7 +86,12 @@ pub(super) fn project_report(
     let ord_type_tag = parsed.get(&40).copied().unwrap_or("");
     let limit_price: f64 = parsed.get(&44).and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let stop_px: f64 = parsed.get(&99).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let outside_rth = parsed.get(&6433).map(|s| *s == "1").unwrap_or(false);
+    let include_overnight = parsed.get(&8534).copied() == Some("1");
+    // The 10.51 reference reports outsideRth for a server-confirmed
+    // includeOvernight order even when 6433 is absent (i196, 19/10/2026).
+    // This also applies without a locally tracked submission after reconnect.
+    let outside_rth = parsed.get(&6433).copied() == Some("1")
+        || (include_overnight && !form_10_40);
     let clearing_intent = parsed.get(&6419).map(|v| (*v).to_owned()).unwrap_or_default();
     let auto_cancel_date = parsed.get(&6596).map(|v| (*v).to_owned()).unwrap_or_default();
     let exec_exchange = parsed.get(&30).map(|v| (*v).to_owned()).unwrap_or_default();
@@ -262,6 +269,7 @@ pub(super) fn project_report(
         // Filled so far, not the quantity still working (ibx#309).
         filled_quantity: cum_qty,
         outside_rth,
+        include_overnight,
         clearing_intent,
         auto_cancel_date,
         submitter: account_id.to_string(),
@@ -363,6 +371,7 @@ mod tests {
 
     fn input() -> ReportProjection<'static> {
         ReportProjection {
+            form_10_40: false,
             order_id: 1_791_024_000_001,
             parent_id: 1_791_024_000_000,
             status: OrderStatus::Cancelled,
@@ -373,6 +382,28 @@ mod tests {
             combo: None,
             trail_limit: None,
             combo_leg_prices: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn overnight_report_flags_do_not_require_locally_tracked_submission() {
+        for form_10_40 in [false, true] {
+            for include in [None, Some("0"), Some("1")] {
+                for outside in [None, Some("0"), Some("1")] {
+                    let mut fields = HashMap::from([(59, "0".to_string())]);
+                    if let Some(value) = include { fields.insert(8534, value.into()); }
+                    if let Some(value) = outside { fields.insert(6433, value.into()); }
+                    let projected = project_report(
+                        &crate::protocol::fix::field_view(&fields),
+                        ReportProjection { form_10_40, ..input() },
+                    );
+                    assert_eq!(projected.order.include_overnight, include == Some("1"));
+                    assert_eq!(projected.order.outside_rth,
+                        outside == Some("1") || (include == Some("1") && !form_10_40));
+                    assert_eq!(projected.order.tif,
+                        if include == Some("1") { "OVERNIGHT + DAY" } else { "DAY" });
+                }
+            }
         }
     }
 
